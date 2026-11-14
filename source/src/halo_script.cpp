@@ -3,6 +3,7 @@
 #include "halo_campaign.h"
 #include "halo_collision.h"
 #include "halo_script.h"
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <random>
