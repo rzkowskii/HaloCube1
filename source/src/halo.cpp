@@ -922,3 +922,10 @@ void halorendervehicle()
     origin.z -= player1->eyeheight;
     rendermodel("halo/warthog", ANIM_MAPMODEL, 0, -1, origin, 0, player1->yaw + 90, 0, 0, 0);
 }
+
+#ifdef HALO_QA
+// Verification hooks live in tests/native. They read this file's internal
+// campaign state, so they compile into the same translation unit.
+#include "campaign_qa.inc"
+#include "b30_qa.inc"
+#endif

@@ -78,3 +78,7 @@ The signed Apple Silicon app played The Pillar of Autumn opening at normal speed
 | Two Betrayals | 5 | Reverse Control Room route and final pulse generator interaction |
 | Keyes | 6 | Cruiser exterior and interiors, implant recovery and hangar return |
 | The Maw | 8 | Autumn interiors, reactor interaction and timed Warthog escape |
+
+## Verification
+
+Run `./scripts/test-macos.sh` to build the game and the `halo-ac-qa` client, package the app and run the quick test tier. Add `--slow` for the full-speed opening and keystroke tests. Results, logs and profiles go to `build/qa/`. [Test guide](../tests/README.md)

@@ -27,4 +27,4 @@ The playable route uses 55 AssaultCube sections. Full retail parity remains in p
 
 The local asset library includes the original campaign, multiplayer and menu caches plus converted geometry, collision, models, bitmaps and sound variants. The build guide covers regenerating the library and explains what the app currently uses.
 
-[Build and asset import guide](docs/macos-build.md)
+[Build and asset import guide](docs/macos-build.md) · [Tests](tests/README.md)
