@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(HaloInAssaultCube LANGUAGES C CXX)
 
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED YES)
+option(HALO_BUILD_QA "Build the halo-ac-qa verification client used by tests/" OFF)
+
 if(NOT APPLE)
     message(FATAL_ERROR "This build targets macOS.")
 endif()
@@ -46,10 +50,10 @@ set(CLIENT_SOURCES
     docs.cpp
     editing.cpp
     entities.cpp
-    halo.cpp
     halo_collision.cpp
     halo_counter.cpp
     halo_script.cpp
+    halo_world.cpp
     http.cpp
     log.cpp
     main.cpp
@@ -88,11 +92,22 @@ set(CLIENT_SOURCES
 )
 list(TRANSFORM CLIENT_SOURCES PREPEND "source/src/")
 
-add_executable(halo-ac ${CLIENT_SOURCES})
-set_target_properties(halo-ac PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED YES)
-target_include_directories(halo-ac PRIVATE source/src source/src/bot source/include
+# Everything except halo.cpp is shared by the game and the QA client. halo.cpp
+# is compiled per executable because the QA hooks join its translation unit.
+add_library(halo-engine OBJECT ${CLIENT_SOURCES})
+target_include_directories(halo-engine PUBLIC source/src source/src/bot source/include
     "${VORBIS_INCLUDE_DIR}" "${OGG_INCLUDE_DIR}")
-target_compile_definitions(halo-ac PRIVATE GL_SILENCE_DEPRECATION)
-target_compile_options(halo-ac PRIVATE -fsigned-char -fno-strict-aliasing)
-target_link_libraries(halo-ac PRIVATE enet SDL2::SDL2 SDL2_image::SDL2_image ZLIB::ZLIB
+target_compile_definitions(halo-engine PUBLIC GL_SILENCE_DEPRECATION)
+target_compile_options(halo-engine PUBLIC -fsigned-char -fno-strict-aliasing)
+target_link_libraries(halo-engine PUBLIC enet SDL2::SDL2 SDL2_image::SDL2_image ZLIB::ZLIB
     "${OPENGL_FRAMEWORK}" "${OPENAL_FRAMEWORK}" "${VORBISFILE_LIBRARY}")
+
+add_executable(halo-ac source/src/halo.cpp)
+target_link_libraries(halo-ac PRIVATE halo-engine)
+
+if(HALO_BUILD_QA)
+    add_executable(halo-ac-qa source/src/halo.cpp tests/native/b30_trace_qa.cpp)
+    target_compile_definitions(halo-ac-qa PRIVATE HALO_QA)
+    target_include_directories(halo-ac-qa PRIVATE tests/native)
+    target_link_libraries(halo-ac-qa PRIVATE halo-engine)
+endif()

@@ -6,36 +6,6 @@
 #include "halo_script.h"
 #include "halo_world.h"
 
-bool halocinematicground(const vec &point, float &ground)
-{
-    if(strcmp(haloWorldMap, halocinematicworld())) return false;
-    float best = 2.4f;
-    bool found = false;
-    auto test = [&](const std::vector<const HaloWorldVertex *> &triangles)
-    {
-        for(const HaloWorldVertex *a : triangles)
-        {
-            const HaloWorldVertex &b = a[1], &c = a[2];
-            float bx = b.x - a->x, by = b.y - a->y;
-            float cx = c.x - a->x, cy = c.y - a->y;
-            float px = point.x - a->x, py = point.y - a->y;
-            float area = bx * cy - by * cx;
-            float u = (px * cy - py * cx) / area, v = (bx * py - by * px) / area;
-            if(u < 0 || v < 0 || u + v > 1) continue;
-            float z = a->z + (b.z - a->z) * u + (c.z - a->z) * v;
-            float delta = fabsf(point.z - z);
-            if(delta >= best) continue;
-            best = delta;
-            ground = z;
-            found = true;
-        }
-    };
-    auto cell = haloGround.find(groundKey(groundCell(point.x), groundCell(point.y)));
-    if(cell != haloGround.end()) test(cell->second);
-    test(haloWideGround);
-    return found;
-}
-
 bool hasTE = false, hasMT = false, hasMDA = false, hasDRE = false, hasstencil = false, hasST2 = false, hasSTW = false, hasSTS = false, hasAF;
 
 // GL_ARB_multitexture
@@ -1074,7 +1044,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     effective_stencilshadow = mapoverride_nostencilshadows && !ignoreoverride_nostencilshadows ? 0 : stencilshadow;
     bool effective_waterreflect = waterreflect && !editmode && (!mapoverride_nowaterreflect || ignoreoverride_nowaterreflect);
 
-    const bool useHaloWorld = hasHaloWorld();
+    const bool useHaloWorld = haloworldready();
     const bool scene = halocinematic();
 
     dodynlights();
@@ -1158,9 +1128,9 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
         glPushMatrix();
         glScalef(1, 1, -1);
         // The space sky retains the authored camera parallax at its imported scale.
-        if(!haloNozzles.empty()) glTranslatef(-camera1->o.x / 400, -camera1->o.y / 400, -camera1->o.z / 400);
-        drawHaloWorld(HALO_SKY_ADDITIVE);
-        drawHaloWorld(HALO_SKY);
+        if(haloworldhasnozzles()) glTranslatef(-camera1->o.x / 400, -camera1->o.y / 400, -camera1->o.z / 400);
+        haloworlddraw(HALO_SKY_ADDITIVE);
+        haloworlddraw(HALO_SKY);
         glPopMatrix();
     }
     glDepthFunc(GL_LESS);
@@ -1173,8 +1143,8 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     {
         // The retail mesh supplies visible depth independently of world collision.
         resettmu(0);
-        drawHaloWorld(HALO_SOLID);
-        drawHaloNozzles();
+        haloworlddraw(HALO_SOLID);
+        haloworlddrawnozzles();
     }
     setuptmu(0, "T * P x 2");
     if(!useHaloWorld) renderstrips();
@@ -1218,9 +1188,9 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     if(useHaloWorld)
     {
         resettmu(0);
-        drawHaloWorld(HALO_WATER);
-        drawHaloWorld(HALO_ADDITIVE);
-        drawHaloCoronas(camright, camup, camdir);
+        haloworlddraw(HALO_WATER);
+        haloworlddraw(HALO_ADDITIVE);
+        haloworlddrawcoronas(camright, camup, camdir);
         setuptmu(0, "T * P x 2");
     }
 
