@@ -16,3 +16,4 @@
 /packages/maps/halo_scene_*.mesh
 /packages/maps/halo_scene_*.hcol
 /packages/textures/halo_scene_*/
+/packages/textures/halo_hud/
