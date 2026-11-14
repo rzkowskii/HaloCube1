@@ -10,6 +10,7 @@
 #include "halo_ai.h"
 #include "halo_script.h"
 #include "halo_weapons.h"
+#include <algorithm>
 #include <sstream>
 
 namespace
@@ -21,7 +22,7 @@ namespace
     enum Awareness { UNAWARE, ALERT, COMBAT };
     enum Morale { STEADY, PANICKED, BERSERK };
     // Retail actr types used for leader and swarm rules.
-    enum { TYPE_ELITE = 0, TYPE_JACKAL = 1, TYPE_GRUNT = 2, TYPE_HUNTER = 3, TYPE_MARINE = 7 };
+    enum { TYPE_ELITE = 0, TYPE_JACKAL = 1, TYPE_GRUNT = 2, TYPE_HUNTER = 3, TYPE_MARINE = 7, TYPE_INFECTION = 10 };
     // Retail squad states (none, sleep, alert, the move states, guard, search, flee).
     enum { STATE_SLEEP = 1, STATE_MOVE_FIRST = 3, STATE_MOVE_LAST = 7, STATE_GUARD = 8, STATE_GUARD_AT = 9,
            STATE_SEARCH = 10, STATE_FLEE = 11 };
@@ -58,8 +59,13 @@ namespace
         int thinks = 0, shots = 0, destinationGroup = -1;
         float homeYaw = 0;
         int nextGlance = 0;
+        int nextLeap = 0, leaps = 0;
+        const playerent *follow = nullptr;
+        float followDistance = 0;
     };
     std::vector<Actor> actors;
+    std::vector<const playerent *> preferred;
+    bool grenadesAllowed = true;
     struct Noise { const playerent *source; vec at; int millis; };
     std::vector<Noise> noises;
 
@@ -167,7 +173,8 @@ namespace
         eachCombatant([&](playerent *p)
         {
             if(p == a.bot || !haloactorhostile(a.bot, p) || !sees(a, body, p)) return;
-            const float d = p->o.dist(a.bot->o) * (p == a.target ? 0.8f : 1.0f);
+            float d = p->o.dist(a.bot->o) * (p == a.target ? 0.8f : 1.0f);
+            if(std::find(preferred.begin(), preferred.end(), p) != preferred.end()) d *= 0.5f;
             if(d < bestDistance) { bestDistance = d; best = p; }
         });
         if(best)
@@ -367,7 +374,7 @@ namespace
     {
         const HaloActorDef &d = *a.def;
         botent *e = a.bot;
-        if(!BotManager.BotsShoot() || !a.target || lastmillis < a.nextGrenade || e->mag[GUN_GRENADE] <= 0 || d.grenadeChance <= 0) return;
+        if(!grenadesAllowed || !BotManager.BotsShoot() || !a.target || lastmillis < a.nextGrenade || e->mag[GUN_GRENADE] <= 0 || d.grenadeChance <= 0) return;
         a.nextGrenade = lastmillis + 4000 + rnd(4000);
         const float distance = e->o.dist(a.target->o), s = scale();
         if(distance < max(d.grenadeRangeMin, 2.0f) * s || distance > max(d.grenadeRangeMax, 8.0f) * s) return;
@@ -446,6 +453,38 @@ namespace
         return true;
     }
 
+    // Infection forms lunge at a target a few strides away: a hop with a burst of
+    // forward speed, then a cooldown while they scuttle.
+    void leap(Actor &a)
+    {
+        botent *e = a.bot;
+        const playerent *t = a.target;
+        if(a.def->type != TYPE_INFECTION || !t || !alive(t) || lastmillis < a.nextLeap || !e->onfloor) return;
+        const float s = scale(), distance = e->o.dist(t->o);
+        if(distance < 2.5f * s || distance > 7.0f * s || !::IsVisible(e->o, centreOf(t), NULL)) return;
+        vec dir = vec(t->o).sub(e->o);
+        dir.z = 0;
+        if(dir.iszero()) return;
+        dir.normalize();
+        e->vel.x = dir.x * 1.1f;
+        e->vel.y = dir.y * 1.1f;
+        e->jumpnext = true;
+        a.nextLeap = lastmillis + 1500 + rnd(1500);
+        ++a.leaps;
+    }
+
+    // Infection forms head for a fallen marine or Elite when it is closer than their target.
+    bool seekCorpse(Actor &a, CBot *body)
+    {
+        if(a.def->type != TYPE_INFECTION) return false;
+        const float s = scale();
+        vec corpse;
+        if(!halonearestcorpse(a.bot->o, 40.0f * s, corpse)) return false;
+        if(a.awareness == COMBAT && a.target && a.bot->o.dist(a.target->o) < a.bot->o.dist(corpse)) return false;
+        walkTo(a, body, corpse, 1.5f, true);
+        return true;
+    }
+
     void think(Actor &a, CBot *body)
     {
         ++a.thinks;
@@ -465,6 +504,7 @@ namespace
         }
 
         const float s = scale();
+        if(seekCorpse(a, body)) return;
         if(a.awareness == COMBAT && a.target)
         {
             if(a.morale == BERSERK || (a.def->actrFlags & 1) || e->weaponsel->type == GUN_KNIFE)
@@ -483,11 +523,19 @@ namespace
                 if(lastmillis >= a.nextWander) { a.nextWander = lastmillis + 900 + rnd(1500); e->strafe = rnd(3) - 1; }
             }
             if(!a.hasDestination && a.morale != BERSERK) keepRange(a, body);
+            leap(a);
             fire(a, body);
             if(!(a.flags & HALO_AI_PLAYFIGHT)) throwGrenade(a, body);
             return;
         }
 
+        if(alive(a.follow) && a.awareness != ALERT)
+        {
+            // Squads told to follow a unit trail it at their follow distance.
+            const float want = max(a.followDistance, 4.0f) * s;
+            if(e->o.dist(a.follow->o) > want * 1.5f) walkTo(a, body, a.follow->o, want, true);
+            return;
+        }
         if((a.flags & HALO_AI_FOLLOW_PLAYER) || (a.team == HALO_TEAM_HUMAN && !a.positions))
         {
             // Stay near the player when following and nothing is to be fought.
@@ -585,7 +633,12 @@ void haloactorattach(botent *bot, const HaloActorDef *def, int team)
 void haloactordetach(const playerent *bot)
 {
     for(size_t i = 0; i < actors.size(); ++i) if(actors[i].bot == bot) { actors.erase(actors.begin() + i); break; }
-    for(Actor &a : actors) if(a.target == bot) { a.target = nullptr; if(a.awareness == COMBAT) a.awareness = ALERT; }
+    for(Actor &a : actors)
+    {
+        if(a.target == bot) { a.target = nullptr; if(a.awareness == COMBAT) a.awareness = ALERT; }
+        if(a.follow == bot) a.follow = nullptr;
+    }
+    preferred.erase(std::remove(preferred.begin(), preferred.end(), bot), preferred.end());
 }
 
 void haloactorsclear() { actors.clear(); noises.clear(); }
@@ -625,7 +678,7 @@ void haloactorsetpositions(const playerent *bot, const std::vector<HaloFiringPos
 
 void haloactorsetposture(const playerent *bot, int posture)
 {
-    if(Actor *a = find(bot)) if(a->posture != posture) { a->posture = posture; a->positionUntil = 0; }
+    if(Actor *a = find(bot)) if(a->posture != posture && !(posture == HALO_PURSUING && (a->flags & HALO_AI_NO_MANEUVER))) { a->posture = posture; a->positionUntil = 0; }
 }
 
 int haloactorposture(const playerent *bot) { const Actor *a = find(bot); return a ? a->posture : HALO_ATTACKING; }
@@ -684,6 +737,48 @@ float haloactorhealthfraction(const playerent *bot)
 }
 
 int haloactorflags(const playerent *bot) { const Actor *a = find(bot); return a ? a->flags : 0; }
+void haloaisetgrenades(bool on) { grenadesAllowed = on; }
+bool haloaigrenades() { return grenadesAllowed; }
+
+void haloactorberserk(const playerent *bot, bool on)
+{
+    Actor *a = find(bot);
+    if(!a) return;
+    if(on) { a->morale = BERSERK; a->moraleUntil = INT_MAX; a->hiding = false; a->berserkTried = true; }
+    else if(a->morale == BERSERK) a->morale = STEADY;
+    a->positionUntil = 0;
+}
+
+void haloactorfollow(const playerent *bot, const playerent *target)
+{
+    if(Actor *a = find(bot)) a->follow = target;
+}
+void haloactorfollowdistance(const playerent *bot, float distance) { if(Actor *a = find(bot)) a->followDistance = distance; }
+const playerent *haloactorfollowing(const playerent *bot) { const Actor *a = find(bot); return a ? a->follow : nullptr; }
+
+void haloactorprefer(const playerent *target, bool on)
+{
+    if(!target) return;
+    const bool present = std::find(preferred.begin(), preferred.end(), target) != preferred.end();
+    if(on && !present) preferred.push_back(target);
+    else if(!on && present) preferred.erase(std::remove(preferred.begin(), preferred.end(), target), preferred.end());
+}
+
+int haloactorstarthealth(const playerent *bot) { const Actor *a = find(bot); return a ? a->startHealth : 0; }
+
+void haloactorrenew(playerent *bot)
+{
+    const Actor *a = find(bot);
+    if(!a || !alive(bot)) return;
+    haloenemyrenew(bot, a->startHealth, a->def->grenadeMax);
+}
+
+void haloactorsethealthfraction(playerent *bot, float fraction)
+{
+    Actor *a = find(bot);
+    if(!a || a->startHealth <= 0 || !alive(bot)) return;
+    bot->health = max(1, int(clamp(fraction, 0.0f, 1.0f) * a->startHealth + .5f));
+}
 
 void haloactornoise(const playerent *source)
 {
@@ -741,17 +836,18 @@ void haloactordump(const char *label)
     for(const Actor &a : actors)
     {
         const botent *e = a.bot;
-        conoutf("ACTOR_QA %s name=%s family=%s team=%d alive=%d awareness=%s morale=%s posture=%d hiding=%d status=%d "
-                "target=%s pos=%.1f,%.1f,%.1f dest=%d group=%d mask=%u positions=%d command=%d health=%d shots=%d flags=%d",
-                label, e->name, a.def->family.c_str(), a.team, e->state == CS_ALIVE, awareness[a.awareness], morale[a.morale],
+        conoutf("ACTOR_QA %s cn=%d name=%s family=%s team=%d alive=%d awareness=%s morale=%s posture=%d hiding=%d status=%d "
+                "target=%s pos=%.1f,%.1f,%.1f dest=%d group=%d mask=%u positions=%d command=%d health=%d shots=%d flags=%d leaps=%d",
+                label, e->clientnum, e->name, a.def->family.c_str(), a.team, e->state == CS_ALIVE, awareness[a.awareness], morale[a.morale],
                 a.posture, a.hiding, haloactorstatus(e), a.target ? (a.target == player1 ? "player" : a.target->name) : "-",
                 e->o.x, e->o.y, e->o.z, a.hasDestination, a.destinationGroup, a.masks[maskFor(a)],
                 a.positions ? int(a.positions->size()) : 0, a.commandStatus,
-                e->health, a.shots, a.flags);
+                e->health, a.shots, a.flags, a.leaps);
+        conoutf("ACTOR_EXTRA %s cn=%d follow=%d grenades=%d grenades_on=%d shield=%.3f", label, e->clientnum, a.follow != nullptr, e->mag[GUN_GRENADE], grenadesAllowed, haloenemyshieldfraction(e));
         vec delta = vec(player1->o).sub(e->o);
         const float yaw = e->yaw * RAD;
         const float angle = acosf(clamp(vec(delta.x, delta.y, 0).normalize().dot(vec(sinf(yaw), -cosf(yaw), 0)), -1.0f, 1.0f)) / RAD;
-        conoutf("ACTOR_VIEW %s name=%s yaw=%.0f angle=%.0f distance=%.1f range=%.1f visible=%d thinks=%d", label, e->name, e->yaw,
+        conoutf("ACTOR_VIEW %s cn=%d name=%s yaw=%.0f angle=%.0f distance=%.1f range=%.1f visible=%d thinks=%d", label, e->clientnum, e->name, e->yaw,
                 angle, delta.magnitude(), a.def->visionDistance * scale(), ::IsVisible(e->o, centreOf(player1), NULL), a.thinks);
     }
     fflush(stdout);

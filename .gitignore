@@ -1,19 +1,9 @@
 /build/
 /.DS_Store
 **/__pycache__/
-/packages/maps/halo_a30.cgz
-/packages/textures/halo_a30/
-/packages/textures/skymaps/halo_a30/
-/packages/models/mapmodels/halo_a30/
-/packages/models/halo/
-/packages/audio/halo/
-/packages/maps/halo_a30.mesh
-/packages/maps/halo_???_??.*
-/packages/textures/halo_???_??/
-/packages/textures/skymaps/halo_???_??/
-
-/packages/halo/
-/packages/maps/halo_scene_*.mesh
-/packages/maps/halo_scene_*.hcol
-/packages/textures/halo_scene_*/
-/packages/textures/halo_hud/
+# Everything under packages/ is generated from retail assets: deny by default.
+# Only files listed here are ours. scripts/check-no-retail.sh enforces this.
+/packages/*
+!/packages/maps/
+/packages/maps/*
+!/packages/maps/halo_a30.cfg

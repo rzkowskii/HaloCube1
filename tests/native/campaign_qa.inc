@@ -393,6 +393,42 @@ COMMANDF(qa_actor_place, "s", (const char *encounter)
     conoutf("ACTOR_PLACE %s %d", encounter, haloscenarioplace(encounter));
     fflush(stdout);
 });
+// Kills every living campaign actor, as the player's fire would.
+static void qaKillActors(int kind)
+{
+    loopv(enemies)
+        if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && (kind < 0 || enemies[i].kind == kind))
+            dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
+}
+COMMANDF(qa_actor_kill, "i", (int *kind) { qaKillActors(*kind); });
+// Living actors per body: FLOOD_QA label infection=2 carrier=0 flood_human=1 ...
+COMMANDF(qa_actor_count, "s", (const char *label)
+{
+    int counts[ACTOR_COUNT] = {};
+    loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE) ++counts[enemies[i].kind];
+    conoutf("FLOOD_QA %s grunt=%d elite=%d jackal=%d hunter=%d flood_elite=%d flood_human=%d infection=%d carrier=%d sentinel=%d marine=%d",
+            label, counts[GRUNT], counts[ELITE], counts[JACKAL], counts[HUNTER], counts[FLOOD_ELITE], counts[FLOOD_HUMAN],
+            counts[INFECTION], counts[CARRIER], counts[SENTINEL], counts[MARINE]);
+    fflush(stdout);
+});
+// Leaves `count` dead entries in the squad list, as a long fight does.
+COMMANDF(qa_squad_pad, "i", (int *count) { haloscenarioqapad(*count); });
+// Places every encounter of the section one after another, killing each squad before the next
+// so only the cap on living actors can stop a placement: SQUAD_QA <name> starts=<n> placed=<n>.
+COMMANDF(qa_place_all, "", ()
+{
+    int total = 0;
+    loopi(haloscenarioencountercount())
+    {
+        const int starts = haloscenarioencounterstarts(i);
+        const int placed = starts > 0 ? max(0, haloscenarioplace(haloscenarioencountername(i))) : 0;
+        total += placed;
+        conoutf("SQUAD_QA %s starts=%d placed=%d", haloscenarioencountername(i), starts, placed);
+        qaKillActors(-1);
+    }
+    conoutf("SQUAD_QA total placed=%d", total);
+    fflush(stdout);
+});
 // Spawns an actor of a family at forward/side offsets (Halo world units) from the player, facing it.
 static void qaActorSpawn(int kind, int team, float forward, float side)
 {
@@ -402,7 +438,7 @@ static void qaActorSpawn(int kind, int team, float forward, float side)
     at.add(vec(sinf(yaw), -cosf(yaw), 0).mul(forward * s)).add(vec(cosf(yaw), sinf(yaw), 0).mul(side * s));
     // Allies face the way the player looks; hostiles face the player.
     botent *bot = spawnEnemy(ActorKind(clamp(kind, 0, int(ACTOR_COUNT) - 1)), at, player1->yaw + (team ? 0 : 180), -1, -1, team);
-    conoutf("ACTOR_SPAWN %s %d", bot ? bot->name : "-", bot ? team : -1);
+    conoutf("ACTOR_SPAWN %s %d hp=%d", bot ? bot->name : "-", bot ? team : -1, bot ? bot->health : 0);
     fflush(stdout);
 }
 COMMANDF(qa_actor_spawn, "iiff", (int *kind, int *team, float *forward, float *side) { qaActorSpawn(*kind, *team, *forward, *side); });
@@ -436,6 +472,60 @@ static void qaCommandStatus(const char *encounter)
     fflush(stdout);
 }
 COMMANDF(qa_hs_command, "s", (const char *encounter) { qaCommandStatus(encounter); });
+// Script commands with several arguments (tests/test_actor_ai.py). Each token is a number, an encounter or
+// squad name, `list:NAME` (ai_actors), `unit:NAME:N` (the N-th actor of NAME), `obj:NAME` (a scripted object),
+// `player`, `players`, `s:TEXT` (a string argument) or true/false.
+// qa_hs_cmd ai_follow_target_ai "squad_a squad_b" prints HS_CMD <command> <value>.
+static double qaToken(const char *token)
+{
+    if(!strcmp(token, "true")) return 1;
+    if(!strcmp(token, "false")) return 0;
+    if(!strcmp(token, "player")) return -2;
+    if(!strcmp(token, "players")) return -3;
+    if(!strncmp(token, "list:", 5)) return haloscenariocall("ai_actors", haloscenarioencounter(token + 5), 0);
+    if(!strncmp(token, "unit:", 5))
+    {
+        string encounter;
+        copystring(encounter, token + 5);
+        char *colon = strchr(encounter, ':');
+        const int n = colon ? atoi(colon + 1) : 0;
+        if(colon) *colon = 0;
+        const double list = haloscenariocall("ai_actors", haloscenarioencounter(encounter), 0);
+        return haloscenariocall("list_get", list, n);
+    }
+    if(!strncmp(token, "obj:", 4)) return haloscenarioobject(token + 4);
+    char *end = NULL;
+    const double number = strtod(token, &end);
+    if(end && !*end) return number;
+    return haloscenarioencounter(token);
+}
+COMMANDF(qa_hs_cmd, "ss", (const char *command, const char *arguments)
+{
+    vector<char *> words;
+    explodelist(arguments, words);
+    double values[8] = {};
+    const char *texts[8] = {};
+    const int count = min(words.length(), 8);
+    loopi(count)
+    {
+        // s:NAME passes a string argument (an effect or permutation name).
+        if(!strncmp(words[i], "s:", 2)) texts[i] = words[i] + 2; else { texts[i] = ""; values[i] = qaToken(words[i]); }
+    }
+    conoutf("HS_CMD %s %.4f", command, haloscenariocallv(command, values, texts, count));
+    words.deletearrays();
+    fflush(stdout);
+});
+// qa_hs_object state obj:NAME prints the state the object commands set.
+COMMANDF(qa_hs_object, "ss", (const char *what, const char *name)
+{
+    conoutf("HS_OBJECT %s %s %.0f", what, name, haloscenarioobjectstate(what, haloscenarioobject(!strncmp(name, "obj:", 4) ? name + 4 : name)));
+    fflush(stdout);
+});
+COMMANDF(qa_player_vitals, "", ()
+{
+    conoutf("QA_VITALS health=%d shield=%.3f protected=%d", player1->health, haloplayershieldfraction(), haloplayerprotected());
+    fflush(stdout);
+});
 COMMANDF(qa_actor_table, "", ()
 {
     loopi(haloactordefcount())
@@ -449,4 +539,42 @@ COMMANDF(qa_actor_table, "", ()
 COMMANDF(qa_actor_flag, "ii", (int *flag, int *on)
 {
     loopv(enemies) if(enemies[i].bot) haloactorsetflag(enemies[i].bot, *flag, *on != 0);
+});
+
+// ---- Script pacing commands (tests/test_script_coverage.py)
+// qa_hs_call hud_get_timer_ticks 0 0 prints HS_CALL <command> <value>.
+COMMANDF(qa_hs_call, "sff", (const char *command, float *first, float *second)
+{
+    conoutf("HS_CALL %s %.4f", command, haloscenariocall(command, *first, *second));
+    fflush(stdout);
+});
+// qa_hs_script endgame_cinematics 1 wakes (0), or reports started (1) or finished (2) for a script.
+COMMANDF(qa_hs_script, "si", (const char *name, int *action)
+{
+    conoutf("HS_SCRIPT %s %d %.0f", name, *action, haloscenarioqascript(name, *action));
+    fflush(stdout);
+});
+
+// ---- Ending (tests/test_campaign_ending.py)
+// Plays the section's exit scene, as reaching the final objective does.
+COMMANDF(qa_halo_finale, "", () { if(haloactive()) finishSection(); });
+COMMANDF(qa_halo_ending, "", ()
+{
+    conoutf("QA_ENDING ending=%d done=%d beaten=%d won=%d finished=%d cinematic=%d alive=%d",
+        ending, endingDone, campaignBeaten, winPending, campaignFinished, halocinematic(), player1->state == CS_ALIVE);
+    fflush(stdout);
+});
+// Queues a section as real campaign play (not a standalone preview): 1-based mission and section.
+COMMANDF(qa_campaign_play, "ii", (int *m, int *s)
+{
+    loadProgress();
+    queueSection(*m - 1, *s - 1);
+});
+
+// Difficulty (tests/test_difficulty.py): the selected level, the script's view of it and the damage multiplier.
+COMMANDF(qa_difficulty, "", ()
+{
+    conoutf("DIFFICULTY %d script=%d damage=%.2f health=%.2f", halodifficulty(),
+            int(haloscenariocall("game_difficulty_get", 0, 0)), halodifficultydamage(), halodifficultyhealth());
+    fflush(stdout);
 });

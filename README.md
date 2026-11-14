@@ -24,7 +24,7 @@ The build loads the original compiled HaloScript from all ten missions. It runs 
 
 The Silent Cartographer uses the original structure BSPs for movement, weapon traces, and bot sight. The Cartographer terminal runs the original map scene, and the return route leads to the Pelican landing zone. Press **E** at the ramp to board once the Pelican arrives.
 
-The playable route uses 55 AssaultCube sections. Full retail parity remains in progress, including continuous traversal of multi-level BSPs, vehicle and biped physics, cinematic effects and poses, allied squads, encounter branches, the full arsenal, vehicle combat, and co-op. Retail assets are generated from a local Xbox copy and ignored by Git.
+The playable route uses 55 AssaultCube sections. The campaign is single-player; co-op, multiplayer and splitscreen are out of scope. Full retail parity remains in progress, including continuous traversal of multi-level BSPs, vehicle and biped physics, cinematic effects and poses, allied squads, encounter branches, the full arsenal and vehicle combat. Retail assets are generated from a local Xbox copy of Halo CE (the expanded maps directory named in the build guide) and ignored by Git. This is an unofficial fan project, not affiliated with Microsoft, 343 Industries or Bungie; see [NOTICE.md](NOTICE.md).
 
 The local asset library includes the original campaign, multiplayer and menu caches plus converted geometry, collision, models, bitmaps and sound variants. The build guide covers regenerating the library and explains what the app currently uses.
 

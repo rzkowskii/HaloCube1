@@ -15,7 +15,9 @@ enum { HALO_TEAM_COVENANT = 0, HALO_TEAM_HUMAN = 1 };
 enum HaloPosture { HALO_ATTACKING = 0, HALO_DEFENDING, HALO_PURSUING };
 // Scripted switches, set by the ai_* commands.
 enum { HALO_AI_BLIND = 1, HALO_AI_DEAF = 2, HALO_AI_BRAINDEAD = 4, HALO_AI_PLAYFIGHT = 8, HALO_AI_DISREGARD = 16,
-       HALO_AI_MAGIC_SIGHT = 32, HALO_AI_FOLLOW_PLAYER = 64, HALO_AI_FORCE_ACTIVE = 128, HALO_AI_FLEE = 256 };
+       HALO_AI_MAGIC_SIGHT = 32, HALO_AI_FOLLOW_PLAYER = 64, HALO_AI_FORCE_ACTIVE = 128, HALO_AI_FLEE = 256,
+       HALO_AI_NO_DAMAGE = 512, HALO_AI_IMPERVIOUS = 1024, HALO_AI_NO_DROPS = 2048, HALO_AI_NO_DORMANT = 4096,
+       HALO_AI_NO_MANEUVER = 8192 };
 
 struct HaloActorDef
 {
@@ -71,6 +73,22 @@ playerent *haloactortarget(const playerent *bot);
 // Current health over the health the actor spawned with; the player uses 75.
 float haloactorhealthfraction(const playerent *bot);
 int haloactorflags(const playerent *bot);
+// ai_grenades: whether any actor may throw grenades (on by default; the scenario resets it per section).
+void haloaisetgrenades(bool on);
+bool haloaigrenades();
+// ai_berserk: charge into melee until switched off.
+void haloactorberserk(const playerent *bot, bool on);
+// ai_follow_target_ai / _disable / ai_follow_distance: stay near `target` (null clears) while nothing is fought.
+void haloactorfollow(const playerent *bot, const playerent *target);
+void haloactorfollowdistance(const playerent *bot, float distance);
+const playerent *haloactorfollowing(const playerent *bot);
+// ai_prefer_target: actors weigh preferred units as closer when choosing whom to fight.
+void haloactorprefer(const playerent *target, bool on);
+// Sets health to a fraction of what the actor spawned with.
+void haloactorsethealthfraction(playerent *bot, float fraction);
+int haloactorstarthealth(const playerent *bot);
+// ai_renew: full health, shield and the actor's grenade allowance.
+void haloactorrenew(playerent *bot);
 
 // Events from the game.
 void haloactornoise(const playerent *source);

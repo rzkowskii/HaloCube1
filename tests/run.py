@@ -30,6 +30,11 @@ QUICK = [
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine
     'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands
+    'test_campaign_ending.py',        # game_won/game_lost raise the ending, credits, beaten flag
+    'test_script_coverage.py',        # every sleep_until/if condition command is bound; a10 tutorial, d40 timer
+    'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
+    'test_flood.py',                  # squad cap counts living actors; carrier burst, corpse infection, infection leap
+    'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
 ]
 SLOW = [
     'test_autumn_opening.py',         # four-minute Autumn opening at normal speed

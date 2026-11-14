@@ -21,6 +21,10 @@ namespace
     int savedMission = 0, savedSection = 0;
     bool progressLoaded = false;
     bool campaignFinished = false, authoredTransition = false;
+    // Ending: set once The Maw's finale plays out (game_won, or the finale cue ending the last section).
+    bool campaignBeaten = false, ending = false, endingDone = false, winPending = false;
+    int endingStart = 0;
+    const int creditsTime = 34000;
     bool driving = false;
     int escapeDeadline = 0, incomingEscapeTime = 0;
     const int escapeTime = 180000;
@@ -83,6 +87,9 @@ namespace
     int shieldHit = 0;
     bool shieldRecharging = false;
     float shield = playerShield;
+    // Script-set limits: unit_set_maximum_vitality and unit_impervious on the player.
+    float shieldCap = playerShield, maxVitalityHealth = 100, maxVitalityShield = 75;
+    bool playerProtected = false;
     bool atCheckpoint = false;
     int checkpointHealth = playerHealth, checkpointWeapon = GUN_ASSAULT;
     int checkpointMag[NUMGUNS], checkpointAmmo[NUMGUNS];
@@ -94,6 +101,16 @@ namespace
     vector<int> waveStarts[2], route[3];
     int nextRouteMarker = 0;
     vector<HaloEnemy> enemies;
+    // Flood life cycle: carriers burst into infection forms, infection forms
+    // reaching a marine or Elite body turn it into a combat form after a delay.
+    struct Corpse { vec o; float yaw; ActorKind kind; int expires; };
+    struct FloodSpawn { vec o; float yaw; ActorKind kind; int count; int at; };
+    vector<Corpse> corpses;
+    vector<FloodSpawn> floodSpawns;
+    const int corpseLife = 90000, infectionDelay = 2500;
+    const float infectionReach = 4.0f;
+
+    void clearFlood() { corpses.setsize(0); floodSpawns.setsize(0); }
     // The player carries two retail weapons, each bound to an AssaultCube slot.
     HaloWeaponState carried[2], checkpointCarried[2];
     int carriedGun[2] = {GUN_ASSAULT, GUN_PISTOL}, currentCarried = 0, checkpointCurrent = 0;
@@ -246,7 +263,7 @@ namespace
         // before the first checkpoint that is the section's placements.
         groundWeapons.setsize(0);
         loopv(checkpointGround) groundWeapons.add(checkpointGround[i]);
-        shield = playerShield;
+        shield = shieldCap;
         shieldHit = 0;
         shieldRecharging = false;
     }
@@ -294,10 +311,12 @@ namespace
         botent *bot = BotManager.CreateBot(human ? "RVSF" : "CLA", kind == ELITE ? "worse" : "bad", name);
         if(!bot) return nullptr;
         // The variant's vitality overrides the body defaults when it sets one.
-        const float shieldMax = actor && actor->shield > 0 ? actor->shield : float(profile.shield);
+        // Difficulty toughens or softens the Covenant and the Flood; allies are unchanged.
+        const float vitality = human ? 1.0f : halodifficultyhealth();
+        const float shieldMax = (actor && actor->shield > 0 ? actor->shield : float(profile.shield)) * vitality;
         enemies.add(HaloEnemy{bot, kind, shieldMax, lastmillis, HaloWeaponState(), team, shieldMax});
         enemies.last().weapon.reset(def);
-        bot->health = actor && actor->body > 0 ? int(actor->body + .5f) : profile.health;
+        bot->health = max(1, int((actor && actor->body > 0 ? int(actor->body + .5f) : profile.health) * vitality + .5f));
         bot->maxeyeheight = bot->eyeheight = profile.eyeheight;
         bot->radius = profile.radius;
         bot->armour = 0;
@@ -396,6 +415,7 @@ namespace
     {
         haloclearbolts();
         enemies.setsize(0);
+        clearFlood();
         haloactorsclear();
         kickallbots();
         clearbounceents();
@@ -433,6 +453,57 @@ namespace
     }
 
     vec feetOf(const playerent *p) { return vec(p->o).sub(vec(0, 0, p->eyeheight)); }
+
+    // A new actor beside a body: on retail collision it must find floor, otherwise
+    // it only needs open space, as entinmap settles it.
+    bool spawnNear(ActorKind kind, const vec &feet, float yaw, int team)
+    {
+        if(halocollisionactive()) return haloscenariospawnenemy(kind, feet, yaw, -1, team) != nullptr;
+        const int x = int(feet.x), y = int(feet.y);
+        if(halocinematic() || editmode || OUTBORD(x, y) || SOLID(S(x, y))) return false;
+        return spawnEnemy(kind, vec(feet).add(vec(0, 0, profiles[kind].eyeheight)), yaw, -1, -1, team) != nullptr;
+    }
+
+    // Spawns `count` actors of a kind in a ring around a point, as many as fit.
+    int spawnRing(ActorKind kind, const vec &feet, float yaw, int count, int team)
+    {
+        int placed = 0;
+        for(int attempt = 0; attempt < count * 4 && placed < count; ++attempt)
+        {
+            const float angle = (attempt * 360.0f / max(count, 1) + rnd(30)) * RAD, r = count > 1 ? 1.0f + rndscale(1.8f) : 0.0f;
+            const vec at = vec(feet).add(vec(cosf(angle) * r, sinf(angle) * r, 0));
+            if(spawnNear(kind, at, yaw + rnd(360), team)) ++placed;
+        }
+        return placed;
+    }
+
+    void updateFlood()
+    {
+        // Infection forms touching a body convert it; the form is spent.
+        loopv(enemies)
+        {
+            botent *bot = enemies[i].bot;
+            if(!bot || bot->state != CS_ALIVE || enemies[i].kind != INFECTION) continue;
+            loopvj(corpses)
+            {
+                if(fabsf(corpses[j].o.z - feetOf(bot).z) > 4.0f || corpses[j].o.distxy(bot->o) > infectionReach) continue;
+                const Corpse &c = corpses[j];
+                floodSpawns.add(FloodSpawn{c.o, c.yaw, c.kind == ELITE ? FLOOD_ELITE : FLOOD_HUMAN, 1, lastmillis + infectionDelay});
+                conoutf("Halo: infection form takes a %s body", profiles[c.kind].name);
+                corpses.remove(j);
+                dodamage(INT_MAX, bot, bot, GUN_KNIFE);
+                break;
+            }
+        }
+        loopvrev(corpses) if(lastmillis >= corpses[i].expires) corpses.remove(i);
+        loopvrev(floodSpawns)
+        {
+            if(lastmillis < floodSpawns[i].at) continue;
+            const FloodSpawn spawn = floodSpawns.remove(i);
+            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, HALO_TEAM_COVENANT);
+            if(placed) conoutf("Halo: flood %s rises", profiles[spawn.kind].name);
+        }
+    }
 
     void showPickup(const char *text)
     {
@@ -529,11 +600,13 @@ namespace
         FILE *file = fopen(findfile(progressFile, "rb"), "rb");
         if(!file) return;
         int version = 0, m = 0, s = 0;
-        if(fscanf(file, "%d %d %d", &version, &m, &s) == 3 && version == 1 &&
-           m >= 0 && m < haloMissionCount && s >= 0 && s < haloMissions[m].sections)
+        int beaten = 0;
+        const int fields = fscanf(file, "%d %d %d %d", &version, &m, &s, &beaten);
+        if(fields >= 3 && version == 1 && m >= 0 && m < haloMissionCount && s >= 0 && s < haloMissions[m].sections)
         {
             savedMission = m;
             savedSection = s;
+            campaignBeaten = fields == 4 && beaten == 1;
         }
         fclose(file);
     }
@@ -545,12 +618,37 @@ namespace
         formatstring(temporary)("%s.tmp", destination);
         FILE *file = fopen(temporary, "wb");
         if(!file) { conoutf("Halo: unable to open campaign progress"); return; }
-        bool written = fprintf(file, "1 %d %d\n", savedMission, savedSection) > 0;
+        bool written = (campaignBeaten ? fprintf(file, "1 %d %d 1\n", savedMission, savedSection)
+                                       : fprintf(file, "1 %d %d\n", savedMission, savedSection)) > 0;
         if(fclose(file) != 0 || !written || rename(temporary, destination) != 0)
         {
             remove(temporary);
             conoutf("Halo: unable to save campaign progress");
         }
+    }
+
+    void beginEnding()
+    {
+        if(ending || preview) return;
+        ending = true;
+        endingDone = winPending = false;
+        endingStart = lastmillis;
+        campaignBeaten = true;
+        savedMission = mission;
+        savedSection = section;
+        saveProgress();
+        player1->attacking = false;
+        player1->stopmoving();
+        conoutf("Halo ending reached: %s complete", haloMissions[mission].title);
+    }
+
+    // Credits are over (or skipped): leave the finished campaign at the Halo menu.
+    void finishEnding()
+    {
+        if(!ending || endingDone) return;
+        endingDone = true;
+        conoutf("Halo credits finished");
+        showmenu("Halo Campaign");
     }
 
     bool installed(int m, int s)
@@ -664,6 +762,31 @@ namespace
         draw_text(text, alignRight ? -text_width(text) : 0, 0, 146, 231, 250, 245);
         glPopMatrix();
     }
+
+    void drawEnding()
+    {
+        const char *const credits[] = {
+            "HALO", "Combat Evolved", "",
+            "Pillar of Autumn  to  The Maw", "Campaign complete", "",
+            "Original game and campaign", "Bungie", "",
+            "Engine", "AssaultCube 1.3.0.2", "",
+            "Rebuilt on the AssaultCube engine", "from the original Xbox maps", "",
+            "Thank you for playing", "",
+            "Enter  Skip"
+        };
+        const int count = sizeof(credits) / sizeof(credits[0]);
+        const int elapsed = lastmillis - endingStart;
+        glDisable(GL_TEXTURE_2D);
+        box(0, 0, VIRTW, VIRTH, 0, 0, 0, clamp(elapsed / 6, 0, 235));
+        glEnable(GL_TEXTURE_2D);
+        const float scroll = clamp(elapsed / float(creditsTime), 0.0f, 1.0f);
+        const float top = VIRTH + 40 - scroll * (VIRTH + 40 + count * 52);
+        loopi(count)
+        {
+            const float y = top + i * 52;
+            if(credits[i][0] && y > -40 && y < VIRTH) label(credits[i], VIRTW/2 - int(text_width(credits[i]) * (i < 2 ? 0.45f : 0.3f)), int(y), i < 2 ? 0.9f : 0.6f);
+        }
+    }
 }
 
 bool haloactive() { return active && gamemode == GMODE_BOTTEAMDEATHMATCH && !multiplayer(NULL); }
@@ -673,11 +796,17 @@ void halomapstart(const char *name)
     haloscenariostop();
     halocollisionmap(nullptr);
     authoredTransition = false;
+    ending = endingDone = winPending = false;
     active = startPending = driving = false;
     player1->maxspeed = 16.0f;
     haloclearbolts();
     enemies.setsize(0);
+    clearFlood();
     haloactorsclear();
+    shield = shieldCap = playerShield;
+    maxVitalityHealth = 100;
+    maxVitalityShield = 75;
+    playerProtected = false;
     groundWeapons.setsize(0);
     checkpointGround.setsize(0);
     nearbyWeapon = -1;
@@ -747,10 +876,69 @@ playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int act
     return spawnEnemy(ActorKind(kind), point, yaw, -1, actorIndex, team);
 }
 
+// Milliseconds left on the escape countdown, or -1 outside the escape run.
+int haloescapemillis() { return driving ? max(0, escapeDeadline - lastmillis) : -1; }
+float haloplayershieldfraction() { return clamp(shield / float(playerShield), 0.0f, 1.0f); }
+
 float haloenemyshieldfraction(const playerent *p)
 {
     HaloEnemy *enemy = enemyState(p);
     return enemy && enemy->shieldMax > 0 ? enemy->shield / enemy->shieldMax : 0;
+}
+
+// Script control of the player's and the enemies' vitality (unit_set_*_vitality, unit_impervious, ai_renew, ai_teleport_*).
+// Values are in the script's units: the player's maximum defaults to 100 health and 75 shield, an actor's to 1.
+void haloplayersetvitality(float health, float shieldValue, bool maximum)
+{
+    if(maximum)
+    {
+        maxVitalityHealth = max(health, 1.0f);
+        maxVitalityShield = max(shieldValue, 0.0f);
+        shieldCap = maxVitalityShield > 0 ? float(playerShield) : 0.0f;
+        shield = min(shield, shieldCap);
+        return;
+    }
+    if(player1->state == CS_ALIVE)
+        player1->health = clamp(int(health / maxVitalityHealth * playerHealth + .5f), 1, playerHealth);
+    shield = maxVitalityShield > 0 ? clamp(shieldValue / maxVitalityShield, 0.0f, 1.0f) * shieldCap : 0.0f;
+    shieldHit = lastmillis;
+    shieldRecharging = false;
+}
+void haloplayerprotect(bool on) { playerProtected = on; }
+bool haloplayerprotected() { return playerProtected; }
+
+void haloenemysetshield(const playerent *p, float fraction)
+{
+    if(HaloEnemy *enemy = enemyState(p)) enemy->shield = clamp(fraction, 0.0f, 1.0f) * enemy->shieldMax;
+}
+
+// Refills health, shield and grenades (ai_renew).
+void haloenemyrenew(playerent *p, int health, int grenades)
+{
+    HaloEnemy *enemy = enemyState(p);
+    if(!enemy || p->state != CS_ALIVE) return;
+    enemy->shield = enemy->shieldMax;
+    p->health = max(p->health, health);
+    p->mag[GUN_GRENADE] = max(p->mag[GUN_GRENADE], grenades);
+}
+
+// Puts an enemy on the ground at a world point, as when it was placed.
+bool haloenemymove(playerent *p, const vec &point)
+{
+    HaloEnemy *enemy = enemyState(p);
+    if(!enemy || p->state != CS_ALIVE) return false;
+    const ActorProfile &profile = profiles[enemy->kind];
+    if(halocollisionactive())
+    {
+        HaloCollisionHit hit;
+        if(!halocollisionsweep(vec(point).add(vec(0, 0, 1.26f)), vec(0, 0, -4.26f), profile.radius,
+                               profile.eyeheight + .7f, hit) || hit.normal.z < .65f) return false;
+        p->o = vec(point).add(vec(0, 0, profile.eyeheight));
+    }
+    else p->o = point;
+    p->vel = vec(0, 0, 0);
+    entinmap(p);
+    return true;
 }
 
 void haloscenarioplayersave()
@@ -787,7 +975,7 @@ void haloupdate(int elapsed)
     {
         launchPending = false;
         preview = pendingPreview;
-        campaignFinished = false;
+        campaignFinished = ending = endingDone = winPending = false;
         string name;
         halosectionname(pendingMission, pendingSection, name, sizeof(name));
         requestedSection = true;
@@ -818,6 +1006,26 @@ void haloupdate(int elapsed)
     }
     haloscenariotick(elapsed);
     if(haloscenariocomplete()) finishSection(true);
+    if(haloscenariogamewon())
+    {
+        if(!preview && mission == haloMissionCount - 1 && section == haloMissions[mission].sections - 1) winPending = true;
+        else conoutf("Halo: game_won ignored on %s, section %d", haloMissions[mission].title, section + 1);
+    }
+    if(haloscenariogamelost() && !ending && !halocinematic() && player1->state == CS_ALIVE)
+    {
+        conoutf("Halo game over: game_lost, reverting");
+        dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+    }
+    if(!ending && !halocinematic() && (winPending || (campaignFinished && stage == COMPLETE))) beginEnding();
+    if(ending)
+    {
+        // The credits run over the live level; nothing may interrupt them.
+        player1->attacking = false;
+        player1->stopmoving();
+        if(player1->state == CS_ALIVE) { player1->health = max(player1->health, playerHealth); shield = playerShield; }
+        if(lastmillis - endingStart >= creditsTime) finishEnding();
+        return;
+    }
     if(authoredTransition && stage == COMPLETE)
     {
         nextSection();
@@ -841,13 +1049,14 @@ void haloupdate(int elapsed)
         }
         else if(markers.inrange(nextRouteMarker) && near(markers[nextRouteMarker], 13.0f)) ++nextRouteMarker;
     }
-    if(shield < playerShield && !shieldRecharging && lastmillis - shieldHit >= shieldDelay)
+    if(shield < shieldCap && !shieldRecharging && lastmillis - shieldHit >= shieldDelay)
     {
         haloplaysound("shield-charge", S_NULL);
         shieldRecharging = true;
     }
-    shieldTick(shield, playerShield, shieldHit, shieldDelay, shieldRecharge, elapsed);
+    shieldTick(shield, shieldCap, shieldHit, shieldDelay, shieldRecharge, elapsed);
     updateWeapons(elapsed);
+    updateFlood();
     loopv(enemies)
     {
         HaloEnemy &enemy = enemies[i];
@@ -882,8 +1091,12 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     if(damage <= 0 || damage == INT_MAX) return;
     // Playfighting actors go through the motions without hurting anyone.
     if(haloactorflags(attacker) & HALO_AI_PLAYFIGHT) { damage = 0; return; }
+    // object_cannot_take_damage and unit_impervious.
+    if((target == player1 && playerProtected) || (haloactorflags(target) & (HALO_AI_NO_DAMAGE | HALO_AI_IMPERVIOUS))) { damage = 0; return; }
     if(target == player1)
     {
+        // Enemy fire hurts more on the higher difficulties.
+        if(attacker != player1 && halodifficulty() != 1) damage = max(1, int(damage * halodifficultydamage() + .5f));
         shieldHit = lastmillis;
         shieldRecharging = false;
         const bool hadShield = shield > 0;
@@ -1064,6 +1277,11 @@ void halodrawhud()
         glEnd();
     }
     glEnable(GL_TEXTURE_2D);
+    if(ending)
+    {
+        drawEnding();
+        return;
+    }
     if(!tagHud) label("SHIELD", right-299, 79);
     if(driving && stage != COMPLETE)
     {
@@ -1235,7 +1453,11 @@ COMMANDF(halo_section, "ii", (int *m, int *s)
         queueSection(*m - 1, *s - 1, true);
 });
 COMMANDF(halo_restart, "", () { if(haloactive()) queueSection(mission, section, preview); });
-COMMANDF(halo_next, "", () { if(!halocinematicskip()) nextSection(); });
+COMMANDF(halo_next, "", ()
+{
+    if(ending) { finishEnding(); return; }
+    if(!halocinematicskip()) nextSection();
+});
 COMMANDF(halo_use, "", ()
 {
     if(haloscenariouse()) return;
@@ -1426,11 +1648,17 @@ playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeapon
 void halokilled(playerent *victim, playerent *killer)
 {
     if(!haloactive() || !victim || victim == player1) return;
+    const bool keepsItems = !(haloactorflags(victim) & HALO_AI_NO_DROPS);
     haloactordeath(victim, killer);
     HaloEnemy *enemy = enemyState(victim);
     if(!enemy) return;
+    const vec feet = feetOf(victim);
+    if(enemy->kind == CARRIER) floodSpawns.add(FloodSpawn{feet, victim->yaw, INFECTION, 4 + rnd(5), lastmillis});
+    else if((enemy->kind == MARINE || enemy->kind == ELITE) && corpses.length() < 32)
+        corpses.add(Corpse{feet, victim->yaw, enemy->kind, lastmillis + corpseLife});
     const HaloWeaponDef *d = haloweapon(enemy->weapon.def);
-    if(!d || !d->playable()) return;
+    // unit_doesnt_drop_items leaves nothing behind.
+    if(!keepsItems || !d || !d->playable()) return;
     // A dropped weapon keeps part of its battery or magazine.
     HaloWeaponState dropped;
     dropped.reset(d);
@@ -1441,6 +1669,21 @@ void halokilled(playerent *victim, playerent *killer)
         dropped.reserve = int(dropped.reserve * rndscale(0.5f));
     }
     dropWeapon(dropped, feetOf(victim), victim->yaw);
+}
+
+// Scripted mass kills (ai_erase_all) are cleanup, so they leave no burst or bodies behind.
+void haloclearflood() { clearFlood(); }
+
+bool halonearestcorpse(const vec &from, float range, vec &body)
+{
+    float best = range;
+    bool found = false;
+    loopv(corpses)
+    {
+        const float d = corpses[i].o.dist(from);
+        if(d < best) { best = d; body = corpses[i].o; found = true; }
+    }
+    return found;
 }
 
 void halorenderweapons()

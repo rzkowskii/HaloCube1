@@ -4,6 +4,7 @@
 #include "halo_collision.h"
 #include "halo_script.h"
 #include "halo_ai.h"
+#include "halo_weapons.h"
 #include <algorithm>
 #include <cmath>
 #include <memory>
@@ -14,6 +15,13 @@
 #include <vector>
 
 VARP(halo_scripttrace, 0, 0, 1);
+// 0 Easy, 1 Normal, 2 Hard, 3 Impossible. Read when a section starts or restarts.
+VARP(halo_difficulty, 0, 1, 3);
+
+int halodifficulty() { return clamp(int(halo_difficulty), 0, 3); }
+// Enemy damage and vitality relative to Normal, and the player's incoming damage.
+float halodifficultydamage() { static const float scale[4] = {0.6f, 1.0f, 1.3f, 1.7f}; return scale[halodifficulty()]; }
+float halodifficultyhealth() { static const float scale[4] = {0.75f, 1.0f, 1.25f, 1.5f}; return scale[halodifficulty()]; }
 
 namespace
 {
@@ -117,6 +125,7 @@ namespace
         std::vector<SquadStart> starts;
         int initial = 0, defaultState = 0, maneuver = -1;
         unsigned flags = 0, masks[7] = {};
+        int counts[4] = {-1, -1, -1, -1};  // starts placed on Easy, Normal, Hard, Impossible; -1 = all (version 5 and 6)
     };
     struct Encounter
     {
@@ -190,7 +199,7 @@ namespace
             Reader r(path);
             if(r.bytes(4) != "HSCB") return false;
             const uint32_t version = r.number<uint32_t>();
-            if(version != 5 && version != 6) return false;
+            if(version < 5 || version > 7) return false;
             auto u8 = [&] { return r.number<uint8_t>(); };
             auto u16 = [&] { return r.number<uint16_t>(); };
             auto i16 = [&] { return r.number<int16_t>(); };
@@ -308,6 +317,7 @@ namespace
                         squad.flags = u32();
                         squad.maneuver = i16();
                         loopi(7) squad.masks[i] = u32();
+                        if(version >= 7) loopi(4) squad.counts[i] = i16();
                         const uint32_t starts = r.number<uint32_t>();
                         if(starts != squad.starts.size()) return false;
                         for(SquadStart &start : squad.starts)
@@ -383,6 +393,10 @@ namespace
         explicit Frame(uint32_t expression) : expression(expression) {}
     };
 
+    // The one HUD countdown, and the tutorial prompts that wait for the player to act.
+    struct HudTimer { bool shown = false, running = false; int remaining = 0, end = 0; };
+    struct TutorialPoll { int first = 0; float yaw = 0, pitch = 0; };
+
     struct Thread
     {
         std::vector<Frame> stack;
@@ -402,6 +416,11 @@ namespace
         int parent = noObject;
         int gait = -1, gaitStart = 0;
         int baseSeat = -1;
+        // Script-set object state: unit_open, vehicle_hover, object_cannot_take_damage and friends.
+        bool open = false, hovering = true, collideable = true, enterable = true, suspended = false;
+        bool cannotTakeDamage = false, meleeInhibited = false, rangedInhibited = false;
+        int squadReference = -1;   // ai_attach: the squad this unit belongs to, -1 when free
+        std::string permutation;
         size_t input = 0;
         std::string parentMarker, childMarker;
         const Recording *recording = nullptr;
@@ -440,6 +459,7 @@ namespace
         playerent *bot;
         int encounter, squad;
         bool suspended = false;
+        int scriptFlags = 0;   // HALO_AI_* bits scripts set, reapplied when a revert respawns the actor
     };
 
     struct Playback
@@ -492,6 +512,8 @@ namespace
         std::vector<HaloCommandProgram> commandPrograms;
         std::vector<int> actorLists;
         std::set<int> maneuvered, flipped;
+        std::vector<std::pair<int, int>> links;       // ai_link_activation
+        std::set<int> migrationTargets;               // ai_automatic_migration_target
         std::vector<DeviceGroup> groups, savedGroups;
         std::vector<DeviceState> devices, savedDevices;
         std::vector<int> objectDevices;
@@ -518,6 +540,7 @@ namespace
         bool loaded = false, letterbox = false, cameraControl = false, paused = false;
         bool pendingCheckpoint = false;
         bool exitPlayed = false, completeExit = false, failedEscape = false, runningGameplay = false;
+        bool gameWon = false, gameLost = false;
         std::string worldName;
         std::string subtitle;
         std::string objective, help;
@@ -528,6 +551,8 @@ namespace
         bool savedShowHelp = false;
         std::unordered_map<int, Value> savedExternal;
         const char *cache = "";
+        HudTimer hudTimer;
+        std::unordered_map<std::string, TutorialPoll> tutorialPolls;
 
         void start(int m, int s);
         void stop();
@@ -541,12 +566,21 @@ namespace
         bool pelicanReady() const;
         bool cartographerInterior() const;
         bool cartographerMapped() const;
-        void placeSquads(int reference, int limit);
+        void placeSquads(int reference, int limit, bool scaled = true);
+        size_t livingBots() const;
         void eraseSquads(int reference);
         int living(int reference) const;
         void restoreSquads();
         bool matchesSquad(int reference, int encounter, int squad) const;
         void prepareAI();
+        void updateLinks();
+        void migrateBot(SquadBot &bot, int newGroup);
+        vec startPoint(const SquadStart &start) const;
+        void setUnitFlag(playerent *unit, int flag, bool on);
+        SquadBot *squadBotOf(const playerent *unit);
+        Actor *scripted(int id);
+        template<class F> void eachUnit(int value, F f);
+        bool aiCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
         void configureActor(playerent *bot, int encounter, int squad, const SquadStart &start);
         void updatePlatoons();
         int actorListFor(int reference);
@@ -555,6 +589,7 @@ namespace
         bool objectPosition(int value, vec &position) const;
         Value literal(const Node &node) const;
         Value command(Thread &thread, const Node &node, const char *name, const std::vector<Value> &args, bool scene);
+        bool pacingCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
         void wake(int script, bool scene = false);
         void sleep(Thread &thread, const std::vector<Value> &args);
         void complete(Thread &thread, Value result);
@@ -1661,7 +1696,7 @@ namespace
         }
         if(is("ai_place") || is("ai_spawn_actor"))
         {
-            if(!scene) placeSquads(index(0), is("ai_spawn_actor") ? 1 : index(1));
+            if(!scene) placeSquads(index(0), is("ai_spawn_actor") ? 1 : index(1), !is("ai_spawn_actor"));
             return {};
         }
         if(is("ai_kill") || is("ai_kill_silent") || is("ai_erase"))
@@ -1671,7 +1706,11 @@ namespace
         }
         if(is("ai_erase_all"))
         {
-            if(!scene) for(SquadBot &bot : squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+            if(!scene)
+            {
+                for(SquadBot &bot : squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+                haloclearflood();
+            }
             return {};
         }
         if(is("ai_living_count")) return result(living(index(0)));
@@ -1792,18 +1831,7 @@ namespace
         {
             int oldGroup = index(0), newGroup = index(1);
             if(!scene && newGroup != -1) for(SquadBot &bot : squadBots)
-            {
-                if(!bot.bot || !matchesSquad(oldGroup, bot.encounter, bot.squad)) continue;
-                bot.encounter = newGroup & 0xffff;
-                const unsigned kind = uint32_t(newGroup) >> 30;
-                if(kind == 2) bot.squad = (uint32_t(newGroup) >> 16) & 0xff;
-                // The migrated actors take the target squad's positions and walk to them.
-                const Encounter *encounter = at(program.encounters, bot.encounter);
-                const Squad *squad = encounter ? at(encounter->squads, bot.squad) : nullptr;
-                static const unsigned anyGroup[7] = {};
-                if(bot.encounter < int(encounterPositions.size()))
-                    haloactorsetpositions(bot.bot, &encounterPositions[bot.encounter], squad ? squad->masks : anyGroup);
-            }
+                if(bot.bot && matchesSquad(oldGroup, bot.encounter, bot.squad)) migrateBot(bot, newGroup);
             return {};
         }
         if(is("random_range") || is("real_random_range"))
@@ -1813,7 +1841,7 @@ namespace
             double selected = std::uniform_real_distribution<double>(lower, upper)(random);
             return result(is("random_range") ? floor(selected) : selected);
         }
-        if(is("game_difficulty_get") || is("game_difficulty_get_real")) return result(1);
+        if(is("game_difficulty_get") || is("game_difficulty_get_real")) return result(halodifficulty());
         if(is("game_is_cooperative") || is("game_saving") || is("game_reverted")) return result(0);
         if(is("game_safe_to_speak") || is("game_all_quiet")) return result(1);
         if(is("cinematic_skip_stop_internal")) return result(1);
@@ -1833,7 +1861,13 @@ namespace
                 pendingCheckpoint = true;
             return {};
         }
-        if(is("game_won") || is("game_lost")) return {};
+        if(is("game_won") || is("game_lost"))
+        {
+            // The mission scripts end the level here. The engine decides what that means (ending, or revert).
+            (is("game_won") ? gameWon : gameLost) = true;
+            if(halo_scripttrace) conoutf("Halo script: %s at tick %d", is("game_won") ? "game_won" : "game_lost", tick);
+            return {};
+        }
         if(is("cinematic_skip_start_internal")) return result(1);
         if(is("camera_control")) { if(scene) cameraControl = truth(0); return {}; }
         if(is("camera_set") || is("camera_set_relative"))
@@ -2115,9 +2149,126 @@ namespace
         if(is("print") || is("cls") || is("object_pvs_set_camera") || is("object_pvs_clear") ||
            is("object_beautify") || is("objects_predict") || is("object_type_predict")) return {};
 
+        Value pacing;
+        if(pacingCommand(name, args, scene, pacing)) return pacing;
+        if(aiCommand(name, args, scene, pacing)) return pacing;
+
         if(*name) unsupported.insert(name);
         return result(0);
     }
+
+    // Commands that pace the scripts: saves, the HUD countdown, tutorial prompts
+    // and presentation calls with nothing to show. They return true when handled.
+    bool Scenario::pacingCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out)
+    {
+        auto is = [name](const char *candidate) { return !strcmp(name, candidate); };
+        auto value = [&](size_t i, double fallback = 0) { return i < args.size() ? args[i].number : fallback; };
+        auto truth = [&](size_t i) { return i < args.size() && args[i].truth(); };
+        auto answer = [&](double v) { out = number(v, 8); return true; };
+        auto handled = [&]() { out = {}; return true; };
+
+        // Saves: safe while no hostile actor is fighting and the player lives.
+        if(is("game_safe_to_save"))
+        {
+            if(player1->state != CS_ALIVE) return answer(0);
+            for(const SquadBot &bot : squadBots)
+                if(bot.bot && bot.bot->state == CS_ALIVE && !bot.suspended && haloactorteam(bot.bot) == HALO_TEAM_COVENANT &&
+                   haloactorstatus(bot.bot) >= 6) return answer(0);
+            return answer(1);
+        }
+        if(is("game_save_cancel")) { pendingCheckpoint = false; return handled(); }
+        if(is("game_revert"))
+        {
+            if(!scene && player1->state == CS_ALIVE) dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+            return handled();
+        }
+        if(is("game_time")) return answer(tick);
+        if(is("game_skip_ticks") || is("game_speed")) return handled();
+        // Vehicles carry no actors yet, so no list of riders.
+        if(is("vehicle_riders")) return answer(0);
+        if(is("player_count")) return answer(1);
+
+        // One HUD countdown. On the escape run it follows the engine's deadline, which is
+        // what fails the run, so scripts waiting on it cannot fire early or late.
+        if(is("hud_set_timer_time"))
+        {
+            hudTimer.remaining = max(0, int((value(0) * 60 + value(1)) * ticksPerSecond));
+            if(hudTimer.running) hudTimer.end = tick + hudTimer.remaining;
+            return handled();
+        }
+        if(is("show_hud_timer"))
+        {
+            hudTimer.shown = truth(0);
+            if(hudTimer.shown && !hudTimer.running) { hudTimer.running = true; hudTimer.end = tick + hudTimer.remaining; }
+            return handled();
+        }
+        if(is("pause_hud_timer"))
+        {
+            const bool pause = truth(0);
+            if(pause && hudTimer.running) { hudTimer.remaining = max(0, hudTimer.end - tick); hudTimer.running = false; }
+            else if(!pause && !hudTimer.running) { hudTimer.running = true; hudTimer.end = tick + hudTimer.remaining; }
+            return handled();
+        }
+        if(is("hud_get_timer_ticks"))
+        {
+            const int escape = haloescapemillis();
+            if(escape >= 0 && hudTimer.running) return answer(int(int64_t(escape) * ticksPerSecond / 1000));
+            return answer(hudTimer.running ? max(0, hudTimer.end - tick) : hudTimer.remaining);
+        }
+        if(is("hud_set_timer_position") || is("hud_set_timer_warning_time") || is("time_code_show") || is("time_code_start") ||
+           is("time_code_stop") || is("time_code_reset") || is("numeric_countdown_timer_set") || is("numeric_countdown_timer_stop"))
+            return handled();
+
+        // Tutorial prompts. Each wait ends on the matching input, or after a few
+        // seconds so a player who ignores the prompt is not held forever.
+        if(!strncmp(name, "player_action_test_", 19))
+        {
+            if(is("player_action_test_reset")) { tutorialPolls.clear(); return handled(); }
+            auto found = tutorialPolls.find(name);
+            if(found == tutorialPolls.end())
+            {
+                TutorialPoll poll;
+                poll.first = tick;
+                poll.yaw = player1->yaw;
+                poll.pitch = player1->pitch;
+                found = tutorialPolls.emplace(name, poll).first;
+            }
+            const TutorialPoll &poll = found->second;
+            const float yaw = fabsf(player1->yaw - poll.yaw), pitch = fabsf(player1->pitch - poll.pitch);
+            bool done = tick - poll.first >= 5 * ticksPerSecond;
+            if(is("player_action_test_primary_trigger")) done |= player1->attacking;
+            else if(is("player_action_test_back")) done |= player1->move < 0;
+            else if(!strncmp(name, "player_action_test_look_relative_", 33)) done |= yaw > 10 || pitch > 5;
+            return answer(done);
+        }
+        if(is("player0_joystick_set_is_normal")) return answer(1);
+        if(is("player0_look_pitch_is_inverted")) return answer(0);
+        if(is("player0_look_invert_pitch")) return handled();
+        if(is("unit_get_total_grenade_count")) return answer(player1->mag[GUN_GRENADE]);
+        if(is("unit_get_shield")) return answer(haloplayershieldfraction());
+        if(is("unit_solo_player_integrated_night_vision_is_active")) return answer(0);
+        if(is("unit_has_weapon_readied"))
+        {
+            const HaloWeaponDef *ready = haloweaponforgun(player1->gunselect);
+            return answer(ready && args.size() > 1 && ready->path == args[1].text);
+        }
+
+        // Nothing to show, change or free in this engine.
+        static const char *const quiet[] = {
+            "player_enable_input", "player_camera_control", "players_unzoom_all", "garbage_collect_now", "inspect", "render_lights",
+            "player_effect_impact", "player_effect_rumble", "player_effect_set_max_rotation", "player_effect_set_max_rumble",
+            "player_effect_set_max_translation", "player_effect_start", "player_effect_stop", "sound_class_set_gain",
+            "hud_blink_health", "hud_blink_motion_sensor", "hud_blink_shield", "hud_show_crosshair", "hud_show_health",
+            "hud_show_motion_sensor", "hud_show_shield", "enable_hud_help_flash", "preload_textures", "object_pvs_activate", "object_pvs_set_object",
+            "cinematic_screen_effect_start", "cinematic_screen_effect_stop", "cinematic_screen_effect_set_convolution",
+            "cinematic_screen_effect_set_filter", "cinematic_screen_effect_set_filter_desaturation_tint",
+            "cinematic_screen_effect_set_video"};
+        for(const char *quietName : quiet) if(is(quietName)) return handled();
+        if(!strncmp(name, "rasterizer_", 11) || !strncmp(name, "effect_new", 10)) return handled();
+        return false;
+    }
+
+#include "halo_script_ai.inc"
 
     bool Scenario::matchesSquad(int reference, int encounter, int squad) const
     {
@@ -2135,6 +2286,8 @@ namespace
     void Scenario::prepareAI()
     {
         encounterPositions.assign(program.encounters.size(), {});
+        links.clear();
+        migrationTargets.clear();
         commandPrograms.clear();
         actorLists.clear();
         maneuvered.clear();
@@ -2177,20 +2330,34 @@ namespace
         return def && def->kind == 9 ? HALO_TEAM_HUMAN : HALO_TEAM_COVENANT;
     }
 
-    void Scenario::placeSquads(int reference, int limit)
+    size_t Scenario::livingBots() const
+    {
+        size_t count = 0;
+        for(const SquadBot &bot : squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) ++count;
+        return count;
+    }
+
+    void Scenario::placeSquads(int reference, int limit, bool scaled)
     {
         int id = reference & 0xffff;
         const Encounter *encounter = at(program.encounters, id);
         if(!encounter || !projection || (encounter->bsp >= 0 && encounter->bsp != projection->bsp)) return;
         const Projection &p = *projection;
-        int count = 0;
+        int count = 0, selected = 0;
         for(size_t i = 0; i < encounter->squads.size(); ++i)
         {
             if(!matchesSquad(reference, id, int(i))) continue;
+            // The squad's size on the chosen difficulty: its first starts that name an actor.
+            // Spawning a single actor ignores it.
+            const int allowed = scaled ? encounter->squads[i].counts[halodifficulty()] : -1;
+            int rank = 0;
             for(const SquadStart &start : encounter->squads[i].starts)
             {
-                if(squadBots.size() >= 128 || (limit > 0 && count >= limit)) break;
+                // Only living actors count towards the cap; dead entries stay for the living fraction.
+                if(livingBots() >= 128 || (limit > 0 && count >= limit)) break;
                 if(start.actor < 0 && !haloactordef(start.variant)) continue;
+                if(allowed >= 0 && rank++ >= allowed) break;
+                ++selected;
                 if(std::any_of(squadBots.begin(), squadBots.end(), [&](const SquadBot &bot) { return bot.start == &start; })) continue;
                 vec point((start.point.x - p.origin.x) * p.xy + p.margin,
                           (p.origin.y - start.point.y) * p.xy + p.margin,
@@ -2204,7 +2371,7 @@ namespace
                 }
             }
         }
-        if(count) conoutf("HaloScript: placed %d actors from %s", count, encounter->name.c_str());
+        if(count) conoutf("HaloScript: placed %d actors from %s (%d starts on difficulty %d)", count, encounter->name.c_str(), selected, halodifficulty());
     }
 
     // Platoon rules switch squads between attacking and defending, and send
@@ -2339,6 +2506,8 @@ namespace
             {
                 squadBots.push_back(saved);
                 configureActor(saved.bot, saved.encounter, saved.squad, start);
+                for(int bit = 1; bit <= HALO_AI_NO_MANEUVER; bit <<= 1)
+                    if(saved.scriptFlags & bit) haloactorsetflag(saved.bot, bit, true);
             }
         }
     }
@@ -2427,7 +2596,9 @@ namespace
         if(continuing)
         {
             world = projection->bsp;
-            exitPlayed = completeExit = failedEscape = pendingCheckpoint = false;
+            exitPlayed = completeExit = failedEscape = pendingCheckpoint = gameWon = gameLost = false;
+            hudTimer = HudTimer();
+            tutorialPolls.clear();
             savedThreads.clear();
             savedActors.clear();
             savedSquadBots.clear();
@@ -2445,7 +2616,9 @@ namespace
         camera = {};
         fade = {};
         chapter = -1;
-        exitPlayed = completeExit = failedEscape = runningGameplay = pendingCheckpoint = false;
+        exitPlayed = completeExit = failedEscape = runningGameplay = pendingCheckpoint = gameWon = gameLost = false;
+        hudTimer = HudTimer();
+        tutorialPolls.clear();
         director = {};
         threads.assign(program.scripts.size(), {});
         globals.assign(program.globals.size(), {});
@@ -2475,6 +2648,7 @@ namespace
             state.position = state.desiredPosition = groupValue(d.positionGroup, d.flags & 1 ? 1 : 0);
         }
         unsupported.clear();
+        haloaisetgrenades(true);
         objective.clear();
         help.clear();
         showHelp = false;
@@ -2599,7 +2773,7 @@ namespace
             ++tick;
             updateRecordings();
             updateDevices(!cue && player1->state == CS_ALIVE && !intermission);
-            if(!cue && tick % 15 == 0) updatePlatoons();
+            if(!cue && tick % 15 == 0) { updatePlatoons(); updateLinks(); }
             updateSound();
             if(cue)
             {
@@ -2747,6 +2921,30 @@ void haloscenariostart(int mission, int section, bool preview, bool continuing)
 
 void haloscenariostop() { scenario.stop(); }
 
+// For the QA client: adds `count` entries for actors that are gone, as a long fight leaves behind.
+void haloscenarioqapad(int count)
+{
+    for(int i = 0; i < count; ++i) scenario.squadBots.push_back({nullptr, nullptr, -1, -1});
+}
+
+int haloscenarioencountercount() { return scenario.loaded ? int(scenario.program.encounters.size()) : 0; }
+
+const char *haloscenarioencountername(int index)
+{
+    return scenario.loaded && index >= 0 && index < int(scenario.program.encounters.size()) ? scenario.program.encounters[index].name.c_str() : "";
+}
+
+// Start count of an encounter on the loaded BSP, or -1 when it belongs to another one.
+int haloscenarioencounterstarts(int index)
+{
+    if(!scenario.loaded || !scenario.projection || index < 0 || index >= int(scenario.program.encounters.size())) return -1;
+    const Encounter &encounter = scenario.program.encounters[index];
+    if(encounter.bsp >= 0 && encounter.bsp != scenario.projection->bsp) return -1;
+    int starts = 0;
+    for(const Squad &squad : encounter.squads) starts += int(squad.starts.size());
+    return starts;
+}
+
 int haloscenarioplace(const char *encounter)
 {
     if(!scenario.loaded) return -1;
@@ -2776,6 +2974,48 @@ double haloscenariocall(const char *command, double first, double second)
     Node node{1, 0xffff, 8, 0, nil, 0, 0};
     std::vector<Value> args{number(first), number(second)};
     return scenario.command(thread, node, command, args, false).number;
+}
+
+// QA probes: a script command with several arguments, an object's index by name, and the state the object commands set.
+double haloscenariocallv(const char *command, const double *values, const char *const *texts, int count)
+{
+    if(!scenario.loaded) return 0;
+    Thread thread;
+    Node node{1, 0xffff, 8, 0, nil, 0, 0};
+    std::vector<Value> args;
+    for(int i = 0; i < count; ++i) { args.push_back(number(values[i])); args.back().text = texts[i]; }
+    return scenario.command(thread, node, command, args, false).number;
+}
+
+int haloscenarioobject(const char *name) { return scenario.loaded ? named(scenario.program.objects, name) : -1; }
+
+double haloscenarioobjectstate(const char *what, int id)
+{
+    if(!scenario.loaded) return -1;
+    const Actor *item = at(scenario.actors, id);
+    if(!item) return -1;
+    if(!strcmp(what, "open")) return item->open;
+    if(!strcmp(what, "hovering")) return item->hovering;
+    if(!strcmp(what, "collideable")) return item->collideable;
+    if(!strcmp(what, "enterable")) return item->enterable;
+    if(!strcmp(what, "suspended")) return item->suspended;
+    if(!strcmp(what, "nodamage")) return item->cannotTakeDamage;
+    if(!strcmp(what, "melee")) return item->meleeInhibited;
+    if(!strcmp(what, "ranged")) return item->rangedInhibited;
+    if(!strcmp(what, "squad")) return item->squadReference;
+    if(!strcmp(what, "permutation")) return double(item->permutation.size());
+    if(!strcmp(what, "door")) return at(scenario.objectDevices, id) && scenario.objectDevices[id] >= 0 ? scenario.devices[scenario.objectDevices[id]].visible : -1;
+    return -1;
+}
+
+// QA probe (the shipping client never calls it): wake a script by name (action 0), or ask whether it has started (1) or finished (2).
+double haloscenarioqascript(const char *name, int action)
+{
+    if(!scenario.loaded) return -1;
+    const int index = named(scenario.program.scripts, name);
+    if(index < 0 || size_t(index) >= scenario.threads.size()) return -1;
+    if(action == 0) { scenario.wake(index, false); return 1; }
+    return action == 1 ? scenario.threads[index].started : scenario.threads[index].done;
 }
 
 void haloscenariowakescript(int script)
@@ -2865,6 +3105,20 @@ bool haloscenariocomplete()
 {
     const bool result = scenario.completeExit;
     scenario.completeExit = false;
+    return result;
+}
+
+bool haloscenariogamewon()
+{
+    const bool result = scenario.gameWon;
+    scenario.gameWon = false;
+    return result;
+}
+
+bool haloscenariogamelost()
+{
+    const bool result = scenario.gameLost;
+    scenario.gameLost = false;
     return result;
 }
 

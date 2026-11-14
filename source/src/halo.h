@@ -18,6 +18,15 @@ void haloclearbolts();
 void haloaddbolt(playerent *owner, const vec &position, const vec &direction, int damage);
 void haloplaysound(const char *sample, int fallback, physent *actor = NULL, const vec *position = NULL);
 bool halodriving();
+int haloescapemillis();
+float haloplayershieldfraction();
+// Script-driven unit state: vitality, damage immunity, renewal and teleports.
+void haloplayersetvitality(float health, float shield, bool maximum);
+void haloplayerprotect(bool on);
+bool haloplayerprotected();
+void haloenemysetshield(const playerent *p, float fraction);
+void haloenemyrenew(playerent *p, int health, int grenades);
+bool haloenemymove(playerent *p, const vec &point);
 void halorendervehicle();
 
 // Tag-driven weapons (halo.cpp loadout, weapon.cpp firing and projectiles).
@@ -36,4 +45,7 @@ playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeapon
 void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int trigger,
                      const vec &from, const vec &to);
 void halokilled(playerent *victim, playerent *killer);
+// The nearest marine or Elite body an infection form could reach within `range`.
+void haloclearflood();
+bool halonearestcorpse(const vec &from, float range, vec &body);
 void halorenderweapons();

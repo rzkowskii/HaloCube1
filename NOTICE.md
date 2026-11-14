@@ -1,0 +1,37 @@
+# Notice
+
+**Halo in AssaultCube** is an unofficial, non-commercial fan project. It is not
+affiliated with, endorsed by, or sponsored by Microsoft, Xbox Game Studios,
+343 Industries, Bungie, or the AssaultCube project. "Halo" and related names,
+characters and artwork are trademarks and property of their owners.
+
+## Bring your own assets
+
+This repository contains no Halo game data. Maps, textures, models, audio,
+scripts and tables are generated locally by the importers in `tools/` from a copy
+of *Halo: Combat Evolved* (Xbox) that you own, and are git-ignored. Do not commit
+or redistribute the generated `packages/` directory or an app built from it
+(`scripts/check-no-retail.sh` guards the repository). AssaultCube stock data is
+read from the AssaultCube release you provide and is covered by its own license
+(`build/runtime/docs/license.html`).
+
+## Engine and libraries
+
+- **AssaultCube 1.3.0.2** (Lockdown Edition) engine source, in `source/`.
+  AssaultCube is based on the Cube engine and uses the same zlib-like license;
+  it also contains code from pCube and Sauerbraten. See `source/README.txt` and
+  `source/README_CUBEENGINE.txt` (copied into the app at `Resources/licenses/`).
+- **Cube engine** (c) 2001-2004 Wouter van Oortmerssen, Lee Salzman, Mike Dysart,
+  Robert Pointon, Quinton Reeves. Permission is granted to use, alter and
+  redistribute the code, provided the origin is not misrepresented, altered
+  versions are marked as such, and this notice is not removed.
+- **ENet** (c) 2002-2012 Lee Salzman, MIT license; see `source/enet/LICENSE`.
+- **zlib**, used for compression, under the zlib license.
+- **SDL2 / sdl2-compat, SDL2_image, libvorbis, libogg** and their image-format
+  dependencies (libpng, libjpeg-turbo, libtiff, libwebp, libavif, libjxl) are
+  bundled in `Contents/Frameworks` of a packaged app under their own permissive
+  licenses (zlib, BSD, libpng). Install them from Homebrew to read the full texts.
+
+## Scope
+
+Single-player campaign only. Co-op, multiplayer and splitscreen are out of scope.
