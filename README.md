@@ -9,9 +9,10 @@ Open [Halo in AssaultCube.app](<build/Halo in AssaultCube.app>) in Finder or run
 | W A S D, mouse | Move and aim |
 | Space, Left Shift | Jump and crouch |
 | Left click, R | Fire and reload |
-| Q or 1 / 2 | Switch between the MA5B and M6D |
+| Q or 1 / 2 | Switch between your two carried weapons |
+| Mouse 2 or Z | Zoom (pistol, sniper rifle, rocket launcher) |
 | G, F | Throw a frag grenade or melee |
-| E | Use a nearby control or activate a marked objective |
+| E | Use a nearby control, swap for a weapon on the ground, or activate a marked objective |
 | Enter | Skip the current cutscene or continue after completing a section |
 | Esc, F5 | Pause or restart the current section |
 | Left click after death | Revert to the most recent checkpoint |

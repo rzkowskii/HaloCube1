@@ -282,3 +282,106 @@ COMMANDF(qa_campaign_resume, "ii", (int *m, int *s)
     loadProgress();
     queueSection(*m - 1, *s - 1);
 });
+
+// ---- Tag-driven weapons (tests/test_weapon_tags.py, tests/test_weapon_fire.py)
+static const HaloWeaponDef *qaWeaponByLabel(const char *label)
+{
+    loopi(haloweaponcount())
+    {
+        const HaloWeaponDef *d = haloweapon(i);
+        if(d && d->playable() && d->label == label) return d;
+    }
+    return NULL;
+}
+
+COMMANDF(qa_weapon_table, "", ()
+{
+    loopi(haloweaponcount())
+    {
+        const HaloWeaponDef *d = haloweapon(i);
+        const HaloMagazineDef *m = d->magazine();
+        const HaloTriggerDef *t = d->trigger();
+        conoutf("WEAPON_TABLE %d %s %d %d %d %d %.3f %.3f %.3f %d", i, d->label.c_str(), int(d->kind),
+                m ? m->loaded : 0, m ? m->maximum : 0, int(d->triggers.size()),
+                t ? t->rate : 0.0f, t && t->projectile.valid ? t->projectile.speed : 0.0f,
+                t && t->projectile.valid ? t->projectile.damageUpper : 0.0f, d->zoomLevels);
+    }
+    fflush(stdout);
+});
+COMMANDF(qa_weapon_give, "s", (const char *label)
+{
+    const HaloWeaponDef *d = qaWeaponByLabel(label);
+    if(!d || !tagWeapons()) { conoutf("WEAPON_QA give-failed %s", label); fflush(stdout); return; }
+    carried[currentCarried].reset(d);
+    equipCarried(true);
+});
+static void qaWeaponState(const char *name)
+{
+    const HaloWeaponState &s = carried[currentCarried];
+    const HaloWeaponDef *d = haloweapon(s.def);
+    const HaloWeaponDef *other = haloweapon(carried[currentCarried ^ 1].def);
+    const HaloTriggerDef *t = d ? d->trigger() : NULL;
+    extern float dynfov();
+    extern float fov;
+    conoutf("WEAPON_QA %s weapon=%s other=%s gun=%d mag=%d ammo=%d battery=%.3f heat=%.3f overheated=%d charged=%d "
+            "zoom=%d fov=%.3f basefov=%.3f delay=%d shots=%d ground=%d nearby=%d",
+            name, d ? d->label.c_str() : "-", other ? other->label.c_str() : "-", player1->weaponsel->type,
+            player1->weaponsel->mag, player1->weaponsel->ammo, s.battery, s.heat, s.overheated, s.charged,
+            s.zoom, dynfov(), float(fov), t ? s.delay(*t) : 0, player1->pstatshots[player1->weaponsel->type],
+            groundWeapons.length(), nearbyWeapon);
+    conoutf("WEAPON_POS %s %.1f %.1f %.1f", name, player1->o.x, player1->o.y, player1->o.z - player1->eyeheight);
+    fflush(stdout);
+}
+COMMANDF(qa_weapon_state, "s", (const char *name) { qaWeaponState(name); });
+COMMANDF(qa_weapon_release, "", () { player1->attacking = false; });
+COMMANDF(qa_weapon_fire, "i", (int *ms)
+{
+    player1->attacking = true;
+    defformatstring(release)("qa_weapon_release");
+    addsleep(*ms, release, true);
+});
+COMMANDF(qa_weapon_charge_release, "", () { haloattackinput(false); player1->attacking = false; });
+COMMANDF(qa_weapon_charge, "i", (int *ms)
+{
+    haloattackinput(true);
+    player1->attacking = true;
+    addsleep(*ms, "qa_weapon_charge_release", true);
+});
+COMMANDF(qa_weapon_goto_ground, "", ()
+{
+    // Stand on the closest ground weapon that differs from both carried ones.
+    float best = 1e9f;
+    int found = -1;
+    loopv(groundWeapons)
+    {
+        const GroundWeapon &g = groundWeapons[i];
+        if(g.state.def == carried[0].def || g.state.def == carried[1].def) continue;
+        const float d = player1->o.dist(g.o);
+        if(d < best) { best = d; found = i; }
+    }
+    if(found < 0)
+    {
+        loopv(groundWeapons) conoutf("WEAPON_GROUND carried %s", haloweapon(groundWeapons[i].state.def)->label.c_str());
+        conoutf("WEAPON_QA no-ground-weapon");
+        fflush(stdout);
+        return;
+    }
+    const vec &o = groundWeapons[found].o;
+    conoutf("WEAPON_GROUND %s at %.1f %.1f %.1f", haloweapon(groundWeapons[found].state.def)->label.c_str(), o.x, o.y, o.z);
+    fflush(stdout);
+    player1->o = vec(groundWeapons[found].o).add(vec(0, 0, player1->eyeheight));
+    player1->vel = vec();
+    player1->resetinterp();
+});
+COMMANDF(qa_weapon_switch, "", () { haloswitchweapon(); });
+COMMANDF(qa_weapon_zoom, "", () { halozoomstep(); });
+COMMANDF(qa_enemy_weapons, "", ()
+{
+    loopv(enemies)
+    {
+        const HaloWeaponDef *d = haloweapon(enemies[i].weapon.def);
+        conoutf("ENEMY_WEAPON %s %s damage=%d", profiles[enemies[i].kind].name, d ? d->label.c_str() : "-",
+                enemies[i].bot ? enemies[i].bot->weapons[GUN_SUBGUN]->info.damage : 0);
+    }
+    fflush(stdout);
+});

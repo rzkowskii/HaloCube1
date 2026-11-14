@@ -12,6 +12,10 @@ import re
 from import_halo_a30 import HaloMap, ac_yaw, encode_map, entity, LIGHT, PLAYERSTART, AMMO, GRENADE, HEALTH
 from halo_collision import write_structure_collision
 from halo_map_art import write_world_mesh
+from halo_weapons import actor_weapon, weapon_index
+
+# PLAYERSTART team value for scenario weapon placements (100 is the route).
+WEAPON_PLACEMENT = 101
 
 
 @dataclass(frozen=True)
@@ -94,7 +98,17 @@ def actor_starts(halo, index):
                     continue
                 actor = tag.name.split('\\')[1]
                 if actor in ACTORS:
-                    yield halo.tags.read('4f', start), ACTORS[actor]
+                    yield halo.tags.read('4f', start), (ACTORS[actor], actor_weapon(halo, tag) or '')
+
+
+def weapon_placements(halo):
+    """Scenario weapon placements: tag path, retail position and yaw."""
+    palette = [halo.reference(halo.tags, entry) for entry in halo.tags.block(halo.scenario + 636, 48)]
+    for placement in halo.tags.block(halo.scenario + 624, 92):
+        kind, = halo.tags.read('h', placement)
+        if 0 <= kind < len(palette) and palette[kind] and palette[kind].group == 'weap':
+            x, y, z, yaw = halo.tags.read('4f', placement + 8)
+            yield palette[kind].name, (x, y, z), yaw
 
 
 @dataclass
@@ -300,6 +314,9 @@ def section_layout(halo, mission, part):
 
 
 def make_section(halo, mission, part, output):
+    weapons = weapon_index(output)
+    if not weapons:
+        raise ValueError('run tools/halo_weapons.py first to write packages/halo/weapons.txt')
     bsp, indoor, (xmin, xmax, ymin, ymax), start, end, actors, factor, projection = section_layout(halo, mission, part)
     size, scale = 1 << factor, projection.scale
     projected_start, projected_end = projection.point(start), projection.point(end)
@@ -342,13 +359,28 @@ def make_section(halo, mission, part, output):
             if abs(floor[place]/4-point[2]) > 8 or math.dist(place,anchor)>35:
                 continue
             eligible.append((math.dist(place,anchor),place,actor,p[3]))
-        for _, place, actor, angle in sorted(eligible):
+        for _, place, (kind, weapon), angle in sorted(eligible):
             if any(math.dist(place,p) < 5 for p in used):
                 continue
-            entries.append(entity(xyz(place),PLAYERSTART,ac_yaw(angle),0,wave,actor))
+            # attr5 holds the carried weapon's packages/halo/weapons.txt index + 1.
+            entries.append(entity(xyz(place),PLAYERSTART,ac_yaw(angle),0,wave,kind,weapons.get(weapon,-1)+1))
             used.append(place)
             if sum(e[4]==PLAYERSTART and e[5]==0 and e[6]==wave for e in entries) >= 4:
                 break
+    placed = 0
+    for weapon, point, yaw in weapon_placements(halo):
+        if weapon not in weapons or not (xmin <= point[0] <= xmax and ymin <= point[1] <= ymax):
+            continue
+        projected_point = projection.point(point)
+        close = [(x,y) for x in range(round(projected_point[0])-4,round(projected_point[0])+5)
+                       for y in range(round(projected_point[1])-4,round(projected_point[1])+5) if (x,y) in parents]
+        if not close:
+            continue
+        place = closest(close,floor,projected_point)
+        if abs(floor[place]/4-projected_point[2]) > 8:
+            continue
+        entries.append(entity(xyz(place),PLAYERSTART,ac_yaw(yaw),WEAPON_PLACEMENT,0,0,weapons[weapon]+1))
+        placed += 1
     for p in (path[0],path[halfway],path[-1]):
         x,y,z = xyz(p)
         entries.append(entity((x,y,z+5),LIGHT,19,165,170,182))
@@ -364,7 +396,7 @@ def make_section(halo, mission, part, output):
     if mission.cache == 'b30' and part < 2:
         count = write_structure_collision(halo, bsp, projection, maps / f'{name}.hcol')
         print(f'{name} BSP {bsp}: {count} retail collision surfaces', flush=True)
-    print(f'{name} BSP {bsp}: {len(path)} steps, {len(used)} actors, {len(parents)} cells; '
+    print(f'{name} BSP {bsp}: {len(path)} steps, {len(used)} actors, {placed} weapons, {len(parents)} cells; '
           f'entry offset {math.dist(xyz(path[0]),projected_start)/scale:.1f}, '
           f'exit offset {math.dist(xyz(path[-1]),projected_end)/scale:.1f} source units',flush=True)
 

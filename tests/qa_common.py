@@ -18,7 +18,8 @@ APP = BUILD / 'Halo in AssaultCube.app'
 APP_EXE = APP / 'Contents/MacOS/Halo in AssaultCube'
 DATA = root / 'tests/data'
 # Expanded Xbox caches, only needed by the tools that read retail data.
-HALO_SOURCE = Path(os.environ.get('HALO_SOURCE', root.parent / 'My 3DS/build/local-assets/NEW2DS/halo-source'))
+# The asset library keeps copies of the caches in build/retail-assets/sources.
+HALO_SOURCE = Path(os.environ.get('HALO_SOURCE', BUILD / 'retail-assets/sources'))
 
 SCRATCH.mkdir(parents=True, exist_ok=True)
 

@@ -4,6 +4,7 @@
 #include "halo_collision.h"
 #include "halo_script.h"
 #include "halo_campaign.h"
+#include "halo_weapons.h"
 
 extern void startgame(const char *name, int mode, int minutes, bool notify);
 
@@ -55,7 +56,21 @@ namespace
         ActorKind kind;
         float shield;
         int hitTime;
+        HaloWeaponState weapon;
     };
+
+    // A weapon lying in the world: scenario placements and drops.
+    struct GroundWeapon
+    {
+        vec o;
+        float yaw;
+        HaloWeaponState state;
+    };
+
+    // Enemies deal a share of the retail projectile damage, standing in for
+    // the AI damage modifiers that the actor definitions apply on Normal.
+    const float aiDamageScale = 0.5f;
+    const char *const defaultWeapons[2] = {"weapons\\assault rifle\\assault rifle", "weapons\\pistol\\pistol"};
 
     bool active = false, startPending = false, launchPending = false, controlsLoaded = false;
     MissionStage stage = INSERTION;
@@ -74,6 +89,12 @@ namespace
     vector<int> waveStarts[2], route[3];
     int nextRouteMarker = 0;
     vector<HaloEnemy> enemies;
+    // The player carries two retail weapons, each bound to an AssaultCube slot.
+    HaloWeaponState carried[2], checkpointCarried[2];
+    int carriedGun[2] = {GUN_ASSAULT, GUN_PISTOL}, currentCarried = 0, checkpointCurrent = 0;
+    vector<GroundWeapon> groundWeapons, checkpointGround;
+    int nearbyWeapon = -1, pickupMessage = 0;
+    string pickupText = "";
 
     vec position(const entity &e) { return vec(e.x, e.y, e.z); }
     bool near(int i, float radius)
@@ -103,27 +124,123 @@ namespace
         info.maxrecoil = 8;
     }
 
+    bool tagWeapons() { return haloweapon(carried[0].def) && haloweapon(carried[1].def); }
+
+    // Two carried weapons need distinct AssaultCube slots; projectile weapons
+    // share the carbine and submachine-gun slots between them.
+    void assignGuns()
+    {
+        loopi(2)
+        {
+            const HaloWeaponDef *d = haloweapon(carried[i].def);
+            carriedGun[i] = d ? d->acgun() : (i ? GUN_PISTOL : GUN_ASSAULT);
+        }
+        if(carriedGun[0] == carriedGun[1]) carriedGun[1] = carriedGun[0] == GUN_CARBINE ? GUN_SUBGUN : GUN_CARBINE;
+    }
+
+    // Copy the slot's live rounds back into the carried weapon.
+    void syncCarried()
+    {
+        if(!tagWeapons()) return;
+        loopi(2)
+        {
+            const HaloWeaponDef *d = haloweapon(carried[i].def);
+            if(d->usesBattery()) continue;
+            carried[i].loaded = player1->mag[carriedGun[i]];
+            carried[i].reserve = player1->ammo[carriedGun[i]];
+        }
+    }
+
+    void applyCarried(int i)
+    {
+        const HaloWeaponDef *d = haloweapon(carried[i].def);
+        if(!d) return;
+        const int gun = carriedGun[i];
+        const HaloMagazineDef *m = d->magazine();
+        const HaloTriggerDef *t = d->trigger();
+        guninfo &info = player1->weapons[gun]->info;
+        info.magsize = d->usesBattery() ? 1 : max(1, m->loaded);
+        info.attackdelay = t ? carried[i].delay(*t) : 100;
+        info.reloadtime = m ? int(m->reload * 1000) : 0;
+        info.damage = t && t->projectile.valid ? int(t->projectile.damageUpper + .5f) : 10;
+        info.spread = 0;
+        info.recoil = 3;
+        info.mdl_kick_back = info.mdl_kick_rot = 0;
+        info.recoilincrease = 32;
+        info.recoilbase = 3;
+        info.maxrecoil = 8;
+        info.isauto = t && max(t->rate, t->finalRate) >= 5;
+        player1->mag[gun] = d->usesBattery() ? (carried[i].canfire(*d) ? 1 : 0) : carried[i].loaded;
+        player1->ammo[gun] = d->usesBattery() ? 0 : carried[i].reserve;
+    }
+
+    void selectCarried(int i, bool immediate)
+    {
+        currentCarried = i;
+        carried[0].zoom = carried[1].zoom = 0;
+        weapon *w = player1->weapons[carriedGun[i]];
+        if(immediate)
+        {
+            player1->selectweapon(carriedGun[i]);
+            player1->nextweaponsel = player1->weaponsel;
+            player1->weaponchanging = 0;
+        }
+        else if(w != player1->weaponsel) player1->weaponswitch(w);
+    }
+
+    void equipCarried(bool immediate)
+    {
+        assignGuns();
+        loopi(2) applyCarried(i);
+        player1->setnextprimary(carriedGun[0]);
+        player1->setprimary(carriedGun[0]);
+        selectCarried(currentCarried, immediate);
+    }
+
     void resetLoadout()
     {
-        campaignWeapon(player1, GUN_ASSAULT, 60, 67, 3400, 10, 60);
-        campaignWeapon(player1, GUN_PISTOL, 12, 286, 2170, 25, 14);
-        player1->setnextprimary(GUN_ASSAULT);
-        player1->setprimary(GUN_ASSAULT);
-        player1->selectweapon(atCheckpoint ? checkpointWeapon : GUN_ASSAULT);
-        player1->nextweaponsel = player1->weaponsel;
-        player1->weaponchanging = 0;
-        player1->health = atCheckpoint ? checkpointHealth : playerHealth;
-        player1->armour = 0;
-        player1->mag[GUN_ASSAULT] = 60;
-        player1->ammo[GUN_ASSAULT] = 180;
-        player1->mag[GUN_PISTOL] = 12;
-        player1->ammo[GUN_PISTOL] = 48;
-        player1->mag[GUN_GRENADE] = 2;
         if(atCheckpoint)
         {
-            memcpy(player1->mag, checkpointMag, sizeof(checkpointMag));
-            memcpy(player1->ammo, checkpointAmmo, sizeof(checkpointAmmo));
+            loopi(2) carried[i] = checkpointCarried[i];
+            currentCarried = checkpointCurrent;
         }
+        else
+        {
+            loopi(2) carried[i].reset(haloweaponfind(defaultWeapons[i]));
+            currentCarried = 0;
+        }
+        if(tagWeapons())
+        {
+            loopi(NUMGUNS) if(i != GUN_GRENADE && i != GUN_KNIFE) player1->mag[i] = player1->ammo[i] = 0;
+            equipCarried(true);
+        }
+        else
+        {
+            // Without packages/halo/weapons.txt keep the original MA5B and M6D numbers.
+            campaignWeapon(player1, GUN_ASSAULT, 60, 67, 3400, 10, 60);
+            campaignWeapon(player1, GUN_PISTOL, 12, 286, 2170, 25, 14);
+            player1->setnextprimary(GUN_ASSAULT);
+            player1->setprimary(GUN_ASSAULT);
+            player1->selectweapon(atCheckpoint ? checkpointWeapon : GUN_ASSAULT);
+            player1->nextweaponsel = player1->weaponsel;
+            player1->weaponchanging = 0;
+            player1->mag[GUN_ASSAULT] = 60;
+            player1->ammo[GUN_ASSAULT] = 180;
+            player1->mag[GUN_PISTOL] = 12;
+            player1->ammo[GUN_PISTOL] = 48;
+            if(atCheckpoint)
+            {
+                memcpy(player1->mag, checkpointMag, sizeof(checkpointMag));
+                memcpy(player1->ammo, checkpointAmmo, sizeof(checkpointAmmo));
+            }
+        }
+        player1->health = atCheckpoint ? checkpointHealth : playerHealth;
+        player1->armour = 0;
+        player1->mag[GUN_GRENADE] = atCheckpoint ? checkpointMag[GUN_GRENADE] : 2;
+        // Reverting restores the weapons lying in the world as they were saved;
+        // before the first checkpoint that is the section's placements.
+        groundWeapons.setsize(0);
+        loopv(checkpointGround) groundWeapons.add(checkpointGround[i]);
         shield = playerShield;
         shieldHit = 0;
         shieldRecharging = false;
@@ -140,19 +257,34 @@ namespace
         checkpointWeapon = player1->weaponsel->type;
         memcpy(checkpointMag, player1->mag, sizeof(checkpointMag));
         memcpy(checkpointAmmo, player1->ammo, sizeof(checkpointAmmo));
+        syncCarried();
+        loopi(2) checkpointCarried[i] = carried[i];
+        checkpointCurrent = currentCarried;
+        checkpointGround.setsize(0);
+        loopv(groundWeapons) checkpointGround.add(groundWeapons[i]);
         checkpointItems.setsize(0);
         loopv(ents) checkpointItems.add(ents[i].spawned);
         haloscenariocheckpoint();
         conoutf("Halo: checkpoint reached");
     }
 
-    botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw)
+    botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw, int weaponIndex = -1)
     {
         const ActorProfile &profile = profiles[kind];
         defformatstring(name)("%.12s %d", profile.name, enemies.length() + 1);
         botent *bot = BotManager.CreateBot("CLA", kind == ELITE ? "worse" : "bad", name);
         if(!bot) return nullptr;
-        enemies.add(HaloEnemy{bot, kind, float(profile.shield), lastmillis});
+        // Script-spawned actors arrive without a variant; give them their usual weapon.
+        static const char *const usual[ACTOR_COUNT] = {
+            "weapons\\plasma pistol\\plasma pistol", "weapons\\plasma rifle\\plasma rifle",
+            "weapons\\plasma pistol\\plasma pistol", "weapons\\fuel rod gun\\hunter fuel rod",
+            "weapons\\plasma rifle\\plasma rifle", "weapons\\assault rifle\\assault rifle", NULL, NULL,
+            "characters\\sentinel\\sentinel",
+        };
+        const HaloWeaponDef *def = profile.melee ? nullptr :
+            weaponIndex >= 0 ? haloweapon(weaponIndex) : usual[kind] ? haloweaponfind(usual[kind]) : nullptr;
+        enemies.add(HaloEnemy{bot, kind, float(profile.shield), lastmillis, HaloWeaponState()});
+        enemies.last().weapon.reset(def);
         bot->health = profile.health;
         bot->maxeyeheight = bot->eyeheight = profile.eyeheight;
         bot->radius = profile.radius;
@@ -169,7 +301,12 @@ namespace
         bot->nextweaponsel = bot->weaponsel;
         bot->weaponchanging = 0;
         loopj(NUMGUNS) bot->mag[j] = bot->ammo[j] = 0;
-        campaignWeapon(bot, gun, 100, profile.delay, 0, profile.damage, kind == ELITE ? 36 : 56);
+        // The retail weapon sets the damage; the actor's cadence keeps AssaultCube
+        // bots from firing at the full player rate of fire.
+        const HaloTriggerDef *t = def ? def->trigger() : nullptr;
+        const int damage = t && t->projectile.valid ? max(1, int(t->projectile.damageUpper * aiDamageScale + .5f)) : profile.damage;
+        const int delay = t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
+        campaignWeapon(bot, gun, 100, delay, 0, damage, kind == ELITE ? 36 : 56);
         bot->mag[gun] = 100;
         return bot;
     }
@@ -180,7 +317,7 @@ namespace
         {
             entity &start = ents[waveStarts[wave][i]];
             const ActorKind kind = start.attr4 < ACTOR_COUNT ? ActorKind(start.attr4) : GRUNT;
-            spawnEnemy(kind, position(start), start.attr1 / 10.0f);
+            spawnEnemy(kind, position(start), start.attr1 / 10.0f, start.attr5 - 1);
         }
         if(!waveStarts[wave].empty()) conoutf("Halo: encounter %d", wave + 1);
     }
@@ -277,6 +414,96 @@ namespace
             nextRouteMarker = checkpointMarker;
         }
         else setStage(halocollisionactive() ? EXTRACTION : INSERTION);
+    }
+
+    vec feetOf(const playerent *p) { return vec(p->o).sub(vec(0, 0, p->eyeheight)); }
+
+    void showPickup(const char *text)
+    {
+        copystring(pickupText, text);
+        pickupMessage = lastmillis;
+    }
+
+    void dropWeapon(const HaloWeaponState &state, const vec &feet, float yaw)
+    {
+        const HaloWeaponDef *def = haloweapon(state.def);
+        if(!def || !def->playable() || def->worldmodel == "-") return;
+        GroundWeapon &g = groundWeapons.add();
+        g.o = feet;
+        g.yaw = yaw;
+        g.state = state;
+        g.state.zoom = 0;
+        g.state.charged = false;
+        g.state.chargeStart = 0;
+    }
+
+    void updateWeapons(int elapsed)
+    {
+        if(!tagWeapons()) return;
+        syncCarried();
+        const int selected = player1->weaponsel->type;
+        if(selected == carriedGun[0] || selected == carriedGun[1]) currentCarried = selected == carriedGun[1];
+        loopi(2)
+        {
+            const HaloWeaponDef *d = haloweapon(carried[i].def);
+            carried[i].tick(*d, elapsed);
+            if(d->usesBattery()) player1->mag[carriedGun[i]] = carried[i].canfire(*d) ? 1 : 0;
+            const HaloTriggerDef *t = d->trigger();
+            if(t) player1->weapons[carriedGun[i]]->info.attackdelay = carried[i].delay(*t);
+            // Holding the trigger on a charging weapon builds its second-trigger shot.
+            if(i == currentCarried && carried[i].chargeStart && t && t->charge > 0 && d->trigger(1))
+                carried[i].charged = lastmillis - carried[i].chargeStart >= int(t->charge * 1000);
+        }
+        loopv(enemies) if(enemies[i].bot && haloweapon(enemies[i].weapon.def))
+            enemies[i].weapon.tick(*haloweapon(enemies[i].weapon.def), elapsed);
+
+        nearbyWeapon = -1;
+        float best = 1e9f;
+        const vec feet = feetOf(player1);
+        loopv(groundWeapons)
+        {
+            GroundWeapon &g = groundWeapons[i];
+            const HaloWeaponDef *d = haloweapon(g.state.def);
+            const float distance = feet.dist(g.o);
+            if(!d || distance > 5.0f) continue;
+            int holder = carried[0].def == g.state.def ? 0 : carried[1].def == g.state.def ? 1 : -1;
+            if(holder < 0)
+            {
+                if(distance < best) { best = distance; nearbyWeapon = i; }
+                continue;
+            }
+            // Walking over a weapon you already carry takes its rounds.
+            const HaloMagazineDef *m = d->magazine();
+            if(d->usesBattery() || !m) continue;
+            HaloWeaponState &c = carried[holder];
+            const int room = max(0, m->maximum - c.loaded - c.reserve);
+            const int take = min(room, g.state.loaded + g.state.reserve);
+            if(take <= 0) continue;
+            c.reserve += take;
+            const int fromReserve = min(take, g.state.reserve);
+            g.state.reserve -= fromReserve;
+            g.state.loaded -= take - fromReserve;
+            player1->ammo[carriedGun[holder]] = c.reserve;
+            audiomgr.playsound(S_ITEMAMMO, SP_HIGH);
+            defformatstring(text)("%s ammo", d->name.c_str());
+            showPickup(text);
+            if(g.state.loaded + g.state.reserve <= 0) groundWeapons.remove(i--);
+        }
+    }
+
+    bool swapWeapon()
+    {
+        if(!tagWeapons() || !groundWeapons.inrange(nearbyWeapon) || player1->weaponsel->reloading || player1->weaponchanging) return false;
+        GroundWeapon picked = groundWeapons.remove(nearbyWeapon);
+        nearbyWeapon = -1;
+        syncCarried();
+        dropWeapon(carried[currentCarried], feetOf(player1), player1->yaw);
+        carried[currentCarried] = picked.state;
+        equipCarried(false);
+        audiomgr.playsound(S_ITEMAMMO, SP_HIGH);
+        const HaloWeaponDef *d = haloweapon(picked.state.def);
+        showPickup(d ? d->name.c_str() : "Weapon");
+        return true;
     }
 
     void loadProgress()
@@ -434,6 +661,9 @@ void halomapstart(const char *name)
     player1->maxspeed = 16.0f;
     haloclearbolts();
     enemies.setsize(0);
+    groundWeapons.setsize(0);
+    checkpointGround.setsize(0);
+    nearbyWeapon = -1;
     loopi(NUMGUNS) player1->weapons[i]->info = guns[i];
     if(gamemode != GMODE_BOTTEAMDEATHMATCH || multiplayer(NULL) || !haloparsemap(behindpath(name), mission, section)) return;
     if(!requestedSection) preview = true;
@@ -457,6 +687,17 @@ void halomapstart(const char *name)
                 if(e.attr3 >= 1 && e.attr3 <= 3) route[e.attr3 - 1].add(i);
                 else if(e.attr3 == 0) extraction = i;
                 break;
+            case 101:
+            {
+                // Scenario weapon placement; attr5 is the weapons.txt index + 1.
+                const HaloWeaponDef *def = haloweapon(e.attr5 - 1);
+                if(!def || !def->playable()) break;
+                GroundWeapon &g = groundWeapons.add();
+                g.o = position(e);
+                g.yaw = e.attr1 / 10.0f;
+                g.state.reset(def);
+                break;
+            }
         }
     }
     if(insertion < 0 || checkpoint < 0 || extraction < 0)
@@ -464,6 +705,7 @@ void halomapstart(const char *name)
         conoutf("Halo: incomplete campaign section markers");
         return;
     }
+    loopv(groundWeapons) checkpointGround.add(groundWeapons[i]);
     atCheckpoint = false;
     active = startPending = true;
     halocollisionmap(behindpath(name));
@@ -581,6 +823,7 @@ void haloupdate(int elapsed)
         shieldRecharging = true;
     }
     shieldTick(shield, playerShield, shieldHit, shieldDelay, shieldRecharge, elapsed);
+    updateWeapons(elapsed);
     loopv(enemies)
     {
         HaloEnemy &enemy = enemies[i];
@@ -643,7 +886,31 @@ bool halopickup(int index, playerent *p)
     if(!haloactive()) return false;
     if(p != player1) return true;
     entity &e = ents[index];
-    int &ammo = p->ammo[GUN_ASSAULT], &clips = p->ammo[GUN_PISTOL], &grenades = p->mag[GUN_GRENADE];
+    int &grenades = p->mag[GUN_GRENADE];
+    // Ammunition boxes refill the carried weapon they belong to, up to its tag maximum.
+    auto refill = [&](const char *path, int fallbackGun, int fallbackRounds, int fallbackMax) -> bool
+    {
+        if(tagWeapons())
+        {
+            loopi(2)
+            {
+                const HaloWeaponDef *d = haloweapon(carried[i].def);
+                const HaloMagazineDef *m = d ? d->magazine() : NULL;
+                if(!d || d->path != path || !m) continue;
+                syncCarried();
+                const int room = m->maximum - carried[i].loaded - carried[i].reserve;
+                if(room <= 0) return false;
+                carried[i].reserve += min(room, m->loaded);
+                p->ammo[carriedGun[i]] = carried[i].reserve;
+                return true;
+            }
+            return false;
+        }
+        int &ammo = p->ammo[fallbackGun];
+        if(ammo >= fallbackMax) return false;
+        ammo = min(ammo + fallbackRounds, fallbackMax);
+        return true;
+    };
     switch(e.type)
     {
         case I_HEALTH:
@@ -651,12 +918,10 @@ bool halopickup(int index, playerent *p)
             p->health = playerHealth;
             break;
         case I_AMMO:
-            if(ammo >= 600) return true;
-            ammo = min(ammo + 60, 600);
+            if(!refill(defaultWeapons[0], GUN_ASSAULT, 60, 600)) return true;
             break;
         case I_CLIPS:
-            if(clips >= 120) return true;
-            clips = min(clips + 12, 120);
+            if(!refill(defaultWeapons[1], GUN_PISTOL, 12, 120)) return true;
             break;
         case I_GRENADE:
             if(grenades >= 4) return true;
@@ -682,6 +947,11 @@ const char *haloactormodel(const playerent *p)
 const char *halohudmodel(int gun)
 {
     if(!haloactive()) return NULL;
+    if(tagWeapons()) loopi(2) if(carriedGun[i] == gun)
+    {
+        const HaloWeaponDef *d = haloweapon(carried[i].def);
+        if(d && d->viewmodel != "-") return d->viewmodel.c_str();
+    }
     if(gun == GUN_ASSAULT) return "halo/ma5b";
     if(gun == GUN_PISTOL) return "halo/pistol";
     return NULL;
@@ -824,10 +1094,54 @@ void halodrawhud()
         return;
     }
     const weapon *current = player1->weaponsel;
-    const char *name = current->type == GUN_PISTOL ? "M6D MAGNUM" : current->type == GUN_KNIFE ? "MELEE" : "MA5B ASSAULT RIFLE";
-    label(name, right, VIRTH-212, 0.60f, true);
-    defformatstring(ammo)("%02d / %03d", current->mag, current->ammo);
-    label(ammo, right, VIRTH-173, 0.96f, true);
+    const HaloWeaponDef *def = tagWeapons() ? haloweapon(carried[currentCarried].def) : NULL;
+    if(def)
+    {
+        const HaloWeaponState &s = carried[currentCarried];
+        string title;
+        copystring(title, def->name.c_str());
+        for(char *c = title; *c; ++c) *c = toupper(*c);
+        label(title, right, VIRTH-212, 0.60f, true);
+        if(def->usesBattery())
+        {
+            // Covenant weapons show battery and heat instead of rounds.
+            glDisable(GL_TEXTURE_2D);
+            box(right-260, VIRTH-178, 260, 14, 18, 60, 81, 210);
+            box(right-260, VIRTH-178, 260 * s.battery, 14, 120, 230, 120, 235);
+            const float heat = def->heatOverheat > 0 ? clamp(s.heat / def->heatOverheat, 0.0f, 1.0f) : 0;
+            box(right-260, VIRTH-158, 260, 10, 18, 60, 81, 210);
+            box(right-260, VIRTH-158, 260 * heat, 10, 255, s.overheated ? 60 : 160, 40, 235);
+            glEnable(GL_TEXTURE_2D);
+            defformatstring(battery)("%d%%", int(s.battery * 100 + .5f));
+            label(s.overheated ? "OVERHEATED" : s.charged ? "CHARGED" : battery, right-270, VIRTH-182, 0.6f, true);
+        }
+        else
+        {
+            defformatstring(ammo)("%02d / %03d", current->mag, current->ammo);
+            label(ammo, right, VIRTH-173, 0.96f, true);
+        }
+        const HaloWeaponDef *other = haloweapon(carried[currentCarried ^ 1].def);
+        if(other) label(other->name.c_str(), right, VIRTH-240, 0.45f, true);
+        if(s.zoom > 0)
+        {
+            defformatstring(zoom)("%.0fx", def->magnification(s.zoom));
+            label(zoom, VIRTW/2+40, VIRTH/2+30, 0.55f);
+        }
+    }
+    else
+    {
+        const char *name = current->type == GUN_PISTOL ? "M6D MAGNUM" : current->type == GUN_KNIFE ? "MELEE" : "MA5B ASSAULT RIFLE";
+        label(name, right, VIRTH-212, 0.60f, true);
+        defformatstring(ammo)("%02d / %03d", current->mag, current->ammo);
+        label(ammo, right, VIRTH-173, 0.96f, true);
+    }
+    if(groundWeapons.inrange(nearbyWeapon))
+    {
+        const HaloWeaponDef *d = haloweapon(groundWeapons[nearbyWeapon].state.def);
+        defformatstring(prompt)("E  Pick up %s", d ? d->name.c_str() : "weapon");
+        label(prompt, VIRTW/2-200, VIRTH/2+90, 0.6f);
+    }
+    if(pickupMessage && lastmillis - pickupMessage < 1600) label(pickupText, VIRTW/2-200, VIRTH/2+130, 0.55f);
     defformatstring(grenades)("FRAG  %d", player1->mag[GUN_GRENADE]);
     label(grenades, right, VIRTH-100, 0.57f, true);
 }
@@ -850,6 +1164,7 @@ COMMANDF(halo_next, "", () { if(!halocinematicskip()) nextSection(); });
 COMMANDF(halo_use, "", ()
 {
     if(haloscenariouse()) return;
+    if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && swapWeapon()) return;
     if(retailCartographer() && (section != 2 || !halopelicanready())) return;
     if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && stage == EXTRACTION && sectionInteraction() &&
        (retailCartographer() || !route[2].inrange(nextRouteMarker)) && near(extraction, markerRadius))
@@ -863,10 +1178,7 @@ COMMANDF(halo_mission, "i", (int *index)
     loadProgress();
     if(*index >= 1 && *index <= haloMissionCount) queueSection(*index - 1, 0);
 });
-COMMANDF(halo_switch, "d", (bool down)
-{
-    if(down && haloactive() && !halocinematic()) execute(player1->weaponsel->type == GUN_ASSAULT ? "weapon pistol" : "weapon assault");
-});
+COMMANDF(halo_switch, "d", (bool down) { if(down) haloswitchweapon(); });
 
 void haloremoveactor(const playerent *p)
 {
@@ -879,7 +1191,9 @@ COMMANDF(halo_melee, "d", (bool down) { if(down) halomelee(); });
 
 COMMANDF(halo_slot, "i", (int *slot)
 {
-    if(haloactive() && !halocinematic() && keypressed) execute(*slot == 2 ? "weapon pistol" : "weapon assault");
+    if(!haloactive() || halocinematic() || !keypressed) return;
+    if(!tagWeapons()) execute(*slot == 2 ? "weapon pistol" : "weapon assault");
+    else if((*slot == 2) != (currentCarried == 1)) haloswitchweapon();
 });
 
 void haloplaysound(const char *sample, int fallback, physent *actor, const vec *position)
@@ -917,11 +1231,167 @@ bool halodriving() { return haloactive() && driving && !editmode && player1->sta
 
 void halorendervehicle()
 {
+    halorenderweapons();
     if(!halodriving()) return;
     vec origin = player1->o;
     origin.z -= player1->eyeheight;
     rendermodel("halo/warthog", ANIM_MAPMODEL, 0, -1, origin, 0, player1->yaw + 90, 0, 0, 0);
 }
+
+const HaloWeaponDef *haloweaponof(const playerent *p, int gun, HaloWeaponState **state)
+{
+    if(!haloactive() || !p) return NULL;
+    if(p == player1)
+    {
+        if(!tagWeapons()) return NULL;
+        loopi(2) if(carriedGun[i] == gun)
+        {
+            if(state) *state = &carried[i];
+            return haloweapon(carried[i].def);
+        }
+        return NULL;
+    }
+    HaloEnemy *enemy = enemyState(p);
+    if(!enemy || gun != GUN_SUBGUN) return NULL;
+    if(state) *state = &enemy->weapon;
+    return haloweapon(enemy->weapon.def);
+}
+
+bool halocarriesgun(int gun)
+{
+    if(!tagWeapons()) return gun == GUN_ASSAULT || gun == GUN_PISTOL;
+    return gun == carriedGun[0] || gun == carriedGun[1];
+}
+
+void haloswitchweapon()
+{
+    if(!haloactive() || halocinematic() || player1->state != CS_ALIVE) return;
+    if(!tagWeapons())
+    {
+        execute(player1->weaponsel->type == GUN_ASSAULT ? "weapon pistol" : "weapon assault");
+        return;
+    }
+    if(!player1->weaponsel->deselectable() || player1->weaponchanging) return;
+    syncCarried();
+    selectCarried(currentCarried ^ 1, false);
+}
+
+void haloattackinput(bool down)
+{
+    if(!haloactive() || !tagWeapons() || player1->state != CS_ALIVE) return;
+    HaloWeaponState &s = carried[currentCarried];
+    const HaloWeaponDef *d = haloweapon(s.def);
+    const HaloTriggerDef *t = d ? d->trigger() : NULL;
+    if(!t || t->charge <= 0 || !d->trigger(1)) return;
+    if(down)
+    {
+        if(s.canfire(*d)) s.chargeStart = lastmillis;
+        return;
+    }
+    // Releasing a charged trigger fires the second trigger's shot.
+    const bool charged = s.charged && s.canfire(*d);
+    s.chargeStart = 0;
+    s.charged = false;
+    if(!charged || halocinematic()) return;
+    vec from = player1->o, to = worldpos;
+    from.z -= weapon::weaponbeloweye;
+    halofiretrigger(player1, *d, s, 1, from, to);
+    player1->weaponsel->updatetimers(lastmillis);
+    player1->lastaction = lastmillis;
+}
+
+float halozoom()
+{
+    if(!haloactive() || !tagWeapons() || player1->state != CS_ALIVE) return 1;
+    const HaloWeaponState &s = carried[currentCarried];
+    const HaloWeaponDef *d = haloweapon(s.def);
+    return d && s.zoom > 0 ? d->magnification(s.zoom) : 1;
+}
+
+void halounzoom()
+{
+    if(!tagWeapons()) return;
+    loopi(2) carried[i].zoom = 0;
+    if(player1->weaponsel->type == GUN_SNIPER) ((sniperrifle *)player1->weaponsel)->setscope(false);
+}
+
+int halomeleedamage()
+{
+    const HaloWeaponDef *d = tagWeapons() ? haloweapon(carried[currentCarried].def) : NULL;
+    return d && d->meleeUpper > 0 ? int(d->meleeUpper + .5f) : 50;
+}
+
+playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeaponDef &def)
+{
+    if(def.autoaimAngle <= 0 || def.autoaimRange <= 0) return NULL;
+    const float range = def.autoaimRange * haloscenarioscale(), cosine = cosf(def.autoaimAngle);
+    playerent *best = NULL;
+    float bestCosine = cosine;
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot->state != CS_ALIVE) continue;
+        // Aim at the upper body rather than the eyes.
+        vec target = bot->o;
+        target.z -= bot->eyeheight * 0.35f;
+        vec delta = vec(target).sub(from);
+        const float distance = delta.magnitude();
+        if(distance < 0.01f || distance > range) continue;
+        const float c = delta.dot(direction) / distance;
+        if(c < bestCosine) continue;
+        vec end = target;
+        if(intersectgeometry(from, end)) continue;
+        bestCosine = c;
+        best = bot;
+    }
+    return best;
+}
+
+void halokilled(playerent *victim)
+{
+    if(!haloactive() || !victim || victim == player1) return;
+    HaloEnemy *enemy = enemyState(victim);
+    if(!enemy) return;
+    const HaloWeaponDef *d = haloweapon(enemy->weapon.def);
+    if(!d || !d->playable()) return;
+    // A dropped weapon keeps part of its battery or magazine.
+    HaloWeaponState dropped;
+    dropped.reset(d);
+    if(d->usesBattery()) dropped.battery = 0.3f + rndscale(0.6f);
+    else
+    {
+        dropped.loaded = max(1, int(dropped.loaded * (0.3f + rndscale(0.7f))));
+        dropped.reserve = int(dropped.reserve * rndscale(0.5f));
+    }
+    dropWeapon(dropped, feetOf(victim), victim->yaw);
+}
+
+void halorenderweapons()
+{
+    if(!haloactive()) return;
+    loopv(groundWeapons)
+    {
+        const GroundWeapon &g = groundWeapons[i];
+        const HaloWeaponDef *d = haloweapon(g.state.def);
+        if(!d || d->worldmodel == "-") continue;
+        // Placed weapons sway slowly so they read as pickups.
+        vec o = g.o;
+        o.z += 0.35f + 0.12f * sinf(lastmillis / 400.0f + i);
+        rendermodel(d->worldmodel.c_str(), ANIM_MAPMODEL|ANIM_LOOP, 0, -1, o, 0, g.yaw + 90, 0, 0, 0);
+    }
+}
+
+void halozoomstep()
+{
+    if(!haloactive() || !tagWeapons() || halocinematic() || player1->state != CS_ALIVE) return;
+    HaloWeaponState &s = carried[currentCarried];
+    const HaloWeaponDef *d = haloweapon(s.def);
+    if(!d || d->zoomLevels <= 0 || player1->weaponsel->reloading) return;
+    s.zoom = (s.zoom + 1) % (d->zoomLevels + 1);
+    if(player1->weaponsel->type == GUN_SNIPER) ((sniperrifle *)player1->weaponsel)->setscope(s.zoom > 0);
+    audiomgr.playsound(S_NOAMMO, SP_LOW);
+}
+COMMANDF(halo_zoom, "d", (bool down) { if(down) halozoomstep(); });
 
 #ifdef HALO_QA
 // Verification hooks live in tests/native. They read this file's internal

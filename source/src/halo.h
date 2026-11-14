@@ -19,3 +19,21 @@ void haloaddbolt(playerent *owner, const vec &position, const vec &direction, in
 void haloplaysound(const char *sample, int fallback, physent *actor = NULL, const vec *position = NULL);
 bool halodriving();
 void halorendervehicle();
+
+// Tag-driven weapons (halo.cpp loadout, weapon.cpp firing and projectiles).
+struct HaloWeaponDef;
+struct HaloWeaponState;
+// The retail weapon behind an AssaultCube gun slot for the player or an enemy.
+const HaloWeaponDef *haloweaponof(const playerent *p, int gun, HaloWeaponState **state = NULL);
+bool halocarriesgun(int gun);
+void haloswitchweapon();
+void haloattackinput(bool down);
+float halozoom();
+void halounzoom();
+int halomeleedamage();
+// The enemy the weapon's aim assist locks onto along a direction, if any.
+playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeaponDef &def);
+void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int trigger,
+                     const vec &from, const vec &to);
+void halokilled(playerent *victim);
+void halorenderweapons();

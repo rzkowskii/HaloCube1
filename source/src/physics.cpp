@@ -1037,7 +1037,11 @@ void attack(bool on)
     {
         if(!on) tryrespawn();
     }
-    else player1->attacking = on;
+    else
+    {
+        if(haloactive() && on != player1->attacking) haloattackinput(on);
+        player1->attacking = on;
+    }
 }
 
 void jumpn(bool on)
@@ -1099,6 +1103,7 @@ void mousemove(int idx, int idy)
 {
     if(halocinematic() || intermission || ispaused || (player1->isspectating() && (player1->spectatemode==SM_FOLLOW1ST||player1->spectatemode==SM_OVERVIEW))) return;
     bool zooming = player1->weaponsel->type == GUN_SNIPER && ((sniperrifle *)player1->weaponsel)->scoped;               // check if player uses scope
+    const float halomagnification = halozoom();                                                                         // retail weapon zoom
     float dx = idx, dy = idy;
     if(mfilter > 0.0001f)
     { // simple IIR-like filter (1st order lowpass)
@@ -1114,6 +1119,7 @@ void mousemove(int idx, int idy)
         if(scopesens > 0.0001f) cursens = scopesens;                                                                    //          if specified, use dedicated (fixed) scope sensitivity
         else cursens *= autoscopesens ? autoscopesensscale : scopesensscale;                                            //          or adjust sensitivity by given (fixed) factor or based on scopefov/fov
     }
+    if(halomagnification > 1.01f && !(zooming && scopesens > 0.0001f)) cursens = sensitivity / halomagnification;     // retail zoom slows aim by its magnification
     cursens /= 33.0f * sensitivityscale;                                                                                // final scaling
 
     camera1->yaw += (float) (dx * cursens);

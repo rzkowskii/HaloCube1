@@ -483,6 +483,9 @@ void fovchanged()
 
 float dynfov()
 {
+    const float halomagnification = halozoom();
+    if(halomagnification > 1.01f && camera1 == player1)
+        return 2 * atanf(tanf(fov * 0.5f * RAD) / halomagnification) / RAD;
     bool isscoped = player1->weaponsel->type == GUN_SNIPER && ((sniperrifle *)player1->weaponsel)->scoped;
     bool useremote = spectfovremote && camera1 != player1 && camera1->type == ENT_PLAYER && ((playerent *)camera1)->ffov && ((playerent *)camera1)->scopefov;
     if(camera1 != player1 && camera1->type < ENT_CAMERA) isscoped = ((playerent *)camera1)->scoping;

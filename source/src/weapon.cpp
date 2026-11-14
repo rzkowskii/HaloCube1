@@ -4,6 +4,7 @@
 #include "halo.h"
 #include "halo_collision.h"
 #include "halo_script.h"
+#include "halo_weapons.h"
 #include "bot/bot.h"
 #include "hudgun.h"
 
@@ -61,7 +62,7 @@ void checkweaponswitch()
 void selectweapon(weapon *w)
 {
     if(!w || !player1->weaponsel->deselectable() || ispaused || (haloactive() && lastmillis < haloActionEnd)) return;
-    if(haloactive() && w->type != GUN_ASSAULT && w->type != GUN_PISTOL) return;
+    if(haloactive() && !halocarriesgun(w->type)) return;
     if(w->selectable())
     {
         if(player1->attacking && player1->state == CS_ALIVE) attack(false);
@@ -93,8 +94,7 @@ void shiftweapon(int *s)
         if(!player1->weaponsel->deselectable()) return;
         if(haloactive())
         {
-            int gun = player1->weaponsel->type == GUN_ASSAULT ? GUN_PISTOL : GUN_ASSAULT;
-            selectweapon(player1->weapons[gun]);
+            haloswitchweapon();
             return;
         }
 
@@ -998,7 +998,7 @@ void weapon::attacksound()
     if(haloactive())
     {
         const char *sample = type == GUN_ASSAULT ? "ma5b-fire" : type == GUN_PISTOL ? "pistol-fire" :
-            type == GUN_SUBGUN ? "plasma-fire" : NULL;
+            type == GUN_SUBGUN || type == GUN_CARBINE ? "plasma-fire" : NULL;
         haloplaysound(sample, info.sound, owner);
     }
     else audiomgr.playsound(info.sound, owner, local ? SP_HIGH : SP_NORMAL);
@@ -1127,6 +1127,16 @@ void weapon::onselecting(bool sound)
 void weapon::renderhudmodel() { renderhudmodel(owner->lastaction); }
 void weapon::renderaimhelp(bool teamwarning)
 {
+    if(!editmode && haloactive())
+    {
+        // The reticle turns red while aim assist has an enemy in range.
+        const HaloWeaponDef *def = haloweaponof(owner, type);
+        static color red(1.0f, 0.25f, 0.2f, 1.0f);
+        vec from = owner->o, aim = vec(worldpos).sub(from);
+        const bool locked = def && !aim.iszero() && haloaimtarget(from, aim.normalize(), *def);
+        drawcrosshair(owner, teamwarning ? CROSSHAIR_TEAMMATE : owner->weaponsel->type, locked ? &red : NULL);
+        return;
+    }
     if(!editmode) drawcrosshair(owner, teamwarning ? CROSSHAIR_TEAMMATE : owner->weaponsel->type);
     else drawcrosshair(owner, CROSSHAIR_EDIT);
 }
@@ -1446,6 +1456,16 @@ bool gun::attack(vec &targ)
     }
 
     attackmillis = lastmillis - min(attackmillis, curtime);
+    HaloWeaponState *halostate = NULL;
+    const HaloWeaponDef *halodef = haloactive() ? haloweaponof(owner, type, &halostate) : NULL;
+    if(halodef && halostate && halodef->usesBattery() && !halostate->canfire(*halodef))
+    {
+        // Overheated or empty Covenant weapons wait without the dry-fire click.
+        gunwait += 100;
+        shots = 0;
+        if(!info.isauto) owner->attacking = false;
+        return false;
+    }
     updatelastaction(owner, attackmillis);
     if(!mag)
     {
@@ -1474,6 +1494,18 @@ bool gun::attack(vec &targ)
     attackevent(owner, type);
 
     hits.setsize(0);
+    if(halodef && halostate)
+    {
+        halofiretrigger(owner, *halodef, *halostate, 0, from, to);
+        attacksound();
+        const HaloTriggerDef *trigger = halodef->trigger();
+        gunwait = owner == player1 && trigger ? halostate->delay(*trigger) : info.attackdelay;
+        if(!halodef->usesBattery()) mag--;
+        else mag = halostate->canfire(*halodef) ? 1 : 0;
+        if(owner == player1) halounzoom();
+        sendshoot(from, to, attackmillis);
+        return true;
+    }
     if(haloactive() && owner->type == ENT_BOT && type == GUN_SUBGUN)
     {
         vec direction = vec(to).sub(from);
@@ -1832,50 +1864,211 @@ void checkweaponstate()
 
 namespace
 {
-    struct PlasmaBolt
+    // A retail projectile in flight: plasma, needles, rockets, pellets and the
+    // enemies' shots. Positions are AssaultCube units, speeds Halo world units.
+    struct HaloShot
     {
         playerent *owner;
+        int def, trigger, damage, expire;
         vec position, direction;
-        int damage, expire;
+        float travelled;
+        playerent *target;
     };
-    vector<PlasmaBolt> plasmaBolts;
+    vector<HaloShot> haloShots;
+    // Retail gravity, in world units per second squared.
+    const float haloGravity = 3.22f;
+
+    vec halocone(const vec &aim, float angle)
+    {
+        if(angle <= 0) return aim;
+        vec side, up;
+        side.cross(aim, fabsf(aim.z) < 0.95f ? vec(0, 0, 1) : vec(1, 0, 0));
+        side.normalize();
+        up.cross(side, aim);
+        const float spin = rndscale(2 * PI), tilt = angle * sqrtf(rndscale(1.0f));
+        vec dir = vec(aim).mul(cosf(tilt));
+        dir.add(vec(side).mul(cosf(spin) * sinf(tilt))).add(vec(up).mul(sinf(spin) * sinf(tilt)));
+        return dir.normalize();
+    }
+
+    const HaloProjectileDef *shotprojectile(const HaloShot &shot)
+    {
+        const HaloWeaponDef *d = haloweapon(shot.def);
+        const HaloTriggerDef *t = d ? d->trigger(shot.trigger) : NULL;
+        return t && t->projectile.valid ? &t->projectile : NULL;
+    }
+
+    // Plasma and needles reduce shields faster; halodamage keys that on the gun.
+    int halodamagegun(const HaloProjectileDef &p, int fallback)
+    {
+        return p.category == 10 || p.guided > 0 ? GUN_SUBGUN : fallback;
+    }
+
+    void areadamage(const HaloShot &shot, const HaloProjectileDef &p, const vec &centre)
+    {
+        const float radius = p.radius * haloscenarioscale();
+        particle_fireball(PART_FIREBALL, centre);
+        loopv(players)
+        {
+            playerent *victim = players[i];
+            if(!victim || victim->state != CS_ALIVE) continue;
+            const float distance = victim->o.dist(centre);
+            if(distance < radius) hit(max(1, int(shot.damage * (1 - distance / radius))), victim, shot.owner,
+                                      vec(victim->o).sub(centre).normalize(), GUN_GRENADE, false, 0);
+        }
+        if(player1->state == CS_ALIVE && player1->o.dist(centre) < radius)
+            hit(max(1, int(shot.damage * (1 - player1->o.dist(centre) / radius))), player1, shot.owner,
+                vec(player1->o).sub(centre).normalize(), GUN_GRENADE, false, 0);
+    }
+}
+
+void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int index,
+                     const vec &from, const vec &to)
+{
+    const HaloTriggerDef *t = def.trigger(index);
+    if(!t || !t->projectile.valid) return;
+    const HaloProjectileDef &p = t->projectile;
+    const float cone = state.shoot(def, *t, lastmillis);
+    vec aim = vec(to).sub(from);
+    if(aim.iszero()) return;
+    aim.normalize();
+    playerent *target = NULL;
+    if(owner == player1)
+    {
+        // Aim assist bends the shot onto an enemy inside the autoaim cone.
+        if((target = haloaimtarget(from, aim, def)))
+        {
+            vec centre = target->o;
+            centre.z -= target->eyeheight * 0.35f;
+            aim = centre.sub(from).normalize();
+        }
+    }
+    else target = player1;
+    const float scale = haloscenarioscale();
+    const int count = max(1, t->projectilesPerShot), fallbackGun = owner->weaponsel->type;
+    const bool instant = p.speed >= 250 && p.guided <= 0 && p.radius <= 0;
+    loopi(count)
+    {
+        const vec dir = halocone(aim, cone + (count > 1 ? t->distribution * 0.5f : 0));
+        // Enemies use their slot's pre-scaled damage; the player rolls the tag range.
+        const int damage = owner == player1 ? max(1, int(p.damageLower + rndscale(max(0.0f, p.damageUpper - p.damageLower)) + .5f))
+                                            : owner->weapons[GUN_SUBGUN]->info.damage;
+        if(!instant)
+        {
+            HaloShot &shot = haloShots.add();
+            shot.owner = owner;
+            shot.def = def.index;
+            shot.trigger = index;
+            shot.damage = damage;
+            shot.position = from;
+            shot.direction = dir;
+            shot.travelled = 0;
+            shot.target = p.guided > 0 ? target : NULL;
+            shot.expire = lastmillis + 8000;
+            continue;
+        }
+        vec end = vec(dir).mul((p.range > 0 ? p.range : 1000) * scale).add(from);
+        intersectgeometry(from, end);
+        playerent *victim = NULL;
+        if(owner == player1)
+        {
+            float distance;
+            int zone;
+            if((victim = intersectclosest(from, end, owner, distance, zone))) shorten(from, end, distance);
+        }
+        else if(player1->state == CS_ALIVE)
+        {
+            vec contact;
+            if(intersect(player1, from, end, &contact)) { victim = player1; end = contact; }
+        }
+        if(victim) hit(damage, victim, owner, dir, halodamagegun(p, fallbackGun), false, 0);
+        else addbullethole(owner, from, end);
+        addshotline(owner, from, end);
+        particle_splash(PART_SPARK, 4, 220, end);
+    }
+    adddynlight(owner, from, 4, 100, 50, p.category == 10 ? 60 : 96, p.category == 10 ? 170 : 80, p.category == 10 ? 250 : 64);
 }
 
 void haloclearbolts()
 {
-    plasmaBolts.setsize(0);
+    haloShots.setsize(0);
     haloActionEnd = 0;
 }
 
 void haloaddbolt(playerent *owner, const vec &position, const vec &direction, int damage)
 {
-    plasmaBolts.add(PlasmaBolt{owner, position, direction, damage, lastmillis + 1500});
+    // Kept for enemies without retail weapon data: a plain plasma bolt.
+    const HaloWeaponDef *def = haloweaponforgun(GUN_SUBGUN);
+    if(!def) return;
+    HaloShot &shot = haloShots.add();
+    shot.owner = owner;
+    shot.def = def->index;
+    shot.trigger = 0;
+    shot.damage = damage;
+    shot.position = position;
+    shot.direction = direction;
+    shot.travelled = 0;
+    shot.target = NULL;
+    shot.expire = lastmillis + 1500;
 }
 
 void haloupdatebolts(int elapsed)
 {
     if(intermission || ispaused || elapsed <= 0) return;
-    loopv(plasmaBolts)
+    const float seconds = elapsed / 1000.0f, scale = haloscenarioscale();
+    loopv(haloShots)
     {
-        PlasmaBolt &bolt = plasmaBolts[i];
-        if(lastmillis >= bolt.expire || players.find(bolt.owner) < 0)
+        HaloShot &shot = haloShots[i];
+        const HaloProjectileDef *p = shotprojectile(shot);
+        if(!p || lastmillis >= shot.expire || players.find(shot.owner) < 0 && shot.owner != player1)
         {
-            plasmaBolts.remove(i--);
+            haloShots.remove(i--);
             continue;
         }
-        vec end = vec(bolt.direction).mul(elapsed * 0.20f).add(bolt.position);
-        const bool worldHit = intersectgeometry(bolt.position, end);
-        vec contact;
-        bool playerHit = player1->state == CS_ALIVE && intersect(player1, bolt.position, end, &contact);
-        if(playerHit) end = contact;
-        particle_trail(PART_PLASMA_BOLT, 34, bolt.position, end);
-        if(playerHit) hit(bolt.damage, player1, bolt.owner, bolt.direction, GUN_SUBGUN, false, 0);
-        if(playerHit || worldHit)
+        const float range = p->range > 0 ? p->range : 1000;
+        // Speed moves from the initial to the final value across the range.
+        const float speed = p->speed + (p->finalSpeed - p->speed) * clamp(shot.travelled / range, 0.0f, 1.0f);
+        if(p->guided > 0 && shot.target && shot.target->state == CS_ALIVE)
         {
-            particle_splash(PART_PLASMA, 5, 165, end);
-            plasmaBolts.remove(i--);
+            vec want = vec(shot.target->o).sub(shot.position).normalize();
+            const float turn = min(1.0f, p->guided * seconds);
+            shot.direction.mul(1 - turn).add(want.mul(turn)).normalize();
         }
-        else bolt.position = end;
+        vec velocity = vec(shot.direction).mul(max(speed, 0.5f));
+        if(p->gravity > 0) velocity.z -= p->gravity * haloGravity * seconds;
+        const float step = velocity.magnitude() * seconds;
+        shot.direction = velocity.normalize();
+        vec end = vec(shot.direction).mul(step * scale).add(shot.position);
+        shot.travelled += step;
+        const bool worldHit = intersectgeometry(shot.position, end);
+        playerent *victim = NULL;
+        vec contact;
+        if(shot.owner == player1)
+        {
+            float distance;
+            int zone;
+            if((victim = intersectclosest(shot.position, end, player1, distance, zone))) { contact = end; shorten(shot.position, contact, distance); end = contact; }
+        }
+        else if(player1->state == CS_ALIVE && intersect(player1, shot.position, end, &contact))
+        {
+            victim = player1;
+            end = contact;
+        }
+        if(p->radius > 0) particle_trail(PART_SMOKE, 300, shot.position, end);
+        else if(p->category == 10 || p->guided > 0) particle_trail(PART_PLASMA_BOLT, 34, shot.position, end);
+        else addshotline(shot.owner, shot.position, end);
+        const bool spent = shot.travelled >= range;
+        if(victim || worldHit || spent)
+        {
+            if(p->radius > 0) areadamage(shot, *p, end);
+            else
+            {
+                if(victim) hit(shot.damage, victim, shot.owner, shot.direction, halodamagegun(*p, GUN_SUBGUN), false, 0);
+                particle_splash(p->category == 10 || p->guided > 0 ? PART_PLASMA : PART_SPARK, 5, 165, end);
+            }
+            haloShots.remove(i--);
+        }
+        else shot.position = end;
     }
 }
 
@@ -1910,7 +2103,7 @@ void halomelee()
     float distance;
     int zone;
     playerent *target = intersectclosest(from, to, player1, distance, zone);
-    if(target) hit(50, target, player1, direction, GUN_KNIFE, false, 0);
+    if(target) hit(halomeleedamage(), target, player1, direction, GUN_KNIFE, false, 0);
     haloplaysound("melee", S_KNIFE);
     haloAction = ANIM_GUN_MELEE;
     haloActionStart = lastmillis;

@@ -2528,6 +2528,12 @@ bool halocartographertarget(vec &point, bool &mapped)
     return true;
 }
 bool haloscenariocollide(physent *entity, float &hi, float &lo) { return scenario.collideDevices(entity, hi, lo); }
+float haloscenarioscale()
+{
+    // The standalone a30 map has no projection; tools/import_halo_a30.py uses HORIZONTAL_SCALE 2.75.
+    return scenario.loaded && scenario.projection ? scenario.projection->xy : 2.75f;
+}
+
 bool haloscenarioexitpoint(vec &point)
 {
     if(!scenario.loaded || !scenario.projection) return false;

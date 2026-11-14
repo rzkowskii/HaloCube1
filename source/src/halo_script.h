@@ -13,6 +13,8 @@ bool haloscenariouse();
 bool halocartographertarget(vec &point, bool &mapped);
 // Center of the authored trigger volume that switches to the next section's BSP.
 bool haloscenarioexitpoint(vec &point);
+// AssaultCube units per Halo world unit for the current section.
+float haloscenarioscale();
 bool haloscenariocollide(physent *entity, float &hi, float &lo);
 struct HaloCollisionHit;
 bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit);

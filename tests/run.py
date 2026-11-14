@@ -26,6 +26,8 @@ QUICK = [
     'test_library_platform.py',       # Library elevated platform
     'test_b30_retail_collision.py',   # Silent Cartographer on retail BSP collision
     'test_campaign_replay.py',        # all 55 sections complete in one run
+    'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
+    'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
 ]
 SLOW = [
     'test_autumn_opening.py',         # four-minute Autumn opening at normal speed

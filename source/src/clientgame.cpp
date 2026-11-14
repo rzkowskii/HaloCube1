@@ -957,6 +957,7 @@ void dodamage(int damage, playerent *pl, playerent *actor, int gun, bool gib, bo
 void dokill(playerent *pl, playerent *act, bool gib, int gun)
 {
     if(pl->state!=CS_ALIVE || intermission) return;
+    if(haloactive()) halokilled(pl);
 
     exechook(HOOK_SP, "onKill", "%d %d %d %d", act->clientnum, pl->clientnum, gun, gib ? 1 : 0);
 

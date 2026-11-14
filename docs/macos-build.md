@@ -48,6 +48,17 @@ The launchers use `~/Library/Application Support/Halo in AssaultCube` for settin
 
 Run `python3 tools/import_halo_asset_library.py "$maps"` to extract the Xbox campaign source assets into `build/halo-assets`. Each mission's JSON index maps original tag IDs and virtual addresses to its tag region, BSPs, texture images and mip chains, sound permutations, model parts, animation tracks and recordings. The material and lens-flare entries identify their bitmap dependencies and preserve the authored stages and reflections. Shared payloads use their SHA-256 as the filename in `blobs/`. Use `--mission` for a single cache or `--output` for a different library path. The playable app uses the converted assets in `packages/`. The source library is available for subsequent engine integration.
 
+## Retail weapons
+
+`tools/halo_weapons.py` reads every `weap` tag in the ten campaign caches, follows each trigger to its projectile and damage tags, and writes `packages/halo/weapons.txt`. The game loads that table at startup. Rounds, reload time, rate of fire and its ramp, spread, heat, battery, charge time, zoom levels, aim assist, projectile speed and homing, and damage all come from the tags. The importer also records the first-person and pickup models from the asset library, so run it after `import_halo_library.py` and before `import_halo_campaign.py`. The campaign importer stores each enemy's carried weapon (from its actor variant) and the scenario's weapon placements in the section maps.
+
+```bash
+python3 tools/halo_weapons.py "$maps"
+python3 tools/import_halo_campaign.py "$maps"
+```
+
+The player carries two of the nine campaign weapons. Walking over a weapon you carry takes its rounds, and **E** swaps the current weapon for one on the ground. **Mouse 2** or **Z** steps through the weapon's zoom levels. Holding fire charges the plasma pistol. Covenant weapons show battery and heat instead of rounds, and overheat. Enemies fire their actor's weapon with a reduced share of its damage and drop it when killed. Reticle artwork, weapon sounds beyond the MA5B, M6D and plasma rifle, and the rocket launcher's first-person placement still need work.
+
 ## Retail mission scripting
 
 The importer reads the original scenario syntax datum array, strings, script and global tables, oriented trigger volumes, camera points, flags, chapter strings, AI squads and conversations. It keeps the compiled nodes and their validated handles. The script import includes 1,673 device placements, 119 BSP switch records, and 349 recorded input streams across the ten missions. Some Xbox voice tags carry no subtitle text.
