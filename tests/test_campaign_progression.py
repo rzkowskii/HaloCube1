@@ -4,14 +4,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 from qa_common import *  # noqa: E402,F403
 import subprocess
 from pathlib import Path
-profile=SCRATCH/'campaign-progression-profile'
-profile.mkdir(exist_ok=True)
+# A fresh profile: halo_campaign resumes from any saved progress.
+profile=scratch('campaign-progression-')
 with (SCRATCH/'campaign-progression.log').open('w') as log:
-    actions=['halo_campaign']
-    actions.extend(f'sleep {1000+i*125} [qa_campaign_advance] 1' for i in range(65))
-    actions.extend(['sleep 9400 [qa_campaign_state; halo_next] 1','sleep 10300 [qa_campaign_state; screenshot next-sector] 1','sleep 11000 [quit] 1'])
+    # Delays count from live gameplay, after the x10 opening cinematic is skipped.
+    actions=[f'sleep {200+i*125} [qa_campaign_advance] 1' for i in range(65)]
+    actions.extend(['sleep 8600 [qa_campaign_state; halo_next] 1','sleep 9500 [qa_campaign_state; screenshot next-sector] 1','sleep 10200 [quit] 1'])
     p=subprocess.run([QA_BIN,'--halo',f'--home={profile}',f'--mod={root}','-t0','-w960','-h600',
-                    '-e'+'; '.join(actions)],cwd=RUNTIME,stdout=log,stderr=subprocess.STDOUT,timeout=22)
+                    '-ehalo_campaign; qa_after_gameplay ['+'; '.join(actions)+']'],cwd=RUNTIME,stdout=log,stderr=subprocess.STDOUT,timeout=90)
     assert p.returncode==0
 rows=(SCRATCH/'campaign-progression.log').read_text().splitlines()
 assert any('map=halo_a10_01 stage=5' in row for row in rows),rows[-30:]

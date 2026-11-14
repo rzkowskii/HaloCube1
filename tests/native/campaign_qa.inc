@@ -1,5 +1,6 @@
 // Verification hooks for tests/. Compiled into halo.cpp only when HALO_QA is
 // defined (the halo-ac-qa target), because they read that file's internal state.
+#include <string>
 
 // ---- Combat, shield and checkpoint replay (tests/qa_replay.py)
 
@@ -57,6 +58,43 @@ static vec qaLibraryExit(int part)
     return exits[part];
 }
 
+static void qaPlaceFeet(const vec &feet)
+{
+    player1->o = vec(feet.x, feet.y, feet.z + player1->eyeheight);
+    player1->vel = vec();
+    player1->resetinterp();
+}
+
+// Runs a command once the queued section is in live gameplay, skipping any
+// cinematic on the way. Sleeps inside the command are relative to that moment,
+// so tests don't depend on how long loading or waypoint generation takes.
+static std::string qaAfterGameplay;
+static int qaAfterGameplayStable = 0, qaAfterGameplayStarted = 0;
+COMMANDF(qa_after_gameplay_poll, "", ()
+{
+    if(qaAfterGameplay.empty()) return;
+    const bool live = haloactive() && !launchPending && !startPending && !halocinematic() && player1->state == CS_ALIVE;
+    if(halocinematic()) halocinematicskip();
+    qaAfterGameplayStable = live ? qaAfterGameplayStable + 1 : 0;
+    if(qaAfterGameplayStable >= 5)
+    {
+        conoutf("QA_GAMEPLAY %s after %d ms", getclientmap(), lastmillis - qaAfterGameplayStarted);
+        fflush(stdout);
+        const std::string body = qaAfterGameplay;
+        qaAfterGameplay.clear();
+        execute(body.c_str());
+        return;
+    }
+    addsleep(20, "qa_after_gameplay_poll", true);
+});
+COMMANDF(qa_after_gameplay, "s", (const char *body)
+{
+    qaAfterGameplay = body;
+    qaAfterGameplayStable = 0;
+    qaAfterGameplayStarted = lastmillis;
+    addsleep(20, "qa_after_gameplay_poll", true);
+});
+
 COMMANDF(qa_campaign_load, "ii", (int *m, int *s)
 {
     loadProgress();
@@ -82,6 +120,27 @@ COMMANDF(qa_campaign_advance, "", ()
     player1->o = target;
     entinmap(player1);
     player1->resetinterp();
+});
+
+// Steps through the current stage's route markers, one per poll, until the
+// stage changes. Teleporting straight to a goal skips the markers it requires.
+static int qaReachStage = -1, qaReachTries = 0;
+COMMANDF(qa_campaign_reach_step, "", ()
+{
+    if(stage != qaReachStage || ++qaReachTries > 400)
+    {
+        conoutf("QA_REACH from=%d stage=%d tries=%d", qaReachStage, stage, qaReachTries);
+        fflush(stdout);
+        return;
+    }
+    execute("qa_campaign_advance");
+    addsleep(20, "qa_campaign_reach_step", true);
+});
+COMMANDF(qa_campaign_reach, "", ()
+{
+    qaReachStage = stage;
+    qaReachTries = 0;
+    execute("qa_campaign_reach_step");
 });
 
 COMMANDF(qa_campaign_full, "", ()
@@ -139,6 +198,34 @@ COMMANDF(qa_campaign_full, "", ()
         {
             loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE)
                 dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
+        }
+        else if(retailCartographer())
+        {
+            // Retail collision has no AssaultCube spawn spots at the adapted
+            // markers, so drive the authored triggers instead: the Cartographer
+            // control, then each BSP switch volume, then the Pelican ramp.
+            vec point;
+            bool mapped = false;
+            if(halocartographertarget(point, mapped) && !mapped)
+            {
+                qaPlaceFeet(point);
+                execute("halo_use");
+            }
+            else if(haloscenarioexitpoint(point))
+            {
+                // testVolume samples the player at 0.45 of eye height.
+                player1->o = point;
+                player1->o.z += .45f * player1->eyeheight;
+                player1->vel = vec();
+                player1->resetinterp();
+            }
+            else if(halopelicanready())
+            {
+                qaPlaceFeet(position(ents[extraction]));
+                execute("halo_use");
+            }
+            // The Pelican's recorded approach outlasts the usual section budget.
+            if(section == 2 && !halopelicanready()) sectionTicks = min(sectionTicks, 300);
         }
         else
         {

@@ -2503,20 +2503,23 @@ const char *haloscenarioobjective()
 }
 void haloscenariorender() { scenario.render(); }
 bool haloscenariouse() { return scenario.useDevice(); }
+static vec volumeCenter(const Volume &volume)
+{
+    vec side;
+    side.cross(volume.up, volume.forward);
+    return vec(volume.origin).add(vec(volume.forward).mul(volume.extent.x * .5f))
+        .add(side.mul(volume.extent.y * .5f)).add(vec(volume.up).mul(volume.extent.z * .5f));
+}
+
 bool halocartographertarget(vec &point, bool &mapped)
 {
     if(!scenario.loaded || !scenario.cartographerInterior()) return false;
     mapped = scenario.cartographerMapped();
     if(mapped)
     {
-        const int id = named(scenario.program.volumes, "bsp1,0");
-        const Volume *volume = at(scenario.program.volumes, id);
+        const Volume *volume = at(scenario.program.volumes, named(scenario.program.volumes, "bsp1,0"));
         if(!volume) return false;
-        vec side;
-        side.cross(volume->up, volume->forward);
-        const vec center = vec(volume->origin).add(vec(volume->forward).mul(volume->extent.x * .5f))
-            .add(side.mul(volume->extent.y * .5f)).add(vec(volume->up).mul(volume->extent.z * .5f));
-        point = toWorld(*scenario.projection, center);
+        point = toWorld(*scenario.projection, volumeCenter(*volume));
         return true;
     }
     const Object *control = at(scenario.program.objects, named(scenario.program.objects, "shafta_map_control"));
@@ -2525,6 +2528,21 @@ bool halocartographertarget(vec &point, bool &mapped)
     return true;
 }
 bool haloscenariocollide(physent *entity, float &hi, float &lo) { return scenario.collideDevices(entity, hi, lo); }
+bool haloscenarioexitpoint(vec &point)
+{
+    if(!scenario.loaded || !scenario.projection) return false;
+    const Projection *next = at(scenario.program.projections, scenario.section + 1);
+    if(!next) return false;
+    for(const BspSwitch &entry : scenario.program.switches)
+    {
+        const Volume *volume = at(scenario.program.volumes, entry.volume);
+        if(entry.from != scenario.world || entry.to != next->bsp || !volume) continue;
+        point = toWorld(*scenario.projection, volumeCenter(*volume));
+        return true;
+    }
+    return false;
+}
+
 bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit)
 {
     if(from == to || !std::isfinite(vec(to).sub(from).squaredlen()) || !std::isfinite(from.squaredlen())) return false;
