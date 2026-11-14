@@ -26,6 +26,8 @@ The quick tier takes 10 to 15 minutes. It needs the imported campaign assets
 | `test_campaign_replay.py` | All 55 sections complete in one run |
 | `test_weapon_tags.py` | Retail weapon table matches known tag values and the engine's parsed copy |
 | `test_weapon_fire.py` | Rate of fire, zoom, overheat, needler ramp, charged shot, swap, revert, enemy weapons and drops |
+| `test_actor_tags.py` | Retail actor table matches known tag values and the engine's parsed copy |
+| `test_actor_ai.py` | Hearing and squad alerts, burst fire, marines against the Covenant, squad positions, script AI commands, command lists |
 | `test_autumn_opening.py` | Slow: four-minute Autumn opening at normal speed |
 | `test_package_input.py` | Slow: real keystrokes into the packaged app |
 | `test_maw_drive.py` | Slow: Warthog escape driven by keystrokes |

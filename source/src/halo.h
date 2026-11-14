@@ -35,5 +35,5 @@ int halomeleedamage();
 playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeaponDef &def);
 void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int trigger,
                      const vec &from, const vec &to);
-void halokilled(playerent *victim);
+void halokilled(playerent *victim, playerent *killer);
 void halorenderweapons();

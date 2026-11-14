@@ -3,6 +3,7 @@
 #include "halo_campaign.h"
 #include "halo_collision.h"
 #include "halo_script.h"
+#include "halo_ai.h"
 #include <algorithm>
 #include <cmath>
 #include <memory>
@@ -19,6 +20,9 @@ namespace
     constexpr uint32_t nil = UINT32_MAX;
     constexpr int ticksPerSecond = 30;
     constexpr int noObject = -1, playerObject = -2, playerList = -3;
+    // Actors and lists of actors are object values below these bases: an actor
+    // is actorObject - its squadBots index, a list is actorList - its actorLists index.
+    constexpr int actorObject = -1000, actorList = -100000;
 
     struct Reader
     {
@@ -102,9 +106,28 @@ namespace
     struct Conversation { std::string name; std::vector<Line> lines; };
     struct Track { float gain; int start, loop, end, alt, altEnd; };
     struct Loop { int id; bool repeat; std::vector<Track> tracks; };
-    struct SquadStart { int actor; vec point; float yaw; };
-    struct Squad { std::string name; int platoon; std::vector<SquadStart> starts; };
-    struct Encounter { std::string name; int team, bsp; std::vector<Squad> squads; };
+    // Version 6 adds per-start AI data: actors.txt index, states and command list.
+    struct SquadStart { int actor; vec point; float yaw; int variant = -1, initial = 0, defaultState = 0, commandList = -1; };
+    struct FiringPosition { vec point; int group, cluster; };
+    struct Platoon { unsigned flags; int attackRule, attackPlatoon, maneuverRule, maneuverPlatoon; };
+    struct Squad
+    {
+        std::string name;
+        int platoon;
+        std::vector<SquadStart> starts;
+        int initial = 0, defaultState = 0, maneuver = -1;
+        unsigned flags = 0, masks[7] = {};
+    };
+    struct Encounter
+    {
+        std::string name;
+        int team, bsp;
+        std::vector<Squad> squads;
+        std::vector<FiringPosition> positions;
+        std::vector<Platoon> platoons;
+    };
+    struct CommandAtom { int type, modifier; float first, second; int point, otherPoint, animation, script, recording, command, object; };
+    struct CommandList { std::string name; unsigned flags; std::vector<CommandAtom> atoms; std::vector<vec> points; };
     struct Projection { int bsp; vec origin; float xy, z, margin; };
     struct BspSwitch { int volume, from, to, flag; };
     struct DeviceBox { vec low, high; };
@@ -146,6 +169,7 @@ namespace
         std::vector<Device> devices;
         std::vector<BspSwitch> switches;
         std::vector<Encounter> encounters;
+        std::vector<CommandList> commandLists;
 
         const Node *node(uint32_t datum) const
         {
@@ -164,7 +188,9 @@ namespace
         {
             defformatstring(path)("packages/halo/%s.hscb", cache);
             Reader r(path);
-            if(r.bytes(4) != "HSCB" || r.number<uint32_t>() != 5) return false;
+            if(r.bytes(4) != "HSCB") return false;
+            const uint32_t version = r.number<uint32_t>();
+            if(version != 5 && version != 6) return false;
             auto u8 = [&] { return r.number<uint8_t>(); };
             auto u16 = [&] { return r.number<uint16_t>(); };
             auto i16 = [&] { return r.number<int16_t>(); };
@@ -267,6 +293,49 @@ namespace
                 });
                 return d;
             });
+            if(version >= 6)
+            {
+                for(Encounter &e : encounters)
+                {
+                    e.positions = r.rows<FiringPosition>(4096, [&] { vec p = r.point(); int g = i16(); return FiringPosition{p, g, i16()}; });
+                    e.platoons = r.rows<Platoon>(256, [&] { unsigned f = u32(); int a = i16(), b = i16(), c = i16(); return Platoon{f, a, b, c, i16()}; });
+                    const uint32_t count = r.number<uint32_t>();
+                    if(count != e.squads.size()) return false;
+                    for(Squad &squad : e.squads)
+                    {
+                        squad.initial = i16();
+                        squad.defaultState = i16();
+                        squad.flags = u32();
+                        squad.maneuver = i16();
+                        loopi(7) squad.masks[i] = u32();
+                        const uint32_t starts = r.number<uint32_t>();
+                        if(starts != squad.starts.size()) return false;
+                        for(SquadStart &start : squad.starts)
+                        {
+                            start.variant = i16();
+                            start.initial = i16();
+                            start.defaultState = i16();
+                            start.commandList = i16();
+                        }
+                    }
+                }
+                commandLists = r.rows<CommandList>(1024, [&]
+                {
+                    CommandList list;
+                    list.name = r.text();
+                    list.flags = u32();
+                    list.atoms = r.rows<CommandAtom>(256, [&]
+                    {
+                        CommandAtom a;
+                        a.type = i16(); a.modifier = i16(); a.first = f32(); a.second = f32();
+                        a.point = i16(); a.otherPoint = i16(); a.animation = i16(); a.script = i16();
+                        a.recording = i16(); a.command = i16(); a.object = i16();
+                        return a;
+                    });
+                    list.points = r.rows<vec>(256, [&] { return r.point(); });
+                    return list;
+                });
+            }
             if(!r.valid || r.file->tell() != r.file->size() || nodes.empty() || scripts.empty()) return false;
             if(groupFlags.size() != deviceGroups.size()) return false;
             for(const Script &script : scripts) if(!node(script.root)) return false;
@@ -418,6 +487,11 @@ namespace
         std::vector<Thread> savedThreads;
         std::vector<Actor> savedActors;
         std::vector<SquadBot> squadBots, savedSquadBots;
+        // Encounter combat positions and command lists in this section's coordinates.
+        std::vector<std::vector<HaloFiringPosition>> encounterPositions;
+        std::vector<HaloCommandProgram> commandPrograms;
+        std::vector<int> actorLists;
+        std::set<int> maneuvered, flipped;
         std::vector<DeviceGroup> groups, savedGroups;
         std::vector<DeviceState> devices, savedDevices;
         std::vector<int> objectDevices;
@@ -472,6 +546,13 @@ namespace
         int living(int reference) const;
         void restoreSquads();
         bool matchesSquad(int reference, int encounter, int squad) const;
+        void prepareAI();
+        void configureActor(playerent *bot, int encounter, int squad, const SquadStart &start);
+        void updatePlatoons();
+        int actorListFor(int reference);
+        template<class F> void eachActor(int reference, F f);
+        playerent *actorFromValue(int value) const;
+        bool objectPosition(int value, vec &position) const;
         Value literal(const Node &node) const;
         Value command(Thread &thread, const Node &node, const char *name, const std::vector<Value> &args, bool scene);
         void wake(int script, bool scene = false);
@@ -1557,11 +1638,30 @@ namespace
         }
         if(is("not")) return result(!truth(0));
         if(is("players")) return result(playerList);
-        if(is("list_get")) return result(index(0) == playerList && index(1) == 0 ? playerObject : noObject);
-        if(is("list_count")) return result(index(0) == playerList ? 1 : max(0, index(0)));
-        if(is("ai_place"))
+        if(is("list_get"))
         {
-            if(!scene) placeSquads(index(0), index(1));
+            const int list = index(0), n = index(1);
+            if(list == playerList) return result(n == 0 ? playerObject : noObject);
+            if(list <= actorList)
+            {
+                // The n-th living actor of the list's encounter, squad or platoon.
+                const int reference = at(actorLists, actorList - list) ? actorLists[actorList - list] : -1;
+                int found = noObject, seen = 0;
+                eachActor(reference, [&](SquadBot &, int i) { if(seen++ == n) found = actorObject - i; });
+                return result(found);
+            }
+            return result(noObject);
+        }
+        if(is("list_count"))
+        {
+            const int list = index(0);
+            if(list == playerList) return result(1);
+            if(list <= actorList) return result(at(actorLists, actorList - list) ? living(actorLists[actorList - list]) : 0);
+            return result(max(0, list));
+        }
+        if(is("ai_place") || is("ai_spawn_actor"))
+        {
+            if(!scene) placeSquads(index(0), is("ai_spawn_actor") ? 1 : index(1));
             return {};
         }
         if(is("ai_kill") || is("ai_kill_silent") || is("ai_erase"))
@@ -1569,13 +1669,125 @@ namespace
             if(!scene) eraseSquads(index(0));
             return {};
         }
-        if(is("ai_living_count") || is("ai_actors")) return result(living(index(0)));
-        if(is("ai_braindead") || is("ai_playfight") || is("ai_disregard"))
+        if(is("ai_erase_all"))
         {
-            if(!scene) for(SquadBot &bot : squadBots)
-                if(matchesSquad(index(0), bot.encounter, bot.squad)) bot.suspended = truth(1);
+            if(!scene) for(SquadBot &bot : squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
             return {};
         }
+        if(is("ai_living_count")) return result(living(index(0)));
+        if(is("ai_actors")) return result(actorListFor(index(0)));
+        if(is("ai_nonswarm_count"))
+        {
+            // Infection forms swarm and are left out of this count.
+            int count = 0;
+            eachActor(index(0), [&](SquadBot &bot, int) { if(bot.start->actor != 6) ++count; });
+            return result(count);
+        }
+        if(is("ai_living_fraction") || is("ai_strength"))
+        {
+            int total = 0, alive = 0;
+            float strength = 0;
+            for(const SquadBot &bot : squadBots)
+            {
+                if(!matchesSquad(index(0), bot.encounter, bot.squad)) continue;
+                ++total;
+                if(!bot.bot || bot.bot->state != CS_ALIVE) continue;
+                ++alive;
+                strength += haloactorhealthfraction(bot.bot);
+            }
+            if(is("ai_living_fraction")) return result(total ? float(alive) / total : 0.0f);
+            return result(total ? strength / total : 0.0f);
+        }
+        if(is("ai_status"))
+        {
+            int status = 0;
+            eachActor(index(0), [&](SquadBot &bot, int) { status = max(status, haloactorstatus(bot.bot)); });
+            return result(status);
+        }
+        // Switches the mission scripts flip on whole encounters, platoons or squads.
+        struct { const char *name; int flag; bool fixed; } switches[] = {
+            {"ai_braindead", HALO_AI_BRAINDEAD, false}, {"ai_playfight", HALO_AI_PLAYFIGHT, false},
+            {"ai_disregard", HALO_AI_DISREGARD, false}, {"ai_set_blind", HALO_AI_BLIND, false},
+            {"ai_set_deaf", HALO_AI_DEAF, false}, {"ai_force_active", HALO_AI_FORCE_ACTIVE, false},
+            {"ai_magically_see_players", HALO_AI_MAGIC_SIGHT, true}, {"ai_magically_see_encounter", HALO_AI_MAGIC_SIGHT, true},
+            {"ai_follow_target_players", HALO_AI_FOLLOW_PLAYER, true}, {"ai_try_to_fight_player", HALO_AI_MAGIC_SIGHT, true},
+            {"ai_try_to_fight", HALO_AI_FORCE_ACTIVE, true},
+        };
+        for(const auto &sw : switches) if(is(sw.name))
+        {
+            const bool on = sw.fixed ? true : truth(1);
+            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { haloactorsetflag(bot.bot, sw.flag, on); });
+            return {};
+        }
+        if(is("ai_attack") || is("ai_defend") || is("ai_retreat") || is("ai_maneuver"))
+        {
+            const int posture = is("ai_attack") ? HALO_ATTACKING : is("ai_maneuver") ? HALO_PURSUING : HALO_DEFENDING;
+            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { haloactorsetposture(bot.bot, posture); });
+            return {};
+        }
+        if(is("ai_command_list") || is("ai_command_list_by_unit"))
+        {
+            const int list = index(1);
+            const HaloCommandProgram *commands = list >= 0 && list < int(commandPrograms.size()) ? &commandPrograms[list] : nullptr;
+            if(scene) return {};
+            if(is("ai_command_list_by_unit")) { if(playerent *bot = actorFromValue(index(0))) haloactorcommand(bot, commands); }
+            else eachActor(index(0), [&](SquadBot &bot, int) { haloactorcommand(bot.bot, commands); });
+            return {};
+        }
+        if(is("ai_command_list_advance"))
+        {
+            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { haloactorcommandadvance(bot.bot); });
+            return {};
+        }
+        if(is("ai_command_list_status"))
+        {
+            // 0 no list, 1 still running, 2 finished, across the given units.
+            const int value = index(0);
+            int status = 0;
+            if(value <= actorList)
+            {
+                const int reference = at(actorLists, actorList - value) ? actorLists[actorList - value] : -1;
+                bool running = false, finished = false;
+                eachActor(reference, [&](SquadBot &bot, int)
+                {
+                    const int s = haloactorcommandstatus(bot.bot);
+                    running |= s == 1;
+                    finished |= s == 2;
+                });
+                status = running ? 1 : finished ? 2 : 0;
+            }
+            else if(playerent *bot = actorFromValue(value)) status = haloactorcommandstatus(bot);
+            return result(status);
+        }
+        if(is("unit_get_health"))
+        {
+            playerent *p = actorFromValue(index(0));
+            return result(p && p->state == CS_ALIVE ? haloactorhealthfraction(p) : -1.0f);
+        }
+        if(is("objects_can_see_object") || is("objects_can_see_flag"))
+        {
+            // Whether the player looks towards the object or flag within the given cone.
+            vec target;
+            bool found = false;
+            if(is("objects_can_see_object")) found = objectPosition(index(1), target);
+            else if(const Flag *flag = at(program.flags, index(1))) { if(projection) { target = toWorld(*projection, flag->pose.position); found = true; } }
+            if(!found || player1->state != CS_ALIVE) return result(false);
+            vec delta = vec(target).sub(player1->o);
+            const float distance = delta.magnitude();
+            if(distance < 0.01f) return result(true);
+            const vec view(sinf(player1->yaw * RAD) * cosf(player1->pitch * RAD), -cosf(player1->yaw * RAD) * cosf(player1->pitch * RAD),
+                           sinf(player1->pitch * RAD));
+            const float cone = max(1.0f, float(value(2, 30))) * RAD;
+            if(delta.dot(view) / distance < cosf(cone)) return result(false);
+            vec end = target;
+            return result(!intersectgeometry(player1->o, end));
+        }
+        // Vehicles are not driven by actors yet. These stand-ins let the waits that
+        // depend on boarding move on instead of hanging.
+        if(is("vehicle_test_seat_list")) return result(true);
+        if(is("ai_going_to_vehicle")) return result(0);
+        if(is("ai_go_to_vehicle") || is("ai_allegiance") || is("ai_vehicle_encounter") || is("ai_vehicle_enterable_distance"))
+            return {};
         if(is("ai_migrate"))
         {
             int oldGroup = index(0), newGroup = index(1);
@@ -1583,7 +1795,14 @@ namespace
             {
                 if(!bot.bot || !matchesSquad(oldGroup, bot.encounter, bot.squad)) continue;
                 bot.encounter = newGroup & 0xffff;
-                bot.squad = (uint32_t(newGroup) >> 16) & 0xff;
+                const unsigned kind = uint32_t(newGroup) >> 30;
+                if(kind == 2) bot.squad = (uint32_t(newGroup) >> 16) & 0xff;
+                // The migrated actors take the target squad's positions and walk to them.
+                const Encounter *encounter = at(program.encounters, bot.encounter);
+                const Squad *squad = encounter ? at(encounter->squads, bot.squad) : nullptr;
+                static const unsigned anyGroup[7] = {};
+                if(bot.encounter < int(encounterPositions.size()))
+                    haloactorsetpositions(bot.bot, &encounterPositions[bot.encounter], squad ? squad->masks : anyGroup);
             }
             return {};
         }
@@ -1912,12 +2131,57 @@ namespace
         return kind == 1 && member && member->platoon == local;
     }
 
+    // Project the encounters' combat positions and the command lists into this section.
+    void Scenario::prepareAI()
+    {
+        encounterPositions.assign(program.encounters.size(), {});
+        commandPrograms.clear();
+        actorLists.clear();
+        maneuvered.clear();
+        flipped.clear();
+        if(!projection) return;
+        for(size_t e = 0; e < program.encounters.size(); ++e)
+            for(const FiringPosition &f : program.encounters[e].positions)
+                encounterPositions[e].push_back(HaloFiringPosition{toWorld(*projection, f.point), f.group});
+        for(const CommandList &list : program.commandLists)
+        {
+            HaloCommandProgram commands;
+            commands.flags = list.flags;
+            for(const CommandAtom &a : list.atoms)
+                commands.commands.push_back(HaloCommand{a.type, a.first, a.second, a.point, a.otherPoint, a.script});
+            for(const vec &point : list.points) commands.points.push_back(toWorld(*projection, point));
+            commandPrograms.push_back(commands);
+        }
+    }
+
+    void Scenario::configureActor(playerent *bot, int e, int s, const SquadStart &start)
+    {
+        const Encounter *encounter = at(program.encounters, e);
+        const Squad *squad = encounter ? at(encounter->squads, s) : nullptr;
+        if(!squad) return;
+        if(e < int(encounterPositions.size())) haloactorsetpositions(bot, &encounterPositions[e], squad->masks);
+        haloactorsetstate(bot, start.initial > 0 ? start.initial : squad->initial);
+        const Platoon *platoon = at(encounter->platoons, squad->platoon);
+        // Platoons flagged "initially defending" start their squads on defending positions.
+        haloactorsetposture(bot, platoon && (platoon->flags & 4) ? HALO_DEFENDING : HALO_ATTACKING);
+        if(start.commandList >= 0 && start.commandList < int(commandPrograms.size()))
+            haloactorcommand(bot, &commandPrograms[start.commandList]);
+    }
+
+    // Encounters on the default team take the side of their actors: marines and
+    // crew fight for the player. Teams 1 and 2 are the player's side explicitly.
+    int teamFor(const Encounter &encounter, const SquadStart &start)
+    {
+        if(encounter.team == 1 || encounter.team == 2) return HALO_TEAM_HUMAN;
+        const HaloActorDef *def = haloactordef(start.variant);
+        return def && def->kind == 9 ? HALO_TEAM_HUMAN : HALO_TEAM_COVENANT;
+    }
+
     void Scenario::placeSquads(int reference, int limit)
     {
         int id = reference & 0xffff;
         const Encounter *encounter = at(program.encounters, id);
         if(!encounter || !projection || (encounter->bsp >= 0 && encounter->bsp != projection->bsp)) return;
-        if(encounter->team == 1 || encounter->team == 2) return;
         const Projection &p = *projection;
         int count = 0;
         for(size_t i = 0; i < encounter->squads.size(); ++i)
@@ -1926,20 +2190,120 @@ namespace
             for(const SquadStart &start : encounter->squads[i].starts)
             {
                 if(squadBots.size() >= 128 || (limit > 0 && count >= limit)) break;
-                if(start.actor < 0) continue;
+                if(start.actor < 0 && !haloactordef(start.variant)) continue;
                 if(std::any_of(squadBots.begin(), squadBots.end(), [&](const SquadBot &bot) { return bot.start == &start; })) continue;
                 vec point((start.point.x - p.origin.x) * p.xy + p.margin,
                           (p.origin.y - start.point.y) * p.xy + p.margin,
                           (start.point.z - p.origin.z) * p.z);
                 if(!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
-                if(playerent *bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD))
+                if(playerent *bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD, start.variant, teamFor(*encounter, start)))
                 {
                     squadBots.push_back({&start, bot, id, int(i)});
+                    configureActor(bot, id, int(i), start);
                     ++count;
                 }
             }
         }
         if(count) conoutf("HaloScript: placed %d actors from %s", count, encounter->name.c_str());
+    }
+
+    // Platoon rules switch squads between attacking and defending, and send
+    // maneuver squads to their partner squad's positions, as casualties mount.
+    void Scenario::updatePlatoons()
+    {
+        for(size_t e = 0; e < program.encounters.size(); ++e)
+        {
+            const Encounter &encounter = program.encounters[e];
+            for(size_t pl = 0; pl < encounter.platoons.size(); ++pl)
+            {
+                auto strength = [&](int platoon, int &total, int &living)
+                {
+                    total = living = 0;
+                    for(const SquadBot &bot : squadBots)
+                    {
+                        const Squad *squad = bot.encounter == int(e) ? at(encounter.squads, bot.squad) : nullptr;
+                        if(!squad || squad->platoon != platoon) continue;
+                        ++total;
+                        if(bot.bot && bot.bot->state == CS_ALIVE) ++living;
+                    }
+                };
+                auto satisfied = [&](int rule, int platoon)
+                {
+                    int total, living;
+                    strength(platoon < 0 ? int(pl) : platoon, total, living);
+                    if(!total || rule <= 0) return false;
+                    const float alive = float(living) / total;
+                    switch(rule)
+                    {
+                        case 1: return alive < 0.75f;
+                        case 2: return alive < 0.5f;
+                        case 3: return alive < 0.25f;
+                        case 4: return living < total;
+                        case 5: return alive <= 0.75f;
+                        case 6: return alive <= 0.5f;
+                        case 7: return alive <= 0.25f;
+                        case 8: return living <= 1;
+                        case 9: return living == 0;
+                        default: return false;
+                    }
+                };
+                const Platoon &platoon = encounter.platoons[pl];
+                const int key = int(e) * 256 + int(pl);
+                if(!flipped.count(key) && satisfied(platoon.attackRule, platoon.attackPlatoon))
+                {
+                    flipped.insert(key);
+                    const int posture = platoon.flags & 4 ? HALO_ATTACKING : HALO_DEFENDING;
+                    for(const SquadBot &bot : squadBots)
+                    {
+                        const Squad *squad = bot.encounter == int(e) ? at(encounter.squads, bot.squad) : nullptr;
+                        if(squad && squad->platoon == int(pl) && bot.bot) haloactorsetposture(bot.bot, posture);
+                    }
+                }
+                if(!maneuvered.count(key) && satisfied(platoon.maneuverRule, platoon.maneuverPlatoon))
+                {
+                    maneuvered.insert(key);
+                    for(const SquadBot &bot : squadBots)
+                    {
+                        const Squad *squad = bot.encounter == int(e) ? at(encounter.squads, bot.squad) : nullptr;
+                        const Squad *partner = squad ? at(encounter.squads, squad->maneuver) : nullptr;
+                        if(squad && squad->platoon == int(pl) && partner && bot.bot)
+                            haloactorsetpositions(bot.bot, &encounterPositions[e], partner->masks);
+                    }
+                }
+            }
+        }
+    }
+
+    int Scenario::actorListFor(int reference)
+    {
+        for(size_t i = 0; i < actorLists.size(); ++i) if(actorLists[i] == reference) return actorList - int(i);
+        actorLists.push_back(reference);
+        return actorList - int(actorLists.size() - 1);
+    }
+
+    template<class F> void Scenario::eachActor(int reference, F f)
+    {
+        for(size_t i = 0; i < squadBots.size(); ++i)
+        {
+            SquadBot &bot = squadBots[i];
+            if(bot.bot && bot.bot->state == CS_ALIVE && matchesSquad(reference, bot.encounter, bot.squad)) f(bot, int(i));
+        }
+    }
+
+    bool Scenario::objectPosition(int value, vec &position) const
+    {
+        if(playerent *p = actorFromValue(value)) { position = p->o; return true; }
+        if(value < 0 || !projection || !at(actors, value) || !actors[value].visible) return false;
+        position = toWorld(*projection, currentActor(value).position);
+        return true;
+    }
+
+    playerent *Scenario::actorFromValue(int value) const
+    {
+        if(value == playerObject) return player1;
+        if(value > actorObject || value <= actorList) return nullptr;
+        const SquadBot *bot = at(squadBots, actorObject - value);
+        return bot ? bot->bot : nullptr;
     }
 
     int Scenario::living(int reference) const
@@ -1968,8 +2332,14 @@ namespace
             vec point((start.point.x - p.origin.x) * p.xy + p.margin,
                       (p.origin.y - start.point.y) * p.xy + p.margin,
                       (start.point.z - p.origin.z) * p.z);
-            saved.bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD);
-            if(saved.bot) squadBots.push_back(saved);
+            const Encounter *encounter = at(program.encounters, saved.encounter);
+            const int team = encounter ? teamFor(*encounter, start) : HALO_TEAM_COVENANT;
+            saved.bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD, start.variant, team);
+            if(saved.bot)
+            {
+                squadBots.push_back(saved);
+                configureActor(saved.bot, saved.encounter, saved.squad, start);
+            }
         }
     }
 
@@ -2053,6 +2423,7 @@ namespace
         section = s;
         projection = at(program.projections, s);
         if(!projection) return;
+        prepareAI();
         if(continuing)
         {
             world = projection->bsp;
@@ -2228,6 +2599,7 @@ namespace
             ++tick;
             updateRecordings();
             updateDevices(!cue && player1->state == CS_ALIVE && !intermission);
+            if(!cue && tick % 15 == 0) updatePlatoons();
             updateSound();
             if(cue)
             {
@@ -2374,6 +2746,42 @@ void haloscenariostart(int mission, int section, bool preview, bool continuing)
 }
 
 void haloscenariostop() { scenario.stop(); }
+
+int haloscenarioplace(const char *encounter)
+{
+    if(!scenario.loaded) return -1;
+    for(size_t i = 0; i < scenario.program.encounters.size(); ++i)
+        if(scenario.program.encounters[i].name == encounter)
+        {
+            const size_t before = scenario.squadBots.size();
+            scenario.placeSquads(int(i), 0);
+            return int(scenario.squadBots.size() - before);
+        }
+    return -1;
+}
+
+int haloscenarioencounter(const char *name)
+{
+    if(!scenario.loaded) return -1;
+    for(size_t i = 0; i < scenario.program.encounters.size(); ++i)
+        if(scenario.program.encounters[i].name == name) return int(i);
+    return -1;
+}
+
+double haloscenariocall(const char *command, double first, double second)
+{
+    // Runs a script command outside any thread, as the QA client's probe.
+    if(!scenario.loaded) return 0;
+    Thread thread;
+    Node node{1, 0xffff, 8, 0, nil, 0, 0};
+    std::vector<Value> args{number(first), number(second)};
+    return scenario.command(thread, node, command, args, false).number;
+}
+
+void haloscenariowakescript(int script)
+{
+    if(scenario.loaded) scenario.wake(script, false);
+}
 
 bool haloscenariobotsuspended(const playerent *bot)
 {

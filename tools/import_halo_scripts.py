@@ -11,6 +11,7 @@ import subprocess
 import unicodedata
 
 from halo_map_art import write_world_mesh
+from halo_actors import actor_index
 from halo_cast import cast_metadata
 from halo_devices import device_rows
 from halo_recordings import decode
@@ -257,30 +258,55 @@ def looping_rows(program):
         yield index, not bool(flags & 2), tracks
 
 
-def squad_rows(halo, limit_to_normal=False):
+def squad_rows(halo, limit_to_normal=False, actors=None):
+    """Encounters for the .hscb. Each also carries its AI data for the version 6 section:
+    firing positions, platoons, and per squad and start the states, masks and indices."""
     t, s = halo.tags, halo.scenario
     palette = t.block(s + 1056, 16)
+    actors = actors or {}
     for encounter in t.block(s + 1068, 176):
         name = t.name(encounter, 32)
         team, = t.read('h', encounter + 36)
         bsp, = t.read('h', encounter + 126)
-        squads = []
+        squads, squad_ai = [], []
         for squad in t.block(encounter + 128, 232):
             default, platoon = t.read('2h', squad + 32)
             normal_count, = t.read('h', squad + 124)
-            starts = []
+            starts, start_ai = [], []
             for p in t.block(squad + 208, 28):
                 variant, = t.read('h', p + 24)
                 variant = default if variant < 0 else variant
                 actor = halo.reference(t, palette[variant]) if 0 <= variant < len(palette) else None
                 family = actor.name.split('\\')[1] if actor else ''
                 starts.append((ACTORS.get(family, -1), *t.read('4f', p)))
+                initial, default_state = t.read('2h', p + 22)[0], t.read('h', p + 20)[0]
+                command_list, = t.read('h', p + 26)
+                start_ai.append((actors.get(actor.name, -1) if actor else -1, initial, default_state, command_list))
             if limit_to_normal:
                 # The other positions are alternatives or reserved for a
                 # higher difficulty. The campaign runs on Normal.
-                starts = [start for start in starts if start[0] >= 0][:max(0, normal_count)]
+                keep = [i for i, start in enumerate(starts) if start[0] >= 0][:max(0, normal_count)]
+                starts = [starts[i] for i in keep]
+                start_ai = [start_ai[i] for i in keep]
             squads.append((t.name(squad, 32), platoon, starts))
-        yield name, team, bsp, squads
+            initial, default_state = t.read('2h', squad + 36)
+            flags, = t.read('I', squad + 40)
+            maneuver, = t.read('h', squad + 78)
+            masks = t.read('7I', squad + 84)
+            squad_ai.append((initial, default_state, flags, maneuver, *masks, start_ai))
+        positions = [(*t.read('3f', p), *t.read('2h', p + 12)) for p in t.block(encounter + 152, 24)]
+        platoons = [(t.read('I', p + 32)[0], *t.read('2h', p + 48), *t.read('2h', p + 60))
+                    for p in t.block(encounter + 140, 172)]
+        yield name, team, bsp, squads, (positions, platoons, squad_ai)
+
+
+def command_lists(halo):
+    """Scenario command lists: name, flags, atoms and points (retail coordinates)."""
+    t, s = halo.tags, halo.scenario
+    for entry in t.block(s + 1080, 96):
+        atoms = [(*t.read('2h', a), *t.read('2f', a + 4), *t.read('7h', a + 12)) for a in t.block(entry + 48, 32)]
+        points = [t.read('3f', p) for p in t.block(entry + 60, 20)]
+        yield t.name(entry, 32), t.read('I', entry + 32)[0], atoms, points
 
 
 def write_program(program, mission, output, objects, animations, sounds, conversations, loops, worlds, devices):
@@ -289,7 +315,7 @@ def write_program(program, mission, output, objects, animations, sounds, convers
     path = output / f'{mission.cache}.hscb'
     out = Writer(path.with_suffix('.tmp'))
     try:
-        out.write('4sI', b'HSCB', 5)
+        out.write('4sI', b'HSCB', 6)
         table(out, program.nodes, lambda *v: out.write('4H3I', *v))
         out.write('I', len(program.strings))
         out.file.write(program.strings)
@@ -341,7 +367,8 @@ def write_program(program, mission, output, objects, animations, sounds, convers
         table(out, [(i,) for i in worlds], lambda i: out.write('H', i))
         table(out, list(hud_rows(h)), lambda name, text: (out.text(name), out.text(text)))
         table(out, [t.read('f', p + 32) for p in t.block(s + 648, 52)], lambda value: out.write('f', value))
-        table(out, list(squad_rows(h, limit_to_normal=mission.cache == 'b30')), lambda name, team, bsp, squads:
+        encounters = list(squad_rows(h, limit_to_normal=mission.cache == 'b30', actors=actor_index(output.parent.parent)))
+        table(out, encounters, lambda name, team, bsp, squads, ai:
               (out.text(name), out.write('2h', team, bsp), table(out, squads, lambda name, platoon, starts:
                (out.text(name), out.write('h', platoon), table(out, starts, lambda *v: out.write('h4f', *v))))))
         table(out, [t.read('4h', p) for p in t.block(s + 924, 8)], lambda *v: out.write('4h', *v))
@@ -356,6 +383,20 @@ def write_program(program, mission, output, objects, animations, sounds, convers
                   (out.write('H', index), table(out, frames, lambda *box: out.write('6f', *box))))
 
         table(out, devices, write_device)
+
+        # Version 6: encounter AI data in the same encounter and squad order, then command lists.
+        def write_encounter_ai(name, team, bsp, squads, ai):
+            positions, platoons, squad_ai = ai
+            table(out, positions, lambda *v: out.write('3f2h', *v))
+            table(out, platoons, lambda *v: out.write('I4h', *v))
+            table(out, squad_ai, lambda *v: (out.write('2hIh7I', *v[:11]),
+                                             table(out, v[11], lambda *start: out.write('4h', *start))))
+
+        for encounter in encounters:
+            write_encounter_ai(*encounter)
+        table(out, list(command_lists(h)), lambda name, flags, atoms, points:
+              (out.text(name), out.write('I', flags), table(out, atoms, lambda *v: out.write('2h2f7h', *v)),
+               table(out, points, lambda *v: out.write('3f', *v))))
     finally:
         out.file.close()
     path.with_suffix('.tmp').replace(path)

@@ -59,6 +59,20 @@ python3 tools/import_halo_campaign.py "$maps"
 
 The player carries two of the nine campaign weapons. Walking over a weapon you carry takes its rounds, and **E** swaps the current weapon for one on the ground. **Mouse 2** or **Z** steps through the weapon's zoom levels. Holding fire charges the plasma pistol. Covenant weapons show battery and heat instead of rounds, and overheat. Enemies fire their actor's weapon with a reduced share of its damage and drop it when killed. Reticle artwork, weapon sounds beyond the MA5B, M6D and plasma rifle, and the rocket launcher's first-person placement still need work.
 
+## Actor AI
+
+`tools/halo_actors.py` writes `packages/halo/actors.txt` from the campaign `actr` and `actv` tags: vision and hearing, firing range, rate and error, burst timing, combat range, target leading, grenades, vitality, shield-based hiding, panic chances, berserk thresholds and position hold times. Run it after `halo_weapons.py`. `import_halo_scripts.py` then writes version 6 `.hscb` files. These add each encounter's combat positions, squad states and position-group masks, platoon rules, per-start variants and command lists, and the scenario's command lists.
+
+Campaign bots think with `source/src/halo_ai.cpp` instead of AssaultCube's bot AI. AssaultCube still handles movement, pathfinding and physics. Actors:
+- notice targets inside their vision cone, or hear gunfire, after a reaction delay
+- alert nearby squadmates
+- take combat positions from their squad's groups for attacking, defending or pursuing
+- fire in retail bursts and throw grenades
+- hide when their shields are low, panic when friends or leaders die, and go berserk when badly hurt
+- follow command lists.
+
+Marine and crew encounters now spawn on the player's side and fight the Covenant and Flood. Platoon rules switch squads between attacking and defending as casualties mount. The scripts' AI commands work, including `ai_actors` lists, `ai_status`, `ai_living_fraction`, `ai_strength`, magic sight, follow and fight orders, `ai_migrate` to new positions, command lists and their status, and `objects_can_see_*`. Vehicle boarding commands are stand-ins until vehicles exist. Balance has only been checked in short QA runs: enemies are accurate at close range.
+
 ## Retail mission scripting
 
 The importer reads the original scenario syntax datum array, strings, script and global tables, oriented trigger volumes, camera points, flags, chapter strings, AI squads and conversations. It keeps the compiled nodes and their validated handles. The script import includes 1,673 device placements, 119 BSP switch records, and 349 recorded input streams across the ten missions. Some Xbox voice tags carry no subtitle text.

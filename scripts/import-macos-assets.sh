@@ -14,6 +14,8 @@ python3 tools/import_halo_a30.py "$maps/a30.map"
 # and the campaign sections record enemy weapons and placements by its index.
 python3 tools/import_halo_library.py "$maps"
 python3 tools/halo_weapons.py "$maps"
+# Actor behaviour tables; the scripts importer stores their indices per squad start.
+python3 tools/halo_actors.py "$maps"
 python3 tools/import_halo_campaign.py "$maps"
 python3 tools/import_halo_models.py "$maps/a30.map" "$root"
 python3 tools/import_halo_campaign_actors.py "$maps" "$root"

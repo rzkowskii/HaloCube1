@@ -5,6 +5,8 @@
 #include "halo_script.h"
 #include "halo_campaign.h"
 #include "halo_weapons.h"
+#include "halo_ai.h"
+#include "halo_hud.h"
 
 extern void startgame(const char *name, int mode, int minutes, bool notify);
 
@@ -28,7 +30,7 @@ namespace
     const float markerRadius = 8.0f, firstContactRadius = 62.0f;
 
     enum MissionStage { INSERTION, FIRST_CONTACT, REACH_PASS, SECOND_CONTACT, EXTRACTION, COMPLETE };
-    enum ActorKind { GRUNT, ELITE, JACKAL, HUNTER, FLOOD_ELITE, FLOOD_HUMAN, INFECTION, CARRIER, SENTINEL, ACTOR_COUNT };
+    enum ActorKind { GRUNT, ELITE, JACKAL, HUNTER, FLOOD_ELITE, FLOOD_HUMAN, INFECTION, CARRIER, SENTINEL, MARINE, ACTOR_COUNT };
 
     struct ActorProfile
     {
@@ -48,6 +50,7 @@ namespace
         {"Infection Form", "halo/infection", 15, 0, 550, 18, 1.0f, 0.45f, true},
         {"Carrier Form", "halo/carrier", 50, 0, 900, 36, 2.7f, 0.95f, true},
         {"Sentinel", "halo/sentinel", 65, 0, 225, 7, 3.8f, 0.95f, false},
+        {"Marine", "halo/marine", 45, 24, 300, 6, 3.6f, 1.0f, false},
     };
 
     struct HaloEnemy
@@ -57,6 +60,8 @@ namespace
         float shield;
         int hitTime;
         HaloWeaponState weapon;
+        int team;
+        float shieldMax;
     };
 
     // A weapon lying in the world: scenario placements and drops.
@@ -268,24 +273,31 @@ namespace
         conoutf("Halo: checkpoint reached");
     }
 
-    botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw, int weaponIndex = -1)
+    botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw, int weaponIndex = -1, int actorIndex = -1,
+                       int team = HALO_TEAM_COVENANT)
     {
         const ActorProfile &profile = profiles[kind];
-        defformatstring(name)("%.12s %d", profile.name, enemies.length() + 1);
-        botent *bot = BotManager.CreateBot("CLA", kind == ELITE ? "worse" : "bad", name);
-        if(!bot) return nullptr;
         // Script-spawned actors arrive without a variant; give them their usual weapon.
         static const char *const usual[ACTOR_COUNT] = {
             "weapons\\plasma pistol\\plasma pistol", "weapons\\plasma rifle\\plasma rifle",
             "weapons\\plasma pistol\\plasma pistol", "weapons\\fuel rod gun\\hunter fuel rod",
             "weapons\\plasma rifle\\plasma rifle", "weapons\\assault rifle\\assault rifle", NULL, NULL,
-            "characters\\sentinel\\sentinel",
+            "characters\\sentinel\\sentinel", "weapons\\assault rifle\\assault rifle",
         };
+        const HaloActorDef *actor = haloactordef(actorIndex);
+        if(actor && actor->weapon >= 0) weaponIndex = actor->weapon;
         const HaloWeaponDef *def = profile.melee ? nullptr :
             weaponIndex >= 0 ? haloweapon(weaponIndex) : usual[kind] ? haloweaponfind(usual[kind]) : nullptr;
-        enemies.add(HaloEnemy{bot, kind, float(profile.shield), lastmillis, HaloWeaponState()});
+        if(!actor) actor = haloactordefault(kind, def ? def->index : -1);
+        defformatstring(name)("%.12s %d", profile.name, enemies.length() + 1);
+        const bool human = team == HALO_TEAM_HUMAN;
+        botent *bot = BotManager.CreateBot(human ? "RVSF" : "CLA", kind == ELITE ? "worse" : "bad", name);
+        if(!bot) return nullptr;
+        // The variant's vitality overrides the body defaults when it sets one.
+        const float shieldMax = actor && actor->shield > 0 ? actor->shield : float(profile.shield);
+        enemies.add(HaloEnemy{bot, kind, shieldMax, lastmillis, HaloWeaponState(), team, shieldMax});
         enemies.last().weapon.reset(def);
-        bot->health = profile.health;
+        bot->health = actor && actor->body > 0 ? int(actor->body + .5f) : profile.health;
         bot->maxeyeheight = bot->eyeheight = profile.eyeheight;
         bot->radius = profile.radius;
         bot->armour = 0;
@@ -301,13 +313,16 @@ namespace
         bot->nextweaponsel = bot->weaponsel;
         bot->weaponchanging = 0;
         loopj(NUMGUNS) bot->mag[j] = bot->ammo[j] = 0;
-        // The retail weapon sets the damage; the actor's cadence keeps AssaultCube
-        // bots from firing at the full player rate of fire.
+        // Damage is the retail projectile's, scaled by the variant's damage modifier;
+        // the variant's rate of fire sets the cadence inside a burst.
         const HaloTriggerDef *t = def ? def->trigger() : nullptr;
-        const int damage = t && t->projectile.valid ? max(1, int(t->projectile.damageUpper * aiDamageScale + .5f)) : profile.damage;
-        const int delay = t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
+        const float damageScale = actor && actor->damageScale > 0 ? actor->damageScale : aiDamageScale;
+        const int damage = t && t->projectile.valid ? max(1, int(t->projectile.damageUpper * damageScale + .5f)) : profile.damage;
+        const int delay = actor && actor->rate > 0 ? int(1000 / actor->rate) :
+                          t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
         campaignWeapon(bot, gun, 100, delay, 0, damage, kind == ELITE ? 36 : 56);
         bot->mag[gun] = 100;
+        haloactorattach(bot, actor, team);
         return bot;
     }
 
@@ -325,7 +340,7 @@ namespace
     int remaining()
     {
         int count = 0;
-        loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE) ++count;
+        loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && enemies[i].team != HALO_TEAM_HUMAN) ++count;
         return count;
     }
 
@@ -381,6 +396,7 @@ namespace
     {
         haloclearbolts();
         enemies.setsize(0);
+        haloactorsclear();
         kickallbots();
         clearbounceents();
         showscores(false);
@@ -661,6 +677,7 @@ void halomapstart(const char *name)
     player1->maxspeed = 16.0f;
     haloclearbolts();
     enemies.setsize(0);
+    haloactorsclear();
     groundWeapons.setsize(0);
     checkpointGround.setsize(0);
     nearbyWeapon = -1;
@@ -713,8 +730,9 @@ void halomapstart(const char *name)
     checkpointItems.setsize(0);
 }
 
-playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw)
+playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int actorIndex, int team)
 {
+    if(const HaloActorDef *actor = haloactordef(actorIndex)) if(kind < 0) kind = actor->kind;
     if(kind < 0 || kind >= ACTOR_COUNT || !haloactive() || halocinematic() || editmode) return nullptr;
     if(halocollisionactive())
     {
@@ -722,11 +740,17 @@ playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw)
         HaloCollisionHit hit;
         if(!halocollisionsweep(vec(point).add(vec(0, 0, 1.26f)), vec(0, 0, -4.26f), profile.radius,
                                profile.eyeheight + .7f, hit) || hit.normal.z < .65f) return nullptr;
-        return spawnEnemy(ActorKind(kind), vec(point).add(vec(0, 0, profile.eyeheight)), yaw);
+        return spawnEnemy(ActorKind(kind), vec(point).add(vec(0, 0, profile.eyeheight)), yaw, -1, actorIndex, team);
     }
     const int x = int(point.x), y = int(point.y);
     if(OUTBORD(x, y) || SOLID(S(x, y)) || fabsf(S(x, y)->floor - point.z) > 5.0f) return nullptr;
-    return spawnEnemy(ActorKind(kind), point, yaw);
+    return spawnEnemy(ActorKind(kind), point, yaw, -1, actorIndex, team);
+}
+
+float haloenemyshieldfraction(const playerent *p)
+{
+    HaloEnemy *enemy = enemyState(p);
+    return enemy && enemy->shieldMax > 0 ? enemy->shield / enemy->shieldMax : 0;
 }
 
 void haloscenarioplayersave()
@@ -827,8 +851,8 @@ void haloupdate(int elapsed)
     loopv(enemies)
     {
         HaloEnemy &enemy = enemies[i];
-        if(profiles[enemy.kind].shield && enemy.bot && enemy.bot->state == CS_ALIVE)
-            shieldTick(enemy.shield, profiles[enemy.kind].shield, enemy.hitTime, eliteDelay, eliteRecharge, elapsed);
+        if(enemy.shieldMax > 0 && enemy.bot && enemy.bot->state == CS_ALIVE)
+            shieldTick(enemy.shield, enemy.shieldMax, enemy.hitTime, eliteDelay, eliteRecharge, elapsed);
     }
     if(retailCartographer()) return;
     switch(stage)
@@ -856,6 +880,8 @@ void haloupdate(int elapsed)
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
 {
     if(damage <= 0 || damage == INT_MAX) return;
+    // Playfighting actors go through the motions without hurting anyone.
+    if(haloactorflags(attacker) & HALO_AI_PLAYFIGHT) { damage = 0; return; }
     if(target == player1)
     {
         shieldHit = lastmillis;
@@ -869,7 +895,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         return;
     }
     HaloEnemy *enemy = enemyState(target);
-    if(!enemy || profiles[enemy->kind].shield == 0) return;
+    if(!enemy || enemy->shieldMax <= 0) return;
     enemy->hitTime = lastmillis;
     float modifier = gun == GUN_ASSAULT ? 0.7f : 1.0f;
     float absorbed = min(enemy->shield, damage * modifier);
@@ -980,6 +1006,11 @@ void halodrawhud()
         box(0, 0, 25, VIRTH, 70, 168, 255, alpha);
         box(VIRTW-25, 0, 25, VIRTH, 70, 168, 255, alpha);
     }
+    // The retail HUD tags draw the shield, health and motion sensor when present;
+    // the boxes below are the fallback without packages/halo/hud.txt.
+    const bool tagHud = halohudready() && tagWeapons();
+    if(!tagHud)
+    {
     box(right-318, 72, 318, 120, 7, 24, 44, 160);
     box(right-299, 123, 278, 16, 18, 60, 81, 210);
     box(right-299, 123, 278 * shield / playerShield, 16, 91, 216, 255, 235);
@@ -1007,7 +1038,10 @@ void halodrawhud()
         vec delta = vec(bot->o).sub(player1->o);
         if(delta.sqrxy() > 58.0f*58.0f) continue;
         delta.rotate_around_z(-yaw);
-        box(trackerX + delta.x*2-7, trackerY + delta.y*2-7, 14, 14, 255, 74, 81, 250);
+        // Allies show yellow on the motion tracker, hostiles red.
+        const bool ally = enemies[i].team == HALO_TEAM_HUMAN;
+        box(trackerX + delta.x*2-7, trackerY + delta.y*2-7, 14, 14, 255, ally ? 220 : 74, ally ? 60 : 81, 250);
+    }
     }
     if(stage != COMPLETE)
     {
@@ -1030,7 +1064,7 @@ void halodrawhud()
         glEnd();
     }
     glEnable(GL_TEXTURE_2D);
-    label("SHIELD", right-299, 79);
+    if(!tagHud) label("SHIELD", right-299, 79);
     if(driving && stage != COMPLETE)
     {
         int seconds = max(0, (escapeDeadline - lastmillis + 999) / 1000);
@@ -1040,8 +1074,9 @@ void halodrawhud()
     if(!preview || mission != 1 || section != 0)
     {
         defformatstring(title)("%s  %d/%d", haloMissions[mission].title, section + 1, haloMissions[mission].sections);
-        label(title, left, 37, 0.56f);
+        label(title, left, 262, 0.56f);
     }
+    // Mission text sits below the retail weapon and grenade panels in the top-left corner.
     const char *task = objectives[stage];
     if(mission != 1 || section != 0 || !preview)
     {
@@ -1067,7 +1102,7 @@ void halodrawhud()
     const bool cartographer = stage != COMPLETE && halocartographertarget(control, mapped);
     if(cartographer) task = mapped ? "Return to the surface" : "Access the Cartographer";
     if(retailCartographer() && section == 2 && stage != COMPLETE && !halopelicanready()) task = "Reach the Pelican landing zone";
-    label(task, left, 76, 0.72f);
+    label(task, left, 301, 0.72f);
     if(player1->state == CS_DEAD)
     {
         label("Click to revert to checkpoint", VIRTW/2-240, VIRTH/2+100, 0.65f);
@@ -1075,18 +1110,18 @@ void halodrawhud()
     }
     if(stage == COMPLETE)
     {
-        label(preview || campaignFinished ? "F5  Restart section" : "Enter  Continue   /   F5  Restart section", left, 125);
+        label(preview || campaignFinished ? "F5  Restart section" : "Enter  Continue   /   F5  Restart section", left, 350);
         return;
     }
     if((cartographer && !mapped && player1->o.dist(control) < 13.0f) ||
        (stage == EXTRACTION && sectionInteraction() &&
         (retailCartographer() ? section == 2 && halopelicanready() : !route[2].inrange(nextRouteMarker)) &&
         near(extraction, markerRadius)))
-        label("E  Interact", left, 128);
+        label("E  Interact", left, 353);
     else
     {
         defformatstring(distance)("%d m", int(bearing.magnitudexy()/2.75f + 0.5f));
-        label(distance, left, 128);
+        label(distance, left, 353);
     }
     if(driving)
     {
@@ -1095,7 +1130,44 @@ void halodrawhud()
     }
     const weapon *current = player1->weaponsel;
     const HaloWeaponDef *def = tagWeapons() ? haloweapon(carried[currentCarried].def) : NULL;
-    if(def)
+    if(def && tagHud)
+    {
+        // Feed the retail HUD: weapon state, shields and health, grenades and contacts.
+        const HaloWeaponState &st = carried[currentCarried];
+        HaloHudWeapon w;
+        w.weapon = def->index;
+        w.loaded = current->mag;
+        w.reserve = current->ammo;
+        w.magazine = def->magazine() ? def->magazine()->loaded : 0;
+        w.maximum = def->magazine() ? def->magazine()->maximum : 0;
+        w.battery_weapon = def->usesBattery();
+        w.heat = def->heatOverheat > 0 ? clamp(st.heat / def->heatOverheat, 0.0f, 1.0f) : 0;
+        w.battery = st.battery;
+        w.overheated = st.overheated;
+        w.reloading = current->reloading != 0;
+        w.charging = st.chargeStart != 0;
+        w.zoom = st.zoom;
+        vec from = player1->o, aim = vec(worldpos).sub(from);
+        w.locked = !aim.iszero() && haloaimtarget(from, aim.normalize(), *def);
+        HaloHudUnit u;
+        u.shield = clamp(shield / playerShield, 0.0f, 1.0f);
+        u.health = clamp(player1->health / float(playerHealth), 0.0f, 1.0f);
+        u.grenades = player1->mag[GUN_GRENADE];
+        HaloHudBlip blips[64];
+        int count = 0;
+        const float scale = haloscenarioscale();
+        loopv(enemies)
+        {
+            const botent *bot = enemies[i].bot;
+            // The sensor shows contacts that move or fire, as the retail tracker does.
+            if(!bot || bot->state != CS_ALIVE || count >= 64 || (bot->vel.sqrxy() < 0.01f && lastmillis - bot->lastaction > 500)) continue;
+            vec delta = vec(bot->o).sub(player1->o);
+            delta.rotate_around_z(-yaw);
+            blips[count++] = HaloHudBlip{delta.x / scale, delta.y / scale, enemies[i].team == HALO_TEAM_HUMAN};
+        }
+        halohuddraw(w, u, blips, count);
+    }
+    else if(def)
     {
         const HaloWeaponState &s = carried[currentCarried];
         string title;
@@ -1142,8 +1214,11 @@ void halodrawhud()
         label(prompt, VIRTW/2-200, VIRTH/2+90, 0.6f);
     }
     if(pickupMessage && lastmillis - pickupMessage < 1600) label(pickupText, VIRTW/2-200, VIRTH/2+130, 0.55f);
-    defformatstring(grenades)("FRAG  %d", player1->mag[GUN_GRENADE]);
-    label(grenades, right, VIRTH-100, 0.57f, true);
+    if(!tagHud)
+    {
+        defformatstring(grenades)("FRAG  %d", player1->mag[GUN_GRENADE]);
+        label(grenades, right, VIRTH-100, 0.57f, true);
+    }
 }
 
 COMMANDF(halo_campaign, "", ()
@@ -1183,6 +1258,7 @@ COMMANDF(halo_switch, "d", (bool down) { if(down) haloswitchweapon(); });
 void haloremoveactor(const playerent *p)
 {
     loopv(enemies) if(enemies[i].bot == p) enemies[i].bot = NULL;
+    haloactordetach(p);
     haloscenarioremovebot(p);
 }
 
@@ -1330,7 +1406,7 @@ playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeapon
     loopv(enemies)
     {
         botent *bot = enemies[i].bot;
-        if(!bot || bot->state != CS_ALIVE) continue;
+        if(!bot || bot->state != CS_ALIVE || enemies[i].team == HALO_TEAM_HUMAN) continue;
         // Aim at the upper body rather than the eyes.
         vec target = bot->o;
         target.z -= bot->eyeheight * 0.35f;
@@ -1347,9 +1423,10 @@ playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeapon
     return best;
 }
 
-void halokilled(playerent *victim)
+void halokilled(playerent *victim, playerent *killer)
 {
     if(!haloactive() || !victim || victim == player1) return;
+    haloactordeath(victim, killer);
     HaloEnemy *enemy = enemyState(victim);
     if(!enemy) return;
     const HaloWeaponDef *d = haloweapon(enemy->weapon.def);
@@ -1394,6 +1471,7 @@ void halozoomstep()
 COMMANDF(halo_zoom, "d", (bool down) { if(down) halozoomstep(); });
 
 #ifdef HALO_QA
+#include "halo_ai.h"
 // Verification hooks live in tests/native. They read this file's internal
 // campaign state, so they compile into the same translation unit.
 #include "campaign_qa.inc"

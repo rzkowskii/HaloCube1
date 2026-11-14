@@ -5,6 +5,8 @@
 #include "halo_collision.h"
 #include "halo_script.h"
 #include "halo_weapons.h"
+#include "halo_ai.h"
+#include "halo_hud.h"
 #include "bot/bot.h"
 #include "hudgun.h"
 
@@ -1127,6 +1129,8 @@ void weapon::onselecting(bool sound)
 void weapon::renderhudmodel() { renderhudmodel(owner->lastaction); }
 void weapon::renderaimhelp(bool teamwarning)
 {
+    // The retail HUD draws its own reticles (halo_hud.cpp).
+    if(!editmode && haloactive() && halohudready() && haloweaponof(owner, type)) return;
     if(!editmode && haloactive())
     {
         // The reticle turns red while aim assist has an enemy in range.
@@ -1626,6 +1630,8 @@ void sniperrifle::renderhudmodel() { if(!scoped) weapon::renderhudmodel(); }
 
 void sniperrifle::renderaimhelp(bool teamwarning)
 {
+    // The retail HUD draws the scope mask and reticles for campaign weapons.
+    if(!editmode && haloactive() && halohudready() && haloweaponof(owner, type)) return;
     if(scoped) drawscope();
     if(!editmode)
     {
@@ -1943,7 +1949,8 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
             aim = centre.sub(from).normalize();
         }
     }
-    else target = player1;
+    else if(!(target = haloactortarget(owner))) target = player1;
+    haloactornoise(owner);
     const float scale = haloscenarioscale();
     const int count = max(1, t->projectilesPerShot), fallbackGun = owner->weaponsel->type;
     const bool instant = p.speed >= 250 && p.guided <= 0 && p.radius <= 0;
@@ -1976,10 +1983,11 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
             int zone;
             if((victim = intersectclosest(from, end, owner, distance, zone))) shorten(from, end, distance);
         }
-        else if(player1->state == CS_ALIVE)
+        else
         {
+            // Actors hit the nearest hostile combatant: the player, marines or the Covenant.
             vec contact;
-            if(intersect(player1, from, end, &contact)) { victim = player1; end = contact; }
+            if((victim = haloactorhit(owner, from, end, contact))) end = contact;
         }
         if(victim) hit(damage, victim, owner, dir, halodamagegun(p, fallbackGun), false, 0);
         else addbullethole(owner, from, end);
@@ -2049,11 +2057,7 @@ void haloupdatebolts(int elapsed)
             int zone;
             if((victim = intersectclosest(shot.position, end, player1, distance, zone))) { contact = end; shorten(shot.position, contact, distance); end = contact; }
         }
-        else if(player1->state == CS_ALIVE && intersect(player1, shot.position, end, &contact))
-        {
-            victim = player1;
-            end = contact;
-        }
+        else if((victim = haloactorhit(shot.owner, shot.position, end, contact))) end = contact;
         if(p->radius > 0) particle_trail(PART_SMOKE, 300, shot.position, end);
         else if(p->category == 10 || p->guided > 0) particle_trail(PART_PLASMA_BOLT, 34, shot.position, end);
         else addshotline(shot.owner, shot.position, end);

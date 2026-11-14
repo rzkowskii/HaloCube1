@@ -385,3 +385,68 @@ COMMANDF(qa_enemy_weapons, "", ()
     }
     fflush(stdout);
 });
+
+// ---- Actor AI (tests/test_actor_ai.py)
+COMMANDF(qa_actor_state, "s", (const char *label) { haloactordump(label); });
+COMMANDF(qa_actor_place, "s", (const char *encounter)
+{
+    conoutf("ACTOR_PLACE %s %d", encounter, haloscenarioplace(encounter));
+    fflush(stdout);
+});
+// Spawns an actor of a family at forward/side offsets (Halo world units) from the player, facing it.
+static void qaActorSpawn(int kind, int team, float forward, float side)
+{
+    const float yaw = player1->yaw * RAD;
+    const float s = haloscenarioscale();
+    vec at = player1->o;
+    at.add(vec(sinf(yaw), -cosf(yaw), 0).mul(forward * s)).add(vec(cosf(yaw), sinf(yaw), 0).mul(side * s));
+    // Allies face the way the player looks; hostiles face the player.
+    botent *bot = spawnEnemy(ActorKind(clamp(kind, 0, int(ACTOR_COUNT) - 1)), at, player1->yaw + (team ? 0 : 180), -1, -1, team);
+    conoutf("ACTOR_SPAWN %s %d", bot ? bot->name : "-", bot ? team : -1);
+    fflush(stdout);
+}
+COMMANDF(qa_actor_spawn, "iiff", (int *kind, int *team, float *forward, float *side) { qaActorSpawn(*kind, *team, *forward, *side); });
+// Calls a script AI command on a named encounter: qa_hs_ai ai_status first_wave 0
+static void qaScriptAI(const char *command, const char *encounter, float second)
+{
+    const int reference = haloscenarioencounter(encounter);
+    const double value = reference < 0 ? -999 : haloscenariocall(command, reference, second);
+    conoutf("HS_AI %s %s %.4f", command, encounter, value);
+    fflush(stdout);
+}
+COMMANDF(qa_hs_ai, "ssf", (const char *command, const char *encounter, float *second) { qaScriptAI(command, encounter, *second); });
+// ai_actors on an encounter, then list_count and list_get through the script commands.
+static void qaScriptList(const char *encounter)
+{
+    const int reference = haloscenarioencounter(encounter);
+    const double list = haloscenariocall("ai_actors", reference, 0);
+    const int count = int(haloscenariocall("list_count", list, 0));
+    int units = 0;
+    loopi(count) if(haloscenariocall("list_get", list, i) <= -1000) ++units;
+    conoutf("HS_LIST %s list=%.0f count=%d units=%d", encounter, list, count, units);
+    fflush(stdout);
+}
+COMMANDF(qa_hs_list, "s", (const char *encounter) { qaScriptList(encounter); });
+// ai_command_list_status across an encounter's actors (0 none, 1 running, 2 finished).
+static void qaCommandStatus(const char *encounter)
+{
+    const int reference = haloscenarioencounter(encounter);
+    const double list = haloscenariocall("ai_actors", reference, 0);
+    conoutf("HS_COMMAND %s %.0f", encounter, haloscenariocall("ai_command_list_status", list, 0));
+    fflush(stdout);
+}
+COMMANDF(qa_hs_command, "s", (const char *encounter) { qaCommandStatus(encounter); });
+COMMANDF(qa_actor_table, "", ()
+{
+    loopi(haloactordefcount())
+    {
+        const HaloActorDef *d = haloactordef(i);
+        conoutf("ACTOR_TABLE %d %s %d %d %.3f %.3f %.3f", i, d->family.c_str(), d->kind, d->weapon, d->rate, d->burstMin, d->visionDistance);
+    }
+    fflush(stdout);
+});
+// Sets an AI switch on every campaign actor: qa_actor_flag 1 1 blinds them all.
+COMMANDF(qa_actor_flag, "ii", (int *flag, int *on)
+{
+    loopv(enemies) if(enemies[i].bot) haloactorsetflag(enemies[i].bot, *flag, *on != 0);
+});

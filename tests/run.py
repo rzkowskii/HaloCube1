@@ -28,6 +28,8 @@ QUICK = [
     'test_campaign_replay.py',        # all 55 sections complete in one run
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
+    'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine
+    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands
 ]
 SLOW = [
     'test_autumn_opening.py',         # four-minute Autumn opening at normal speed

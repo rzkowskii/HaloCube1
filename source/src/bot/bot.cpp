@@ -12,6 +12,7 @@
 
 #include "cube.h"
 #include "halo.h"
+#include "halo_ai.h"
 #include "bot.h"
 
 vector<botent *> bots;
@@ -117,7 +118,8 @@ void CBot::Think()
         }
         p = p->next;
     }
-    if (!BotManager.IdleBots()) { MainAI(); }
+    // Campaign actors think with halo_ai.cpp; other bots keep AssaultCube's AI.
+    if (!BotManager.IdleBots()) { if(!haloactorthink(this)) MainAI(); }
     else { ResetMoveSpeed(); }
     // Aim to ideal yaw and pitch
     AimToIdeal();

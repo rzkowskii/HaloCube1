@@ -15,6 +15,11 @@ bool halocartographertarget(vec &point, bool &mapped);
 bool haloscenarioexitpoint(vec &point);
 // AssaultCube units per Halo world unit for the current section.
 float haloscenarioscale();
+// Places every squad of a named encounter; returns how many actors spawned, or -1.
+int haloscenarioplace(const char *encounter);
+// QA probes: an encounter's script reference, and a script command called directly.
+int haloscenarioencounter(const char *name);
+double haloscenariocall(const char *command, double first, double second);
 bool haloscenariocollide(physent *entity, float &hi, float &lo);
 struct HaloCollisionHit;
 bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit);
@@ -33,7 +38,7 @@ void haloscenariorender();
 void haloscenariopausestate(bool paused);
 void haloscenariocheckpoint();
 void haloscenarioplayersave();
-playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw);
+playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int actorIndex = -1, int team = 0);
 bool haloscenariobotsuspended(const playerent *bot);
 void haloscenarioremovebot(const playerent *bot);
 
