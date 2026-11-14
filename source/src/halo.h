@@ -1,0 +1,21 @@
+// Offline Halo campaign hooks into the AssaultCube client.
+bool haloactive();
+void halomapstart(const char *name);
+bool halorespawn();
+void haloupdate(int elapsed);
+void halodrawhud();
+void halodamage(int &damage, playerent *target, playerent *attacker, int gun);
+bool halopickup(int index, playerent *player);
+const char *haloactormodel(const playerent *player);
+const char *halohudmodel(int gun);
+void haloupdatecounter(int rounds);
+Texture *halocountertexture(const char *mesh, Texture *fallback);
+void haloremoveactor(const playerent *player);
+void halofrag();
+void halomelee();
+void haloupdatebolts(int elapsed);
+void haloclearbolts();
+void haloaddbolt(playerent *owner, const vec &position, const vec &direction, int damage);
+void haloplaysound(const char *sample, int fallback, physent *actor = NULL, const vec *position = NULL);
+bool halodriving();
+void halorendervehicle();
