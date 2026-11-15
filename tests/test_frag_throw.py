@@ -3,8 +3,9 @@
 NOT YET RUN: written while testing was on hold.
 
 tools/import_halo_campaign.py plans the s3 manifold of d40 section 5 (The Maw, the engine room) as a
-ThrowTarget: no walkable spot sees either of its detectors, so the route stands on the top floor and
-throws frags into the channel's mouth, one route row per aim (flag 2048, `target@health ax ay az`),
+ThrowTarget: no walkable spot sees either of its detectors, so the route stands on one spot (since the
+route batch on floor 2's walkway below the channel, before it on the top floor) and throws frags into
+the channel, one route row per aim (flag 2048, `target@health ax ay az`),
 from a simulation of the engine's grenade physics (halo_collision.GrenadeArcs). This checks the
 simulation against the game without walking the section's 5,000 rows:
 

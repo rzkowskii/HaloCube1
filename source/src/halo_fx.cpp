@@ -35,6 +35,9 @@ namespace
         float scale = 1, lightRadius = 0, lightSeconds = 0, blast = 0;
         vec light = vec(1, 1, 1);
         int systems = 0, particles = 0;
+        // The strongest damaging jpt! part (`damage` and `materials` lines), when it has one.
+        bool hasDamage = false;
+        HaloEffectDamage damage;
     };
 
     // A value easing linearly from `from` to `to` between two times (lastmillis).
@@ -180,6 +183,35 @@ namespace
             }
             else if(key == "light") in >> def->lightRadius >> def->light.x >> def->light.y >> def->light.z >> def->lightSeconds;
             else if(key == "blast") in >> def->blast;
+            else if(key == "damage")
+            {
+                // inner outer lower upper-min upper-max side-effect category core (world units)
+                HaloEffectDamage &d = def->damage;
+                float lower, low, high, core;
+                if(in >> d.inner >> d.outer >> lower >> low >> high >> d.sideEffect >> d.category >> core &&
+                   std::isfinite(d.inner) && std::isfinite(d.outer) && std::isfinite(lower) && std::isfinite(low) &&
+                   std::isfinite(high) && std::isfinite(core) && d.outer > 0 && d.outer < 1000 && high > 0 && high < 100000)
+                {
+                    d.inner = clamp(d.inner, 0.0f, d.outer);
+                    d.damage.upperMax = high;
+                    d.damage.upperMin = clamp(low, 0.0f, high);
+                    d.damage.lower = clamp(lower, 0.0f, high);
+                    d.damage.core = clamp(core, 0.0f, d.outer);
+                    def->hasDamage = true;
+                }
+            }
+            else if(key == "materials")
+            {
+                HaloDamage &d = def->damage.damage;
+                int read = 0;
+                while(read < HALO_DAMAGE_MATERIALS && in >> d.materials[read])
+                {
+                    if(!std::isfinite(d.materials[read])) break;
+                    d.materials[read] = clamp(d.materials[read], 0.0f, 100.0f);
+                    ++read;
+                }
+                d.hasMaterials = read == HALO_DAMAGE_MATERIALS;
+            }
             else if(key == "particles") in >> def->systems >> def->particles;
             else if(key == "sound")
             {
@@ -401,6 +433,14 @@ bool halofxeffect(const char *tag, const vec &point, bool visual)
         adddynlight(NULL, point, clamp(int(def->lightRadius * scale * .5f), 8, 48), clamp(int(def->lightSeconds * 1000), 150, 1500), 300,
                     uchar(255 * def->light.x), uchar(255 * def->light.y), uchar(255 * def->light.z));
     return def != &fallback;
+}
+
+bool halofxeffectdamage(const char *tag, HaloEffectDamage &out)
+{
+    const EffectDef *def = findEffect(tag);
+    if(!def || !def->hasDamage) return false;
+    out = def->damage;
+    return true;
 }
 
 void halofxblast(const vec &point, float radius)

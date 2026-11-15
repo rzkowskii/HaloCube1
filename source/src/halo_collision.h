@@ -14,6 +14,10 @@ struct HaloCollisionHit
 // Hit flag of an authored walking assist (the .hcol's AST1 trailer, ASSISTS in
 // tools/import_halo_campaign.py): not retail data, never stored in the file's flags.
 constexpr unsigned haloCollisionAssist = 16;
+// Hit flag of a scenery placement's polygon (the .hcol's SCN1 trailer, SCENERY_COLLISION in
+// tools/import_halo_campaign.py): retail scenery collision, which everything collides with; the flag
+// only tells QA and the log what it is.
+constexpr unsigned haloCollisionScenery = 32;
 
 void halocollisionmap(const char *name);
 bool halocollisionactive();
@@ -33,5 +37,9 @@ bool halocollisionoverlap(const vec &feet, float radius, float height, HaloColli
 // The number of walking assists in the loaded mesh; with index in range, also that assist's
 // centre and normal (index in file order: the AST1 trailer's, which is ASSISTS' order) (QA: tests/native/retail_qa.inc qa_retail_assists).
 int halocollisionassist(int index, vec &centre, vec &normal);
+// The number of scenery placements baked into the loaded mesh (its SCN1 trailer); with index in
+// range, also that placement's scenario scenery index and the bounds of its polygons (QA:
+// tests/native/retail_qa.inc qa_retail_scenery).
+int halocollisionscenery(int index, int &placement, vec &low, vec &high);
 
 #endif

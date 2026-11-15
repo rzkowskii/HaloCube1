@@ -21,6 +21,23 @@ Written while testing was on hold: not yet run.
 4. The player's own weapon: facing the Wraith (qa_vehicle_aim) and firing hits its body (its health
    drops, `takes ... from the player` with halo_vehicletrace 1), with qa_vehicle_protect 1 nothing
    is hurt and shots pass.
+
+Batch 5's critic, gaps 8 and 11 (written while testing was on hold, not yet run):
+5. Covered riders (gap 8): a frag grenade going off 0.3 units beside a Wraith with an Elite at its
+   controls (qa_vehicle_blast) leaves the Elite's health and shield as they were (covered=1, the hull
+   covers the invisible seat) and lowers the Wraith's health; the same blast beside a Ghost with an
+   Elite on it hurts the Elite (covered=0: the Ghost's seat stays open) and the Ghost.
+6. The death explosion (gap 11): a Grunt put 1.3 half-widths out from the Wraith's middle takes the
+   death explosion's jpt! damage when the Wraith is destroyed (`death explosion deals its damage`, a
+   DAMAGE_TRACE from the player of 55 to 65 on Normal); effects.txt gives the death explosion that
+   `damage` line (1.5 2.5 55 55 65) and a modifier of 0 for metal (no chain of explosions).
+7. The tilted hit box (gap 11): a level probe across the parked Wraith above its box's top behind the
+   middle misses the level box and hits it pitched nose-down 30 degrees (qa_vehicle_tilt,
+   qa_vehicle_probe); one above the top at the middle misses level and hits rolled 30 degrees.
+8. The wreck (gap 11, halo_vehiclewreck, off by default): with it off the destroyed Wraith of item 2
+   leaves no wreck (wreck=0); with it on, a checkpoint, then the Wraith destroyed: its row has wreck=1,
+   qa_vehicle_wrecks finds it and it stops the player's body; after a death and revert to the
+   checkpoint the Wraith exists again and no wreck is left.
 """
 import re
 import subprocess
@@ -121,6 +138,8 @@ assert 'Halo vehicle: the Wraith is destroyed' in text, text[-3000:]
 assert cmds[-1] == -1, ('a destroyed vehicle no longer exists for the scripts', cmds)
 end = {int(r['vehicle']): r for r in rows(text, 'VEHICLE_QA', 'end')[1:]}
 assert end[wraith]['exists'] == '0', end[wraith]
+ended = {int(r['vehicle']): r for r in rows(text, 'VEHICLE_HEALTH', 'end')}
+assert ended[wraith].get('wreck') == '0', ('no wreck while halo_vehiclewreck is off (the default)', ended[wraith])
 assert re.search(r'death.explosion|death_explosion', text), ('the body depleted effect played', text[-3000:])
 pilot = re.search(rf'VEHICLE_QA pilot vehicle={wraith} ok=1 name=(\S+)', text)
 assert pilot, text[-3000:]
@@ -160,3 +179,84 @@ assert float(shot[wraith]['health']) < 1, ('the rifle hits the Wraith\'s body', 
 assert re.search(r'Halo vehicle \d+ \(Wraith\) takes [\d.]+ from the player', text), text[-3000:]
 assert protected[wraith]['health'] == shot[wraith]['health'], ('qa_vehicle_protect stops vehicle damage', protected[wraith])
 print('rifle: the player\'s shots hit the Wraith\'s body; protected vehicles take none.')
+
+# 5. Blasts leave a covered rider to the hull (gap 8); the Ghost's open seat still takes them.
+text = run('covered', [
+    (300, 'qa_combat_protect 1'), (400, f'qa_vehicle_pilot {wraith} 1 0 driver'), (500, f'qa_vehicle_pilot {ghost} 1 0 driver'),
+    (800, f'qa_vehicle_blast {wraith} 0 0.3'), (1100, f'qa_vehicle_blast {ghost} 0 0.3'), (1400, 'quit')])
+blasts = {int(f['vehicle']): f for f in (fields(l) for l in text.splitlines() if l.startswith('VEHICLE_QA blast '))}
+assert blasts.get(wraith, {}).get('ok') == '1' and blasts[wraith]['pilot'] != '-', ('a frag beside the piloted Wraith', blasts, text[-3000:])
+assert blasts[wraith]['covered'] == '1' and blasts[wraith]['alive'] == '1', blasts[wraith]
+assert blasts[wraith]['before'] == blasts[wraith]['after'], ('the Wraith\'s driver is left to the hull', blasts[wraith])
+after = [r for r in rows(text, 'VEHICLE_HEALTH', 'blast') if int(r['vehicle']) == wraith]
+assert float(after[0]['health']) < 1, ('the Wraith\'s hull takes the blast', after[0])
+assert blasts.get(ghost, {}).get('ok') == '1' and blasts[ghost]['covered'] == '0', ('the Ghost\'s seat is open', blasts.get(ghost))
+hp0, sh0 = (float(x) for x in blasts[ghost]['before'].split(','))
+hp1, sh1 = (float(x) for x in blasts[ghost]['after'].split(','))
+assert blasts[ghost]['alive'] == '0' or (hp1, sh1) < (hp0, sh0), ('the Ghost\'s rider takes the blast', blasts[ghost])
+ghosted = [r for r in rows(text, 'VEHICLE_HEALTH', 'blast') if int(r['vehicle']) == ghost]
+assert float(ghosted[-1]['health']) < 1, ('the ridden Ghost takes it too', ghosted[-1])
+print(f'blasts: the Wraith\'s driver untouched (hull {float(after[0]["health"]):.2f}); the Ghost\'s rider hurt.')
+
+# 6. The death explosion's jpt! damage (gap 11).
+death, metal, current = None, None, None
+for line in effects.splitlines():
+    if line.startswith('path '):
+        current = line[5:]
+    elif line.startswith('damage ') and current == records['wraith']['destroyed']:
+        death = [float(x) for x in line.split()[1:]]
+    elif line.startswith('materials ') and current == records['wraith']['destroyed']:
+        metal = float(line.split()[1 + 7])
+assert death and death[:5] == [1.5, 2.5, 55, 55, 65], ('effects.txt: the death explosion\'s damage (re-run tools/halo_effects.py)', death)
+assert metal == 0, ('metal takes none of it: no chain of vehicle explosions', metal)
+text = run('explosion', [
+    (300, 'qa_combat_protect 1'), (400, f'qa_vehicle_approach {wraith} 0'), (500, 'qa_actor_spawn 0 0 3 0'),
+    (700, f'qa_vehicle_place_actor {wraith} 0 1.3'), (800, f'qa_vehicle_pilot {wraith} 1 0 driver'),
+    (1000, f'qa_vehicle_damage {wraith} 2000 1'), (1300, 'quit')])
+placed = re.search(r'VEHICLE_QA place actor vehicle=\d+ ok=1 name=(\S+) inside=-1', text)
+assert placed, ('a Grunt beside the Wraith, outside its box', text[-3000:])
+assert re.search(r"Halo vehicle: the Wraith's death explosion deals its damage", text), text[-3000:]
+hits = [fields(l) for l in text.splitlines() if l.startswith('DAMAGE_TRACE ') and f' target={placed.group(1)} ' in l + ' ']
+assert hits and hits[0]['attacker'] == 'player' and 55 - .01 <= float(hits[0]['amount']) <= 65 + .01, ('the Grunt takes the explosion', hits)
+print(f'death explosion: {placed.group(1)} beside the Wraith took {float(hits[0]["amount"]):.1f}.')
+
+# 7. The tilted hit box (gap 11).
+import math
+text = run('tilt', [
+    (300, f'qa_vehicle_probe {wraith} 0 0'), (500, 'quit')])
+box = fields(next(l for l in text.splitlines() if l.startswith('VEHICLE_QA probe ')))
+back, front, halfw, top = (float(box[k]) for k in ('back', 'front', 'halfwidth', 'top'))
+t = math.radians(-30)
+x, z = .8 * back, .8 * top
+along, up = x * math.cos(t) - z * math.sin(t), x * math.sin(t) + z * math.cos(t)
+assert up > top and back < along < front, ('the pitch probe is above the level box', along, up, box)
+roll_up = 1.15 * top
+assert halfw * .5 + top * math.cos(math.radians(30)) > roll_up, ('the roll probe is below the rolled box\'s raised edge', box)
+middle = (back + front) / 2
+text = run('tilted', [
+    (300, f'qa_vehicle_probe {wraith} {along:.3f} {up:.3f}; qa_vehicle_probe {wraith} {middle:.3f} {roll_up:.3f}'),
+    (400, f'qa_vehicle_tilt {wraith} -30 0'), (500, f'qa_vehicle_probe {wraith} {along:.3f} {up:.3f}'),
+    (600, f'qa_vehicle_tilt {wraith} 0 30'), (700, f'qa_vehicle_probe {wraith} {middle:.3f} {roll_up:.3f}'), (900, 'quit')])
+probes = [fields(l) for l in text.splitlines() if l.startswith('VEHICLE_QA probe ')]
+assert len(probes) == 4 and all(p['ok'] == '1' for p in probes), probes
+assert probes[0]['hit'] == '0' and probes[1]['hit'] == '0', ('the level box is missed above its top', probes)
+assert probes[2]['hit'] == '1', ('pitched nose-down, its raised back is hit', probes[2])
+assert probes[3]['hit'] == '1', ('rolled, its raised side is hit', probes[3])
+print('hit box: pitched and rolled boxes are hit where the level box is not.')
+
+# 8. The wreck (gap 11, halo_vehiclewreck 1), gone again after a revert to before it.
+text = run('wreck', [
+    (300, 'qa_combat_protect 1; halo_vehiclewreck 1; qa_checkpoint_save'), (500, f'qa_vehicle_pilot {wraith} 1 0 driver'),
+    (700, f'qa_vehicle_damage {wraith} 2000 1'), (900, f'qa_vehicle_wrecks {wraith}; qa_vehicle_state wrecked'),
+    (1100, 'qa_combat_protect 0; qa_halo_damage 100000'), (2700, 'qa_halo_revert'), (4200, f'qa_vehicle_wrecks {wraith}; qa_vehicle_state reverted'),
+    (4400, 'quit')])
+assert re.search(r"Halo vehicle: the Wraith leaves its wreck at", text), text[-3000:]
+wrecks = [fields(l) for l in text.splitlines() if l.startswith('VEHICLE_QA wrecks ')]
+assert len(wrecks) == 2, (wrecks, text[-3000:])
+assert wrecks[0]['wreck'] == '1' and wrecks[0]['blocked'] == '1' and int(wrecks[0]['count']) >= 1, ('the wreck is solid', wrecks[0])
+wrecked = {int(r['vehicle']): r for r in rows(text, 'VEHICLE_HEALTH', 'wrecked')}
+assert wrecked[wraith]['wreck'] == '1' and wrecked[wraith]['destroyed'] == '1', wrecked[wraith]
+assert wrecks[1]['wreck'] == '0' and wrecks[1]['count'] == '0', ('the revert goes back to before the wreck', wrecks[1])
+reverted = {int(r['vehicle']): r for r in rows(text, 'VEHICLE_QA', 'reverted')[1:]}
+assert reverted[wraith]['exists'] == '1', ('the Wraith is back after the revert', reverted[wraith])
+print('wreck: left where the Wraith blew up, solid, and gone after a revert to the checkpoint before it.')

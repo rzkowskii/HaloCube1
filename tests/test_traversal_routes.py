@@ -17,7 +17,11 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
     are all 4096 Warthog rows, steps of at most one cell but at a jump's landing (flag 2); a flown
     section boards a Banshee before its first flight row and gets out after its last, its flight rows
     at most two flight cells (8 units) apart; every 16384 row follows a 4096 row; its metrics record
-    the vehicle route (`vehicle_route`) and c40 section 1's .hcol holds BSP 12 (EXTRA_BSPS),
+    the vehicle route (`vehicle_route`) and c40 section 1's .hcol holds BSP 12 (EXTRA_BSPS), and since the
+    route batch (gap 2, not yet run) its route boards and gets out twice, has foot rows between its
+    first landing and its second boarding (into pulse_1_trigger and back) and ends in its exit; the Maw's
+    planned drive of sections 6 to 8 (each section's metrics `vehicle_route.drive.seconds`, batch 10,
+    not yet run) takes at most two thirds of the 180 s escape countdown,
   * action rows (written while testing was on hold, not yet run): a row with flag 256 (use a
     control) names the machine and the position it waits for, 512 (shoot a damage target) the
     target, the health it shoots it down to and an aim point (eight columns), 1024 (wait at a
@@ -25,10 +29,16 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
     point; each repeats the position of the step row before it. d40 section 5 uses its four manifold
     controls (enc5_1_pistons1, _pistonn1, _pistonn3, _pistons3, in that order), shoots the detectors
     of s1, n1 and n3, and throws frags at s3's (ThrowTarget: no walkable spot sees them) from one
-    spot after the s3 control's row, its aims straight after one another; a10 section 5 waits at
+    spot after the s3 control's row, its aims straight after one another (three to five of them since
+    the route batch, each going off beyond the frag's outer radius from the thrower, as the metrics'
+    `throws` record); a10 section 5 waits at
     tunnel_door_2 and section 6 at cryo_door_2 on rows of their own (DOOR_WAITS), and section 5's
     route passes tunnel_trigger_close before tunnel_door_2's row (the importer's `door_order` in
     halo_a10_05.metrics.json, DOOR_PREREQUISITES),
+  * b30's first two sections are walked routes since the route batch (RASTER_ROUTES is empty): both end
+    in their exit volumes (their metrics), section 1 has no action rows, section 2 a door row at
+    shafta_lock_door before its one use row (holohalo_1, the Cartographer's control; written while
+    testing was on hold, not yet run),
   * b30's return (halo_b30_03) is a walked route now (not RASTER_ROUTES): no action rows, and it ends
     within 1.5 retail units of the ledge beside the extraction Pelican's ramp (its end marker),
   * with CRASH_SITE, the Crash Site (halo_a30) has an .hcol and a route of plain, crouch, jump and
@@ -60,6 +70,9 @@ from import_halo_campaign import (ASSISTS, CRASH_SITE, CRASH_SITE_NAME, DRIVEN_S
 maps = root / 'packages/maps'
 require(maps, 'run scripts/import-macos-assets.sh')
 problems, checked = [], 0
+# The Maw's escape (sections 6 to 8, keys 5 to 7) and its countdown in seconds (halo.cpp escapeTime).
+ESCAPE_SECTIONS, ESCAPE_TIME = {('d40', 5), ('d40', 6), ('d40', 7)}, 180
+escape_seconds = {}
 
 
 def rows(path):
@@ -148,6 +161,23 @@ for mission in MISSIONS:
                 problems.append(f'{name}: metrics do not record its vehicle route (re-run the import)')
             elif list(EXTRA_BSPS.get(key, ())) != vehicle_metrics.get('extra_bsps'):
                 problems.append(f'{name}: metrics name extra BSPs {vehicle_metrics.get("extra_bsps")}, EXTRA_BSPS {EXTRA_BSPS.get(key)}')
+            elif key in ESCAPE_SECTIONS:
+                # The Maw's escape: the drive's planned time (batch 10: `drive` in the metrics).
+                drive = vehicle_metrics.get('drive') or {}
+                if not drive.get('seconds'):
+                    problems.append(f'{name}: metrics do not record the drive\'s time (re-run the import)')
+                else:
+                    escape_seconds[key] = drive['seconds']
+            if key == ('c40', 0) and vehicle_metrics:
+                # The route batch (gap 2): both flights and both foot legs between them are planned (into
+                # pulse_1_trigger through the doorway BSPs 2 and 12 share, back to the Banshee, then from
+                # the c bridge through door_c1), so the route boards and gets out twice and ends in its exit.
+                ended = json.loads(metrics_path.read_text()).get('ends_in_exit')
+                if (vehicle_metrics.get('boards'), vehicle_metrics.get('get_outs'), ended) != (2, 2, True):
+                    problems.append(f'{name}: {vehicle_metrics.get("boards")} boards, {vehicle_metrics.get("get_outs")} '
+                                    f'get-outs, ends in exit {ended}; expected 2, 2, True (pulse_1_trigger, then door_c1)')
+                elif not any(not f & (ROUTE_VEHICLE | ROUTE_BOARD | ROUTE_GET_OUT) for _, f, _, _ in table[outs[0] + 1:boards[1]]):
+                    problems.append(f'{name}: no foot rows between the first landing and the second boarding')
             continue
         if not route.exists():
             continue
@@ -193,6 +223,9 @@ for mission in MISSIONS:
                             ['enc5_1_detector_s1', 'enc5_1_detector_n1', 'enc5_1_detector_n3'], [], ['enc5_1_detector_s3']),
             'halo_a10_05': ([], [], ['tunnel_door_2'], []),
             'halo_a10_06': ([], [], ['cryo_door_2'], []),
+            # The route batch (gap 7): b30's shaft A descent uses the Cartographer's control (shafta_map_control,
+            # read by holohalo_1, which the scene sets to 1) after a door row at shafta_lock_door.
+            'halo_b30_02': (['holohalo_1'], [], ['shafta_lock_door'], []),
         }.get(name, ([], [], [], []))
         thrown = sorted({table[i][2][:-1] if table[i][2].endswith('b') else table[i][2] for i in throws})
         if thrown != expected_actions[3]:
@@ -207,6 +240,19 @@ for mission in MISSIONS:
             for i in throws:
                 if table[i][3] is None or not 0 <= table[i][3] < 1:
                     problems.append(f'{name}: throw row {i} health {table[i][3]}')
+            # The route batch (gap 9): three to five aims, each going off beyond the frag's outer blast
+            # radius from the thrower's body (the importer's metrics, `throws`).
+            if not 3 <= len(throws) <= 5:
+                problems.append(f'{name}: {len(throws)} throw rows, expected 3 to 5')
+            metrics = maps / f'{name}.metrics.json'
+            planned = json.loads(metrics.read_text()).get('throws') if metrics.is_file() else None
+            if not planned or len(planned) != len(throws):
+                problems.append(f'{name}: metrics record {len(planned or ())} planned throws for {len(throws)} throw rows '
+                                '(re-import the section)')
+            else:
+                close = [t for t in planned if t['thrower_distance'] <= t['blast_outer']]
+                if close:
+                    problems.append(f'{name}: planned throws within the blast radius of the thrower: {close}')
         if uses != expected_actions[0]:
             problems.append(f'{name}: use rows {uses}, expected {expected_actions[0]}')
         # Either detector of a manifold destroys it (enc5_1_destroyed_poll): s1 or s1b, and so on.
@@ -222,6 +268,22 @@ for mission in MISSIONS:
             if entry is None or 'tunnel_trigger_close' not in entry.get('passed', ()):
                 problems.append(f'{name}: the route does not pass tunnel_trigger_close before tunnel_door_2 '
                                 f'(door_order {order}; re-import a10 part 5)')
+        if name in ('halo_b30_01', 'halo_b30_02'):
+            # Planned since the route batch (gap 7; no longer RASTER_ROUTES): walked routes that end in
+            # their exit (bsp 0,1; section 2 back in bsp 1,0 after the Cartographer), and section 2's
+            # door row comes before its use row (the door is on the way down).
+            metrics = maps / f'{name}.metrics.json'
+            m = json.loads(metrics.read_text()) if metrics.is_file() else {}
+            if m.get('mode') != 'walked' or m.get('ends_in_exit') is not True:
+                problems.append(f'{name}: mode {m.get("mode")}, ends in its exit {m.get("ends_in_exit")} '
+                                f'(expected a walked route ending in it; re-import b30 part {name[-1]})')
+            if name == 'halo_b30_01' and any(flags & (256 | 512 | 1024 | 2048) for _, flags, _, _ in table):
+                problems.append(f'{name}: action rows on the beach walk')
+            if name == 'halo_b30_02':
+                door = [i for i, (_, flags, _, _) in enumerate(table) if flags & 1024]
+                use = [i for i, (_, flags, _, _) in enumerate(table) if flags & 256]
+                if door and use and door[0] > use[0]:
+                    problems.append(f'{name}: door row {door[0]} after the use row {use[0]}')
         if name == 'halo_b30_03':
             if any(flags & (256 | 512 | 1024 | 2048) for _, flags, _, _ in table):
                 problems.append(f'{name}: action rows on the walked return')
@@ -252,7 +314,8 @@ if CRASH_SITE:
             problems.append(str(error))
 
 
-# Walking assists: the .hcol's AST1 trailer (halo_collision.write_structure_collision).
+# Walking assists: the .hcol's AST1 trailer (halo_collision.write_structure_collision); an SCN1 trailer
+# (scenery collision) may stand before it, and its surfaces before the assists (tests/test_retail_scenery.py).
 def hcol_surfaces(path):
     data = path.read_bytes()
     if data[:4] != b'HCL1':
@@ -266,8 +329,10 @@ def hcol_surfaces(path):
     trailers = {}
     while offset < len(data):
         tag, entries = struct.unpack_from('<4sI', data, offset)
-        trailers[tag.decode()] = list(struct.unpack_from(f'<{entries}I', data, offset + 8))
-        offset += 8 + 4 * entries
+        # SCN1 (scenery collision, SCENERY_COLLISION) has three uints an entry: placement, first surface, count.
+        width = 3 if tag == b'SCN1' else 1
+        trailers[tag.decode()] = list(struct.unpack_from(f'<{entries * width}I', data, offset + 8))
+        offset += 8 + 4 * entries * width
     return surfaces, trailers
 
 
@@ -380,6 +445,15 @@ for route in sorted(maps.glob('halo_*_*.route')):
                 break
 print(f'{parked_checked} routes past parked vehicles checked' if bounds else
       'packages/halo/vehicles.txt missing: parked vehicles not checked')
+
+# The Maw's escape countdown (180 s from section 6's start, source/src/halo.cpp escapeTime) against the
+# planned drive of sections 6 to 8 at each section's planned speed (`drive.speed`: 0.9 of the Warthog's
+# top speed, 0.75 in section 8; jumps included): it must leave a third of the time for corners, section loads and the walker easing off.
+if len(escape_seconds) == len(ESCAPE_SECTIONS):
+    total = sum(escape_seconds.values())
+    print(f"the Maw's planned escape drive: {total:.0f} s of the 180 s countdown")
+    if total > ESCAPE_TIME * 2 / 3:
+        problems.append(f"the Maw's planned drive takes {total:.0f} s, more than two thirds of the {ESCAPE_TIME} s countdown")
 
 print(f'{checked} route files checked')
 if problems:

@@ -10,8 +10,11 @@ source/src/halo_fx.cpp:
   (radius in world units, colour, duration), the largest area radius of its `jpt!` parts and
   how many particle systems and particles it carries. The engine draws an effect with
   AssaultCube's own particles (fireballs, sparks, smoke) and a flash sprite sized from these;
-  the tags' particle systems, decals and debris are not converted, and effect damage is not
-  dealt (presentation only).
+  the tags' particle systems, decals and debris are not converted. The strongest damaging `jpt!`
+  part is written as the optional `damage` and `materials` lines (batch 5's critic, gap 11): the
+  engine deals it for a vehicle's death explosion and, with halo_effectdamage 1, for the
+  scripts' effect_new (haloeffectblast in source/src/weapon.cpp). The format stays 1: older
+  games skip the new lines.
 - the player's flashlight (`characters\\cyborg\\flashlight_cyborg`): radius and cone angles.
 - the sound class of every `snd!` tag in each cache (the `classes` lines), which
   sound_class_set_gain fades.
@@ -24,7 +27,7 @@ from pathlib import Path
 
 from import_halo_a30 import HaloMap
 from halo_weapons import CAMPAIGN, EFFECT_EVENTS, EVENT_STRIDE, EVENT_PARTS, PART_STRIDE, PART_TYPE, \
-    effect_sound, jpt_damage, number
+    effect_sound, jpt_damage, jpt_materials, materials_line, number
 
 FORMAT = 1
 EVENT_PARTICLES, PARTICLE_STRIDE = 56, 232     # an effect event's particles block
@@ -41,7 +44,10 @@ FIELDS = '''# flashlight <radius> <falloff angle> <cutoff angle> <r> <g> <b>   w
 #   kind explosion|burst|smoke|glow <scale>   how the engine draws it with its own particles, and how
 #                                         big (1.6 the tags' large particle systems, 0.6 small ones)
 #   light <radius> <r> <g> <b> <seconds>  the first light part
-#   blast <radius>                        the largest jpt! area radius (size only: no damage)
+#   blast <radius>                        the largest jpt! area radius (the drawn blast's size)
+#   damage <inner> <outer> <lower> <upper min> <upper max> <side effect> <category> <core>
+#                                         the strongest damaging jpt! part (world units, points)
+#   materials <33 modifiers>              that part's damage modifier per retail material type
 #   particles <systems> <particles>       particle system and particle parts it carries
 #   sound play <snd! tag>                 the first sound part
 #   end
@@ -92,6 +98,7 @@ def vehicle_effects(halo):
 def effect_record(halo, tag):
     t = halo.tags
     light, blast, strongest, systems, particles, names = None, 0.0, None, 0, 0, [tag.name.lower()]
+    damage, materials = None, None
     for event in t.block(tag.address + EFFECT_EVENTS, EVENT_STRIDE):
         for part in t.block(event + EVENT_PARTS, PART_STRIDE):
             found = halo.reference(t, part + PART_TYPE)
@@ -104,6 +111,9 @@ def effect_record(halo, tag):
                 d = jpt_damage(halo, found)
                 if strongest is None or (d.upper_max, d.outer) > strongest:
                     strongest, blast = (d.upper_max, d.outer), d.outer
+                    # Its damage, when it deals any (a shock wave only pushes).
+                    if d.upper_max > 0 and d.outer > 0:
+                        damage, materials = d, jpt_materials(halo, found)
             elif found.group == 'pctl':
                 systems += 1
                 names.append(found.name.lower())
@@ -122,7 +132,7 @@ def effect_record(halo, tag):
     else:
         kind = 'glow'
     return {'path': tag.name, 'kind': kind, 'scale': scale, 'light': light, 'blast': blast, 'systems': systems,
-            'particles': particles, 'sound': effect_sound(halo, tag)}
+            'particles': particles, 'sound': effect_sound(halo, tag), 'damage': damage, 'materials': materials}
 
 
 def main():
@@ -158,6 +168,12 @@ def main():
             lines.append('light ' + ' '.join(map(number, e['light'])))
         if e['blast'] > 0:
             lines.append(f'blast {number(e["blast"])}')
+        d = e['damage']
+        if d:
+            lines.append('damage ' + ' '.join(map(number, (d.inner, d.outer, d.lower, d.upper_min, d.upper_max))) +
+                         f' {d.side_effect} {d.category} {number(d.core)}')
+            if e['materials']:
+                lines.append(materials_line(e['materials']))
         lines.append(f'particles {e["systems"]} {e["particles"]}')
         if e['sound']:
             lines.append(f'sound play {e["sound"]}')

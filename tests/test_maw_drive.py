@@ -9,7 +9,10 @@ QA client, campaign play with the mission script (qa_maw_route starts section 6)
 2. The QA autopilot drives at the route markers: section 6 hands over to section 7 with the
    player still at the wheel and the countdown carried over (not reset).
 3. Section 8 to the finale: the autopilot reaches grand_finale, the finale plays and the
-   campaign ending is reached before the deadline.
+   campaign ending is reached before the deadline. Batch 10: section 8's drive (the pit room's
+   drop under the hanging bridge segment) is planned below full speed; the autopilot's throttle
+   is capped at the planned speed (`vehicle_route.drive.speed` in halo_d40_08.metrics.json,
+   qa_vehicle_cruise), as a player eases off there. Not yet run.
 4. Killed at the wheel, the player reverts to the section start in a Warthog again.
 5. Slow keystroke run in the packaged app: E, then W held, exits cleanly (the old smoke test).
 6. The escape Warthog and the scenario's: on retail collision section 6 seats the player in one
@@ -18,6 +21,7 @@ QA client, campaign play with the mission script (qa_maw_route starts section 6)
    the script's seat tests (trench_jeep_test) see the player at the wheel in sections 6, 7 and 8.
    Added with the vehicle fixes; not yet run.
 """
+import json
 import re
 import subprocess
 import sys
@@ -90,8 +94,11 @@ assert escapes[first7]['seated'] == '1', ('the player arrives in section 7 at th
 assert int(escapes[first7]['remaining']) <= int(last6['remaining']) + 100, ('the countdown carries over', last6, escapes[first7], log)
 print(f'section 6 driven to section 7 with {int(escapes[first7]["remaining"]) / 1000:.0f} s left.')
 
-# 3. Section 8 to the finale.
-text, log = run('drive8', 'qa_campaign_play 10 8', [(500, 'qa_vehicle_autopilot 170'), (172000, 'quit')], timeout=300)
+# 3. Section 8 to the finale, at the drive's planned speed when it is below full speed.
+metrics8 = root / 'packages/maps/halo_d40_08.metrics.json'
+drive8 = ((json.loads(metrics8.read_text()).get('vehicle_route') or {}).get('drive') or {}) if metrics8.is_file() else {}
+cruise8 = f'qa_vehicle_cruise halo_d40_08 {drive8["speed"]}; ' if drive8.get('speed') else ''
+text, log = run('drive8', 'qa_campaign_play 10 8', [(500, f'{cruise8}qa_vehicle_autopilot 170'), (172000, 'quit')], timeout=300)
 assert 'escape Warthog at' in text, ('section 8 starts at the wheel', log)
 assert 'Halo ending reached' in text or 'cinematic_finale' in text, ('the run reaches the finale', log)
 assert 'cinematic_time_up' not in text, ('before the deadline', log)

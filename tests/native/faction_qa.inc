@@ -147,3 +147,11 @@ COMMANDF(qa_actor_kill_one, "i", (int *kind)
 
 // ATTACH_QA (tests/test_ai_attach.py): the actors ai_attach made of scripted bipeds, and those waiting.
 COMMANDF(qa_attach_state, "s", (const char *label) { haloscenarioattachdump(label); });
+// qa_attach_move OBJECT FORWARD SIDE: the actor attached to OBJECT put that far (world units, by its
+// facing) from where it stands: ATTACH_QA move object=<name> ok=<0|1> (tests/test_ai_attach.py item 10).
+static void qaAttachMove(const char *object, float forward, float side)
+{
+    conoutf("ATTACH_QA move object=%s ok=%d", object, haloscenarioqaattachmove(object, forward, side));
+    fflush(stdout);
+}
+COMMANDF(qa_attach_move, "sff", (const char *object, float *forward, float *side) { qaAttachMove(object, *forward, *side); });

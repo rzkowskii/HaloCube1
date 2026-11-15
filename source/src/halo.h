@@ -19,6 +19,22 @@ struct HaloDamage;
 void halohit(float damage, int sideEffect, playerent *victim, playerent *owner, const vec &dir, int gun, bool gib, int info,
              const HaloDamage *source = NULL, const vec *at = NULL);
 void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source = NULL, const vec *at = NULL);
+// A jpt! blast that is not a weapon's (weapon.cpp): full strength inside `inner`, falling to the
+// lower bound at `outer` (world units, scaled to the section), none beyond; bodies need the line
+// from the centre to their middle clear unless inside the jpt! AOE core radius, as for grenades;
+// riders the hull covers are left to the hull (halovehicleridercovered); the vehicles it reaches
+// take it with the tag's material modifier. `owner` deals it (null: the scripts, in the player's
+// name without counting as betrayal; the player's own hurt as self-inflicted).
+void haloareablast(const vec &centre, const HaloDamage &damage, float inner, float outer, int sideEffect, playerent *owner);
+// Effect `tag`'s jpt! area damage (effects.txt `damage` line, halofxeffectdamage) at `centre`
+// through haloareablast: a vehicle's death explosion (halo_vehicle.cpp) and, with
+// halo_effectdamage 1, the scripts' effect_new. False when the table gives the effect no damage.
+bool haloeffectblast(const char *tag, const vec &centre, playerent *owner);
+// An actor fired a weapon trigger (halofiretrigger): the Hunter's belly window (halodamage) opens
+// from its own cannon fire, not from its smash.
+void haloactorfired(const playerent *p);
+// QA (tests/test_vehicle_damage.py): a grenade of `type` thrown by `owner` goes off at `at` at once.
+bool haloqagrenadeat(int type, const vec &at, playerent *owner);
 // Opacity a camouflaged actor is drawn with (rendermodel.cpp), or a negative value for a body
 // drawn as usual.
 float halomodelalpha(const playerent *p);
@@ -79,6 +95,9 @@ void haloplayermoved(const char *why, const vec *kept = NULL);
 // floor there (retail collision: standing room on the mesh; stock geometry: clear of the cubes).
 // False, and the player left where they are, otherwise or while seated, dead or in the ending.
 bool haloplayerplace(const vec *feet, float yaw, const char *why);
+// The floor under `from` the player's body fits on (`ground`: the feet there), straight down the
+// retail mesh or the cube column; false when there is none (the scripted seat's guard).
+bool haloplayerfloorbelow(const vec &from, vec &ground);
 // FNV-1a of a file's bytes (the progress file's check), 0 when it cannot be read.
 unsigned halofilehash(const char *path);
 int haloescapemillis();

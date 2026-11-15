@@ -1518,6 +1518,37 @@ COMMANDF(qa_retail_assist_stand, "i", (int *index)
     conoutf("RETAIL_QA assist-stand %d at=%.2f,%.2f,%.2f", *index, centre.x, centre.y, centre.z);
     fflush(stdout);
 });
+// qa_retail_scenery: the loaded .hcol's scenery placements (its SCN1 trailer, SCENERY_COLLISION in
+// tools/import_halo_campaign.py), each checked the way Halo collides with scenery: a ray down onto the
+// top of its polygons' bounds stops on a scenery surface (shots and sight lines hit it), a grenade's
+// sweep (assists off) stops on one too, and so does a body's capsule. A placement thinner than the
+// probe at its centre (a tree trunk's side, a tilted plank) may report a miss; the test reads the
+// counts. For tests/test_retail_scenery.py.
+COMMANDF(qa_retail_scenery, "", ()
+{
+    int placement = -1;
+    vec low;
+    vec high;
+    const int count = halocollisionscenery(-1, placement, low, high);
+    conoutf("RETAIL_QA scenery map=%s collision=%d count=%d", getclientmap(), halocollisionactive(), count);
+    loopi(count)
+    {
+        halocollisionscenery(i, placement, low, high);
+        const vec centre((low.x + high.x) / 2, (low.y + high.y) / 2, high.z);
+        const vec above = vec(centre).add(vec(0, 0, 1.5f));
+        const vec down(0, 0, -(high.z - low.z) - 1.6f);
+        HaloCollisionHit ray;
+        HaloCollisionHit body;
+        HaloCollisionHit bounce;
+        const bool rayHits = halocollisiontrace(above, vec(above).add(down), ray) && (ray.flags & haloCollisionScenery);
+        const bool bounceHits = halocollisionsweep(above, down, .2f, .4f, bounce, false) && (bounce.flags & haloCollisionScenery);
+        const bool bodyHits = halocollisionsweep(above, down, player1->radius, player1->eyeheight + player1->aboveeye, body) &&
+                              (body.flags & haloCollisionScenery);
+        conoutf("RETAIL_QA scenery %d placement=%d low=%.2f,%.2f,%.2f high=%.2f,%.2f,%.2f ray_hits=%d bounce_hits=%d body_hits=%d",
+                i, placement, low.x, low.y, low.z, high.x, high.y, high.z, rayHits, bounceHits, bodyHits);
+    }
+    fflush(stdout);
+});
 // qa_retail_where: the player's feet and state, for tests/test_retail_recovery.py.
 COMMANDF(qa_retail_where, "", ()
 {

@@ -42,6 +42,13 @@ VAR(halo_vehicleai, 0, 1, 1);
 // take damage and are destroyed (0: none is hurt; the QA vehicle walker sets it, as the foot
 // walker protects the player).
 VAR(halo_vehicledamage, 0, 1, 1);
+// A destroyed vehicle's body depleted effect deals its jpt! area damage (the Wraith's, Ghost's
+// and Banshee's death explosion: 55 to 65 inside 1.5 world units, 55 at 2.5; haloeffectblast).
+VAR(halo_vehicleexplosion, 0, 1, 1);
+// A grounded vehicle that is destroyed leaves its wreck: a static box bodies collide with, drawn
+// with its model and smoking, until the section ends or a revert goes back past it (off by
+// default: an engine choice, untested against the planned routes, which do not expect it).
+VAR(halo_vehiclewreck, 0, 0, 1);
 
 namespace
 {
@@ -49,7 +56,9 @@ namespace
     // drive; format 1 tables still load (their props take a class from their motion kind).
     constexpr int formatVersion = 2;
     constexpr int maxSeats = 6;
-    constexpr float gravity = 40.0f;            // AssaultCube units per s², as bounce entities fall
+    // AssaultCube units per s², as bounce entities fall: a vehicle's gravity without the table's
+    // `physics` line (an older table, or the built-in Warthog). vehicleGravity derives it otherwise.
+    constexpr float legacyGravity = 40.0f;
     constexpr float minimumTopSpeed = 36.0f;    // the escape's old foot speed: the timer was tuned for it
     constexpr float stockStep = 1.3f;           // the cube grid's floors step by whole cubes
     constexpr int flipEject = 700;              // ms upside down before the riders fall out
@@ -89,6 +98,9 @@ namespace
         unsigned collFlags = 0;
         int material = -1;
         std::string destroyedEffect, variantPath;
+        // The physics (`physics` line): the phys tag's gravity scale and the world's gravity in
+        // Halo units per tick squared (the globals' falling damage block); 0: none in the table.
+        float gravityScale = 1, worldGravity = 0;
     };
     constexpr unsigned collTakesRiderDamage = 2, collOnlyExplosives = 32, collOnlyOccupied = 64;
 
@@ -100,6 +112,10 @@ namespace
         bool exists = false, placed = false, escape = false;
         vec pos, vel;                           // pos: the model origin (its floor), AssaultCube units
         float yaw = 0, pitch = 0, roll = 0, pitchVel = 0, rollVel = 0, steer = 0, climb = 0;
+        // The vertical rate of the surface under the wheels at the current velocity (units/s): from
+        // the floor's normal under the trailing axle (on the cube grid, the slope between the
+        // axles). A vehicle that leaves the ground keeps it: its velocity along the surface.
+        float tangent = 0;
         float smoothZ = 0;                      // drawn height: the cube grid's whole-cube steps eased
         bool grounded = false, flipped = false, sleeping = false, carried = false;
         int flippedAt = 0, stillSince = 0;
@@ -133,6 +149,11 @@ namespace
         // `destroyed`: it blew up (it no longer exists; the scripts' object is gone too).
         float health = 1;
         bool destroyed = false;
+        // A destroyed vehicle left as a wreck (halo_vehiclewreck): it does not exist (no seats, no
+        // shots stopped, no scripts' object), but bodies collide with its box and it is drawn
+        // where it blew up. `wreckSmoke`: when it last gave off smoke.
+        bool wreck = false;
+        int wreckSmoke = 0;
     };
 
     std::vector<VehicleDef> defs;
@@ -146,6 +167,16 @@ namespace
     vec seatEye;                                // where the player was put on the seat last
     float qaThrottle = 0, qaSteer = 0;
     int qaUntil = 0;
+    // QA cruising speeds by section map (qa_vehicle_cruise): QA throttle input stops at the speed
+    // the importer planned that section's drive at (its metrics' `vehicle_route.drive.speed`).
+    struct QaCruise { std::string map; float speed; };
+    std::vector<QaCruise> qaCruise;
+    float qaCruiseCap()
+    {
+        const char *map = getclientmap() ? behindpath(getclientmap()) : nullptr;
+        for(const QaCruise &c : qaCruise) if(c.map == "*" || (map && c.map == map)) return c.speed;
+        return 0;
+    }
     // Bodies part way inside a vehicle that no push could get out (depenetrate): they collide
     // with every other vehicle but may walk out of this one. `retry`: when to try again.
     struct Trap { const physent *body; int vehicle, retry; };
@@ -228,6 +259,8 @@ namespace
         if(!finiteValue(d.modelScale) || d.modelScale <= 0 || !finiteValue(d.radius) || d.radius < 0) return false;
         for(float f : {d.forward, d.reverse, d.acceleration, d.deceleration, d.turn, d.slide}) if(!finiteValue(f)) return false;
         if(!finiteValue(d.vitality) || d.vitality < 0 || !finiteValue(d.bodyMultiplier)) return false;
+        if(!finiteValue(d.gravityScale) || d.gravityScale < 0 || d.gravityScale > 10) return false;
+        if(!finiteValue(d.worldGravity) || d.worldGravity < 0 || d.worldGravity > .1f) return false;
         if(!finiteValue(d.low) || !finiteValue(d.high) || !finiteValue(d.camera)) return false;
         loopi(3) if(d.high[i] <= d.low[i] || d.high[i] - d.low[i] > 100) return false;
         for(const SeatDef &s : d.seats) if(!finiteValue(s.at) || !finiteValue(s.enter)) return false;
@@ -287,6 +320,12 @@ namespace
                 ok = bool(in >> def->vitality >> def->collFlags >> def->material >> def->bodyMultiplier) && def->vitality >= 0;
             else if(key == "destroyed") std::getline(in >> std::ws, def->destroyedEffect);
             else if(key == "variant") std::getline(in >> std::ws, def->variantPath);
+            else if(key == "physics")
+            {
+                // mass, gravity scale, world gravity (Halo units per tick squared), ground depth.
+                float mass = 0, depth = 0;
+                ok = bool(in >> mass >> def->gravityScale >> def->worldGravity >> depth);
+            }
             else if(key == "sound")
             {
                 // Unknown roles are skipped, so a newer table still loads.
@@ -449,6 +488,24 @@ namespace
         return max(floor, def.forward * 30 * s);
     }
 
+    // Airborne gravity in AssaultCube units per s² (also the pull along a slope it drives on):
+    // the world's gravity (Halo units per tick squared, 30 ticks a second) times the phys tag's
+    // gravity scale at the section's scale, times the square of how much faster the engine runs the
+    // vehicle than Halo does (its top speed over the retail speed at that scale, at least 1). The
+    // Warthog's speed is kept at 36 units a second or more for the Maw's timer: 2.1 times the
+    // retail speed at d40 section 8's scale, where retail gravity alone would carry it 4.4 times as
+    // far off a ramp as Halo's Warthog goes. With gravity scaled by the speed ratio squared it flies
+    // the retail Warthog's arcs over the same ground, that much faster (31.8 there, 35.8 in section
+    // 6, 22 in section 7). tools/import_halo_campaign.py vehicle_gravity plans its jumps with the
+    // same value. Without the table's `physics` line, the old 40.
+    float vehicleGravity(const VehicleDef &def, float s)
+    {
+        if(def.worldGravity <= 0) return legacyGravity;
+        const float retail = def.forward * 30 * s;
+        const float ratio = retail > .5f ? max(1.0f, topSpeed(def, s) / retail) : 1.0f;
+        return clamp(def.worldGravity * 900 * def.gravityScale * s * ratio * ratio, 1.0f, 80.0f);
+    }
+
     // Degrees per second a hover craft or a tank turns on the spot: the tag's turn rate when it
     // has one, else the Ghost's 150, slower for the heavier and slower ones (the Wraith about 60,
     // the Scorpion about 45).
@@ -467,15 +524,19 @@ namespace
     }
 
     // Highest floor under (x, y) between `top` and `bottom`. `wall`: solid or too steep there.
-    bool groundAt(float x, float y, float top, float bottom, float &z, bool &wall)
+    // `normal`, when given, gets the floor's normal on retail collision (straight up on the cube
+    // grid, whose floors the drive treats as level).
+    bool groundAt(float x, float y, float top, float bottom, float &z, bool &wall, vec *normal = nullptr)
     {
         wall = false;
+        if(normal) *normal = vec(0, 0, 1);
         if(halocollisionactive())
         {
             HaloCollisionHit hit;
             if(!haloscenariotrace(vec(x, y, top), vec(x, y, bottom), hit)) return false;
             if(hit.normal.z < .2f) { wall = true; return false; }
             z = top + (bottom - top) * hit.fraction;
+            if(normal) *normal = hit.normal;
             return true;
         }
         const int ix = int(floorf(x)), iy = int(floorf(y));
@@ -715,6 +776,7 @@ namespace
         if(!drivenClass(def.vehicleClass) || def.vehicleClass == HALO_VEHICLE_FLYER) throttle = steer = strafe = 0;
         const bool car = def.vehicleClass == HALO_VEHICLE_CAR;
         const float top = topSpeed(def, d.s);
+        const float gravity = vehicleGravity(def, d.s);
         const float reverseTop = max(top * .4f, def.reverse * 30 * d.s);
         const float accelTime = clamp(def.acceleration > 0 ? def.forward / def.acceleration / 30 : 2.0f, 1.2f, 3.0f);
         const float accel = top / accelTime, brake = accel * 2.5f, coast = accel * .35f;
@@ -776,12 +838,29 @@ namespace
         }
         v.vel = vec(f).mul(vf).add(vec(r).mul(vr)).add(vec(0, 0, v.vel.z));
 
-        // Vertical motion while airborne.
+        // Vertical motion while airborne. Rising, it stops at a ceiling (a doorway's lintel over
+        // the far side of a jump) rather than passing into it.
         const float oldz = v.pos.z;
         if(!v.grounded)
         {
             v.vel.z -= gravity * dt;
-            v.pos.z += v.vel.z * dt;
+            float rise = v.vel.z * dt;
+            if(rise > 0 && halocollisionactive())
+            {
+                const float radius = d.halfW * .95f, height = max(2 * radius, d.height - d.step);
+                const float offset = max(0.0f, d.halfL - radius);
+                for(float along : {offset, -offset})
+                {
+                    const vec feet = vec(v.pos).add(vec(f).mul(d.centre + along)).add(vec(0, 0, d.step));
+                    HaloCollisionHit hit;
+                    if(halocollisionsweep(feet, vec(0, 0, rise), radius, height, hit, false) && hit.normal.z < -.3f)
+                    {
+                        rise *= max(0.0f, hit.fraction - .05f);
+                        v.vel.z = 0;
+                    }
+                }
+            }
+            v.pos.z += rise;
             v.pitch += v.pitchVel * dt;
             v.roll += v.rollVel * dt;
             v.pitchVel -= 15.0f * dt;
@@ -840,13 +919,14 @@ namespace
         const float searchTop = max(oldz, v.pos.z) + d.step;
         const float searchBottom = v.grounded ? v.pos.z - d.step * 1.5f : v.pos.z - .02f;
         float heights[4];
+        vec normals[4];
         bool found[4], anyWall = false;
         int count = 0;
         float sum = 0;
         loopi(4)
         {
             bool wall = false;
-            found[i] = groundAt(wheels[i].x, wheels[i].y, searchTop, searchBottom, heights[i], wall);
+            found[i] = groundAt(wheels[i].x, wheels[i].y, searchTop, searchBottom, heights[i], wall, &normals[i]);
             anyWall |= wall;
             if(found[i]) { sum += heights[i]; ++count; }
         }
@@ -857,12 +937,20 @@ namespace
             v.vel.x *= -.2f;
             v.vel.y *= -.2f;
         }
+        // Leaving the ground (the floor ends under all four wheels, or a crest at speed), the
+        // vehicle keeps its velocity along the surface it was on: the horizontal velocity, which
+        // it has, and the surface's vertical rate under the wheels (`tangent`; at most 0.8 of the
+        // speed upwards, and a downhill edge keeps its descent). It used to keep only the eased
+        // climbing rate, and nothing going down. tools/halo_collision.py VehicleGround.jump plans
+        // the d40 jumps with the same launch.
+        const float flat = vec(v.vel.x, v.vel.y, 0).magnitude();
+        const float launchRate = clamp(v.tangent, -flat, flat * .8f);
         if(!count)
         {
             if(v.grounded)
             {
                 v.grounded = false;
-                v.vel.z = v.climb > 0 ? min(v.climb, vec(v.vel.x, v.vel.y, 0).magnitude() * .8f) : 0;
+                v.vel.z = launchRate;
                 v.pitchVel = clamp(v.pitchVel, -120.0f, 120.0f);
                 v.rollVel = clamp(v.rollVel, -120.0f, 120.0f);
             }
@@ -878,7 +966,7 @@ namespace
             if(launch)
             {
                 v.grounded = false;
-                v.vel.z = min(v.climb, vec(v.vel.x, v.vel.y, 0).magnitude() * .8f);
+                v.vel.z = max(0.0f, launchRate);
                 v.pitchVel = clamp(v.pitchVel, -120.0f, 120.0f);
                 v.rollVel = clamp(v.rollVel, -120.0f, 120.0f);
             }
@@ -898,6 +986,27 @@ namespace
                 // The rate it climbs, eased over a tenth of a second: a ramp's, not a single step's.
                 const float rising = clamp((ground - v.pos.z) / max(dt, 1e-3f), -30.0f, 30.0f);
                 v.climb += (rising - v.climb) * min(1.0f, dt * 10);
+                // The surface's vertical rate under the wheels at the vehicle's velocity: on retail
+                // collision from the floor's normal under the trailing axle (the rear wheels going
+                // forward, the last to leave a ramp's end, so the take-off has the angle of the
+                // ramp's lip), else (the cube grid) from the slope between the axles with all four
+                // wheels down. Eased over a sixtieth of a second, against single steps and seams.
+                const int trail = v.vel.dot(f) >= 0 ? 2 : 0;
+                float rate = 0;
+                bool measured = false;
+                if(v.flipped) measured = true;
+                else if(halocollisionactive() && found[trail] && found[trail + 1])
+                {
+                    for(int k = trail; k < trail + 2; ++k)
+                        rate += -(normals[k].x * v.vel.x + normals[k].y * v.vel.y) / max(normals[k].z, .2f) * .5f;
+                    measured = true;
+                }
+                else if(count == 4)
+                {
+                    rate = v.vel.dot(f) * tanf(clamp(pitchTarget, -60.0f, 60.0f) * RAD);
+                    measured = true;
+                }
+                if(measured) v.tangent += (rate - v.tangent) * min(1.0f, dt * 60);
                 v.pos.z = ground;
                 if(!v.flipped)
                 {
@@ -989,7 +1098,7 @@ namespace
         v.pitch += clamp(clamp(in.aimPitch, -55.0f, 55.0f) - v.pitch, -70 * dt, 70 * dt);
         const float bank = clamp(turn / max(dt, 1e-3f) * .35f + in.strafe * 25, -45.0f, 45.0f);
         v.roll += (bank - v.roll) * min(1.0f, dt * 4);
-        v.pitchVel = v.rollVel = v.steer = v.climb = 0;
+        v.pitchVel = v.rollVel = v.steer = v.climb = v.tangent = 0;
         const float yaw = v.yaw * RAD, pitch = v.pitch * RAD;
         const vec nose(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
         vec want(0, 0, 0);
@@ -1000,7 +1109,7 @@ namespace
         const float most = top / 1.6f * dt * (want.magnitude() < v.vel.magnitude() ? 1.4f : 1.0f);
         if(change.magnitude() > most) change.normalize().mul(most);
         v.vel.add(change);
-        if(stunned) v.vel.z -= gravity * .5f * dt;
+        if(stunned) v.vel.z -= vehicleGravity(def, d.s) * .5f * dt;
         vec delta = vec(v.vel).mul(dt);
         for(int pass = 0; pass < 3 && !delta.iszero(); ++pass)
         {
@@ -1044,7 +1153,7 @@ namespace
            groundAt(feet.x, feet.y, feet.z + d.height + 2, feet.z - 8 * d.s, z, wall)) v.pos.z = z;
         v.smoothZ = v.pos.z;
         v.vel = vec(0, 0, 0);
-        v.pitch = v.roll = v.pitchVel = v.rollVel = v.climb = v.steer = 0;
+        v.pitch = v.roll = v.pitchVel = v.rollVel = v.climb = v.tangent = v.steer = 0;
         v.grounded = false;
         v.flipped = v.sleeping = false;
         v.stillSince = 0;
@@ -1366,7 +1475,7 @@ namespace
         for(playerent *&p : v.riders) if(p && p != player1) p = nullptr;
         v.exists = exists;
         v.health = 1;
-        v.destroyed = false;
+        v.destroyed = v.wreck = false;
         v.carried = false;
         v.gun = HaloWeaponState();
         settle(v, v.spawnFeet);
@@ -1672,7 +1781,8 @@ namespace
         loopv(vehicles)
         {
             const Vehicle &v = vehicles[i];
-            if(!v.exists || !defOf(v) || v.carried) continue;
+            // A wreck too (halo_vehiclewreck): a body caught in it when it blew up is pushed out.
+            if(!(v.exists || v.wreck) || !defOf(v) || v.carried) continue;
             const Dims d = dims(v);
             eachBody([&](physent *b, bool isPlayer)
             {
@@ -2323,30 +2433,71 @@ namespace
         return false;
     }
 
+    // The body box as shots, blasts and EMP see it (boxEntry, boxDistance, boxCentre): the yaw-only
+    // box tilted by the vehicle's pitch and roll about its floor point, as halovehiclesrender draws
+    // the model (a Warthog nosing up a ramp, a banking Banshee). A flipped vehicle keeps the level
+    // box of 0.6 of its height (vehicleTop). Axis 0 is forward, 1 right, 2 up; the box spans
+    // low..high along them from `origin`. Bodies still collide with the level box
+    // (halovehiclecollide: the physics stands bodies on its top).
+    struct HitBox { vec origin, axis[3]; float low[3], high[3]; };
+
+    HitBox hitBox(const Vehicle &v, const Dims &dm)
+    {
+        HitBox b;
+        const float yaw = v.yaw * RAD, p = v.flipped ? 0 : v.pitch * RAD, r = v.flipped ? 0 : v.roll * RAD;
+        const vec f(sinf(yaw) * cosf(p), -cosf(yaw) * cosf(p), sinf(p));
+        const vec upLevel(-sinf(yaw) * sinf(p), cosf(yaw) * sinf(p), cosf(p)), right = rightOf(v.yaw);
+        b.origin = v.pos;
+        b.axis[0] = f;
+        b.axis[1] = vec(right).mul(cosf(r)).sub(vec(upLevel).mul(sinf(r)));
+        b.axis[2] = vec(upLevel).mul(cosf(r)).add(vec(right).mul(sinf(r)));
+        b.low[0] = dm.centre - dm.halfL;
+        b.high[0] = dm.centre + dm.halfL;
+        b.low[1] = -dm.halfW;
+        b.high[1] = dm.halfW;
+        b.low[2] = 0;
+        b.high[2] = vehicleTop(v, dm) - v.pos.z;
+        return b;
+    }
+
     // The middle of the body box.
     vec boxCentre(const Vehicle &v, const Dims &dm)
     {
-        return vec(v.pos).add(vec(forwardOf(v.yaw)).mul(dm.centre)).add(vec(0, 0, (vehicleTop(v, dm) - v.pos.z) * .5f));
+        const HitBox b = hitBox(v, dm);
+        vec centre = b.origin;
+        loopi(3) centre.add(vec(b.axis[i]).mul((b.low[i] + b.high[i]) * .5f));
+        return centre;
     }
 
-    // Where the segment enters the body box (yaw only), as a fraction along it, or -1.
+    // How far `point` is from the nearest point of the body box (0 inside it).
+    float boxDistance(const Vehicle &v, const Dims &dm, const vec &point)
+    {
+        const HitBox b = hitBox(v, dm);
+        const vec rel = vec(point).sub(b.origin);
+        float sum = 0;
+        loopi(3)
+        {
+            const float x = rel.dot(b.axis[i]), out = x < b.low[i] ? b.low[i] - x : x > b.high[i] ? x - b.high[i] : 0;
+            sum += out * out;
+        }
+        return sqrtf(sum);
+    }
+
+    // Where the segment enters the body box (pitch and roll included), as a fraction along it, or -1.
     float boxEntry(const Vehicle &v, const Dims &dm, const vec &from, const vec &to)
     {
-        const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
-        const vec centre = vec(v.pos).add(vec(f).mul(dm.centre));
-        const vec o = vec(from).sub(centre), dir = vec(to).sub(from);
-        const float bottom = v.pos.z - centre.z, top = vehicleTop(v, dm) - centre.z;
-        const float origin[3] = {o.dot(f), o.dot(r), o.z}, delta[3] = {dir.dot(f), dir.dot(r), dir.z};
-        const float low[3] = {-dm.halfL, -dm.halfW, bottom}, high[3] = {dm.halfL, dm.halfW, top};
+        const HitBox b = hitBox(v, dm);
+        const vec o = vec(from).sub(b.origin), dir = vec(to).sub(from);
         float enter = 0, leave = 1;
         loopi(3)
         {
-            if(fabsf(delta[i]) < 1e-6f)
+            const float origin = o.dot(b.axis[i]), delta = dir.dot(b.axis[i]);
+            if(fabsf(delta) < 1e-6f)
             {
-                if(origin[i] < low[i] || origin[i] > high[i]) return -1;
+                if(origin < b.low[i] || origin > b.high[i]) return -1;
                 continue;
             }
-            float t0 = (low[i] - origin[i]) / delta[i], t1 = (high[i] - origin[i]) / delta[i];
+            float t0 = (b.low[i] - origin) / delta, t1 = (b.high[i] - origin) / delta;
             if(t0 > t1) std::swap(t0, t1);
             enter = max(enter, t0);
             leave = min(leave, t1);
@@ -2356,7 +2507,8 @@ namespace
     }
 
     // Blown up: the body depleted effect where it stood, every rider killed (the player too,
-    // unless protected), and the vehicle and the scripts' object gone.
+    // unless protected), the effect's jpt! area damage round it (halo_vehicleexplosion), and the
+    // vehicle and the scripts' object gone; a grounded one may leave its wreck (halo_vehiclewreck).
     void destroyVehicle(Vehicle &v, int index, playerent *attacker)
     {
         const VehicleDef &d = *defOf(v);
@@ -2370,6 +2522,8 @@ namespace
         loopi(maxSeats) riders[i] = v.riders[i];
         ejectRiders(v, index);
         v.exists = false;
+        v.wreck = halo_vehiclewreck && v.grounded && !v.carried && d.vehicleClass != HALO_VEHICLE_FLYER;
+        v.wreckSmoke = 0;
         v.sleeping = false;
         // Nobody walks to a seat of it any more.
         for(Boarding &b : boardings) if(b.vehicle == index) b.until = 0;
@@ -2382,7 +2536,21 @@ namespace
             // QA walker's protection.
             dodamage(100000, p, killer, GUN_GRENADE, true);
         }
-        if(v.object >= 0) haloscenarioobjectdestroyed(v.object);
+        if(v.wreck && halo_vehicletrace) conoutf("Halo vehicle: the %s leaves its wreck at %.1f,%.1f,%.1f", d.displayName.c_str(), v.pos.x, v.pos.y, v.pos.z);
+        // `v` is not used past here: the blast below runs other code (deaths, other vehicles).
+        const int object = v.object;
+        // The death explosion's own damage, in the name of whoever destroyed it. The vehicle no
+        // longer exists, so it takes none of it; the tag's modifier for metal is 0, so other
+        // vehicles take none either (no chain of explosions, as in Halo); bodies near it do.
+        if(halo_vehicleexplosion && !halocinematic() && !d.destroyedEffect.empty())
+        {
+            // Nobody living destroyed it (a rider's own mortar, the rider dead with it now; no
+            // attacker): the blast is nobody's (haloareablast's null owner: no betrayal).
+            playerent *owner = attacker && (attacker == player1 || aliveBot(attacker)) ? attacker : nullptr;
+            const bool dealt = haloeffectblast(d.destroyedEffect.c_str(), centre, owner);
+            if(halo_vehicletrace) conoutf("Halo vehicle: the %s's death explosion %s", d.displayName.c_str(), dealt ? "deals its damage" : "has no damage in effects.txt");
+        }
+        if(object >= 0) haloscenarioobjectdestroyed(object);
     }
 }
 
@@ -2547,12 +2715,14 @@ bool halovehiclesstaterestore(const std::vector<std::string> &records, std::stri
         if(r.ok && r.more()) { v.health = r.f(); v.destroyed = r.b(); }
         if(!r.ok || r.more() || !std::isfinite(v.health)) { why = "a vehicle record is damaged"; return false; }
         v.health = clamp(v.health, 0.0f, 1.0f);
-        // A destroyed vehicle is gone; it can only be created again by the script.
+        // A destroyed vehicle is gone; it can only be created again by the script. Its wreck is not
+        // in the record: one is left where it stood when halo_vehiclewreck is on now.
         if(v.destroyed) v.exists = false;
         v.type = -1;
         for(const VehicleDef &d : defs) if(d.name == type) v.type = d.index;
         const VehicleDef *d = defOf(v);
         if(!d) { why = "a saved vehicle's type is not in vehicles.txt"; return false; }
+        v.wreck = v.destroyed && halo_vehiclewreck && v.grounded && !v.carried && d->vehicleClass != HALO_VEHICLE_FLYER;
         if(object != haloscenarioobjectname(v.object)) { why = "a saved vehicle names another scenario object"; return false; }
         if(seat >= int(d->seats.size())) { why = "a saved vehicle seat does not exist"; return false; }
         if(seat >= 0) v.riders[seat] = player1;
@@ -2680,6 +2850,12 @@ void halovehicledrive(int curtime)
             // QA input; a steer outside -1..1 keeps the camera steering.
             if(qa) { in.throttle = qaThrottle; if(fabsf(qaSteer) <= 1) in.steer = qaSteer; }
         }
+        // QA: the planned drive's cruising speed (qa_vehicle_cruise): off the throttle at or above it.
+        if(qa && in.throttle > 0 && d.vehicleClass != HALO_VEHICLE_FLYER)
+        {
+            const float cap = qaCruiseCap();
+            if(cap > 0 && forwardSpeed >= cap) in.throttle = 0;
+        }
         // Stunned by EMP: the engine is out, the car coasts (a Banshee sinks, fly).
         // A hover craft's strafe is its engine too.
         if(lastmillis < v.stunnedUntil) in.throttle = in.strafe = 0;
@@ -2724,6 +2900,12 @@ void halovehiclesupdate(int elapsed)
     {
         Vehicle &v = vehicles[i];
         const VehicleDef *d = defOf(v);
+        // A wreck (halo_vehiclewreck) only smokes.
+        if(v.wreck && !v.exists && d && !halocinematic() && lastmillis - v.wreckSmoke >= 400)
+        {
+            v.wreckSmoke = lastmillis;
+            particle_splash(PART_SMOKE, 3, 1800, boxCentre(v, dims(v)).add(vec(0, 0, dims(v).height * .5f)));
+        }
         if(!v.exists || !d) continue;
         // Carried by a scripted object (a Pelican's cargo hook) or moved by a recording.
         vec carriedAt;
@@ -2858,17 +3040,8 @@ int halovehicleemp(const vec &centre, float radius, int stuck, int millis)
         Vehicle &v = vehicles[i];
         if(!v.exists || !defOf(v)) continue;
         bool reached = i == stuck;
-        if(!reached && radius > 0)
-        {
-            // The nearest point of the body's box (yaw only) to the centre.
-            const Dims dm = dims(v);
-            const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
-            const vec rel = vec(centre).sub(vec(v.pos).add(vec(f).mul(dm.centre)));
-            const float along = max(0.0f, fabsf(rel.dot(f)) - dm.halfL), side = max(0.0f, fabsf(rel.dot(r)) - dm.halfW);
-            const float top = v.pos.z + (v.flipped ? dm.height * .6f : dm.height);
-            const float up = centre.z > top ? centre.z - top : centre.z < v.pos.z ? v.pos.z - centre.z : 0;
-            reached = along * along + side * side + up * up <= radius * radius;
-        }
+        // The nearest point of the body's box (pitch and roll included) to the centre.
+        if(!reached && radius > 0) reached = boxDistance(v, dims(v), centre) <= radius;
         if(!reached) continue;
         v.stunnedUntil = max(v.stunnedUntil, lastmillis + millis);
         v.sleeping = false;
@@ -2908,20 +3081,26 @@ int halovehiclesnear(const vec &centre, float radius, int *out, float *distances
     {
         const Vehicle &v = vehicles[i];
         if(count >= capacity || !destructible(v)) continue;
-        // The nearest point of the body's box (yaw only), as halovehicleemp.
-        const Dims dm = dims(v);
-        const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
-        const vec rel = vec(centre).sub(vec(v.pos).add(vec(f).mul(dm.centre)));
-        const float along = max(0.0f, fabsf(rel.dot(f)) - dm.halfL), side = max(0.0f, fabsf(rel.dot(r)) - dm.halfW);
-        const float top = vehicleTop(v, dm);
-        const float up = centre.z > top ? centre.z - top : centre.z < v.pos.z ? v.pos.z - centre.z : 0;
-        const float distance = sqrtf(along * along + side * side + up * up);
+        // The nearest point of the body's box (pitch and roll included), as halovehicleemp.
+        const float distance = boxDistance(v, dims(v), centre);
         if(distance >= radius) continue;
         out[count] = i;
         distances[count] = distance;
         ++count;
     }
     return count;
+}
+
+bool halovehicleridercovered(const playerent *unit)
+{
+    if(!unit || !haloactive() || !halo_vehicledamage) return false;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        if(!destructible(v) || v.destroyed || !rides(v, unit)) continue;
+        return coversRider(v, *defOf(v), unit);
+    }
+    return false;
 }
 
 float halovehiclehit(int index, float damage, const HaloDamage *source, bool explosive, playerent *attacker)
@@ -3149,7 +3328,9 @@ void halovehiclesrender()
     {
         Vehicle &v = vehicles[i];
         VehicleDef *d = v.type >= 0 && v.type < int(defs.size()) ? &defs[v.type] : nullptr;
-        if(!v.exists || !d || !hasModel(*d)) continue;
+        // A wreck is drawn with the vehicle's own model (the converted models carry no destroyed
+        // permutation), smoking (halovehiclesupdate).
+        if(!(v.exists || v.wreck) || !d || !hasModel(*d)) continue;
         const float s = vehicleScale();
         if(camera1->o.dist(v.pos) > 3200) continue;
         // Orientation as the scene renderer takes it: the retail frame (y flipped) angles.
@@ -3179,7 +3360,7 @@ void halovehiclesrenderplaceholders()
     {
         Vehicle &v = vehicles[i];
         VehicleDef *d = v.type >= 0 && v.type < int(defs.size()) ? &defs[v.type] : nullptr;
-        if(!v.exists || !d || hasModel(*d)) continue;
+        if(!(v.exists || v.wreck) || !d || hasModel(*d)) continue;
         if(!any) { glDisable(GL_TEXTURE_2D); glColor3f(.55f, .8f, .45f); any = true; }
         const Dims dm = dims(v);
         const vec f = forwardOf(v.yaw), r = rightOf(v.yaw), c = vec(v.pos).add(vec(f).mul(dm.centre));
@@ -3203,7 +3384,8 @@ bool halovehiclecollide(physent *d, float &hi, float &lo)
     loopv(vehicles)
     {
         const Vehicle &v = vehicles[i];
-        if(!v.exists || !defOf(v)) continue;
+        // A wreck (halo_vehiclewreck) is as solid as the vehicle was.
+        if(!(v.exists || v.wreck) || !defOf(v)) continue;
         bool rider = false;
         for(playerent *p : v.riders) rider |= p == d;
         if(rider) continue;
@@ -3265,6 +3447,15 @@ void halovehicleobject(int object, bool exists, bool reset, bool bulk)
     Vehicle &v = vehicles[index];
     if(!exists)
     {
+        // The script's object_destroy (and object_destroy_all: `reset`) of a destroyed vehicle
+        // removes its wreck too (halo_vehiclewreck); the destroyed hook (haloscenarioobjectdestroyed,
+        // no reset) that destroyVehicle itself calls leaves it.
+        if(!v.exists && v.wreck && reset)
+        {
+            v.wreck = false;
+            if(halo_vehicletrace) conoutf("Halo vehicle %d's wreck removed by the script", index);
+            return;
+        }
         // Bulk clean-ups (object_destroy_all) leave the player's own vehicle alone.
         if(!v.exists || (bulk && index == playerVehicle)) return;
         ejectRiders(v, index);
@@ -3539,9 +3730,9 @@ void halovehicledump(const char *label)
         const HaloActorDef *variant = d ? variantOf(*d) : nullptr;
         const char *object = haloscenarioobjectname(v.object);
         conoutf("VEHICLE_HEALTH %s vehicle=%d name=%s health=%.3f destroyed=%d vitality=%g flags=%u material=%d occupied=%d "
-                "variant=%d modifier=%g error=%g", label, i, object && *object ? object : "-", v.health, v.destroyed,
+                "variant=%d modifier=%g error=%g wreck=%d", label, i, object && *object ? object : "-", v.health, v.destroyed,
                 d ? d->vitality : 0.0f, d ? d->collFlags : 0u, d ? d->material : -1, occupied(v), variant ? variant->index : -1,
-                variant ? variant->damageScale : 0.0f, variant ? variant->error : 0.0f);
+                variant ? variant->damageScale : 0.0f, variant ? variant->error : 0.0f, v.wreck && !v.exists);
     }
     fflush(stdout);
 }
@@ -3549,6 +3740,66 @@ void halovehicledump(const char *label)
 float halovehicleqadamage(int vehicle, float amount, bool explosive)
 {
     return halovehiclehit(vehicle, amount, nullptr, explosive, player1);
+}
+
+playerent *halovehicleqadriver(int vehicle)
+{
+    return vehicles.inrange(vehicle) && vehicles[vehicle].exists && defOf(vehicles[vehicle]) ? driverOf(vehicles[vehicle]) : nullptr;
+}
+
+bool halovehicleqabeside(int vehicle, float side, vec &point)
+{
+    if(!vehicles.inrange(vehicle) || !vehicles[vehicle].exists || !defOf(vehicles[vehicle])) return false;
+    const Vehicle &v = vehicles[vehicle];
+    const Dims dm = dims(v);
+    const HitBox b = hitBox(v, dm);
+    // From the box's middle out past its right side by `side` units.
+    point = boxCentre(v, dm).add(vec(b.axis[1]).mul(dm.halfW + side));
+    return true;
+}
+
+bool halovehicleqatilt(int vehicle, float pitch, float roll)
+{
+    if(!vehicles.inrange(vehicle) || !vehicles[vehicle].exists || !defOf(vehicles[vehicle])) return false;
+    Vehicle &v = vehicles[vehicle];
+    v.pitch = clamp(pitch, -80.0f, 80.0f);
+    v.roll = clamp(roll, -80.0f, 80.0f);
+    v.pitchVel = v.rollVel = 0;
+    v.flipped = false;
+    // Held there: asleep, so the ground does not level it again before the shot.
+    v.sleeping = true;
+    return true;
+}
+
+bool halovehicleqaprobe(int vehicle, float along, float up, float &fraction, float box[4])
+{
+    if(!vehicles.inrange(vehicle) || !vehicles[vehicle].exists || !defOf(vehicles[vehicle])) return false;
+    const Vehicle &v = vehicles[vehicle];
+    const Dims dm = dims(v);
+    box[0] = dm.centre - dm.halfL;
+    box[1] = dm.centre + dm.halfL;
+    box[2] = dm.halfW;
+    box[3] = vehicleTop(v, dm) - v.pos.z;
+    // Across the vehicle from side to side, level, `along` forward of its floor point and `up` above it.
+    const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
+    const vec at = vec(v.pos).add(vec(f).mul(along)).add(vec(0, 0, up));
+    const vec from = vec(at).sub(vec(r).mul(dm.halfW + 5)), to = vec(at).add(vec(r).mul(dm.halfW + 5));
+    fraction = boxEntry(v, dm, from, to);
+    return true;
+}
+
+bool halovehicleqawreckat(int vehicle, vec &centre)
+{
+    if(!vehicles.inrange(vehicle) || !vehicles[vehicle].wreck || vehicles[vehicle].exists || !defOf(vehicles[vehicle])) return false;
+    centre = boxCentre(vehicles[vehicle], dims(vehicles[vehicle]));
+    return true;
+}
+
+int halovehicleqawrecks()
+{
+    int count = 0;
+    loopv(vehicles) count += vehicles[i].wreck && !vehicles[i].exists;
+    return count;
 }
 
 bool halovehicleqapose(vec &pos, float &yaw)
@@ -3690,6 +3941,45 @@ bool halovehicleqapush(int vehicle, float speed)
     v.vel = vec(forwardOf(v.yaw)).mul(speed);
     v.sleeping = false;
     v.stillSince = 0;
+    return true;
+}
+
+bool halovehicleqajump(const vec &feet, float yaw, float speed)
+{
+    if(!halovehicleseated()) return false;
+    Vehicle &v = vehicles[playerVehicle];
+    v.pos = feet;
+    v.smoothZ = v.stillZ = feet.z;
+    v.yaw = fmodf(yaw + 360.0f, 360.0f);
+    v.pitch = v.roll = v.pitchVel = v.rollVel = v.steer = v.climb = v.tangent = 0;
+    v.vel = vec(forwardOf(v.yaw)).mul(speed);
+    v.grounded = true;
+    v.flipped = v.sleeping = false;
+    v.stillSince = v.airSince = v.embeddedSince = v.stalledSince = 0;
+    player1->yaw = v.yaw;
+    placePlayerOnSeat();
+    return true;
+}
+
+void halovehicleqacruise(const char *map, float speed)
+{
+    if(!map || !*map) { qaCruise.clear(); return; }
+    qaCruise.erase(std::remove_if(qaCruise.begin(), qaCruise.end(), [&](const QaCruise &c) { return c.map == map; }), qaCruise.end());
+    if(speed > 0) qaCruise.push_back({map, speed});
+}
+
+bool halovehicleqamotion(vec &pos, vec &vel, bool &grounded, bool &flipped, float &gravity, float &tangent)
+{
+    if(!halovehicleseated()) return false;
+    const Vehicle &v = vehicles[playerVehicle];
+    const VehicleDef *d = defOf(v);
+    if(!d) return false;
+    pos = v.pos;
+    vel = v.vel;
+    grounded = v.grounded;
+    flipped = v.flipped;
+    gravity = vehicleGravity(*d, vehicleScale());
+    tangent = v.tangent;
     return true;
 }
 

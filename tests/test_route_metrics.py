@@ -28,8 +28,9 @@ low share only means a big map window). The test fails when
 Driven and flown sections with a planned vehicle route (VEHICLE_ROUTES, gap 5: their metrics carry
 `vehicle_route`) are judged as walked ones: a route that ends inside its exit is not held to the reach
 share, and one that does not counts as a stub. Their exit offset is measured to the exit volume's
-middle. With those routes the gate's table keeps c40 section 1 and d40 section 8 (new reasons) and has
-never seen c40 section 4 or d40 sections 6 and 7 as stubs (their raster routes were not either).
+middle. With those routes the gate's table kept c40 section 1 and d40 section 8 (new reasons) and has
+never seen c40 section 4 or d40 sections 6 and 7 as stubs (their raster routes were not either). d40
+section 8 has since left the table (batch 10: its drive reaches grand_finale over three planned jumps, at 0.75 of top speed).
 Not re-run since (testing on hold).
 
 halo_a30, the Crash Site (the engine's first a30 section), is imported from the retail BSP when
@@ -57,15 +58,17 @@ from import_halo_campaign import (CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, 
 # above the cave floor), halo_b30_03 (now a walked route to the Pelican's ledge, no longer
 # RASTER_ROUTES) and halo_b40_03 (now ends in the b3 tower's bottom doorway, the first bsp 1,8).
 # Batch 6 took out halo_c10_03 (now walked on retail collision over two walking assists, ASSISTS).
+# The scenery batch (gap 5 of batch 5's critic) took out halo_c10_06 (now walked on retail collision up the
+# fallen debris under the upper floor's broken edge, over two walking assists, to lift_d; from the
+# importer's metrics, not run through this gate).
+# Batch 10 took out halo_d40_08 (the planned Warthog drive now reaches grand_finale: the jumps launch
+# along the ramp and fall at the retail-derived vehicle gravity, import_halo_campaign.vehicle_gravity).
+# The route batch took out halo_c40_01 (gap 2 of batch 5's critic: the generator doorway was never narrower
+# than the body; BSP 12's seal across it, and BSP 2's, kept the walk out of the room, and are left
+# out now, held_bsps; the planned route ends in bsp 2,10 through door_c1).
 KNOWN_STUBS = {
     'halo_c10_05': "stock geometry (STOCK_SECTIONS): bridge_c's flicker (its panels retract; no assist: a link Halo does not have); "
                    "the raster route ends short of the exit",
-    'halo_c10_06': "stock geometry (STOCK_SECTIONS): the upper storey is out of reach (climbs of 1.0 and more, beyond Halo's jump); "
-                   "the raster route ends short",
-    'halo_c40_01': "flown (VEHICLE_ROUTES): the planned route walks to fly_away_1 and flies to pulse generator 1's platform, "
-                   "but the doorway into its room (BSP 12) is narrower than the body at the section's scale",
-    'halo_d40_08': "driven (VEHICLE_ROUTES): the planned Warthog drive stops at the first gap of the last stretch, which the "
-                   "engine's car cannot jump",
 }
 
 parser = argparse.ArgumentParser()

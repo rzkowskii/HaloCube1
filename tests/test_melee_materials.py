@@ -25,6 +25,15 @@ a30 section 2 (no enemies), with Elites, a Hunter and a Flood combat form spawne
    Flood combat form takes 0.05 of a sniper hit (material 19).
 5. The needle supercombine (qa_damage_needles): 6 needles at once set off nothing, 7 set off one
    super detonation (SUPERCOMBINE needles=7), and with halo_supercombine 0, 7 set off none.
+
+Batch 5's critic, gap 11 and the melee review (written while testing was on hold, not yet run):
+6. Allies are spared the kill from behind (a judgement call, docs "Damage fidelity"): the player's melee
+   from behind on a calm marine (qa_damage_melee_friend) logs DAMAGE_UNSUSPECTING_SPARED (team 1,
+   attached 0) and no DAMAGE_UNSUSPECTING line; its DAMAGE_TRACE amount is the melee's own, not the
+   marine's whole health and shield. (a50's attached Keyes: tests/test_ai_attach.py item 11.)
+7. The Hunter's belly window opens from its cannon fire only: a frontal hit at belly height just after
+   a smash (qa_damage_hunter_act 0: lastaction set, as the smash does) lands on the shield arm (32);
+   just after a cannon shot (qa_damage_hunter_act 1: haloactorfired) on the skin (13).
 """
 import re
 import subprocess
@@ -209,3 +218,34 @@ assert needles['seven']['detonations'] == '1', ('seven needles super-detonate', 
 assert needles['off']['detonations'] == '0', ('halo_supercombine 0 turns it off', needles['off'])
 assert re.search(r'SUPERCOMBINE target=\S+ needles=7 damage=60', text), ('the super detonation is logged', log)
 print('a30 section 2: six stuck needles do nothing, seven super-detonate, halo_supercombine 0 stops it.')
+
+# ---- 6. Allies are spared the kill from behind (batch 5's critic; normal melee damage still applies)
+text, log = run('ally', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_actor_spawn 9 1 6 0'),
+    (1000, 'qa_damage_melee_friend ally'),
+    (1400, 'quit'),
+])
+r = regions(text)
+assert 'ally' in r and 'name' in r['ally'], ('a marine to strike', log)
+spared = [fields(l) for l in text.splitlines() if l.startswith('DAMAGE_UNSUSPECTING_SPARED ')]
+assert spared and spared[0]['team'] == '1' and spared[0]['attached'] == '0', ('the ally is spared and logged', spared, log)
+assert 'DAMAGE_UNSUSPECTING ' not in text, ('no kill from behind on an ally', log)
+traces = [fields(l) for l in text.splitlines() if l.startswith('DAMAGE_TRACE ') and l.split('target=')[1].split()[0] == r['ally']['name']]
+assert traces, ('the melee still lands on the ally', log)
+print(f'a30 section 2: a marine struck from behind is spared the kill (melee {traces[0]["amount"]}, alive={r["ally"]["alive"]}).')
+
+# ---- 7. The Hunter's belly window opens after a cannon shot, not after a smash
+text, log = run('belly', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_actor_spawn 3 0 10 0'),
+    (1000, f'qa_damage_hunter_act 0; qa_damage_region 3 0 0.45 {p} 5 smashed'),
+    (1800, f'qa_damage_hunter_act 1; qa_damage_region 3 0 0.45 {p} 5 fired'),
+    (2200, 'quit'),
+])
+r = regions(text)
+for label, material in {'smashed': '32', 'fired': '13'}.items():
+    assert label in r and r[label].get('material_line'), (label, log)
+    got = r[label]['material_line']
+    assert got['kind'] == '3' and got['material'] == material, (label, material, got)
+print('a30 section 2: the Hunter\'s belly is open after its cannon shot (skin), shut after its smash (shield arm).')

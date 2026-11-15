@@ -303,6 +303,20 @@
         {
             const bool maximum = is("unit_set_maximum_vitality");
             const float health = float(value(1)), shield = float(value(2));
+            // An object ai_attach is about to make an actor (c10's marine_suicidal, given its vitality
+            // right after its attach): queued, and applied when the actor spawns (attachActors, gap 4).
+            const int id = index(0) >= 0 ? object(0) : -1;
+            if(!maximum && !scene && id >= 0 && !actorFromValue(id) && at(attachedAt, id) && attachedAt[id] >= 0 &&
+               at(actors, id) && actors[id].squadReference >= 0 && std::isfinite(health) && std::isfinite(shield))
+            {
+                attachVitality[id] = {clamp(health, 0.0f, 1.0f), clamp(shield, 0.0f, 1.0f)};
+                if(halo_scripttrace) conoutf("HaloScript: %s's vitality waits for its actor (%.2f, %.2f)", program.objects[id].name.c_str(), health, shield);
+            }
+            // One carried in from the section before that has not spawned behind the player yet
+            // (spawnCarried): it spawns with this vitality, and unit_get_health answers it meanwhile.
+            if(!maximum && !scene && id >= 0 && std::isfinite(health) && std::isfinite(shield))
+                for(CarriedAttach &c : carriedAttached)
+                    if(c.object == id) { c.health = clamp(health, 0.0f, 1.0f); c.shield = clamp(shield, 0.0f, 1.0f); }
             eachUnit(index(0), [&](playerent *unit)
             {
                 if(unit == player1) haloplayersetvitality(health, shield, maximum);
@@ -456,7 +470,12 @@
             {
                 // A dropship or Pelican: the actors ride at its seats until vehicle_unload. The
                 // player (unit_enter_vehicle (player0) ...: a10's cryotube, an insertion Pelican
-                // outside a scene) is held in the seat until unit_exit_vehicle (seatPlayer).
+                // outside a scene) is held in the seat until unit_exit_vehicle (seatPlayer). On the
+                // scene stage the player is off stage: the seat is remembered, and taken in play when
+                // the scene ends if nothing in the scene took it back (endCue: b40's pelican_up).
+                if(scene && enter && scriptVehicle(id))
+                    for(playerent *unit : units(index(0)))
+                        if(unit == player1) { sceneSeat = id; sceneSeatName = text(2); }
                 if(scene || !scriptVehicle(id)) return false;
                 bool loaded = false;
                 for(playerent *unit : units(index(enter ? 0 : 2)))
@@ -477,6 +496,9 @@
             bool released = false;
             for(playerent *unit : units(index(0)))
             {
+                // A seat given on the scene stage and taken back there is not taken in play (a50's,
+                // b30's and c10's insertion Pelicans seat and release the player inside their scenes).
+                if(unit == player1 && scene) { sceneSeat = noObject; sceneSeatName.clear(); }
                 // Out of the seat the script held the player in (not in a scene: a scene's player
                 // is off stage, and the scene's end hands them back).
                 if(unit == player1 && !scene && boardedVehicle != noObject && boardedScripted)
@@ -795,7 +817,7 @@
             // The guard against a script that never lets the player out of its seat.
             if(boardedScripted && halo_scriptseatmax > 0 && lastmillis - boardedSince > halo_scriptseatmax * 1000)
             {
-                unseatScripted("held too long (halo_scriptseatmax)");
+                unseatScripted("held too long (halo_scriptseatmax)", true);
                 return;
             }
             // Something else moved the player since the last frame put them in the scripted seat
@@ -924,11 +946,26 @@
     // Out of the scripted seat: where the seat is when the vehicle carried the player off (a
     // Pelican ride), else back where they stood when seated (a10's cryotube: the start in front of
     // it; the tutorial then teleports the player to tutorial_exit_cryotube_flag).
-    void Scenario::unseatScripted(const char *why)
+    // `toFloor` (the halo_scriptseatmax guard, gap 10): a seat carried off may be anywhere, a
+    // Pelican's in mid-air; the player is put on the retail floor under it instead
+    // (haloplayerfloorbelow, the spawn helper's sweep), else back where they were seated.
+    void Scenario::unseatScripted(const char *why, bool toFloor)
     {
         if(boardedVehicle == noObject || !boardedScripted) return;
         const bool carried = projection && boardedAt.dist(boardedStart) > 2.0f * projection->xy;
         conoutf("Halo: the scripted seat lets the player out (%s, after %.1f s)", why, (lastmillis - boardedSince) / 1000.0f);
+        vec ground;
+        if(toFloor && carried && haloplayerfloorbelow(boardedAt, ground))
+        {
+            conoutf("Halo: the player is put on the floor under the seat (%.1f below it)", max(0.0f, boardedAt.z - ground.z));
+            boardedAt = ground;
+        }
+        else if(toFloor && carried)
+        {
+            conoutf("Halo: no floor under the seat; the player goes back where they were seated");
+            unboard(false);
+            return;
+        }
         unboard(carried);
     }
 

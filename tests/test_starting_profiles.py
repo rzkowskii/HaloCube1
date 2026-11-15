@@ -22,6 +22,11 @@ QA client (fresh profiles):
 5. a10 section 1 finished into section 2: the unarmed loadout is carried, not the profile again.
 6. A checkpoint saved unarmed writes `empty 0` and `empty 1` and no weapon line; Continue in a second
    launch is still unarmed.
+7. The fresh-start script (gap 6 of batch 5's critic, freshScripts in source/src/halo_script.cpp, not yet
+   run): a10 section 5 started on its own on Normal logs "a10 section 5 started afresh: the script brought
+   forward (5 globals set, 2 threads passed over, 2 woken)"; mission_tunnel and cryo_search have started,
+   mark_bridge_cutscene is true, the player is never seated in cryotube_1 (no "seats the player"), and
+   mission_a10 goes on to its later wakes (mission_boom started). Section 6 the same; section 4 not at all.
 """
 import subprocess
 import sys
@@ -135,3 +140,19 @@ assert 'empty 0' in lines and 'empty 1' in lines and 'weapon' not in saved, line
 text, profile = run('continue', 'halo_title; sleep 300 [halo_continue] 1; qa_after_gameplay [qa_loadout_state continued; quit]', profile)
 assert loadout(text, 'continued')['unarmed'] == '1', loadout(text, 'continued')
 print('A checkpoint saved unarmed kept the empty slots through Continue.')
+
+# 7. The fresh-start script fast-forward (gap 6): a10 sections 5 and 6 started on their own.
+for part in (5, 6):
+    text, _ = run(f'a10-{part}-fresh', f'halo_scripttrace 1; halo_difficulty 1; qa_campaign_resume 1 {part}; qa_after_gameplay ['
+                  'sleep 12000 [qa_hs_script mission_tunnel 1; qa_hs_script cryo_search 1; qa_hs_script mission_boom 1; '
+                  'qa_hs_global mark_bridge_cutscene; quit] 1]', timeout=150)
+    assert f'a10 section {part} started afresh: the script brought forward (5 globals set, 2 threads passed over, 2 woken)' in text, text[-2000:]
+    started = {line.split()[1]: line.split()[-1] for line in text.splitlines() if line.startswith('HS_SCRIPT ')}
+    assert started.get('mission_tunnel') == '1' and started.get('cryo_search') == '1', started
+    assert started.get('mission_boom') == '1', ('mission_a10 went on past its bridge wait', started)
+    assert [line for line in text.splitlines() if line.startswith('QA_HS_GLOBAL mark_bridge_cutscene')][-1].split()[-1] != '0.0000', text[-2000:]
+    assert 'the script seats the player in cryotube_1' not in text, ('the cryo exit is passed over', text[-2000:])
+    print(f'a10 section {part} on its own: mission_tunnel and cryo_search woken, the cryotube passed over.')
+text, _ = run('a10-4-fresh', 'halo_difficulty 1; qa_campaign_resume 1 4; qa_after_gameplay [sleep 300 [quit] 1]')
+assert 'started afresh: the script brought forward' not in text, text[-2000:]
+print('a10 section 4 on its own is not brought forward.')

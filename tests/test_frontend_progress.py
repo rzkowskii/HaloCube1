@@ -41,6 +41,10 @@ QA client, throwaway profiles. NOT YET RUN: written while testing was on hold.
    scripts' seat test asks whether the player boarded instead of falling back to true) and, after
    sound_class_set_gain music 0.25, `s gain` (Continue keeps the music class at 0.25); a checkpoint on
    a50 section 4 after captain_keyes is attached writes `s attached` and Continue brings the actor back.
+15. A scripted seat round trip (gap 10 of batch 5's critic, not yet run): on a10 section 1 at Normal the
+   tutorial holds the player in cryotube_1; a checkpoint taken then writes `s boarded` with the trailing
+   scripted flag (1), and Continue puts the player back in the tube ("player aboard cryotube_1 again",
+   CARGO_QA boarded=cryotube_1 scripted=1) instead of on foot inside it.
 """
 import shutil
 import struct
@@ -370,3 +374,21 @@ text, profile = run('attach-continue', 'halo_title; sleep 300 [halo_continue] 1;
 keyes = [line for line in rows(text, 'ATTACH_QA continued') if 'object=captain_keyes' in line]
 assert keyes and 'alive=1' in keyes[0], rows(text, 'ATTACH_QA')
 print('Continue kept a boardable Pelican, the music class gain and an attached Keyes.')
+
+# 15. A scripted seat in the state block (gap 10): the cryotube hold survives a save and Continue.
+cryo = read_hscb(root / 'packages/halo/a10.hscb')['objects'].index('cryotube_1')
+text, profile = run('seat-scripted-save', 'halo_scripttrace 1; halo_difficulty 1; qa_campaign_play 1 1; '
+                    'qa_after_gameplay [sleep 1500 [qa_cargo_state seated] 1; sleep 1800 [qa_checkpoint_save] 1; sleep 2100 [quit] 1]',
+                    timeout=150)
+seated = [line for line in rows(text, 'CARGO_QA seated ') if ' loaded=1 ' in line]
+assert seated and 'boarded=cryotube_1' in seated[0] and 'scripted=1' in seated[0], seated
+saved = read_progress(profile)
+boarded = [r for r in saved['records']['s'] if r.startswith('boarded ')]
+assert boarded and boarded[0].split()[1] == str(cryo) and ' =cryotube_1 ' in boarded[0] + ' ' and boarded[0].split()[-1] == '1', \
+    ('the scripted seat is written with its flag', boarded)
+text, profile = run('seat-scripted-continue', 'halo_scripttrace 1; halo_title; sleep 300 [halo_continue] 1; '
+                    'qa_after_gameplay [qa_cargo_state continued; sleep 300 [quit] 1]', profile, timeout=150)
+assert 'Halo: player aboard cryotube_1 again' in text, text[-2000:]
+cont = [line for line in rows(text, 'CARGO_QA continued ') if ' loaded=1 ' in line]
+assert cont and 'boarded=cryotube_1' in cont[0] and 'scripted=1' in cont[0], cont
+print('A save in the cryotube kept the scripted seat; Continue put the player back in it.')

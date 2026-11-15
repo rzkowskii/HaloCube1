@@ -528,15 +528,25 @@ def autumn_nozzles(halo, coronas):
         yield cx, rear + .25, cz, radius
 
 
-def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', bsp=0, include_sky=True, sky_index=None, extra_bsps=()):
+# The mesh loader's limit on one batch's vertices (halo_world.cpp): a larger batch is written as several.
+MESH_BATCH_VERTICES = 199998
+
+
+def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', bsp=0, include_sky=True, sky_index=None, extra_bsps=(),
+                     scenery=()):
     # `extra_bsps`: other BSPs drawn in the same mesh (import_halo_campaign.EXTRA_BSPS: c40 section 1's
-    # pulse generator room).
+    # pulse generator room). `scenery`: scenery placements drawn in it, [(scen tag, (x, y, z, yaw, pitch,
+    # roll))] in retail units (import_halo_campaign.SCENERY_COLLISION: those baked into the section's
+    # .hcol that no mapmodel draws), each in its render model's first permutation (model_meshes), opaque
+    # but for its alpha-tested soso parts (cutout), shaded with the BSP's lightmap colour round its origin.
     legacy = map_name == 'halo_a30'
     xmin, xmax, ymin, ymax = bounds
     flyby = map_name == 'halo_scene_a10_07'
     # The New 3DS renderer selects the authored 64-texel world mip.
     resolution = 64 if flyby else None
     draw_batches, lightmaps = {}, {}
+    # BSP vertex colours by 2-unit cell (retail), which shade the scenery drawn in the mesh.
+    shading = {}
     textures = output / 'textures' / map_name / 'bsp'
     for shader, lightmap_tag, lightmap_index, vertices in (s for b in (bsp, *extra_bsps) for s in halo.surfaces(b)):
         positions = [vertex[0] for vertex in vertices]
@@ -574,10 +584,49 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
                 color = (190, 190, 190)
             else:
                 color = sampled_light(lightmap, lu, lv) if lightmap else (192, 193, 201)
+            if scenery and flags in (0, 1):
+                shading.setdefault((round(x / 2), round(y / 2)), []).append((z, color))
             alpha = 154 if flags == 2 else 255
             batch.extend(struct.pack('<5f4B', *ac_xy(x, y), ac_z(z), u, v, *color, alpha))
             if use_lightmap:
                 batch.extend(struct.pack('<2f', lu, lv))
+    if scenery:
+        from halo_collision import euler_rows
+        models, cutouts = {}, set()
+        drawn = 0
+        for tag, (ox, oy, oz, yaw, pitch, roll) in scenery:
+            if tag.address not in models:
+                model = halo.reference(halo.tags, tag.address + 40, 'mode')
+                try:
+                    models[tag.address] = list(model_meshes(halo, model)) if model else []
+                except (ValueError, IndexError):
+                    models[tag.address] = []
+                if model:
+                    # A soso shader without its "not alpha tested" flag (+40, bit 2) is alpha tested in
+                    # Halo (the pine boughs): its base map goes in a cutout batch (flags 1, alpha kept,
+                    # halo_world.cpp HALO_CUTOUT) rather than an opaque one, whose alpha is forced to 255.
+                    for reference in halo.tags.block(model.address + 220, 32):
+                        shader = halo.reference(halo.tags, reference)
+                        if shader and shader.group == 'soso' and not halo.tags.read('H', shader.address + 40)[0] & 4:
+                            base = halo.reference(halo.tags, shader.address + 164, 'bitm')
+                            if base:
+                                cutouts.add(base.address)
+            if not models[tag.address]:
+                continue
+            near = [c for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                    for z, c in shading.get((round(ox / 2) + dx, round(oy / 2) + dy), ()) if abs(z - oz) < 3]
+            color = tuple(round(sum(c[i] for c in near) / len(near)) for i in range(3)) if near else (192, 193, 201)
+            rows = euler_rows(yaw, pitch, roll)
+            for texture, points, uv, triangles, _ in models[tag.address]:
+                placed = [tuple(sum(a * b for a, b in zip(row, p)) + o for row, o in zip(rows, (ox, oy, oz))) for p in points]
+                batch = draw_batches.setdefault((texture, 1 if texture.address in cutouts else 0, 0.0, -1), bytearray())
+                for triangle in triangles:
+                    for index in triangle:
+                        x, y, z = placed[index]
+                        u, v = uv[index]
+                        batch.extend(struct.pack('<5f4B', *ac_xy(x, y), ac_z(z), u, v, *color, 255))
+            drawn += 1
+        print(f'{map_name}: {drawn} of {len(scenery)} scenery placements drawn in the mesh', flush=True)
     sky_refs = halo.tags.block(halo.scenario + 48, 16)
     sky_model = None
     if include_sky and sky_refs:
@@ -596,7 +645,7 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
                     u, v = uv[index]
                     batch.extend(struct.pack('<5f4B', x / 100, -y / 100, z / 100, u, v, 255, 255, 255, 255))
     batches = bytearray()
-    triangle_count = 0
+    triangle_count = written = 0
     for i, ((texture, flags, detail_scale, light_index), vertices) in enumerate(sorted(draw_batches.items(), key=lambda item: item[0][1])):
         try:
             w, h, (pixels,) = decode_bitmap(halo, texture, resolution=resolution)
@@ -614,14 +663,22 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
             # Terrain base-map alpha chooses Halo detail layers and does
             # not make the terrain surface transparent.
             pixels[3::4] = bytes([255]) * (w * h)
+        if i > 99:
+            raise ValueError(f'{map_name}: more than 100 mesh textures (halo_world.cpp reads two digits)')
         filename = f'packages/textures/{map_name}/bsp/material_{i:02}.png'
         write_png(textures / f'material_{i:02}.png', w, h, pixels)
-        count = len(vertices) // (32 if light_index >= 0 else 24)
-        batches.extend(struct.pack('<96s2If', filename.encode(), flags, count, detail_scale))
-        if flyby:
-            batches.extend(struct.pack('<i', light_index))
-        batches.extend(vertices)
-        triangle_count += count // 3
+        stride = 32 if light_index >= 0 else 24
+        total = len(vertices) // stride
+        # Every BSP batch so far is under the loader's limit, so their files are unchanged; a larger
+        # one (the drawn scenery's) is split, sharing its texture.
+        for first in range(0, total, MESH_BATCH_VERTICES):
+            count = min(MESH_BATCH_VERTICES, total - first)
+            batches.extend(struct.pack('<96s2If', filename.encode(), flags, count, detail_scale))
+            if flyby:
+                batches.extend(struct.pack('<i', light_index))
+            batches.extend(vertices[first * stride:(first + count) * stride])
+            written += 1
+        triangle_count += total // 3
     if flyby:
         for index, image in lightmaps.items():
             if image is None:
@@ -648,7 +705,9 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
         batches.extend(struct.pack('<I', len(nozzles)))
         for nozzle in nozzles:
             batches.extend(struct.pack('<4f', *nozzle))
+    if written > 128:
+        raise ValueError(f'{map_name}: {written} mesh batches, more than halo_world.cpp loads (128)')
     magic = b'HWM4' if flyby else b'HWM2'
-    (maps / f'{map_name}.mesh').write_bytes(struct.pack('<4sI', magic, len(draw_batches)) + batches)
+    (maps / f'{map_name}.mesh').write_bytes(struct.pack('<4sI', magic, written) + batches)
     print(f'{map_name}: {triangle_count:,} BSP triangles and {len(draw_batches)} texture batches', flush=True)
     return triangle_count

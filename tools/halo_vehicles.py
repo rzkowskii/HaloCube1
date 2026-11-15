@@ -39,6 +39,15 @@ OBJECT_COLLISION = 112
 UNIT_SEATS, SEAT_STRIDE = 740, 284  # unit seats block: flags u32 at 0, label at 4, marker at 36
 COLL_FLAGS, COLL_INDIRECT, COLL_VITALITY, COLL_DEPLETED_EFFECT = 0, 4, 8, 168
 COLL_MATERIALS, MATERIAL_STRIDE, MATERIAL_TYPE, MATERIAL_BODY = 564, 72, 36, 60
+# The object's physics (phys, object +128): mass at 8, gravity scale at 28 and ground depth (how far
+# its mass points sink into the ground before it pushes back, Halo units) at 36.
+OBJECT_PHYSICS, PHYS_MASS, PHYS_GRAVITY_SCALE, PHYS_GROUND_DEPTH = 128, 8, 28, 36
+# The world's gravity, which no tag stores directly: the globals' (matg) falling damage block (+392,
+# 152 bytes) holds the maximum falling distance at 40 (Halo units) and, computed by the cache
+# builder, the velocity a fall that far reaches at 140 (units a tick), so gravity = v^2 / 2d
+# (0.003565 Halo units a tick squared in every campaign cache; the harmful 3 and 6 unit falls'
+# velocities at 144 and 148 give the same).
+GLOBALS_FALLING_DAMAGE, FALLING_STRIDE, FALLING_MAXIMUM_DISTANCE, FALLING_MAXIMUM_VELOCITY = 0x188, 152, 40, 140
 
 # name, tag, engine class, vehicle weapon, whether the player may take the driver's seat.
 # `car` drives on wheels (the Warthog), `turret` is a fixed gun with a gunner seat, `hover`
@@ -79,6 +88,10 @@ FIELDS = '''# vehicle <index> <name>
 # destroyed <effe tag>         the body depleted effect, played where it is destroyed
 # variant <actv tag>           the actor variant an actor seated at its gun fights as (by name:
 #                              "<vehicle tag> pilot" or "gunner"; the retail tags reference none)
+# physics <mass> <gravity scale> <world gravity> <ground depth>   the phys tag's mass, gravity
+#                              scale and ground depth (Halo units), and the world's gravity (Halo
+#                              units per tick squared, from the globals' falling damage block): the
+#                              engine's airborne vehicle gravity (halo_vehicle.cpp vehicleGravity)
 '''
 
 
@@ -149,6 +162,9 @@ def record(halo, tag, index, name, kind, weapon, player, output):
     variant = vehicle_variant(halo, tag.name)
     if variant:
         lines.append(f'variant {variant}')
+    physics = vehicle_physics(halo, tag)
+    if physics:
+        lines.append('physics ' + ' '.join(f'{v:.6g}' for v in physics))
     lines.append('end')
     return lines
 
@@ -171,6 +187,38 @@ def vehicle_health(halo, tag):
     if not (vitality > 0 and math.isfinite(vitality)):
         vitality = 0.0
     return vitality, flags, material, multiplier, effect.name if effect and effect.group == 'effe' else None
+
+
+def world_gravity(halo):
+    """The world's gravity in Halo units per tick squared, from the globals' falling damage block
+    (v^2 / 2d of its maximum fall), or None without one."""
+    t = halo.tags
+    globals_tag = next((tag for tag in halo.directory if tag.group == 'matg'), None)
+    if globals_tag is None:
+        return None
+    for block in t.block(globals_tag.address + GLOBALS_FALLING_DAMAGE, FALLING_STRIDE):
+        distance, = t.read('f', block + FALLING_MAXIMUM_DISTANCE)
+        velocity, = t.read('f', block + FALLING_MAXIMUM_VELOCITY)
+        if math.isfinite(distance) and math.isfinite(velocity) and distance > 0 and velocity > 0:
+            gravity = velocity * velocity / (2 * distance)
+            if 1e-4 < gravity < .1:
+                return gravity
+    return None
+
+
+def vehicle_physics(halo, tag):
+    """(mass, gravity scale, world gravity, ground depth) of a vehicle's phys tag, or None."""
+    t = halo.tags
+    phys = halo.reference(t, tag.address + OBJECT_PHYSICS, 'phys')
+    gravity = world_gravity(halo)
+    if not phys or gravity is None:
+        return None
+    mass, = t.read('f', phys.address + PHYS_MASS)
+    scale, = t.read('f', phys.address + PHYS_GRAVITY_SCALE)
+    depth, = t.read('f', phys.address + PHYS_GROUND_DEPTH)
+    if not all(math.isfinite(v) for v in (mass, scale, depth)) or not 0 <= scale <= 10:
+        return None
+    return mass, scale, gravity, depth
 
 
 def vehicle_variant(halo, path):

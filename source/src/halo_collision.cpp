@@ -57,7 +57,10 @@ namespace
         std::vector<Surface> surfaces;
         std::vector<Node> nodes;
         std::vector<int> devices; // scenario machines whose polygons are part of the mesh, sorted
+        std::vector<int> scenery; // scenario scenery placements whose polygons are part of the mesh (SCN1 order)
+        std::vector<unsigned> sceneryFirst, sceneryCount; // each placement's surfaces (file order)
         unsigned assists = 0;     // surfaces that are walking assists (flag haloCollisionAssist)
+        unsigned scenerySurfaces = 0; // surfaces of those scenery placements (flag haloCollisionScenery)
 
         unsigned build(unsigned first, unsigned count)
         {
@@ -144,20 +147,36 @@ namespace
             data.surfaces.push_back(surface);
         }
         // Optional trailers, in this order: DEV1, the static scenario machines baked into the
-        // surfaces; AST1, the surfaces (file order) that are authored walking assists.
+        // surfaces; SCN1, the scenery placements baked in (each its scenario index, then the first
+        // surface and count of its polygons, file order: ordinary static surfaces, counted and
+        // flagged for QA); AST1, the surfaces (file order) that are authored walking assists.
         std::vector<unsigned> assists;
-        bool devicesRead = false, assistsRead = false;
+        bool devicesRead = false, sceneryRead = false, assistsRead = false;
         while(file.tell() < bytes)
         {
             char tag[4];
             if(file.read(tag, sizeof(tag)) != sizeof(tag) || long(file.tell()) + 4 > bytes) return false;
             const unsigned entries = file.getlil<uint>();
             if(entries > 65536 || long(file.tell()) + long(entries) * 4 > bytes) return false;
-            if(!memcmp(tag, "DEV1", sizeof(tag)) && !devicesRead && !assistsRead)
+            if(!memcmp(tag, "DEV1", sizeof(tag)) && !devicesRead && !sceneryRead && !assistsRead)
             {
                 loopi(int(entries)) data.devices.push_back(int(file.getlil<uint>()));
                 std::sort(data.devices.begin(), data.devices.end());
                 devicesRead = true;
+            }
+            else if(!memcmp(tag, "SCN1", sizeof(tag)) && !sceneryRead && !assistsRead)
+            {
+                if(long(file.tell()) + long(entries) * 12 > bytes) return false;
+                loopi(int(entries))
+                {
+                    const unsigned placement = file.getlil<uint>(), first = file.getlil<uint>(), surfaces = file.getlil<uint>();
+                    if(placement > 65535 || !surfaces || first >= count || surfaces > count - first) return false;
+                    if(!data.sceneryFirst.empty() && first < data.sceneryFirst.back() + data.sceneryCount.back()) return false;
+                    data.scenery.push_back(int(placement));
+                    data.sceneryFirst.push_back(first);
+                    data.sceneryCount.push_back(surfaces);
+                }
+                sceneryRead = true;
             }
             else if(!memcmp(tag, "AST1", sizeof(tag)) && !assistsRead)
             {
@@ -175,7 +194,19 @@ namespace
         if(file.tell() != bytes || data.surfaces.empty()) return false;
         for(Surface &surface : data.surfaces)
         {
-            if(!std::binary_search(assists.begin(), assists.end(), unsigned(surface.index))) continue;
+            const unsigned index = unsigned(surface.index);
+            // The ranges ascend without overlapping (checked as they were read).
+            auto next = std::upper_bound(data.sceneryFirst.begin(), data.sceneryFirst.end(), index);
+            if(next != data.sceneryFirst.begin())
+            {
+                const size_t range = size_t(next - data.sceneryFirst.begin()) - 1;
+                if(index - data.sceneryFirst[range] < data.sceneryCount[range])
+                {
+                    surface.flags |= haloCollisionScenery;
+                    ++data.scenerySurfaces;
+                }
+            }
+            if(!std::binary_search(assists.begin(), assists.end(), index)) continue;
             surface.flags |= haloCollisionAssist;
             ++data.assists;
         }
@@ -362,11 +393,38 @@ void halocollisionmap(const char *name)
         return;
     }
     mesh = std::move(loaded);
+    // The scenery count follows the parenthesis, so the machines-and-assists form stays as it was.
+    string scenery = "";
+    if(!mesh.scenery.empty())
+        formatstring(scenery)(", %u scenery objects (%u surfaces)", unsigned(mesh.scenery.size()), mesh.scenerySurfaces);
     if(mesh.assists)
-        conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines, %u walking assists)",
-                unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()), mesh.assists);
+        conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines, %u walking assists)%s",
+                unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()), mesh.assists, scenery);
     else
-        conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines)", unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()));
+        conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines)%s", unsigned(mesh.surfaces.size()), name,
+                unsigned(mesh.devices.size()), scenery);
+}
+
+int halocollisionscenery(int index, int &placement, vec &low, vec &high)
+{
+    if(!halocollisionactive()) return 0;
+    const int objects = int(mesh.scenery.size());
+    if(index < 0 || index >= objects) return objects;
+    placement = mesh.scenery[index];
+    // The tree build reorders mesh.surfaces; a surface keeps its file order in `index`.
+    const int first = int(mesh.sceneryFirst[index]), last = first + int(mesh.sceneryCount[index]);
+    low = vec(1e16f, 1e16f, 1e16f);
+    high = vec(-1e16f, -1e16f, -1e16f);
+    for(const Surface &surface : mesh.surfaces)
+    {
+        if(surface.index < first || surface.index >= last) continue;
+        loopk(3)
+        {
+            low[k] = min(low[k], surface.bounds.low[k]);
+            high[k] = max(high[k], surface.bounds.high[k]);
+        }
+    }
+    return objects;
 }
 
 int halocollisionassist(int index, vec &centre, vec &normal)

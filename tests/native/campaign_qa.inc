@@ -589,6 +589,13 @@ COMMANDF(qa_hs_cue, "s", (const char *script)
     conoutf("QA_CUE %s %d", script, haloscenarioqacue(script));
     fflush(stdout);
 });
+// Skips the scene playing, if one is (QA_SKIP 1), and nothing else: halo_next with no scene
+// playing goes on to the next section (tests/test_mission_exits.py item 6).
+COMMANDF(qa_scene_skip, "", ()
+{
+    conoutf("QA_SKIP %d", halocinematicskip());
+    fflush(stdout);
+});
 // qa_halo_flag river_hide_flag stands the player at a cutscene flag (unchecked, as a QA teleport).
 COMMANDF(qa_halo_flag, "s", (const char *flag)
 {

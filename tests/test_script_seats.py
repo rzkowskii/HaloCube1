@@ -16,6 +16,18 @@ a10 section 1 (retail collision):
 
 c20 section 1: ai_kill of the Monitor's squad (bsp0_monitor) leaves him alive; ai_erase removes him
 with no death (no killed line, living count 0).
+
+b40 section 1 (gaps 3 and 10 of batch 5's critic, not yet run), the opening scene played through
+(not skipped):
+6. cutscene_insertion_a wakes pelican_up on the scene stage, whose unit_enter_vehicle (player0)
+   insertion_pelican p-riderlf is remembered and taken when the scene ends ("Halo scene:
+   cutscene_insertion_a leaves the player seated in insertion_pelican"): CARGO_QA boarded=insertion_pelican
+   scripted=1 after the scene, the Pelican on its recording; the gameplay cutscene_insertion_b waits for
+   the recording and lets the player out (unit_exit_vehicle) at the landing.
+7. halo_scriptseatmax 3 on the same ride: the guard lets the player out while the Pelican flies and
+   puts them on the retail floor under the seat ("put on the floor under the seat"), or, with no floor
+   under it, back where they were seated; either way two samples a second apart stand still (on a floor,
+   not falling).
 """
 import re
 import subprocess
@@ -135,3 +147,45 @@ assert counts[2] == counts[1], ('ai_kill spares the Monitor', counts, log)
 assert counts[3] == 0, ('ai_erase removes him', counts, log)
 assert 'ai_kill spares' in text and 'ai_erase removes' in text, log
 print('c20 section 1: ai_kill spared the Monitor and ai_erase removed him without a death.')
+
+
+# ---- b40 section 1: the insertion Pelican ride (gap 3) and the guard's drop to the floor (gap 10).
+def raw_run(name, start, schedule, timeout=300):
+    # Plain sleeps from launch, so the opening scene plays through (qa_after_gameplay skips scenes).
+    profile = scratch(f'seats-{name}-')
+    body = '; '.join(f'sleep {delay} [{action}] 1' for delay, action in schedule)
+    log = profile / 'run.log'
+    with log.open('w') as output:
+        subprocess.run([QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600',
+                        f'-ehalo_scripttrace 1; {start}; {body}'],
+                       cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, check=True)
+    return log.read_text(errors='replace'), log
+
+
+if not (root / 'packages/maps/halo_b40_01.cgz').exists():
+    print('SKIP b40 insertion ride: halo_b40_01 is not imported.')
+else:
+    samples = [(4000 + 2000 * i, f'qa_cargo_state r{i}') for i in range(70)]
+    text, log = raw_run('b40-ride', 'halo_difficulty 1; qa_campaign_play 5 1', samples + [(146000, 'quit')], timeout=240)
+    assert 'Halo scene: cutscene_insertion_a start' in text and 'Halo scene: cutscene_insertion_a finished' in text, \
+        ('the opening scene played through', log)
+    assert 'Halo scene: cutscene_insertion_a leaves the player seated in insertion_pelican (p-riderlf)' in text, log
+    rows = cargo(text)
+    seated = [r for r in rows if r['boarded'] == 'insertion_pelican' and r['scripted'] == '1']
+    assert seated, ('held in the Pelican after the scene', [(r['label'], r['boarded']) for r in rows], log)
+    after = [r for r in rows if int(r['label'][1:]) > int(seated[-1]['label'][1:])]
+    assert after and after[-1]['boarded'] == '-', ('let out at the landing', [(r['label'], r['boarded']) for r in rows], log)
+    assert re.search(r'the scripted seat lets the player out \(unit_exit_vehicle', text), ('cutscene_insertion_b lets them out', log)
+    assert dist(point(seated[0]), point(seated[-1])) > 2, ('the Pelican carried the player', seated[0], seated[-1])
+    print(f'b40: seated in the insertion Pelican after the scene for {len(seated)} samples, let out by cutscene_insertion_b.')
+
+    samples = [(4000 + 1000 * i, f'qa_cargo_state g{i}') for i in range(70)]
+    text, log = raw_run('b40-guard', 'halo_difficulty 1; halo_scriptseatmax 3; qa_campaign_play 5 1', samples + [(76000, 'quit')], timeout=150)
+    assert 'held too long (halo_scriptseatmax)' in text, log
+    assert 'put on the floor under the seat' in text or 'no floor under the seat' in text, log
+    rows = cargo(text)
+    out = [i for i, r in enumerate(rows) if r['boarded'] == '-' and i and rows[i - 1]['boarded'] == 'insertion_pelican']
+    assert out, ([(r['label'], r['boarded']) for r in rows], log)
+    a, b = rows[out[0] + 1], rows[out[0] + 2]
+    assert abs(point(a)[2] - point(b)[2]) < .2, ('the player stands on a floor after the guard, not falling', a, b)
+    print('b40: the guard let the player out of the flying Pelican onto a floor.')

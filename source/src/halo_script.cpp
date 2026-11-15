@@ -28,6 +28,12 @@ VARP(halo_difficulty, 0, 1, 3);
 // that never reaches its unit_exit_vehicle.
 VAR(halo_scriptseat, 0, 1, 1);
 VAR(halo_scriptseatmax, 0, 180, 3600);
+// effect_new and effect_new_on_object_marker also deal the effect's jpt! area damage
+// (effects.txt `damage` lines, haloeffectblast): off by default, an optional fidelity item. The
+// explosions the scripts create (effects\explosions\...) carry the medium explosion's jpt!, 15 to
+// 25 inside 1.5 world units and 5 at 2.5; their cinematic variants carry none. With it on, a
+// scripted explosion hurts what stands in it, which the planned routes were not made for.
+VAR(halo_effectdamage, 0, 0, 1);
 
 int halodifficulty() { return clamp(int(halo_difficulty), 0, 3); }
 // Enemy damage and vitality relative to Normal, and the player's incoming damage.
@@ -547,11 +553,34 @@ namespace
         bool suspended = false;
         int scriptFlags = 0;   // HALO_AI_* bits scripts set, reapplied when a revert respawns the actor
         // ai_attach: the scripted object this actor stands for (-1 an encounter's own actor). Its
-        // start is Scenario::objectStarts[object]: where it took over, or stood at the checkpoint.
+        // start is Scenario::objectStarts[object]: where it took over (its spawn, which
+        // ai_teleport_to_starting_location goes back to).
         int object = -1;
+        // An attached actor's checkpoint copy (savedSquadBots): where it stood when the checkpoint
+        // was taken (scenario units, as SquadStart), which a revert or Continue brings it back to;
+        // its start stays its spawn.
+        bool stood = false;
+        vec stoodPoint = vec(0, 0, 0);
+        float stoodYaw = 0;
         // An attached object whose actor died before the checkpoint: kept, with no actor, so that
         // a revert does not make the object an actor again (unit_get_health stays -1).
         bool gone = false;
+        // An attached actor's health and shield (fractions) when the checkpoint was taken: a revert
+        // or a Continue brings it back with them (a50's game_lost_script reads Keyes's health).
+        float health = 1, shield = 1;
+    };
+
+    // An actor ai_attach made of a scripted object, alive when the player walked on into the next
+    // section of the mission (a50's Keyes and the freed marines, from the cell block to the hangar):
+    // spawned again behind the player on the next section's first live ticks, with its health,
+    // as a member of its squad standing for its object (Scenario::spawnCarried, gap 4).
+    struct CarriedAttach
+    {
+        int object = -1, encounter = -1, squad = -1;
+        SquadStart start{};
+        float health = 1, shield = 1;
+        bool suspended = false;
+        int scriptFlags = 0, retry = 0;
     };
 
     struct Playback
@@ -638,6 +667,19 @@ namespace
         // block's `s attaching` record carries the waiting ones through a Continue.
         std::vector<SquadStart> objectStarts;
         std::vector<int> attachedAt, attachRetry, savedAttachedAt;
+        // Attached actors carried in from the section before that have no actor here yet
+        // (spawnCarried); savedCarried is the list at the checkpoint (the carried-in section's
+        // checkpoint is usually taken before they spawn), restored by a revert.
+        std::vector<CarriedAttach> carriedAttached, savedCarried;
+        // The living attached actors as the last live tick saw them (snapshotAttached): what a
+        // walk into the next section carries. Kept as plain data, since the actors themselves are
+        // gone (kickallbots) by the time the next section's script starts.
+        std::vector<CarriedAttach> carryCandidates;
+        // Unit commands a script gave an attached object before its actor existed
+        // (unit_set_current_vitality: c10's marine_suicidal right after its ai_attach): the health
+        // and shield fractions, applied when the actor spawns (attachActors). Kept with the checkpoint.
+        struct QueuedVitality { float health, shield; };
+        std::unordered_map<int, QueuedVitality> attachVitality, savedAttachVitality;
         // A Call scene's gameplay music (gap 12): the looping sounds playing when it started,
         // restarted when it ends unless the scene stopped them.
         struct CallMusic { int id; float gain; bool alternate; };
@@ -669,6 +711,19 @@ namespace
         std::mt19937 random{0x48414c4f};
         Thread director;
         std::unordered_map<int, Thread> sceneThreads;
+        // Gameplay scripts the running scene's threads woke (not scenes of the cue table): in Halo
+        // they are ordinary threads that go on after the cutscene, so endCue moves the ones still
+        // running onto the gameplay threads (b30's music_b30 waiting for its cues, a50's and d40's
+        // insertion dialogue). Gap 3.
+        std::vector<int> sceneWoken;
+        // The running scene is one a script calls inside (if (cinematic_skip_start) ...) (x10, d40's
+        // bridge scene): Halo's skip reverts to before it, so a skip leaves nothing it woke or seated.
+        bool cueSkippable = false;
+        // A seat a scene's thread gave the player (unit_enter_vehicle (player0) on the scene stage,
+        // where the player is off stage) and no later unit_exit_vehicle took back: b40's pelican_up,
+        // woken by cutscene_insertion_a. When the scene ends the player takes it in play (endCue).
+        int sceneSeat = noObject;
+        std::string sceneSeatName;
         CameraMotion camera;
         Fade fade;
         const SceneCue *cue = nullptr;
@@ -731,6 +786,8 @@ namespace
         void endCue(bool skipped);
         const SceneCue *callCue(const std::string &script) const;
         bool cueScript(const std::string &script) const;
+        bool skippableScene(const char *scene) const;
+        bool callsScript(uint32_t datum, int target, int depth) const;
         void findHandoff(uint32_t datum, int depth);
         bool placePlayer(int teleport, int facing, const char *why);
         bool unitInVolume(int volume, const playerent *unit) const;
@@ -792,12 +849,15 @@ namespace
         bool board();
         void unboard(bool keepPlace);
         bool seatPlayer(int vehicle, const char *seat);
-        void unseatScripted(const char *why);
+        void unseatScripted(const char *why, bool toFloor = false);
         void clearCargo();
         void configureActor(playerent *bot, int encounter, int squad, const SquadStart &start);
         int attachedEntry(int object) const;
         void attachActors();
+        void spawnCarried();
+        void snapshotAttached();
         void detachActor(int object);
+        void fastForwardFresh();
         void finishTalking();
         void updatePlatoons();
         int actorListFor(int reference);
@@ -916,6 +976,9 @@ namespace
         const Script &script = program.scripts[index];
         if(script.kind > 2) return;
         Thread &thread = scene ? sceneThreads[index] : threads[index];
+        // A gameplay script a scene wakes (gap 3): endCue carries it on in play if it is still running.
+        if(scene && cue && !cueScript(script.name) && std::find(sceneWoken.begin(), sceneWoken.end(), index) == sceneWoken.end())
+            sceneWoken.push_back(index);
         if(thread.done && script.kind != 2) return;
         thread.disabled = false;
         thread.wake = tick;
@@ -2293,6 +2356,8 @@ namespace
             if(value >= 0 && halovehiclebound(value)) return result(halovehiclehealth(value));
             // An attached object whose actor died or is gone (ai_attach, attachActors).
             if(attachedEntry(value) >= 0) return result(-1.0f);
+            // One carried in from the section before that has not spawned here yet (spawnCarried).
+            for(const CarriedAttach &c : carriedAttached) if(c.object == value) return result(c.health);
             if(value < 0 || !at(actors, value) || !actors[value].visible) return result(-1.0f);
             const Object &unit = program.objects[value];
             return result(unit.vitality > 0 ? max(0.0f, 1 - actors[value].damage / unit.vitality) : 1.0f);
@@ -2894,6 +2959,12 @@ namespace
             }
             else if(!scene) found = objectMarkerPosition(object(1), text(2), point);
             if(found || scene) halofxeffect(text(0), point, found);
+            // Its jpt! damage in play (halo_effectdamage, off by default), in the scripts' name.
+            if(found && !scene && halo_effectdamage)
+            {
+                const bool dealt = haloeffectblast(text(0), point, nullptr);
+                if(halo_scripttrace) conoutf("HaloScript: %s %s", text(0), dealt ? "deals its jpt! damage" : "has no jpt! damage");
+            }
             return handled();
         }
         if(is("player_effect_set_max_translation")) { halofxshakelimit(0, float(value(0)), float(value(1)), float(value(2))); return handled(); }
@@ -3215,6 +3286,7 @@ namespace
         if(attachedAt.size() != actors.size()) attachedAt.assign(actors.size(), -1);
         if(attachRetry.size() != actors.size()) attachRetry.assign(actors.size(), 0);
         if(objectStarts.size() != actors.size()) return;
+        spawnCarried();
         for(size_t i = 0; i < actors.size(); ++i)
         {
             const Actor &a = actors[i];
@@ -3262,9 +3334,108 @@ namespace
             }
             squadBots.push_back({&start, bot, e, squad});
             squadBots.back().object = int(i);
+            squadBots.back().suspended = a.suspended;
             configureActor(bot, e, squad, start);
+            // What the script told the object before its actor existed (gap 4): its immunity
+            // (object_cannot_take_damage, kept on the object) and its vitality (queued).
+            if(a.cannotTakeDamage) setUnitFlag(bot, HALO_AI_NO_DAMAGE, true);
+            const auto queued = attachVitality.find(int(i));
+            if(queued != attachVitality.end())
+            {
+                haloactorsethealthfraction(bot, queued->second.health);
+                haloenemysetshield(bot, queued->second.shield);
+                if(halo_scripttrace) conoutf("HaloScript: %s takes the vitality queued for it (%.2f, %.2f)", o.name.c_str(),
+                                             queued->second.health, queued->second.shield);
+                attachVitality.erase(queued);
+            }
             conoutf("HaloScript: %s attached to %s/%s is an actor now", o.name.c_str(), encounter->name.c_str(), member->name.c_str());
         }
+    }
+
+    // The attached actors carried in from the section before (gap 4): each spawns behind the
+    // player, one to three Halo units back and spread to the sides, on retail floor (the spawn
+    // helper, haloscenariospawnenemy), with the health and shield it had, follows the player and
+    // stands for its object again (unit_get_health, ai_living_count, the migrations a50's
+    // mig_into_hangar gives it). Judgement call: Halo's actors walk through the doorway with
+    // the player; the engine's next section is another map. A spot with no floor is tried again a
+    // second later; the object's own destruction (object_destroy, ai_erase) drops it.
+    void Scenario::spawnCarried()
+    {
+        if(carriedAttached.empty() || !projection) return;
+        const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        const vec ahead(sinf(player1->yaw * RAD), -cosf(player1->yaw * RAD), 0), side(-ahead.y, ahead.x, 0);
+        int slot = 0;
+        for(size_t k = 0; k < carriedAttached.size(); ++slot)
+        {
+            CarriedAttach &c = carriedAttached[k];
+            const Encounter *encounter = at(program.encounters, c.encounter);
+            if(!encounter || !at(encounter->squads, c.squad) || !at(objectStarts, c.object) || attachedEntry(c.object) >= 0)
+            {
+                carriedAttached.erase(carriedAttached.begin() + k);
+                continue;
+            }
+            if(tick < c.retry) { ++k; continue; }
+            const float back = (1.0f + .5f * (slot % 5)) * projection->xy, across = ((slot % 3) - 1) * .8f * projection->xy;
+            const vec tries[] = {
+                vec(feet).sub(vec(ahead).mul(back)).add(vec(side).mul(across)),
+                vec(feet).sub(vec(ahead).mul(back)),
+                vec(feet).add(vec(side).mul(1.2f * projection->xy)),
+                vec(feet).sub(vec(side).mul(1.2f * projection->xy)),
+                vec(feet).add(vec(ahead).mul(1.5f * projection->xy)),
+            };
+            playerent *bot = nullptr;
+            vec spot = feet;
+            // Only spots the player could walk to in a line: not past a wall, a closed door or a
+            // ledge's lip between them (the spawn helper checks the floor alone; final review).
+            const vec chest(0, 0, player1->eyeheight * .6f);
+            for(const vec &point : tries)
+            {
+                HaloCollisionHit hit;
+                if(halocollisionactive() && haloscenariotrace(vec(feet).add(chest), vec(point).add(chest), hit)) continue;
+                if((bot = haloscenariospawnenemy(c.start.actor, point, player1->yaw, c.start.variant, teamFor(*encounter, c.start)))) { spot = point; break; }
+            }
+            if(!bot) { c.retry = tick + ticksPerSecond; ++k; continue; }
+            SquadStart &start = objectStarts[c.object];
+            start = c.start;
+            start.point = fromWorld(*projection, vec(bot->o).sub(vec(0, 0, bot->eyeheight)));
+            start.yaw = (90 - bot->yaw) * RAD;
+            squadBots.push_back({&start, bot, c.encounter, c.squad});
+            SquadBot &entry = squadBots.back();
+            entry.object = c.object;
+            entry.suspended = c.suspended;
+            entry.scriptFlags = c.scriptFlags;
+            configureActor(bot, c.encounter, c.squad, start);
+            for(int bit = 1; bit <= HALO_AI_NO_MANEUVER; bit <<= 1) if(c.scriptFlags & bit) haloactorsetflag(bot, bit, true);
+            haloactorsethealthfraction(bot, c.health);
+            haloenemysetshield(bot, c.shield);
+            haloactorfollow(bot, player1);
+            if(at(attachedAt, c.object)) attachedAt[c.object] = 0;
+            conoutf("HaloScript: %s came along with the player into section %d (%.1f units away, health %.2f)",
+                    program.objects[c.object].name.c_str(), section + 1, spot.dist(feet), c.health);
+            carriedAttached.erase(carriedAttached.begin() + k);
+        }
+    }
+
+    // The living attached actors, as plain data, every live tick: what a walk on into the next
+    // section brings along (Scenario::start), with those still waiting to spawn here.
+    void Scenario::snapshotAttached()
+    {
+        carryCandidates.clear();
+        for(const SquadBot &bot : squadBots)
+        {
+            if(bot.object < 0 || !bot.bot || bot.bot->state != CS_ALIVE || !bot.start) continue;
+            CarriedAttach c;
+            c.object = bot.object;
+            c.encounter = bot.encounter;
+            c.squad = bot.squad;
+            c.start = *bot.start;
+            c.health = haloactorhealthfraction(bot.bot);
+            c.shield = haloenemyshieldfraction(bot.bot);
+            c.suspended = bot.suspended;
+            c.scriptFlags = bot.scriptFlags;
+            carryCandidates.push_back(c);
+        }
+        for(CarriedAttach c : carriedAttached) { c.retry = 0; carryCandidates.push_back(c); }
     }
 
     // The scripted object is destroyed or created anew: its actor (ai_attach) goes with it, at
@@ -3272,6 +3443,11 @@ namespace
     void Scenario::detachActor(int object)
     {
         if(at(attachedAt, object)) attachedAt[object] = -1;
+        // Nor does it come along into the next section, or wait to (gap 4); nor take queued vitality.
+        auto same = [object](const CarriedAttach &c) { return c.object == object; };
+        carriedAttached.erase(std::remove_if(carriedAttached.begin(), carriedAttached.end(), same), carriedAttached.end());
+        carryCandidates.erase(std::remove_if(carryCandidates.begin(), carryCandidates.end(), same), carryCandidates.end());
+        attachVitality.erase(object);
         for(SquadBot &entry : squadBots)
         {
             if(entry.object != object) continue;
@@ -3304,6 +3480,18 @@ namespace
     void Scenario::eraseSquads(int reference, bool erase)
     {
         HaloScriptDamage scripted;
+        // Attached actors carried in that have not spawned yet (spawnCarried) die too: their object
+        // keeps an entry with no actor, so unit_get_health answers -1 as for one killed here.
+        for(size_t k = 0; k < carriedAttached.size();)
+        {
+            const CarriedAttach &c = carriedAttached[k];
+            if(!matchesSquad(reference, c.encounter, c.squad) || !at(objectStarts, c.object)) { ++k; continue; }
+            objectStarts[c.object] = c.start;
+            squadBots.push_back({&objectStarts[c.object], nullptr, c.encounter, c.squad});
+            squadBots.back().object = c.object;
+            squadBots.back().gone = true;
+            carriedAttached.erase(carriedAttached.begin() + k);
+        }
         for(SquadBot &bot : squadBots)
         {
             if(!bot.bot || bot.bot->state != CS_ALIVE || !matchesSquad(reference, bot.encounter, bot.squad)) continue;
@@ -3327,18 +3515,27 @@ namespace
             // An attached object whose actor was dead at the checkpoint stays without one.
             if(saved.gone) { saved.bot = nullptr; squadBots.push_back(saved); continue; }
             const SquadStart &start = *saved.start;
-            vec point((start.point.x - p.origin.x) * p.xy + p.margin,
-                      (p.origin.y - start.point.y) * p.xy + p.margin,
-                      (start.point.z - p.origin.z) * p.z);
+            // An attached actor comes back where it stood at the checkpoint; the rest at their start.
+            const vec stand = saved.stood ? saved.stoodPoint : start.point;
+            const float yaw = saved.stood ? saved.stoodYaw : start.yaw;
+            vec point((stand.x - p.origin.x) * p.xy + p.margin,
+                      (p.origin.y - stand.y) * p.xy + p.margin,
+                      (stand.z - p.origin.z) * p.z);
             const Encounter *encounter = at(program.encounters, saved.encounter);
             const int team = encounter ? teamFor(*encounter, start) : HALO_TEAM_DEFAULT;
-            saved.bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD, start.variant, team);
+            saved.bot = haloscenariospawnenemy(start.actor, point, 90 - yaw / RAD, start.variant, team);
             if(saved.bot)
             {
                 squadBots.push_back(saved);
                 configureActor(saved.bot, saved.encounter, saved.squad, start);
                 for(int bit = 1; bit <= HALO_AI_NO_MANEUVER; bit <<= 1)
                     if(saved.scriptFlags & bit) haloactorsetflag(saved.bot, bit, true);
+                // An attached actor (a50's Keyes) comes back as hurt as it was at the checkpoint.
+                if(saved.object >= 0)
+                {
+                    if(saved.health < 1) haloactorsethealthfraction(saved.bot, saved.health);
+                    if(saved.shield < 1) haloenemysetshield(saved.bot, saved.shield);
+                }
             }
         }
     }
@@ -3352,6 +3549,10 @@ namespace
         cue = nullptr;
         callActors.clear();
         sceneObjects.clear();
+        sceneWoken.clear();
+        sceneSeat = noObject;
+        sceneSeatName.clear();
+        cueSkippable = false;
         handoffTeleport = handoffFacing = -1;
         projection = nullptr;
         worldName.clear();
@@ -3465,12 +3666,22 @@ namespace
             savedThreads.clear();
             savedActors.clear();
             savedSquadBots.clear();
+            // Actors are not carried into the next section (its map is another), but for those
+            // ai_attach made of scripted objects (gap 4): the living ones come along behind the
+            // player (snapshotAttached, spawnCarried); the others' objects stay as the scripts
+            // left them, with no actor again. The squad entries' actors are gone already.
+            carriedAttached = std::move(carryCandidates);
+            carryCandidates.clear();
+            for(const CarriedAttach &c : carriedAttached)
+                conoutf("HaloScript: %s (%s) comes along into section %d, health %.2f", program.objects[c.object].name.c_str(),
+                        program.encounters[c.encounter].name.c_str(), s + 1, c.health);
             squadBots.clear();
-            // Actors are not carried into the next section (its map is another), attached ones
-            // neither: their objects stay as the scripts left them, with no actor again.
             std::fill(attachedAt.begin(), attachedAt.end(), -1);
             std::fill(savedAttachedAt.begin(), savedAttachedAt.end(), -1);
             std::fill(attachRetry.begin(), attachRetry.end(), 0);
+            attachVitality.clear();
+            savedAttachVitality.clear();
+            savedCarried.clear();
             savedBoarded = {};
             std::fill(conversationStatus.begin(), conversationStatus.end(), 5);
             loaded = true;
@@ -3510,6 +3721,11 @@ namespace
         attachedAt.assign(program.objects.size(), -1);
         savedAttachedAt.assign(program.objects.size(), -1);
         attachRetry.assign(program.objects.size(), 0);
+        carriedAttached.clear();
+        savedCarried.clear();
+        carryCandidates.clear();
+        attachVitality.clear();
+        savedAttachVitality.clear();
         callMusic.clear();
         savedBoarded = {};
         savedGroups.clear();
@@ -3550,6 +3766,7 @@ namespace
         }
         conoutf("HaloScript: %s loaded %zu scripts, %zu camera points, %zu sound tags",
                 cache, program.scripts.size(), program.cameras.size(), program.sounds.size());
+        fastForwardFresh();
         if(!beginCue(SceneTrigger::Entry)) startGameplay();
     }
 
@@ -3568,6 +3785,103 @@ namespace
         }
         startCartographer();
         startPelicanApproach();
+    }
+
+    // A section started afresh (Mission select, a QA start, a revert with no checkpoint: no script
+    // carried in) runs its mission's startup script from the top, which waits for what play in
+    // the earlier sections sets. Where a section's way on is opened only by a script that waits for
+    // that play, the script is brought forward to where a walk from the mission's start would have
+    // it: these globals set, these threads passed over (as finished) and these woken. The
+    // counterpart of halo.cpp's FreshProfile (the loadout). Judgement call (gap 6), read
+    // statically from the decompiled a10 scripts, not checked in Halo; sections from..to, zero-based.
+    struct FreshScript { int mission, from, to; const char *globals, *done, *wake; };
+    const FreshScript freshScripts[] = {
+        // a10 sections 5 and 6. mission_a10 wakes mission_tunnel (which powers tunnel_door_2 in
+        // section 5) and cryo_search (which opens cryo_door_1 and _2 in section 6) only once
+        // mission_bridge has set mark_bridge_cutscene after cinematic_x20, at the end of section 2;
+        // before that it waits for the cryo exit (mark_fast_setup or mark_tutorial_setup). Started
+        // here the bridge and its flags never come. The cryo exit is section 1's: fast_setup and
+        // tutorial_setup would seat the player in cryotube_1, on section 1's map (on Normal for the
+        // minutes the tutorial takes), so both are passed over and mark_fast_setup set. The bridge
+        // flags (mark_bridge_cutscene_start and mark_bridge_cutscene, set by mission_bridge;
+        // mark_weapon and mark_shoot, by mission_shoot in section 3) let mission_a10 go on to its
+        // later wakes (a no-op for the two woken here). mission_bsp, woken as usual, closes the
+        // earlier BSPs' doors itself. a10 has no player_location_index.
+        {0, 4, 5, "mark_fast_setup mark_bridge_cutscene_start mark_bridge_cutscene mark_weapon mark_shoot",
+         "fast_setup tutorial_setup", "mission_tunnel cryo_search"},
+    };
+
+    void Scenario::fastForwardFresh()
+    {
+        for(const FreshScript &f : freshScripts)
+        {
+            if(f.mission != mission || section < f.from || section > f.to) continue;
+            auto each = [](const char *list, auto fn)
+            {
+                for(const char *word = list; *word;)
+                {
+                    while(*word == ' ') ++word;
+                    const char *end = word;
+                    while(*end && *end != ' ') ++end;
+                    if(end > word) fn(std::string(word, end));
+                    word = end;
+                }
+            };
+            int set = 0, passed = 0, woken = 0;
+            each(f.globals, [&](const std::string &name)
+            {
+                const int g = named(program.globals, name.c_str());
+                if(at(globals, g)) { globals[g] = number(1, 5); ++set; }
+                else conoutf("HaloScript: the fresh start's global %s is not in %s", name.c_str(), cache);
+            });
+            each(f.done, [&](const std::string &name)
+            {
+                const int s = named(program.scripts, name.c_str());
+                if(!at(threads, s)) return;
+                threads[s] = {};
+                threads[s].started = threads[s].done = true;
+                ++passed;
+            });
+            each(f.wake, [&](const std::string &name)
+            {
+                const int s = named(program.scripts, name.c_str());
+                if(s < 0) return;
+                wake(s);
+                ++woken;
+            });
+            conoutf("HaloScript: %s section %d started afresh: the script brought forward (%d globals set, %d threads passed over, %d woken)",
+                    cache, section + 1, set, passed, woken);
+        }
+    }
+
+    // Whether the expression at `datum` calls script `target` (itself or inside its arguments).
+    bool Scenario::callsScript(uint32_t datum, int target, int depth) const
+    {
+        const Node *node = program.node(datum);
+        if(!node || (node->flags & 1) || depth > 8) return false;
+        if((node->flags & 2) && node->opcode == target) return true;
+        const Node *head = program.node(node->data);
+        for(uint32_t it = head ? head->next : nil; const Node *arg = program.node(it); it = arg->next)
+            if(callsScript(it, target, depth + 1)) return true;
+        return false;
+    }
+
+    // Whether some script plays this scene inside (if (cinematic_skip_start) ...), the retail way of
+    // making a cutscene skippable (a10's x10, x20 and x30, d40's bridge scene, the cinematic_intro
+    // scenes); b30's and b40's insertions, d20's drop and d40's finale are not.
+    bool Scenario::skippableScene(const char *scene) const
+    {
+        const int skip = named(program.scripts, "cinematic_skip_start"), target = named(program.scripts, scene);
+        if(skip < 0 || target < 0) return false;
+        for(const Node &node : program.nodes)
+        {
+            if((node.flags & 3) || node.opcode != 2) continue;   // a call of if
+            const Node *head = program.node(node.data);
+            const Node *condition = head ? program.node(head->next) : nullptr;
+            if(!condition || !(condition->flags & 2) || condition->opcode != skip) continue;
+            if(callsScript(condition->next, target, 0)) return true;   // its then-branch
+        }
+        return false;
     }
 
     // Whether a script is one the cue table plays (and so is not run inline by a gameplay thread).
@@ -3698,6 +4012,10 @@ namespace
         cue = chosen;
         director = {};
         sceneThreads.clear();
+        sceneWoken.clear();
+        sceneSeat = noObject;
+        sceneSeatName.clear();
+        cueSkippable = skippableScene(chosen->script);
         director.stack.emplace_back(program.scripts[index].root);
         chapter = -1;
         nearClip = .0625f;
@@ -3708,12 +4026,30 @@ namespace
         sceneObjects.clear();
         if(trigger == SceneTrigger::Call) callActors = actors;
         else callActors.clear();
+        std::vector<std::pair<int, int>> standing;   // attached objects with a living actor, and their squad
+        for(const SquadBot &bot : squadBots)
+            if(bot.object >= 0 && bot.bot && bot.bot->state == CS_ALIVE && at(actors, bot.object))
+                standing.emplace_back(bot.object, actors[bot.object].squadReference);
         for(size_t i = 0; i < actors.size(); ++i)
         {
             if(int(i) == boardedPelican) continue;
             actors[i] = {};
             actors[i].pose = program.objects[i].pose;
         }
+        // A scene in the middle of a section, or the one that ends it, finds the actors ai_attach
+        // made of scripted objects where they stand, not at their placement or their pose when
+        // attached (gap 4): Halo's units are the actors. The squad stays on the object.
+        if(projection && (trigger == SceneTrigger::Call || trigger == SceneTrigger::Exit))
+            for(const auto &entry : standing)
+            {
+                const SquadBot *bot = at(squadBots, attachedEntry(entry.first));
+                if(!bot || !bot->bot || entry.first == boardedPelican) continue;
+                Actor &unit = actors[entry.first];
+                unit.visible = true;
+                unit.squadReference = entry.second;
+                unit.pose.position = fromWorld(*projection, vec(bot->bot->o).sub(vec(0, 0, bot->bot->eyeheight)));
+                unit.pose.yaw = (90 - bot->bot->yaw) * RAD;
+            }
         handoffTeleport = handoffFacing = -1;
         findHandoff(program.scripts[index].root, 0);
         setWorld(chosen->bsp);
@@ -3741,6 +4077,34 @@ namespace
             skipping = false;
             if(!director.done && !director.disabled) conoutf("Halo scene: %s did not run to its end when skipped", cue->script);
         }
+        // The gameplay scripts the scene woke that are still running go on in play, from where they
+        // are (gap 3): in Halo a script woken in a cutscene is an ordinary thread. One the scene put
+        // to sleep for good (sleep -1), one finished, and one the gameplay threads already run stay
+        // as they are; a skipped Call scene's wakes from the rest of its script start from their top.
+        // A skipped scene the retail scripts make skippable (cinematic_skip_start) leaves none of
+        // them, nor its seat: Halo's skip reverts the game to before the scene, and the script after
+        // the call sets up the play that follows (judgement call: the engine's skip of a scene Halo
+        // cannot skip, such as b30's and b40's insertions, keeps what the scene had started).
+        const bool dropWoken = skipped && cueSkippable;
+        if(dropWoken && !sceneWoken.empty())
+            conoutf("Halo scene: %s skipped: the %d scripts it woke stop with it (cinematic_skip_start)", cue->script, int(sceneWoken.size()));
+        for(int index : sceneWoken)
+        {
+            if(dropWoken) break;
+            auto found = sceneThreads.find(index);
+            if(found == sceneThreads.end() || !at(threads, index)) continue;
+            Thread &woken = found->second;
+            Thread &gameplay = threads[index];
+            if(woken.done || woken.disabled || woken.stack.empty() || gameplay.started || gameplay.done) continue;
+            gameplay = std::move(woken);
+            gameplay.wake = max(gameplay.wake, tick);
+            conoutf("Halo scene: %s, woken by %s, goes on in play", program.scripts[index].name.c_str(), cue->script);
+        }
+        sceneWoken.clear();
+        const int seatVehicle = dropWoken ? noObject : sceneSeat;
+        const std::string seatName = sceneSeatName;
+        sceneSeat = noObject;
+        sceneSeatName.clear();
         const SceneTrigger trigger = cue->trigger;
         const char *const played = cue->script;
         cue = nullptr;
@@ -3802,6 +4166,20 @@ namespace
         // A scene can leave the player somewhere else (the handoffs above): the fall and wedge
         // recovery forgets the floors from before it.
         haloplayermoved("after a cutscene");
+        // A seat the scene's threads gave the player and kept (b40's pelican_up seats the player in
+        // the insertion Pelican during cutscene_insertion_a; cutscene_insertion_b, gameplay, waits
+        // for the Pelican's recording and lets them out): taken now, in play, while the vehicle
+        // still exists. Not at an exit or a time-out scene, which end the section.
+        if(seatVehicle != noObject && trigger != SceneTrigger::Exit && trigger != SceneTrigger::Timeout)
+        {
+            const Actor *vehicle = at(actors, seatVehicle);
+            if(vehicle && vehicle->visible && scriptVehicle(seatVehicle) && seatPlayer(seatVehicle, seatName.c_str()))
+                conoutf("Halo scene: %s leaves the player seated in %s (%s)", played, program.objects[seatVehicle].name.c_str(),
+                        seatName.empty() ? "-" : seatName.c_str());
+            else if(at(program.objects, seatVehicle))
+                conoutf("Halo scene: %s left the player a seat in %s, which is gone or cannot take them", played,
+                        program.objects[seatVehicle].name.c_str());
+        }
     }
 
     void Scenario::update(int elapsed)
@@ -3859,7 +4237,11 @@ namespace
                         conoutf("Halo checkpoint request: %s at tick %d", program.scripts[i].name.c_str(), tick);
                 }
             }
-            if(!cue) attachActors();
+            if(!cue)
+            {
+                attachActors();
+                snapshotAttached();
+            }
             if(!cue)
             {
                 armSwitches();
@@ -3976,7 +4358,11 @@ namespace
             const bool flown = object.kind >= 0 && !halovehiclebound(int(i)) &&
                                (actor.recording || actor.parent >= 0 || actor.recordingEnd > 0 || boardedVehicle == int(i) ||
                                 std::any_of(cargo.begin(), cargo.end(), [i](const Cargo &entry) { return entry.vehicle == int(i) && !entry.walking; }));
-            if(!cue && int(i) != landingPelican && !(actor.visible && (storyFigure(program, i, actor, actor.squadReference >= 0 && attachedEntry(int(i)) >= 0) || flown))) continue;
+            // An attached object carried in from the section before stands for its actor too while
+            // that waits to spawn behind the player (its pose is the old section's).
+            const bool owned = actor.squadReference >= 0 &&
+                (attachedEntry(int(i)) >= 0 || std::any_of(carriedAttached.begin(), carriedAttached.end(), [i](const CarriedAttach &c) { return c.object == int(i); }));
+            if(!cue && int(i) != landingPelican && !(actor.visible && (storyFigure(program, i, actor, owned) || flown))) continue;
             // Damage targets are invisible in Halo (d40's manifold detectors).
             if(!actor.visible || object.model.empty() || objectDevices[i] >= 0 || object.vitality > 0) continue;
             Pose pose = currentActor(int(i));
@@ -4103,6 +4489,18 @@ double haloscenarioobjectstate(const char *what, int id)
     if(!strcmp(what, "boardable")) return item->boardable;
     if(!strcmp(what, "permutation")) return double(item->permutation.size());
     if(!strcmp(what, "door")) return at(scenario.objectDevices, id) && scenario.objectDevices[id] >= 0 ? scenario.devices[scenario.objectDevices[id]].visible : -1;
+    if(!strcmp(what, "visible")) return item->visible;
+    // tests/test_ai_attach.py (gap 4): how far, in Halo world units, the object's pose is from the
+    // feet of the actor ai_attach made of it (-1 without a living one); a scene's start copies one onto the other.
+    if(!strcmp(what, "attachgap"))
+    {
+        const SquadBot *bot = at(scenario.squadBots, scenario.attachedEntry(id));
+        if(!bot || !bot->bot || bot->bot->state != CS_ALIVE || !scenario.projection) return -1;
+        return item->pose.position.dist(fromWorld(*scenario.projection, vec(bot->bot->o).sub(vec(0, 0, bot->bot->eyeheight))));
+    }
+    // Whether it waits to come along behind the player (carried in from the section before, not spawned yet).
+    if(!strcmp(what, "carried"))
+        return std::any_of(scenario.carriedAttached.begin(), scenario.carriedAttached.end(), [id](const CarriedAttach &c) { return c.object == id; });
     return -1;
 }
 
@@ -4174,6 +4572,13 @@ bool haloscenariobotsuspended(const playerent *bot)
     return false;
 }
 
+bool haloscenarioattachedactor(const playerent *bot)
+{
+    if(!scenario.loaded || !bot) return false;
+    for(const SquadBot &member : scenario.squadBots) if(member.bot == bot && member.object >= 0) return true;
+    return false;
+}
+
 void haloscenarioremovebot(const playerent *bot)
 {
     for(SquadBot &member : scenario.squadBots) if(member.bot == bot) member.bot = nullptr;
@@ -4200,12 +4605,16 @@ void haloscenariocheckpoint()
         if(bot.bot && bot.bot->state == CS_ALIVE)
         {
             scenario.savedSquadBots.push_back(bot);
-            // An attached actor comes back where it stands now (its start is its own).
-            if(bot.object >= 0 && scenario.projection && at(scenario.objectStarts, bot.object))
+            // An attached actor comes back where it stands now, with the health and shield it has
+            // now; its start stays where it took over (ai_teleport_to_starting_location).
+            if(bot.object >= 0 && scenario.projection)
             {
-                SquadStart &start = scenario.objectStarts[bot.object];
-                start.point = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
-                start.yaw = (90 - bot.bot->yaw) * RAD;
+                SquadBot &copy = scenario.savedSquadBots.back();
+                copy.stood = true;
+                copy.stoodPoint = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
+                copy.stoodYaw = (90 - bot.bot->yaw) * RAD;
+                copy.health = haloactorhealthfraction(bot.bot);
+                copy.shield = haloenemyshieldfraction(bot.bot);
             }
         }
         else if(bot.object >= 0)
@@ -4215,6 +4624,8 @@ void haloscenariocheckpoint()
         }
     }
     scenario.savedAttachedAt = scenario.attachedAt;
+    scenario.savedCarried = scenario.carriedAttached;
+    scenario.savedAttachVitality = scenario.attachVitality;
     scenario.savedBoarded = {};
     if(scenario.boardedVehicle != noObject)
     {
@@ -4248,6 +4659,9 @@ void haloscenariorevert()
         scenario.director = {};
         scenario.callActors.clear();
         scenario.sceneObjects.clear();
+        // Nor does it carry the scene's woken scripts or its seat into play: the checkpoint's threads replace them.
+        scenario.sceneWoken.clear();
+        scenario.sceneSeat = noObject;
         scenario.handoffTeleport = scenario.handoffFacing = -1;
         scenario.endCue(false);
     }
@@ -4279,6 +4693,12 @@ void haloscenariorevert()
         // time after it (left as it was, it could hold an attach back for as long as that lasted).
         if(scenario.savedAttachedAt.size() == scenario.attachedAt.size()) scenario.attachedAt = scenario.savedAttachedAt;
         std::fill(scenario.attachRetry.begin(), scenario.attachRetry.end(), 0);
+        // The actors carried in that had not spawned at the checkpoint spawn behind the player
+        // again (the section's start checkpoint is usually taken before they do), and the
+        // vitality queued then waits for its actor again.
+        scenario.carriedAttached = scenario.savedCarried;
+        for(CarriedAttach &c : scenario.carriedAttached) c.retry = 0;
+        scenario.attachVitality = scenario.savedAttachVitality;
         std::fill(scenario.conversationStatus.begin(), scenario.conversationStatus.end(), 5);
         // Aboard a script vehicle at the checkpoint (a30's extraction Pelicans): aboard again.
         const Scenario::Boarded &b = scenario.savedBoarded;
@@ -4340,7 +4760,29 @@ namespace
         // Scripted objects attached in play whose actor does not exist yet (posed, carried or
         // within the two ticks): the optional `s attaching` record.
         std::vector<int> attaching;
+        // Attached actors carried in from the section before, not spawned yet (gap 4).
+        const std::vector<CarriedAttach> *carried = nullptr;
     };
+
+    // The optional `s attached` record: an actor ai_attach made of a scripted object, its squad,
+    // its variant and where it stands, then (gap 4, optional on reading) its health and shield
+    // fractions and whether it is one carried in from the section before that spawns behind the
+    // player (its point unused), then (batch 5's critic, gap 11; optional on reading) its start,
+    // where it took over, which ai_teleport_to_starting_location goes back to.
+    void writeAttached(std::string &out, int object, int encounter, int squad, bool suspended, int flags, bool gone,
+                       const SquadStart &start, const vec &point, float yaw, float health, float shield, bool near)
+    {
+        const Program &p = scenario.program;
+        halostatef(out, "s attached %d", object);
+        halostateword(out, p.objects[object].name);
+        halostatef(out, " %d", encounter);
+        halostateword(out, p.encounters[encounter].name);
+        halostatef(out, " %d", squad);
+        halostateword(out, p.encounters[encounter].squads[squad].name);
+        halostatef(out, " %d %d %d %d %d %.9g %.9g %.9g %.9g %.6g %.6g %d %.9g %.9g %.9g %.9g\n", suspended, flags, gone, start.actor,
+                   start.variant, point.x, point.y, point.z, yaw, clamp(health, 0.0f, 1.0f), clamp(shield, 0.0f, 1.0f), near,
+                   start.point.x, start.point.y, start.point.z, start.yaw);
+    }
 
     void writeValue(std::string &out, const Value &v)
     {
@@ -4502,21 +4944,19 @@ namespace
             {
                 const SquadStart *start = at(scenario.objectStarts, bot.object);
                 if(!s || !start || !at(p.objects, bot.object)) continue;
-                vec point = start->point;
-                float yaw = start->yaw;
+                // Where it stood at the checkpoint (its start when it had not moved: a record read
+                // from a save written before the stood point was kept).
+                vec point = bot.stood ? bot.stoodPoint : start->point;
+                float yaw = bot.stood ? bot.stoodYaw : start->yaw, health = bot.health, shield = bot.shield;
                 if(bot.bot && bot.bot->state == CS_ALIVE && scenario.projection && v.threads == &scenario.threads)
                 {
                     point = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
                     yaw = (90 - bot.bot->yaw) * RAD;
+                    health = haloactorhealthfraction(bot.bot);
+                    shield = haloenemyshieldfraction(bot.bot);
                 }
-                halostatef(out, "s attached %d", bot.object);
-                halostateword(out, p.objects[bot.object].name);
-                halostatef(out, " %d", bot.encounter);
-                halostateword(out, e->name);
-                halostatef(out, " %d", bot.squad);
-                halostateword(out, s->name);
-                halostatef(out, " %d %d %d %d %d %.9g %.9g %.9g %.9g\n", bot.suspended, bot.scriptFlags, bot.gone, start->actor, start->variant,
-                           point.x, point.y, point.z, yaw);
+                writeAttached(out, bot.object, bot.encounter, bot.squad, bot.suspended, bot.scriptFlags, bot.gone, *start, point, yaw,
+                              health, shield, false);
                 continue;
             }
             if(!s || s->starts.empty() || bot.start < s->starts.data() || bot.start >= s->starts.data() + s->starts.size()) continue;
@@ -4526,6 +4966,15 @@ namespace
             halostateword(out, s->name);
             halostatef(out, " %d %d %d\n", int(bot.start - s->starts.data()), bot.suspended, bot.scriptFlags);
         }
+        // Attached actors carried in from the section before that have not spawned yet (gap 4):
+        // the same record, flagged to spawn behind the player again.
+        if(v.carried)
+            for(const CarriedAttach &c : *v.carried)
+            {
+                if(!at(p.objects, c.object) || !at(p.encounters, c.encounter) || !at(p.encounters[c.encounter].squads, c.squad)) continue;
+                writeAttached(out, c.object, c.encounter, c.squad, c.suspended, c.scriptFlags, false, c.start, vec(0, 0, 0), 0, c.health,
+                              c.shield, true);
+            }
         for(size_t i = 0; i < v.groups->size(); ++i)
         {
             const DeviceGroup &g = (*v.groups)[i];
@@ -4569,13 +5018,17 @@ namespace
         std::vector<int> boardable;
         for(size_t i = 0; i < v.actors->size(); ++i) if((*v.actors)[i].boardable) boardable.push_back(int(i));
         if(!boardable.empty()) writeInts(out, "board", boardable);
-        // A seat the script held the player in is not written (the record is the Pelican boarded
-        // with E; a Continue puts the player where the checkpoint had them, on foot).
-        if(at(p.objects, v.boarded.vehicle) && !v.boarded.scripted)
+        // The vehicle the player is aboard: a Pelican boarded with E, or (gap 10) a seat the script
+        // holds them in, with a trailing scripted flag (a10's cryotube: a Continue puts the player
+        // back in the tube, and the restored tutorial's unit_exit_vehicle lets them out). A scripted
+        // seat may be -1, the middle of a vehicle with no seats in the table. Older saves have no flag.
+        if(at(p.objects, v.boarded.vehicle))
         {
             halostatef(out, "s boarded %d", v.boarded.vehicle);
             halostateword(out, p.objects[v.boarded.vehicle].name);
-            halostatef(out, " %d %.9g %.9g %.9g\n", v.boarded.seat, v.boarded.from.x, v.boarded.from.y, v.boarded.from.z);
+            halostatef(out, " %d %.9g %.9g %.9g", v.boarded.seat, v.boarded.from.x, v.boarded.from.y, v.boarded.from.z);
+            if(v.boarded.scripted) halostatef(out, " 1");
+            out += '\n';
         }
         if(!v.attaching.empty()) writeInts(out, "attaching", v.attaching);
         float gains[HALO_SOUND_CLASSES];
@@ -4610,6 +5063,7 @@ namespace
         // Optional records: attached actors (with their starts), boardable script vehicles, the
         // vehicle the player is aboard, the sound class gains.
         std::vector<std::pair<SquadBot, SquadStart>> attached;
+        std::vector<CarriedAttach> carried;
         std::vector<int> boardable, attaching;
         Scenario::Boarded boarded;
         bool gains = false;
@@ -4797,6 +5251,35 @@ namespace
                 start.variant = r.i();
                 start.point.x = r.f(); start.point.y = r.f(); start.point.z = r.f();
                 start.yaw = r.f();
+                // Optional (gap 4): health, shield, and whether it was carried in and spawns behind the player.
+                bool near = false;
+                if(r.ok && r.more())
+                {
+                    bot.health = r.f();
+                    bot.shield = r.f();
+                    near = r.b();
+                    if(!std::isfinite(bot.health) || !std::isfinite(bot.shield)) r.ok = false;
+                    bot.health = clamp(bot.health, 0.0f, 1.0f);
+                    bot.shield = clamp(bot.shield, 0.0f, 1.0f);
+                }
+                // Optional (gap 11): its start, where it took over; the point above is where it
+                // stood, which a Continue brings it back to. Without it the two are the same.
+                if(r.ok && r.more())
+                {
+                    vec origin;
+                    origin.x = r.f(); origin.y = r.f(); origin.z = r.f();
+                    const float originYaw = r.f();
+                    if(r.ok && (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) || !std::isfinite(originYaw)))
+                        r.ok = false;
+                    if(r.ok && !near)
+                    {
+                        bot.stood = true;
+                        bot.stoodPoint = start.point;
+                        bot.stoodYaw = start.yaw;
+                        start.point = origin;
+                        start.yaw = originYaw;
+                    }
+                }
                 const Encounter *e = at(p.encounters, bot.encounter);
                 const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
                 if(!r.ok || !at(p.objects, bot.object) || p.objects[bot.object].name != object || !sq || e->name != encounter ||
@@ -4804,7 +5287,20 @@ namespace
                    !std::isfinite(start.yaw))
                     return fail("unknown attached actor", line);
                 bot.bot = nullptr;
-                s.attached.emplace_back(bot, start);
+                if(near && !bot.gone)
+                {
+                    CarriedAttach c;
+                    c.object = bot.object;
+                    c.encounter = bot.encounter;
+                    c.squad = bot.squad;
+                    c.start = start;
+                    c.health = bot.health;
+                    c.shield = bot.shield;
+                    c.suspended = bot.suspended;
+                    c.scriptFlags = bot.scriptFlags;
+                    s.carried.push_back(c);
+                }
+                else s.attached.emplace_back(bot, start);
             }
             else if(r.key("board"))
             {
@@ -4822,8 +5318,11 @@ namespace
                 const std::string name = r.word();
                 s.boarded.seat = r.i();
                 s.boarded.from.x = r.f(); s.boarded.from.y = r.f(); s.boarded.from.z = r.f();
+                // Optional: a seat the script holds the player in (gap 10).
+                s.boarded.scripted = r.ok && r.more() && r.b();
                 const Object *o = at(p.objects, s.boarded.vehicle);
-                if(!r.ok || !o || o->name != name || !at(o->seats, s.boarded.seat) || !std::isfinite(s.boarded.from.x) ||
+                const bool seat = o && (at(o->seats, s.boarded.seat) || (s.boarded.scripted && s.boarded.seat == -1 && o->seats.empty()));
+                if(!r.ok || !o || o->name != name || !seat || !std::isfinite(s.boarded.from.x) ||
                    !std::isfinite(s.boarded.from.y) || !std::isfinite(s.boarded.from.z))
                     return fail("bad boarded vehicle", line);
             }
@@ -4875,6 +5374,7 @@ bool haloscenariostatesave(std::string &out, bool live)
     else v = StateView{&s.savedGlobals, &s.savedThreads, &s.savedActors, s.savedSquadBots, &s.savedGroups, &s.savedDevices,
                        &s.savedExternal, &s.savedObjective, &s.savedHelp, s.savedShowHelp, &s.savedNavPoints, s.savedHudHidden,
                        s.savedHudBlinking, s.savedChapter, s.savedChapterStart, s.savedTick, s.savedBoarded, {}};
+    v.carried = live ? &s.carriedAttached : &s.savedCarried;
     // The objects attached in play still waiting for their actor (a50's jailed marines, posed in
     // their cells until the rescue): without them a Continue would leave them figures for good.
     const std::vector<int> &attachedAt = live ? s.attachedAt : s.savedAttachedAt;
@@ -4928,6 +5428,9 @@ bool haloscenariostaterestore(const std::vector<std::string> &records, bool comm
         if(at(s.attachedAt, entry.first.object)) s.attachedAt[entry.first.object] = 0;
         if(at(s.savedAttachedAt, entry.first.object)) s.savedAttachedAt[entry.first.object] = 0;
     }
+    // Carried in from the section before and not spawned yet: they spawn behind the player after
+    // the revert that follows (it copies savedCarried), as they did when the section began.
+    s.savedCarried = std::move(parsed.carried);
     // Attached in play, its actor still to come (the revert that follows copies savedAttachedAt).
     for(int object : parsed.attaching)
     {
@@ -5338,6 +5841,22 @@ void haloscenarioattachdump(const char *label)
     conoutf("ATTACH_QA %s count=%d figures=%d", label, count,
             int(std::count_if(sc.program.objectFlags.begin(), sc.program.objectFlags.end(), [](unsigned char f) { return (f & OBJECT_STORY_FIGURE) != 0; })));
     fflush(stdout);
+}
+
+// QA (tests/test_ai_attach.py item 10): the living actor attached to scripted object `object` walks
+// (is put) `forward` and `side` world units from where it stands, by its facing; false without one.
+bool haloscenarioqaattachmove(const char *object, float forward, float side)
+{
+    if(!scenario.loaded || !object) return false;
+    for(const SquadBot &b : scenario.squadBots)
+    {
+        if(b.object < 0 || !b.bot || b.bot->state != CS_ALIVE || scenario.program.objects[b.object].name != object) continue;
+        const float yaw = b.bot->yaw * RAD, s = haloscenarioscale();
+        const vec ahead(sinf(yaw), -cosf(yaw), 0), right(cosf(yaw), sinf(yaw), 0);
+        const vec feet = vec(b.bot->o).sub(vec(0, 0, b.bot->eyeheight)).add(vec(ahead).mul(forward * s)).add(vec(right).mul(side * s));
+        return haloenemymove(b.bot, feet);
+    }
+    return false;
 }
 
 // QA (tests/test_mission_exits.py): the looping sounds playing, the conversations being spoken and

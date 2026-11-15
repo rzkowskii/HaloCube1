@@ -17,6 +17,14 @@ QA client (fresh profiles, real campaign play):
    Exit row any more), so each starts once.
 4. A Call scene skipped at once still runs the rest of its script: b30's cutscene_shaftb_goal
    leaves shafta_lock_door open (it closes it first and opens it later in the scene).
+6. Gameplay scripts a scene wakes go on in play (gap 3 of batch 5's critic, not yet run): b30's
+   cutscene_insertion wakes music_b30 on its first tick, which waits for the mission's music cues; with
+   the scene skipped, it carries on as a gameplay thread ("Halo scene: music_b30, woken by
+   cutscene_insertion, goes on in play"; qa_hs_script music_b30 1 answers 1).
+
+Static (gap 3): SCENE_WAKES below lists, per cue-table scene, the gameplay scripts its threads wake
+(through static calls and the woken scripts' own wakes), read from the maps; the test fails on any
+change, and checks that b40's pelican_up is the one that seats the player (the seat endCue takes in play).
 
 Written while testing was on hold: not yet run.
 """
@@ -76,6 +84,120 @@ for cache, (found, names) in calls.items():
 assert not uncued, ('scene scripts with no cue row', uncued)
 print(f'{sum(len(v) for v in cued.values())} cued scenes cover every camera script of the ten missions '
       f'({len(NOT_CUED)} listed as gameplay).')
+
+# --- Static (gap 3): the gameplay scripts each cued scene wakes. A scene's thread that wakes one of
+# these starts it on the scene stage; endCue moves those still running onto the gameplay threads
+# (Scenario::sceneWoken), and a seat one of them gives the player (b40's pelican_up) is taken in play.
+SCENE_WAKES = {
+    ('a10', 'x10'): {'tank_run_1', 'tank_run_2', 'x10_crew_panic_1', 'x10_crew_panic_2', 'x10_crew_panic_3', 'x10_crew_panic_4',
+                     'x10_crew_panic_5', 'x10_crew_panic_6', 'x10_crew_salute_1', 'x10_crew_salute_2', 'x10_crew_walk_1',
+                     'x10_crew_walk_2', 'x10_crew_walk_3', 'x10_crew_walk_4', 'x10_hog_1', 'x10_hog_2', 'x10_hog_3', 'x10_hog_4',
+                     'x10_hog_5', 'x10_tankpel'},
+    ('a10', 'x30'): {'approach_setup', 'heavy_fire_1', 'heavy_fire_2', 'pass_pyro', 'safe_pyro'},
+    ('a30', 'cutscene_bridge'): {'save_cave_bridge'},
+    ('a50', 'cutscene_insertion'): {'dialog_insertion'},
+    ('b30', 'cutscene_extraction_exit'): {'extraction_music', 'pelican_fade'},
+    ('b30', 'cutscene_insertion'): {'music_b30', 'music_b30_01', 'music_b30_02', 'music_b30_03', 'music_b30_031', 'music_b30_032',
+                                    'music_b30_05', 'music_b30_06'},
+    ('b30', 'cutscene_ledge'): {'ledge_music'},
+    ('b40', 'cutscene_extraction'): {'extraction_music'},
+    ('b40', 'cutscene_insertion_a'): {'pelican_up'},
+    ('c10', 'cutscene_extraction'): {'extraction_music'},
+    # x50 ends section 5: door_open opens the lab's control_door_a and control_infection places Flood
+    # (dropped on the scene stage) in BSP 3, both finished inside the scene; none of them moves a door
+    # of section 6 (BSP 4), whose route has no door rows.
+    ('c10', 'x50'): {'control_infection', 'door_open', 'the_horror'},
+    ('c40', 'cutscene_extraction'): {'extraction_music'},
+    ('c40', 'cutscene_insertion'): {'animation_fix_1', 'chief_puzzled', 'chip_insert', 'insertion_music_1'},
+    ('d20', 'cinematic_captain'): {'captain_music'},
+    ('d20', 'cinematic_drop'): {'fall_music'},
+    ('d20', 'cinematic_intro'): {'oops'},
+    ('d40', 'cinematic_bridge'): {'bridge_music_1', 'chief_duck', 'engine_sentinels_1', 'engine_sentinels_2', 'sentinels_enter_1',
+                                  'sentinels_enter_2', 'sentinels_fire'},
+    ('d40', 'cinematic_finale'): {'flood_army_pyros', 'flood_chase', 'hangar_pyrotechnics_1', 'hangar_pyrotechnics_2', 'helmet',
+                                  'launch_2_pyro', 'sit_pyrotechnics', 'x80_elite_speech'},
+    ('d40', 'cinematic_intro'): {'insertion_dialog', 'insertion_music'},
+}
+SCENE_SEATS = {('b40', 'cutscene_insertion_a'): {'pelican_up'}}
+sys.path.insert(0, str(root / 'tools'))
+import mmap  # noqa: E402
+from import_halo_a30 import HaloMap  # noqa: E402
+
+
+def scene_wakes(cache):
+    """Per cued scene of the mission, the non-cue scripts its threads wake, and those that seat player0."""
+    with (HALO_SOURCE / f'{cache}.map').open('rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        h = HaloMap(m)
+        t, a = h.tags, h.scenario
+        p, s, ln = t.read('I', a + 1152)[0], t.read('I', a + 1172)[0], t.read('I', a + 1160)[0]
+        roots = [(t.name(b, 32), *t.read('HHI', b + 32)) for b in t.block(a + 1180, 92)]
+        nodes = [t.read('4H3I', p + 56 + 20 * i) for i in range((t.read('I', a + 1140)[0] - 56) // 20)]
+
+        def name(i):
+            return t.name(s + i, 256) if i < ln else ''
+
+        def children(i):
+            data, out = nodes[i & 65535][6], []
+            while data != 0xffffffff:
+                out.append(data)
+                data = nodes[data & 65535][4]
+            return out
+
+        def visit(i, calls, wakes, seats):
+            _, op, _, flag, _, _, _ = nodes[i & 65535]
+            if flag & 1:
+                return
+            if flag & 2:
+                calls.add(op)
+            kids = children(i)
+            if not kids:
+                return
+            head = nodes[kids[0] & 65535]
+            head_name = name(head[5]) if head[3] & 1 else ''
+            if head_name == 'wake' and len(kids) > 1:
+                arg = nodes[kids[1] & 65535]
+                if arg[3] & 1 and arg[1] == 10:
+                    wakes.add(arg[6] & 65535)
+            if head_name == 'unit_enter_vehicle' and len(kids) > 1:
+                unit = nodes[kids[1] & 65535]
+                if not unit[3] & 1 and unit[3] & 2 and roots[unit[1]][0] == 'player0':
+                    seats.add(True)
+            for kid in kids[1:]:
+                visit(kid, calls, wakes, seats)
+
+        index = {r[0]: k for k, r in enumerate(roots)}
+        woken, seating = {}, {}
+        for scene in sorted(cued.get(cache, ())):
+            if scene not in index:
+                continue
+            todo, seen = [index[scene]], set()
+            while todo:
+                k = todo.pop()
+                if k in seen:
+                    continue
+                seen.add(k)
+                calls, wakes, seats = set(), set(), set()
+                visit(roots[k][3], calls, wakes, seats)
+                todo += [c for c in calls if c < len(roots) and roots[c][1] == 3]
+                for w in wakes:
+                    if roots[w][0] not in cued[cache]:
+                        woken.setdefault((cache, scene), set()).add(roots[w][0])
+                    todo.append(w)
+                if seats and roots[k][0] in woken.get((cache, scene), ()):
+                    seating.setdefault((cache, scene), set()).add(roots[k][0])
+        return woken, seating
+
+
+found_wakes, found_seats = {}, {}
+for cache in IDS:
+    woken, seating = scene_wakes(cache)
+    found_wakes.update(woken)
+    found_seats.update(seating)
+assert found_wakes == SCENE_WAKES, ('the gameplay scripts the scenes wake changed',
+                                    {k: found_wakes.get(k) for k in set(found_wakes) | set(SCENE_WAKES) if found_wakes.get(k) != SCENE_WAKES.get(k)})
+assert found_seats == SCENE_SEATS, ('a woken script seats the player', found_seats)
+print(f'{sum(len(v) for v in SCENE_WAKES.values())} gameplay scripts are woken by {len(SCENE_WAKES)} scenes; '
+      'pelican_up alone seats the player.')
 
 require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
 require(root / 'packages/maps/halo_d40_08.cgz', 'import the campaign (docs/macos-build.md)')
@@ -202,4 +324,20 @@ text, log = run('call-talk', 'qa_campaign_play 3 4', [
 states = [line.split()[-1] for line in text.splitlines() if line.startswith(f'QA_CONVERSATION {talk} ')]
 assert states[:1] == ['2'] and states[-1] == '5', (talk, states, log)
 print(f'A Call scene restarted gameplay loop {loop} after it and finished the conversation {talk} it cut.')
+# 6. Gap 3: a gameplay script a scene woke goes on in play (b30's music director, woken on the
+#    insertion's first tick). Plain sleeps from launch, so the scene runs a while before qa_scene_skip
+#    skips it (qa_after_gameplay skips it at once, possibly before its first tick).
+profile = scratch('exits-scene-wakes-')
+log = profile / 'run.log'
+with log.open('w') as output:
+    subprocess.run([QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600',
+                    '-ehalo_scripttrace 1; halo_difficulty 1; qa_campaign_play 4 1; sleep 12000 [qa_scene_skip] 1; '
+                    'sleep 13000 [qa_hs_script music_b30 1; qa_hs_script music_b30 2] 1; sleep 13500 [quit] 1'],
+                   cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=120, check=True)
+text = log.read_text(errors='replace')
+assert 'QA_SKIP 1' in text and 'Halo scene: cutscene_insertion skipped' in text, ('the insertion was playing at 12 s', log)
+assert 'Halo scene: music_b30, woken by cutscene_insertion, goes on in play' in text, log
+states = [line.split()[-1] for line in text.splitlines() if line.startswith('HS_SCRIPT music_b30 ')]
+assert states[:2] == ['1', '0'], ('music_b30 runs as a gameplay thread, waiting for its cues', states, log)
+print('The Silent Cartographer: music_b30, woken by the skipped insertion, went on in play.')
 print('Mission exits, the finale and script-called scenes behave.')

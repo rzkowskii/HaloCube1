@@ -2,7 +2,7 @@
 
     python3 tests/test_retail_assists.py
 
-For each section ASSISTS lists (c10 section 3 today), starts it as campaign play and checks that
+For each section ASSISTS lists (c10 sections 3 and 6 today), starts it as campaign play and checks that
   * the engine loaded its .hcol with as many walking assists as ASSISTS lists ("Halo: loaded N retail
     collision surfaces for <map> (M static machines, K walking assists)"),
   * every assist (qa_retail_assists in tests/native/retail_qa.inc) lets a ray through (shots, sight

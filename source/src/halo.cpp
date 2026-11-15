@@ -130,6 +130,9 @@ namespace
         float damageScale = 0.5f, healthCarry = 0;
         // When the actor was last hurt, which makes active camouflage flicker (haloactorcloak).
         int hurtAt = -100000;
+        // When it last fired its weapon (haloactorfired, from halofiretrigger): a Hunter's belly
+        // window opens after its own cannon shot, not after its smash (which sets lastaction too).
+        int firedAt = -100000;
     };
 
     // The hit weapon.cpp is dealing (halohit): its exact amount and jpt! side effect, which
@@ -466,7 +469,8 @@ namespace
     // Starting profiles a fresh start of a later section adds to the mission's profile 0, for what
     // its script gives the player in an earlier section and does not give again when started
     // afresh there: a10's pistol at the bridge (mission_shoot, just past cinematic_x20 at the start
-    // of section 3).
+    // of section 3). The mission script's counterpart is freshScripts in halo_script.cpp (a10
+    // sections 5 and 6: mission_tunnel and cryo_search woken, the bridge flags set).
     struct FreshProfile { int mission, section; const char *profile; };
     const FreshProfile freshProfiles[] = { {0, 2, "bridge0_profile"} };
 
@@ -2473,6 +2477,37 @@ bool haloplayerplace(const vec *feet, float yaw, const char *why)
     return true;
 }
 
+// The floor under `from` the player's body fits on (gap 10: the scripted seat's guard lets the
+// player out of a Pelican that may be in mid-air): on retail collision the first floor straight
+// down the mesh, at `from` or at the spawn helper's ring of nearby spots (retailfloorspot), that
+// standable accepts; on stock geometry the floor of the cube column. False when there is none.
+bool haloplayerfloorbelow(const vec &from, vec &ground)
+{
+    if(!haloactive() || !std::isfinite(from.x) || !std::isfinite(from.y) || !std::isfinite(from.z)) return false;
+    if(!halocollisionactive())
+    {
+        const int x = int(from.x), y = int(from.y);
+        if(OUTBORD(x, y) || SOLID(S(x, y)) || S(x, y)->floor > from.z + 1.26f) return false;
+        ground = vec(from.x, from.y, S(x, y)->floor);
+        return true;
+    }
+    vec low, high;
+    if(!halocollisionbounds(low, high)) return false;
+    static const float ring[][2] = {{0, 0}, {.6f, 0}, {-.6f, 0}, {0, .6f}, {0, -.6f}, {1.2f, 0}, {-1.2f, 0}, {0, 1.2f}, {0, -1.2f},
+                                    {2.4f, 0}, {-2.4f, 0}, {0, 2.4f}, {0, -2.4f}};
+    const float height = bodyHeight(player1), radius = player1->radius;
+    for(const auto &offset : ring)
+    {
+        const vec top(from.x + offset[0], from.y + offset[1], from.z + 1.26f);
+        const float depth = top.z - (low.z - 1.0f);
+        if(depth <= 0) continue;
+        HaloCollisionHit hit;
+        if(!halocollisionsweep(top, vec(0, 0, -depth), radius, height, hit) || hit.normal.z < .65f || hit.fraction <= 0) continue;
+        if(standable(vec(top.x, top.y, top.z - depth * hit.fraction + .015f), ground)) return true;
+    }
+    return false;
+}
+
 bool haloscenariotransition()
 {
     if(!haloactive() || (preview && !retailCartographer()) || authoredTransition || launchPending || halocinematic() ||
@@ -2712,6 +2747,12 @@ VAR(halo_hunterregions, 0, 1, 1);
 // 0.05, the assault rifle's on an Elite's shield 0.7, the plasma rifle's 2).
 VAR(halo_actormaterials, 0, 0, 1);
 
+void haloactorfired(const playerent *p)
+{
+    HaloEnemy *enemy = enemyState(p);
+    if(enemy) enemy->firedAt = lastmillis;
+}
+
 float haloactordamagescale(const playerent *p)
 {
     const HaloEnemy *enemy = enemyState(p);
@@ -2772,8 +2813,9 @@ namespace
     //   front of the back: the head (the coll's head-flagged material is hunter skin), a hit in the
     //   top fifth of the body from outside the shield arm's 60 degrees; and the belly, a hit from
     //   the front between 30% and 60% of its height while it fires its cannon (the 0.6 s after a
-    //   shot, when the shield arm swings aside). Engine judgements: the retail coll tag's regions
-    //   are not traced, the body is a cylinder here.
+    //   cannon shot, when the shield arm swings aside: HaloEnemy::firedAt, so a smash, which sets
+    //   lastaction too, does not open it). Engine judgements: the retail coll tag's regions are not
+    //   traced, the body is a cylinder here.
     //   Sentinel, Monitor and Engineer have one material each (sentinel, monitor, engineer skin);
     //   the Monitor's body multiplier is 0, so nothing hurts it.
     // `region` returns the material type used (-1: none applies); `shieldScale` multiplies what an
@@ -2796,7 +2838,7 @@ namespace
                         const float yaw = target->yaw * RAD;
                         const float facing = delta.normalize().dot(vec(sinf(yaw), -cosf(yaw), 0));
                         const float height = halo_hunterregions ? hitHeight(target, hit) : -1;
-                        const bool firing = lastmillis - target->lastaction >= 0 && lastmillis - target->lastaction < 600;
+                        const bool firing = lastmillis - enemy.firedAt >= 0 && lastmillis - enemy.firedAt < 600;
                         if(facing > cosf(60 * RAD))
                             region = height >= .3f && height <= .6f && firing ? HALO_MATERIAL_HUNTER_SKIN : HALO_MATERIAL_HUNTER_SHIELD;
                         else if(facing < cosf(130 * RAD) || height >= .8f) region = HALO_MATERIAL_HUNTER_SKIN;
@@ -2934,6 +2976,13 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     // (not in combat, or fighting someone else) takes the actor's whole shield and health, whatever
     // the shield's modifier (applied below, after the shield). A body its material leaves unhurt
     // (the Monitor, a Hunter's shield arm) stays unhurt; the actors' own melee is not affected.
+    // Judgement call (batch 5's critic): only an actor hostile to the player now. The player's
+    // allies (the marines, until a betrayal turns them) and the actors ai_attach made of story
+    // figures (a50's Keyes and freed marines, c10's marine_suicidal, whatever their team) take
+    // the melee's normal damage instead: the tags give the side effect to every weapon's melee and
+    // say nothing of allies, and whether Halo CE's own check spares an ally that is not in combat
+    // is not confirmed here, while one stray tap from behind would otherwise end a50 (Keyes's
+    // death is game_lost_script's loss). halo_damagetrace logs DAMAGE_UNSUSPECTING_SPARED for them.
     bool unsuspecting = false;
     if(side == HALO_SIDE_EFFECT_UNSUSPECTING && halo_meleeunsuspecting && attacker == player1 && amount > 0 &&
        (region < 0 || material > 0))
@@ -2945,10 +2994,20 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         const int status = haloactorstatus(target);
         if(facing < cosf(120 * RAD) && (status < 6 || haloactortarget(target) != attacker))
         {
-            unsuspecting = true;
-            if(halo_damagetrace)
-                conoutf("DAMAGE_UNSUSPECTING target=%s kind=%d status=%d facing=%.3f amount=%.2f", target->name, int(enemy->kind),
-                        status, facing, max(amount, enemy->shield + float(max(target->health, 0)) + 1));
+            const bool attached = haloscenarioattachedactor(target);
+            if(attached || !haloactorhostile(target, player1))
+            {
+                if(halo_damagetrace)
+                    conoutf("DAMAGE_UNSUSPECTING_SPARED target=%s kind=%d team=%d attached=%d facing=%.3f", target->name, int(enemy->kind),
+                            haloactorteam(target), attached, facing);
+            }
+            else
+            {
+                unsuspecting = true;
+                if(halo_damagetrace)
+                    conoutf("DAMAGE_UNSUSPECTING target=%s kind=%d status=%d facing=%.3f amount=%.2f", target->name, int(enemy->kind),
+                            status, facing, max(amount, enemy->shield + float(max(target->health, 0)) + 1));
+            }
         }
     }
     if(unsuspecting && enemy->shieldMax > 0 && enemy->shield > 0)

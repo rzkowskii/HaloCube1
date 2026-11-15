@@ -193,15 +193,15 @@ COMMANDF(qa_target_aim, "fff", (float *x, float *y, float *z)
 // ---- The fidelity gaps of batch 9 (tests/test_melee_materials.py)
 
 // The nearest living hostile actor of body kind `kind` (ActorKind; -1 any), renewed: full health
-// and shield, nothing carried.
-static HaloEnemy *qaDamageRenewed(int kind)
+// and shield, nothing carried. `friendly`: the nearest of the player's allies instead.
+static HaloEnemy *qaDamageRenewed(int kind, bool friendly = false)
 {
     HaloEnemy *found = NULL;
     float best = 1e16f;
     loopv(enemies)
     {
         HaloEnemy &e = enemies[i];
-        if(!e.bot || e.bot->state != CS_ALIVE || haloteamfriendly(e.team) || (kind >= 0 && int(e.kind) != kind)) continue;
+        if(!e.bot || e.bot->state != CS_ALIVE || haloteamfriendly(e.team) != friendly || (kind >= 0 && int(e.kind) != kind)) continue;
         const float d = player1->o.squareddist(e.bot->o);
         if(d < best) { best = d; found = &e; }
     }
@@ -251,6 +251,32 @@ COMMANDF(qa_damage_melee, "iis", (int *behind, int *aware, const char *label)
     haloactorforceawareness(e->bot, *aware != 0, player1);
     halomelee();
     qaDamageReport(label, e);
+});
+
+// qa_damage_melee_friend LABEL: as qa_damage_melee 1 0 on the nearest of the player's allies (a
+// marine; a50's Keyes once attached): the player's melee from behind on an ally that is not in
+// combat. Batch 5's critic: allies and attached story figures are spared the kill from behind
+// (DAMAGE_UNSUSPECTING_SPARED), the melee's normal damage still applies. DAMAGE_REGION <label> ...
+COMMANDF(qa_damage_melee_friend, "s", (const char *label)
+{
+    HaloEnemy *e = qaDamageRenewed(-1, true);
+    if(!e) { conoutf("DAMAGE_REGION %s no-actor", label); fflush(stdout); return; }
+    qaDamageStandBy(e->bot, 180.0f, .6f);
+    haloactorforceawareness(e->bot, false, player1);
+    halomelee();
+    qaDamageReport(label, e);
+});
+
+// qa_damage_hunter_act FIRED: the nearest hostile Hunter has just fired its cannon (FIRED 1:
+// haloactorfired, as halofiretrigger records it) or just smashed (0: its lastaction set, as the
+// smash does, and nothing else): the belly window opens only after a cannon shot (gap 11).
+COMMANDF(qa_damage_hunter_act, "i", (int *fired)
+{
+    HaloEnemy *e = qaDamageRenewed(HUNTER);
+    if(e && *fired) haloactorfired(e->bot);
+    else if(e) e->bot->lastaction = lastmillis;
+    conoutf("DAMAGE_HUNTER_ACT ok=%d fired=%d", e != NULL, *fired);
+    fflush(stdout);
 });
 
 // qa_damage_region KIND BEARING HEIGHT WEAPON AMOUNT LABEL: the nearest hostile actor of body kind

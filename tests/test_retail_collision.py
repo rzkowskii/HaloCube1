@@ -36,12 +36,15 @@ The driven and flown sections (DRIVEN_SECTIONS) with a planned vehicle route (VE
 tools/import_halo_campaign.py: d40 sections 6 to 8, c40 sections 1 and 4) are walked too, by the QA
 vehicle walker (route flags 4096 drive or fly, 8192 board, 16384 get out: `RETAIL_QA vehicle ...`
 lines): full throttle at a row ahead, as the foot walker holds forward, with the vehicles kept from
-harm. Their movement feel is not required (a straight on foot is measured if their foot legs have
+harm; a drive planned below 0.9 of top speed (`vehicle_route.drive.speed` in its metrics: d40
+section 8, batch 10) is walked with the QA throttle capped at that speed (qa_vehicle_cruise). Their
+movement feel is not required (a straight on foot is measured if their foot legs have
 one) and the route markers of a flown section's flight stand in the air (the engine's audit skips
 them). Driven sections without a route are skipped as before (tests/test_maw_drive.py drives them).
 Written while testing was on hold; the vehicle walker has not been run.
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -66,10 +69,15 @@ NOMINAL_SPEED = 16.0
 # Sections whose walk is known to stop at a script-gated door (docs/macos-build.md). They are
 # walked and reported every time, but only fail the test once they pass (so the list is pruned).
 KNOWN_BLOCKED = {
-    # mission_tunnel runs only once mission_a10 is past the bridge scene, so section 5 needs a walk
-    # carried in from sections 1 and 2; the last walk started at section 3 and never woke it.
-    'halo_a10_05': 'tunnel_door_2 stayed shut on the last walk (started at section 3: mission_tunnel never ran)',
-    'halo_a10_06': 'reached only through section 5; on its own cryo_search never opens cryo_door_2',
+    # mission_tunnel runs only once mission_a10 is past the bridge scene; the last walk started at
+    # section 3 and never woke it. Since gap 6 of batch 5's critic a fresh start of sections 5 and 6
+    # brings the script forward (freshScripts in source/src/halo_script.cpp: mission_tunnel and
+    # cryo_search woken, the bridge flags set), so both the chained and the standalone walk are
+    # expected to pass; neither has been walked since.
+    'halo_a10_05': 'tunnel_door_2 stayed shut on the last walk (started at section 3: mission_tunnel never ran); '
+                   'pending a walk, chained or started on its own (the fresh start wakes mission_tunnel)',
+    'halo_a10_06': 'cryo_door_2 stayed shut on its own (cryo_search never ran); pending a walk, chained or started on its own '
+                   '(the fresh start wakes cryo_search)',
     # The route rides lift_d down the c1 tower (flag 4). These reasons are what stopped the last walk,
     # made before the walker rode lifts (route flags 16 to 128); PENDING_WALK says what should pass now.
     'halo_b40_06': 'lift_d ride (route flag 4): last walked before the walker rode lifts',
@@ -86,16 +94,13 @@ KNOWN_BLOCKED = {
     # controls and shot, and the section ends on the elevator, which enc5_3 raises to bsp 4,5.
     # The route uses all four controls (256 rows) and shoots the detectors of s1, n1 and n3 (512
     # rows); no walkable spot sees s3's detectors (docs/macos-build.md). It now throws frags into s3's
-    # channel from the top floor (2048 rows, ThrowTarget); never walked, so it stays here until it is.
+    # channel (2048 rows, ThrowTarget; from floor 2's walkway since the route batch); never walked, so
+    # it stays here until it is.
     'halo_d40_05': "s3's detectors are out of sight of every walkable spot: last walked before the frag throws (2048 rows)",
-    # Planned vehicle routes that stop short (the importer's WARNING; docs/macos-build.md): c40 section
-    # 1's flight lands on pulse generator 1's platform, but the doorway into its room (BSP 12) is
-    # narrower than the engine's body at the section's outdoor scale, so pulse_1_trigger, which powers
-    # door_c1, is never entered; d40 section 8's run meets gaps (from about x 876) that the engine's
-    # car, which jumps only at the rate it was climbing and falls at 40 units a second squared, cannot
-    # cross.
-    'halo_c40_01': "the walk from pulse generator 1's platform into pulse_1_trigger is not planned (doorway narrower than the body)",
-    'halo_d40_08': "the planned drive stops at the first gap of the run's last stretch (the engine's car cannot jump it)",
+    # No planned vehicle route stops short now: d40 section 8 (here until batch 10) plans to
+    # grand_finale, and c40 section 1 (here until the route batch) walks into pulse_1_trigger and on through
+    # door_c1 since the seals between BSPs 2 and 12 are left out of its .hcol (held_bsps in
+    # tools/import_halo_campaign.py; the doorway was never too narrow). Both are in PENDING_WALK.
 }
 # Sections the lift and light-bridge machinery (route flags 16, 32, 64 and 128: the walker
 # boards, calls and sends lifts, and waits for bridges; the engine carries every body on a lift
@@ -107,30 +112,53 @@ PENDING_WALK = {
     'halo_c10_01': 'rides lift_a down from lift_a_cont_a on its deck (deck row: send)',
     'halo_c10_02': 'new on retail collision: from the bottom of lift_a, drops into the lower hall beside bridge_a',
     'halo_c10_03': 'new on retail collision (batch 6): over the two walking assists (ASSISTS) to bay B and the lab, '
-                   'x50 at control_lab_trigger, then out by the upper doorway once post_helmet_door_4 is powered',
+                   'x50 at control_lab_trigger, then out by the upper doorway once post_helmet_door_4 is powered; '
+                   're-planned with its scenery collision (SCENERY_COLLISION: the channel crates, the hall D debris)',
     'halo_c10_04': 'rides lift_b down from lift_b_cont_a on its deck (deck row: send)',
+    'halo_c10_06': 'new on retail collision (scenery batch): from the lower BSP 4/3 doorway up the fallen debris over the two '
+                   'walking assists (ASSISTS) to the upper storey, across bridge_e from brdige_e_cont_a, then calls lift_d and '
+                   'rides it up from lift_d_cont_a (deck row: call, send)',
     'halo_c20_01': 'boards platform1 (0.38 units up: the engine lets a body step onto a lift deck) and rides up',
     'halo_c20_02': 'boards platform2 and rides up',
     'halo_c20_03': 'boards platform3 and rides up',
     # Door rows (1024, DOOR_WAITS): the walker stands at the door until it opens and logs its power
     # and position while it waits; a chained walk from section 1 carries cryo_search's open
     # cryo_door_2 into section 6.
-    'halo_a10_05': 'walked on from section 1: passes tunnel_trigger_close, then waits at tunnel_door_2 on its door row '
-                   'until mission_tunnel powers it (about 25 s; tunnel_door_3 needs no reopening)',
-    'halo_a10_06': 'waits at cryo_door_2 on its door row (open when carried in from section 5)',
-    # Throw rows (2048, ThrowTarget): from one spot on the top floor the walker throws frags at the
-    # planned aims, four an aim, until s3's detector is down to 0.1; enc5_2_door then opens.
-    'halo_d40_05': "throws frags into s3's channel mouth from the top floor (2048 rows), then rides the elevator",
+    'halo_a10_05': 'walked on from section 1, or started on its own (freshScripts wakes mission_tunnel): passes '
+                   'tunnel_trigger_close, then waits at tunnel_door_2 on its door row until mission_tunnel powers it '
+                   '(about 25 s; tunnel_door_3 needs no reopening)',
+    'halo_a10_06': 'waits at cryo_door_2 on its door row (open when carried in from section 5, or on its own once '
+                   'freshScripts wakes cryo_search)',
+    # Throw rows (2048, ThrowTarget): from one spot (since the route batch on floor 2's walkway below
+    # the channel, lobs at pitch 48) the walker throws frags at the planned aims, four an aim, until
+    # s3's detector is down to 0.1; enc5_2_door then opens.
+    'halo_d40_05': "throws frags up into s3's channel from floor 2's walkway (2048 rows, the route batch's lobs), "
+                   "then rides the elevator",
     # Route fixes of this batch (not KNOWN_BLOCKED: never walked).
     'halo_a30': 'the Crash Site on retail collision (CRASH_SITE, batch 6): from the lifepod up the valley, sliding down '
-                "two steep slopes (route flag 8) into the marines' basin, to first_marine_extraction",
+                "two steep slopes (route flag 8) into the marines' basin, to first_marine_extraction; since the scenery "
+                'batch round and over the trees, boulders and lifepod as their real collision (SCENERY_COLLISION)',
     'halo_a30_01': 'starts on the valley floor in front of the first structure, ends on the ledge above the cave floor',
     'halo_b30_03': "walked return to the extraction Pelican's ledge; the walker presses E there until the Pelican hovers",
     'halo_b40_03': "ends in the b3 tower's bottom doorway (bsp 1,8), the section ending at its end marker",
     # Planned vehicle routes (VEHICLE_ROUTES, gap 5; never driven or flown by the walker).
     'halo_d40_06': 'drives the planned Warthog route from the elevator landing up the ramp to bsp 5,6',
     'halo_d40_07': 'drives on to bsp 6,7',
+    # Batch 10: the Warthog's jumps launch along the ramp and fall at the retail-derived vehicle gravity;
+    # the drive is planned at 0.75 of top speed, and walked with the QA throttle capped there.
+    'halo_d40_08': "drives to grand_finale at its planned speed (qa_vehicle_cruise): off the pit room's entry road, under "
+                   "the hanging bridge segment into the lower bridge's bowl (a 23 Halo unit drop), kicked off the bowl's "
+                   "far side over the gap into the corridor, and down to the Longsword's hangar",
     'halo_c40_04': "boards the engine's Banshee beside the start, flies to the landing pad and walks into bsp 0,5",
+    # The route batch (gap 7 of batch 5's critic): b30's first two sections are planned (RASTER_ROUTES is empty).
+    'halo_b30_01': 'planned walk (no longer the raster route) from the beach landing zone to the shaft A entrance, bsp 0,1',
+    'halo_b30_02': 'planned walk down shaft A from bsp 1,0: a door row at shafta_lock_door (open since the section start), '
+                   "uses shafta_map_control (row on holohalo_1, which cutscene_map sets), then from player0_map_done "
+                   'back up to bsp 1,0',
+    # The route batch (gap 2 of batch 5's critic): the seals of BSPs 2 and 12 in the generator doorway are left out.
+    'halo_c40_01': "walks to fly_away_1, flies to pulse generator 1's platform, walks through the doorway corridor (BSPs 2 "
+                   "and 12, no seals) into pulse_1_trigger and back, flies down to the c bridge and walks through door_c1 "
+                   "into bsp 2,10 (door_c1 powered by pulse_1_trigger; the walker has no door row there)",
 }
 
 
@@ -246,11 +274,22 @@ def walk_run(mission, walk):
     # Long routes (d40's engine room walks every manifold's bay: 5,000 rows) get more time, as the
     # walker's own deadline does (90 ms a row past 3,000).
     extra = sum(max(0, len(Path(route).read_text().splitlines()) - 3000) * .09 for route in routes if Path(route).is_file())
+    # A drive planned below 0.9 of the car's top speed (its jumps need the slower take-off: d40
+    # section 8's drop, `vehicle_route.drive.speed` in the metrics) is driven at that speed: the QA
+    # throttle is capped there (qa_vehicle_cruise; the walker itself still holds full throttle).
+    cruise = ''
+    for n in walk:
+        name = section_name(mission, n)
+        metrics_path = maps / f'{name}.metrics.json'
+        drive = ((json.loads(metrics_path.read_text()).get('vehicle_route') or {}).get('drive') or {}) if metrics_path.is_file() else {}
+        if drive.get('speed') and drive.get('top') and drive['speed'] < .9 * drive['top'] - .01:
+            cruise += f'qa_vehicle_cruise {name} {drive["speed"]}; '
     with logfile.open('w') as output:
         try:
             result = subprocess.run(
                 [QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600',
-                 f'-ehalo_scripttrace 1; maxfps 120; halo_difficulty {args.difficulty}; sleep 600 [qa_retail_start {mission_index} {engine_section}] 1'],
+                 f'-ehalo_scripttrace 1; maxfps 120; halo_difficulty {args.difficulty}; {cruise}'
+                 f'sleep 600 [qa_retail_start {mission_index} {engine_section}] 1'],
                 cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=args.timeout * len(walk) + extra,
                 env={**os.environ, 'HALOQA_RETAIL_ROUTE': routes[0], 'HALOQA_RETAIL_CHAIN': '\n'.join(routes[1:])})
             code = result.returncode

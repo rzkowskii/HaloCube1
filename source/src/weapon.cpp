@@ -2031,7 +2031,9 @@ namespace
         halofxblast(centre, radius);
         auto blast = [&](playerent *victim)
         {
-            if(!victim || victim->state != CS_ALIVE) return;
+            // A rider the hull covers (the Wraith's driver, a Banshee's pilot) is left to the hull,
+            // which takes the blast below (blastvehicles): it dies with the vehicle.
+            if(!victim || victim->state != CS_ALIVE || halovehicleridercovered(victim)) return;
             const float distance = victim->o.dist(centre);
             if(distance >= radius) return;
             const float damage = shotdamage(shot, halofalloff(distance, inner, radius));
@@ -2149,6 +2151,7 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
         }
     }
     else if(!(target = haloactortarget(owner))) target = player1;
+    if(owner != player1) haloactorfired(owner);
     haloactornoise(owner);
     const float scale = haloscenarioscale();
     const int count = max(1, t->projectilesPerShot), fallbackGun = owner->weaponsel->type;
@@ -2490,6 +2493,9 @@ namespace
             const float distance = centre.dist(o);
             const bool stuck = victim == stuckTo;
             if(!stuck && (distance >= outer || (distance > core && !raycubelos(o, centre, .3f)))) return;
+            // A rider the hull covers is left to the hull (halovehicleridercovered), unless the
+            // grenade is stuck to the rider itself.
+            if(!stuck && halovehicleridercovered(victim)) return;
             const float falloff = stuck ? 1.0f : halofalloff(distance, inner, outer);
             const float full = thrownByPlayer ? def->blast.roll() : def->blast.rollFromLower();
             float damage = def->blast.scaled(full, falloff);
@@ -2521,6 +2527,67 @@ namespace
         }
         if(plasma) halovehicleemp(o, outer, stuckVehicle, HALO_EMP_STUN_MILLIS);
     }
+}
+
+void haloareablast(const vec &centre, const HaloDamage &damage, float innerRadius, float outerRadius, int sideEffect, playerent *owner)
+{
+    if(!haloactive() || !(outerRadius > 0) || !(damage.upperMax > 0) || halocinematic()) return;
+    const float scale = haloscenarioscale();
+    const float outer = outerRadius * scale, inner = clamp(innerRadius * scale, 0.0f, outer);
+    const float core = halo_aoecore ? min(damage.core * scale, outer) : 0;
+    // The scripts' blasts are dealt in the player's name (as damage_new is), without counting as
+    // the player betraying allies; the player's own hurt is self-inflicted (no difficulty scale).
+    playerent *attacker = owner ? owner : player1;
+    struct ScriptScope
+    {
+        bool on;
+        explicit ScriptScope(bool scripted) : on(scripted) { if(on) haloactorscriptdamage(true); }
+        ~ScriptScope() { if(on) haloactorscriptdamage(false); }
+    } scripted(!owner);
+    auto blast = [&](playerent *victim)
+    {
+        if(!victim || victim->state != CS_ALIVE || halovehicleridercovered(victim)) return;
+        const vec middle = vec(victim->o).sub(vec(0, 0, victim->eyeheight * .5f));
+        const float distance = middle.dist(centre);
+        if(distance >= outer || (distance > core && !raycubelos(centre, middle, .3f))) return;
+        const float amount = damage.scaled(damage.roll(), halofalloff(distance, inner, outer));
+        if(!(amount > 0)) return;
+        vec dir = vec(victim->o).sub(centre);
+        if(dir.iszero()) dir = vec(0, 0, 1);
+        halohit(amount, sideEffect, victim, attacker, dir.normalize(), GUN_GRENADE, true, int(distance * DMF), &damage);
+    };
+    blast(player1);
+    loopv(players) blast(players[i]);
+    int vehicles[16];
+    float distances[16];
+    const int count = halovehiclesnear(centre, outer, vehicles, distances, 16);
+    loopi(count)
+    {
+        vec middle;
+        if(distances[i] > core && halovehiclecentre(vehicles[i], middle) && !raycubelos(centre, middle, .3f)) continue;
+        halovehiclehit(vehicles[i], damage.scaled(damage.roll(), halofalloff(distances[i], inner, outer)), &damage, true, owner);
+    }
+    if(sideEffect == HALO_SIDE_EFFECT_EMP) halovehicleemp(centre, outer, -1, HALO_EMP_STUN_MILLIS);
+}
+
+bool haloeffectblast(const char *tag, const vec &centre, playerent *owner)
+{
+    HaloEffectDamage d;
+    if(!halofxeffectdamage(tag, d)) return false;
+    haloareablast(centre, d.damage, d.inner, d.outer, d.sideEffect, owner);
+    return true;
+}
+
+bool haloqagrenadeat(int type, const vec &at, playerent *owner)
+{
+    const HaloGrenadeDef *def = halogrenadedef(type);
+    if(!haloactive() || !owner || !def) return false;
+    halogrenade *g = new halogrenade(owner, type);
+    bounceents.add(g);
+    g->o = at;
+    g->vel = vec(0, 0, 0);
+    g->explode();
+    return true;
 }
 
 static const char *halobouncemodel(const bounceent *p)

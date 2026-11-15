@@ -30,32 +30,34 @@ QUICK = [
     'test_retail_recovery.py',        # falls below or past the retail mesh and wedges put the player back on floor; teleport grace
     'test_traversal_routes.py',       # lift deck and light-bridge route rows are consistent (route files only)
     'test_retail_assists.py',         # walking assists (ASSISTS, .hcol AST1): loaded, rays and grenades pass, bodies stand on them
+    'test_retail_scenery.py',         # scenery collision (SCENERY_COLLISION, .hcol SCN1): trailer matches metrics, loaded, hit by rays, grenades, bodies
     'test_route_metrics.py',          # stub-route gate: importer metrics, the known-bad table may not grow (no game)
     'test_campaign_replay.py',        # all 55 sections complete in one run
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
     'test_combat_equipment.py',       # grenade types, sticky plasma, equipment pickups, overshield, camouflage, weapon sounds
     'test_damage_model.py',           # jpt! range and blast falloff, actor grenade rolls, exact actor shots, EMP, time to kill
-    'test_melee_materials.py',        # melee from behind, Hunter head and belly, material model cvar, needle supercombine, AOE core
+    'test_melee_materials.py',        # melee from behind (allies spared), Hunter head and belly (cannon-fire window), material model cvar, needle supercombine, AOE core
     'test_damage_targets.py',         # d40's manifold detectors: HSCB 8 targets, placed whole, damage rules, a real shot from the route
     'test_frag_throw.py',             # d40's s3 manifold: the importer's planned frag throws (2048 rows) thrown in the game destroy it
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine
     'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands
     'test_factions.py',               # allegiance matrix and commands, betrayal, Hunters, stealth Elites, flyers, Monitor, Keyes
-    'test_ai_attach.py',              # HSCB 9 story-figure flags; ai_attach makes a50's Keyes and marines actors (health, revert, destroy)
+    'test_ai_attach.py',              # HSCB 9 story-figure flags; ai_attach makes a50's Keyes and marines actors (health, revert, destroy, carried into section 5, own start across checkpoints, spared the kill from behind)
     'test_starting_profiles.py',      # HSCB 9 starting profiles: a10 unarmed, player_add_equipment, a30/c20 loadouts, carry, empty slots saved
     'test_campaign_ending.py',        # game_won/game_lost raise the ending, credits, beaten flag
     'test_mission_exits.py',          # every mission's exit scene and the next mission, a30 variants, script-called scenes
     'test_frontend_progress.py',      # title menu, Continue with the script's state (v3), fallbacks, loadout carry, backup, corruption
     'test_nav_points.py',             # script nav points and HUD show/blink commands, waypoint arrows in hud.txt
     'test_script_coverage.py',        # every sleep_until/if condition command is bound; a10 tutorial, d40 timer
-    'test_script_seats.py',           # a10's cryotube as a scripted seat (held, released by the script, guards), marker effects, the Monitor spared
+    'test_script_seats.py',           # a10's cryotube as a scripted seat (held, released by the script, guards), b40's Pelican ride, marker effects, the Monitor spared
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
     'test_flood.py',                  # squad cap counts living actors; carrier burst, corpse infection, infection leap
     'test_vehicles.py',               # vehicle table and placements, Warthog in/out/drive/flip/gunner, turret, seat commands
     'test_enemy_vehicles.py',         # Ghost, Wraith, Scorpion, flown Banshee, AI pilots, dropship cargo, Pelican boarding, c40 flown
-    'test_vehicle_damage.py',         # vehicle body vitality: the Wraith destroyed with its pilot, occupied-only Ghost, vehicle gun variants
-    'test_presentation.py',           # script effects, shake, screen effects, flashlight, damage indicator, class gains, lunge, engine loops
+    'test_vehicle_damage.py',         # vehicle body vitality: the Wraith destroyed with its pilot, occupied-only Ghost, vehicle gun variants, covered riders, death explosion, tilted hit box, wreck
+    'test_vehicle_jump.py',           # d40 section 8's planned Warthog jumps flown by the engine (launch along the ramp, retail-derived gravity)
+    'test_presentation.py',           # script effects, shake, screen effects, flashlight, damage indicator, class gains, lunge, engine loops, effect_new damage cvar
     'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
 ]
 # Release tier (--release, scripts/ci-macos.sh --release): about 10 and 8 minutes; the ASan/UBSan

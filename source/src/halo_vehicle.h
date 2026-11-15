@@ -52,7 +52,8 @@ bool halovehicleriderstunned(const playerent *unit);    // `unit` sits in a stun
 // Only vehicles with a body vitality stop shots and take damage: the Wraith, and the Ghost and the
 // Banshee while someone rides them (their coll's "only damaged while occupied"). The Warthog, the
 // Scorpion and the turret have none (indestructible in Halo) and shots pass through them as before.
-// halovehicletrace: the first such vehicle whose body box (yaw only) the segment passes through,
+// halovehicletrace: the first such vehicle whose body box (turned by its yaw and tilted by its pitch
+// and roll, as it is drawn; a flipped one level) the segment passes through,
 // with the fraction along it, or -1; `shooter`'s own vehicle is left out, and for an actor shooter
 // so is any vehicle no one hostile to it rides (its shots pass friends, as haloactorhit). `met` is the body the
 // shot reached at `to`, or null: a rider of that vehicle in an open seat (the Ghost's) takes the
@@ -61,6 +62,12 @@ bool halovehicleriderstunned(const playerent *unit);    // `unit` sits in a stun
 // children" (flag 2: the Banshee's pilot, the player included).
 struct HaloDamage;
 int halovehicletrace(const vec &from, const vec &to, float &fraction, const playerent *shooter, const playerent *met);
+// `unit` rides a vehicle with a body vitality in a seat its hull covers (the rule above: the
+// Wraith's driver, the Banshee's pilot, the player included): a blast (areadamage, grenades,
+// haloareablast) leaves it alone and the hull takes the blast instead, so a rider is not hurt twice
+// (in its own right and through the hull) and dies with the vehicle. The Ghost's open seat is not
+// covered. False with vehicle damage off (halo_vehicledamage 0).
+bool halovehicleridercovered(const playerent *unit);
 // The vehicles with a body vitality a blast at `centre` reaches within `radius` (AssaultCube
 // units, to the nearest point of the box), with those distances; returns how many.
 int halovehiclesnear(const vec &centre, float radius, int *vehicles, float *distances, int capacity);
@@ -69,7 +76,10 @@ int halovehiclesnear(const vec &centre, float radius, int *vehicles, float *dist
 // its body vitality. `explosive`: area damage (a vehicle "only damaged by explosives" takes only
 // that). Enemy fire on the player's vehicle is scaled by the difficulty as on the player; damage
 // to any other vehicle by the difficulty's enemy health. At no health it explodes (its body
-// depleted effect), its riders die, it is gone and so is the scripts' object (unit_get_health -1).
+// depleted effect), its riders die, the effect's jpt! area damage strikes round it
+// (halo_vehicleexplosion, haloeffectblast), it is gone and so is the scripts' object
+// (unit_get_health -1); a grounded one leaves its wreck, a box bodies collide with, when
+// halo_vehiclewreck is on (off by default).
 // Returns the damage taken (0: none, for an indestructible, empty or protected vehicle).
 float halovehiclehit(int index, float damage, const HaloDamage *source, bool explosive, playerent *attacker);
 // unit_get_health of scenario object `object`'s vehicle: its body health 0..1 (1 for one with no
@@ -159,6 +169,18 @@ int halovehicleengineloops();                           // engine loops playing 
 void halovehicledump(const char *label);
 // QA: damage vehicle `vehicle` as the player would (no jpt! source).
 float halovehicleqadamage(int vehicle, float amount, bool explosive);
+// QA (tests/test_vehicle_damage.py): the unit at vehicle `vehicle`'s controls, or null; the point
+// `side` units out past the right side of its body box at the box's middle height; its pitch and
+// roll set (and held: asleep) for the tilted hit box; where a level segment across it from side to
+// side, `along` units forward of its floor point and `up` above it, enters its hit box (`fraction`,
+// -1 for a miss), with the level box's back, front, half width and top (AssaultCube units, from the
+// floor point); and how many wrecks the section holds (halo_vehiclewreck).
+playerent *halovehicleqadriver(int vehicle);
+bool halovehicleqabeside(int vehicle, float side, vec &point);
+bool halovehicleqatilt(int vehicle, float pitch, float roll);
+bool halovehicleqaprobe(int vehicle, float along, float up, float &fraction, float box[4]);
+int halovehicleqawrecks();
+bool halovehicleqawreckat(int vehicle, vec &centre);   // the middle of vehicle `vehicle`'s wreck box
 // QA vehicle walker (tests/native/retail_qa.inc): the player's vehicle's position (its floor point
 // or a flyer's origin, as the importer's vehicle rows give it) and yaw; and the existing vehicle of
 // vehicles.txt type `name` nearest `near` whose driver's seat is free, with that seat's entry point.
@@ -185,5 +207,14 @@ bool halovehicleqapush(int vehicle, float speed);       // rolls it forward at `
 bool halovehicleqastuck(int vehicle, const char *kind); // fall: below the mesh; sink: half into the floor
 // Seats the player at the wheel, turns it over and throws them out with no room for the body.
 bool halovehicleqathrow(int vehicle);
+// The player's vehicle put on the floor at `feet` heading `yaw` (the camera too) at `speed` units/s
+// forward, for the jump checks (tests/test_vehicle_jump.py); and its motion: position (floor
+// point), velocity, whether it is on the ground or flipped, its airborne gravity (vehicleGravity)
+// and the surface's vertical rate it would leave the ground with.
+bool halovehicleqajump(const vec &feet, float yaw, float speed);
+// QA input (the route walker's, the autopilot's, qa_vehicle_input) stops accelerating at `speed`
+// units/s while section map `map` is loaded ("*": any; an empty map clears every cap, speed 0 one).
+void halovehicleqacruise(const char *map, float speed);
+bool halovehicleqamotion(vec &pos, vec &vel, bool &grounded, bool &flipped, float &gravity, float &tangent);
 
 #endif

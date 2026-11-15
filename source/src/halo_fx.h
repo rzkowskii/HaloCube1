@@ -1,9 +1,12 @@
 #ifndef HALO_FX_H
 #define HALO_FX_H
 
+#include "halo_weapons.h"
+
 // Presentation (halo_fx.cpp): the effects the mission scripts create, camera shake, the cinematic
 // screen effects, the flashlight, the damage-direction indicator and the retail sound classes'
-// gains. Nothing here changes the game's state: no damage, no movement, no script results.
+// gains. Nothing here changes the game's state: no damage, no movement, no script results (an
+// effect's jpt! damage is only read here, halofxeffectdamage; weapon.cpp deals it).
 // The tables come from tools/halo_effects.py (packages/halo/effects.txt: effects, the flashlight,
 // each cache's sound classes) and tools/import_halo_audio.py (packages/audio/halo/tags/classes.txt:
 // the class of each decoded weapon, vehicle and effect sample). Without them the effects fall back
@@ -22,6 +25,17 @@ void halofxupdate(int elapsed);             // every frame (haloupdate): the fla
 bool halofxeffect(const char *tag, const vec &point, bool visual);
 // A blast of `radius` AssaultCube units at `point` (grenades, rockets): the camera shakes near it.
 void halofxblast(const vec &point, float radius);
+// The jpt! area damage of effect `tag` (effects.txt's optional `damage` and `materials` lines: the
+// effect's strongest damaging jpt! part; radii in world units), false when the table gives it none.
+// Drawing an effect deals nothing: halo.h haloeffectblast deals it, for a vehicle's death
+// explosion and (halo_effectdamage 1) the scripts' effect_new.
+struct HaloEffectDamage
+{
+    HaloDamage damage;
+    float inner = 0, outer = 0;
+    int sideEffect = 0, category = 0;
+};
+bool halofxeffectdamage(const char *tag, HaloEffectDamage &out);
 
 // player_effect_*: the scripts' camera shake (translation in world units, rotation in degrees,
 // rumble 0..1 standing in for the controller's motors: a fine shake). `what`: 0 translation,

@@ -68,6 +68,27 @@ def structure_surfaces(halo, bsp, projection):
     return result, CollisionTree(region, base, projection)
 
 
+def overlap_seals(surfaces, other, box=None, depth=.25):
+    """The indices of `surfaces` (structure_surfaces' list of one BSP) that seal that BSP where another
+    BSP of the same scenario carries on: polygons without a material (index -1, the closing face a
+    BSP ends a doorway with; Halo switches BSPs before the player reaches it) whose middle is open
+    space in `other` (the other BSP's CollisionTree) on both sides, `depth` campaign units along the
+    normal, and inside `box` ((x0, y0, z0), (x1, y1, z1), campaign units) when given. A section that
+    holds two BSPs (import_halo_campaign.EXTRA_BSPS) leaves these out of its walking and its .hcol:
+    there the player walks from one BSP's doorway straight into the other's (c40 section 1's pulse
+    generator room, BSP 12, and BSP 2's platform each seal the shared doorway corridor)."""
+    found = []
+    for index, (normal, _, _, material, points) in enumerate(surfaces):
+        if material >= 0:
+            continue
+        middle = [sum(p[i] for p in points) / len(points) for i in range(3)]
+        if box is not None and not all(box[0][i] <= middle[i] <= box[1][i] for i in range(3)):
+            continue
+        if all(other.is_open(*(middle[i] + side * depth * normal[i] for i in range(3))) for side in (-1, 1)):
+            found.append(index)
+    return found
+
+
 class CollisionTree:
     """Open-space and standing-clearance queries on the original collision BSP.
 
@@ -253,6 +274,171 @@ def static_device_surfaces(halo, bsp, projection, output, still=()):
     return surfaces, baked
 
 
+def euler_rows(yaw, pitch, roll):
+    """The rotation of a scenario object placement's (yaw, pitch, roll), as rows (retail axes).
+
+    Halo's own matrix4x3_rotation_from_angles (math/matrix_math.c of the Halo CE source port in
+    ../Halo3DS, which object placement uses through vectors3d_from_euler_angles3d): yaw about +z,
+    then pitch about the world's y axis, then roll about the world's x axis, R = Rx(roll) Ry(-pitch)
+    Rz(yaw). Its matrix rows n[0], n[1], n[2] are the object's forward, left and up. The final
+    integration review replaced the scenery batch's R = Rz(yaw) Ry(-pitch) Rx(roll), which agrees
+    only when the object is not both turned and tilted: against the BSP floors of c10, a50 and b40,
+    Halo's composition leaves 45 tilted Covenant crates resting with fewer vertices in the floor (most
+    with none) against 6 for the old one (25 equal).
+    """
+    cy, sy, cp, sp, cr, sr = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch), math.cos(roll), math.sin(roll)
+    # Columns: forward, left, up.
+    forward = (cy * cp, sy * cr - cy * sp * sr, cy * sp * cr + sy * sr)
+    left = (-sy * cp, sy * sp * sr + cy * cr, cy * sr - sy * sp * cr)
+    up = (-sp, -cp * sr, cp * cr)
+    return tuple(tuple(axis[i] for axis in (forward, left, up)) for i in range(3))
+
+
+# The scenario's scenery placements (scnr +528, 72 bytes each) and palette (scnr +540): the palette
+# index, the object name index, the not-placed flags (1 created only by a script, 2/4/8 not on easy,
+# normal or hard), the desired permutation, then position and (yaw, pitch, roll) at +8.
+SCENERY_BLOCK, SCENERY_PALETTE = 528, 540
+
+
+def scenery_placements(halo, bsp):
+    """Scenery placements in BSP `bsp`: [(placement index, scen tag, name index, not-placed flags,
+    desired permutation, (x, y, z, yaw, pitch, roll))], retail units. A placement is in a BSP when its
+    origin is inside the BSP's open space (halo_devices.structure_leaves), or failing every BSP, inside
+    its bounds, as for the machines (halo_devices.device_rows' bsp mask)."""
+    from halo_devices import structure_leaves
+    tags, scenario = halo.tags, halo.scenario
+    palette = tags.block(scenario + SCENERY_PALETTE, 48)
+    count = len(tags.block(scenario + 1444, 32))
+    regions = [halo.bsp(i) for i in range(count)]
+    bounds = [region.read('6f', address + 200) for region, address in regions]
+    found = []
+    for index, placement in enumerate(tags.block(scenario + SCENERY_BLOCK, 72)):
+        variant, name, not_placed, permutation = tags.read('2hHh', placement)
+        if not 0 <= variant < len(palette):
+            continue
+        tag = halo.reference(tags, palette[variant], 'scen')
+        if tag is None:
+            continue
+        pose = tags.read('6f', placement + 8)
+        candidates = [i for i, extent in enumerate(bounds)
+                      if all(extent[2*j] - 1 <= c <= extent[2*j+1] + 1 for j, c in enumerate(pose[:3]))]
+        inside = [i for i in candidates if structure_leaves(*regions[i], pose[:3])]
+        if bsp in (inside or candidates):
+            found.append((index, tag, name, not_placed, permutation, pose))
+    return found
+
+
+def _scenery_polygons(halo, tag, permutation):
+    """Object-space collision polygons of a scenery tag (its coll tag's BSPs, each node's in the
+    model's bind pose): (normal, flags, breakable, material, points). A node with several BSPs (one per
+    permutation of its region: the boulders' five) contributes the one at `permutation`, or the first,
+    which is the permutation halo_map_art.model_meshes draws."""
+    from import_halo_models import Model
+    tags = halo.tags
+    model_ref = halo.reference(tags, tag.address + 40, 'mode')
+    coll = halo.reference(tags, tag.address + 112, 'coll')
+    if not model_ref or not coll:
+        return []
+    try:
+        model = Model(halo, model_ref.name, 'part')
+    except (ValueError, IndexError):
+        return []
+    names = [name for name, _ in model.nodes]
+    result = []
+    for index, node in enumerate(tags.block(coll.address + 652, 64)):
+        node_name = tags.name(node, 32)
+        model_node = node_name if node_name in model.bind_pose else names[index] if index < len(names) else None
+        if model_node is None:
+            continue
+        bsps = tags.block(node + 52, 96)
+        if not bsps:
+            continue
+        bsp = bsps[permutation] if 0 <= permutation < len(bsps) else bsps[0]
+        transform = model.bind_pose[model_node]
+        planes = [tags.read('3f', q) for q in tags.block(bsp + 12, 16)]
+        edges = [tags.read('6i', q) for q in tags.block(bsp + 72, 24)]
+        vertices = [transform.point(tags.read('3f', q)) for q in tags.block(bsp + 84, 16)]
+        for number, surface in enumerate(tags.block(bsp + 60, 12)):
+            designator, edge, flags, breakable, material = tags.read('IiBBh', surface)
+            plane = designator & 0x7fffffff
+            if plane >= len(planes):
+                continue
+            sign = -1 if designator & 0x80000000 else 1
+            normal = transform.vector(tuple(sign * v for v in planes[plane]))
+            try:
+                points = surface_vertices(number, edge, edges, vertices)
+            except ValueError:
+                continue
+            result.append((normal, flags, breakable, material, points))
+    return result
+
+
+def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=()):
+    """Collision polygons of BSP `bsp`'s scenery placements, in campaign coordinates.
+
+    Halo collides everything with scenery (rocks, trees, crates, the fallen computer banks); the
+    engine's world collision is the .hcol, so a section's scenery goes in as static surfaces, listed
+    in its SCN1 trailer (write_structure_collision). Returns (surfaces, placements, left out):
+    `placements` is [(scenario scenery index, number of its surfaces)] in the order their polygons
+    were appended, and `left out` a {reason: count}. Placements are left out when a script creates, destroys or moves
+    them (not-placed flag 1, or a name the scripts use: object_create, object_destroy, the c10
+    insertion's props) or when some difficulty does not place them (flags 2, 4, 8), since the .hcol
+    is fixed; when their origin is outside `window` (retail xmin, xmax, ymin, ymax: the section's
+    map) or their name is in `skip`; and when their tag has no collision model.
+    """
+    from import_halo_scripts import named_objects, Program
+    program = program or Program(halo)
+    names = {index: name for index, (name, _, _) in enumerate(named_objects(program))}
+    polygons, surfaces, baked, left_out = {}, [], [], {}
+    def leave(reason):
+        left_out[reason] = left_out.get(reason, 0) + 1
+    for index, tag, name_index, not_placed, permutation, pose in scenery_placements(halo, bsp):
+        x, y, z, yaw, pitch, roll = pose
+        name = names.get(name_index, '') if name_index >= 0 else ''
+        if window is not None and not (window[0] <= x <= window[1] and window[2] <= y <= window[3]):
+            leave('outside the map')
+            continue
+        if name and name in skip:
+            leave('skipped')
+            continue
+        if not_placed & 1 or (name and re.search(rb'\b' + re.escape(name.encode()) + rb'\b', program.strings)):
+            leave('scripted')
+            continue
+        if not_placed & 14:
+            leave('not on every difficulty')
+            continue
+        key = tag.address, permutation
+        if key not in polygons:
+            polygons[key] = _scenery_polygons(halo, tag, permutation)
+        if not polygons[key]:
+            leave('no collision model')
+            continue
+        rows = euler_rows(yaw, pitch, roll)
+        before = len(surfaces)
+        def rotate(v):
+            return tuple(sum(a * b for a, b in zip(row, v)) for row in rows)
+        for normal, flags, breakable, material, points in polygons[key]:
+            nx, ny, nz = rotate(normal)
+            length = math.hypot(nx, ny, nz)
+            if not length:
+                continue
+            placed = []
+            for v in points[::-1]:
+                rx, ry, rz = rotate(v)
+                placed.append(projection.point((rx + x, ry + y, rz + z)))
+            if flags & 1 and nz < 0:
+                # A two-sided polygon collides alike from either side (halo_collision.cpp); face it up,
+                # so the planner (floor_samples reads upward normals) walks its back as Halo's biped and
+                # the engine's bodies do: the tilted invisible ramps (door_blast_collision) over c10's
+                # crate piles face down.
+                nx, ny, nz = -nx, -ny, -nz
+                placed.reverse()
+            # Campaign projection reflects Y: flip the normal's Y and reverse the winding.
+            surfaces.append(((nx/length, -ny/length, nz/length), flags & 15, breakable, material, placed))
+        baked.append((index, len(surfaces) - before))
+    return surfaces, baked, left_out
+
+
 def assist_surfaces(assists, projection):
     """Campaign-space collision polygons of a section's authored walking assists
     (import_halo_campaign.ASSISTS): each `points` is a convex, planar polygon in retail units.
@@ -293,19 +479,29 @@ def assist_surfaces(assists, projection):
     return surfaces
 
 
-def write_structure_collision(halo, bsp, projection, destination, machines=((), ()), assists=()):
-    """Write the section's .hcol; `machines` is static_device_surfaces' (surfaces, devices) and
-    `assists` assist_surfaces' polygons (authored, non-retail), listed in an AST1 trailer."""
-    surfaces, _ = structure_surfaces(halo, bsp, projection)
+def write_structure_collision(halo, bsp, projection, destination, machines=((), ()), assists=(), scenery=((), ()),
+                              structure=None):
+    """Write the section's .hcol; `machines` is static_device_surfaces' (surfaces, devices),
+    `assists` assist_surfaces' polygons (authored, non-retail), listed in an AST1 trailer, and
+    `scenery` scenery_surfaces' (surfaces, placements), listed in an SCN1 trailer. `structure`, when
+    given, replaces the BSP's own structure_surfaces (a section holding extra BSPs leaves out the
+    seals between them: overlap_seals)."""
+    surfaces = list(structure) if structure is not None else structure_surfaces(halo, bsp, projection)[0]
     extra, baked = machines
     surfaces = surfaces + list(extra)
+    scenery_polygons, placements = scenery
+    first_scenery = len(surfaces)
+    surfaces = surfaces + list(scenery_polygons)
     first_assist = len(surfaces)
     surfaces = surfaces + list(assists)
-    # HCL1 stores little-endian surface records followed by their boundary vertices. An
-    # optional DEV1 trailer lists the scenario devices whose polygons are included, and an
-    # optional AST1 trailer after it the surface indices (file order) that are walking assists:
-    # the engine collides bodies with them but rays (shots, sight, probes) and grenades pass
-    # through, as there is nothing there in Halo.
+    # HCL1 stores little-endian surface records followed by their boundary vertices. Optional
+    # trailers follow, in this order: DEV1 lists the scenario devices whose polygons are included;
+    # SCN1 the scenery placements baked in (scenery_surfaces: each its scenario scenery index, then
+    # the first surface and count of its polygons in file order; they are ordinary static surfaces,
+    # which everything collides with, as in Halo); AST1 the surface indices (file order) that are
+    # walking assists: the engine collides bodies with them but rays (shots, sight, probes) and
+    # grenades pass through, as there is nothing there in Halo. A file without SCN1 is byte for byte
+    # what this writer wrote before scenery collision (SCENERY_COLLISION in import_halo_campaign.py).
     data = bytearray(struct.pack('<4sI', b'HCL1', len(surfaces)))
     for normal, flags, breakable, material, points in surfaces:
         data.extend(struct.pack('<3fBBhI', *normal, flags, breakable, material, len(points)))
@@ -313,6 +509,16 @@ def write_structure_collision(halo, bsp, projection, destination, machines=((), 
             data.extend(struct.pack('<3f', *point))
     if baked:
         data.extend(struct.pack(f'<4sI{len(baked)}I', b'DEV1', len(baked), *baked))
+    if placements:
+        # scenery_surfaces appends each placement's polygons in turn: recover the ranges from the
+        # per-placement counts it reports.
+        rows, first = [], first_scenery
+        for index, count in placements:
+            rows.extend((index, first, count))
+            first += count
+        if first != first_assist:
+            raise ValueError('scenery placements do not account for the scenery surfaces')
+        data.extend(struct.pack(f'<4sI{len(rows)}I', b'SCN1', len(placements), *rows))
     if assists:
         indices = list(range(first_assist, len(surfaces)))
         data.extend(struct.pack(f'<4sI{len(indices)}I', b'AST1', len(indices), *indices))
@@ -989,13 +1195,16 @@ class GrenadeArcs:
     retailmove (one contact a step, reflected at 1.5 times the inward speed and slowed to 0.7, a floor
     contact stopping the fall), ten 10 ms launch steps and then 5 ms physics steps, and the device
     boxes as Scenario::collideDevices sees them (a grenade that runs into one stays where it was, with
-    its velocity, and lands on a top it falls onto). The sphere sweep against the polygons ignores
-    their edges beyond the radius (an approximation: the engine's capsule sweep rounds them), so a
-    throw that grazes an edge can go otherwise in the game; the planner prefers throws whose
-    neighbours land too. Points are in campaign (cube) coordinates; `boxes` are machine_boxes entries
-    (retail) in the pose of the throw."""
+    its velocity, and lands on a top it falls onto). The sphere sweep is halocollisionsweep's (the
+    route batch, gap 9 of batch 5's critic: before, it ignored polygon edges beyond the radius): the
+    nearest point on each polygon's face, edges or corners, conservative advancement and the rounded
+    contact normal, so a frag that grazes an edge or a corner bounces off it as in the engine. The
+    planner still prefers throws whose neighbours land too. Points are in campaign (cube) coordinates;
+    `boxes` are machine_boxes entries (retail) in the pose of the throw."""
 
     RADIUS, EYE = .2, .3
+    # halo_collision.cpp contactSlop: a contact within it counts.
+    CONTACT_SLOP = .0025
     SPEED = 30.0
     GRAVITY = .5 * 9.81 / 4 / 1000
     SKIN, SLOPE = .015, .65
@@ -1011,7 +1220,7 @@ class GrenadeArcs:
                 e = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
                 inward = (normal[1]*e[2]-normal[2]*e[1], normal[2]*e[0]-normal[0]*e[2], normal[0]*e[1]-normal[1]*e[0])
                 length = math.sqrt(sum(v*v for v in inward)) or 1
-                edges.append((a, tuple(v/length for v in inward)))
+                edges.append((a, tuple(v/length for v in inward), b))
             index = len(self.polygons)
             self.polygons.append((normal, flags & 1, points, low, high, edges))
             for gx in range(int(low[0]) >> 3, (int(high[0]) >> 3) + 1):
@@ -1020,11 +1229,27 @@ class GrenadeArcs:
         # Each box with the radius round its origin that holds it, for a quick rejection.
         self.boxes = [(ox, oy, oz, c, s, *box, (max(abs(box[0]), abs(box[3])) ** 2 + max(abs(box[1]), abs(box[4])) ** 2) ** .5 + .1)
                       for _, (ox, oy, oz, c, s), box in boxes]
+        # The boxes by the 8-unit campaign cells their reach (and the grenade's radius) covers.
+        self.box_cells = {}
+        for entry in self.boxes:
+            ox, oy, reach = entry[0], entry[1], entry[-1] * projection.scale + self.RADIUS + 1
+            cx, cy = (ox - projection.x0) * projection.scale + 9, (projection.y0 - oy) * projection.scale + 9
+            for gx in range(int(cx - reach) >> 3, (int(cx + reach) >> 3) + 1):
+                for gy in range(int(cy - reach) >> 3, (int(cy + reach) >> 3) + 1):
+                    self.box_cells.setdefault((gx, gy), []).append(entry)
         self.nearby = {}
 
     def _sweep(self, centre, delta):
-        """The sphere's first contact moving centre -> centre + delta: (fraction, normal) or None."""
-        r = self.RADIUS
+        """The sphere's first contact moving centre -> centre + delta: (fraction, normal) or None.
+
+        halocollisionsweep for the grenade's body (a sphere: radius 0.2, height max(0.3, 0.4)): per
+        polygon, conservative advancement along the delta by the gap between the sphere's centre and
+        the polygon's nearest point, on its face or, outside the face, on its edges and corners
+        (capsulegap and segmentgap with a zero axis), up to 24 steps; a contact within the engine's
+        slop counts when the polygon is two-sided or the contact normal (from the nearest point to the
+        centre, so rounded round an edge) faces the polygon's front (frontcontact). The earliest
+        contact of all polygons wins, its normal the contact normal."""
+        r, slop, small = self.RADIUS, self.CONTACT_SLOP, 1e-6
         x0, y0, x1, y1 = centre[0], centre[1], centre[0] + delta[0], centre[1] + delta[1]
         key = (int(min(x0, x1) - r) >> 3, int(max(x0, x1) + r) >> 3, int(min(y0, y1) - r) >> 3, int(max(y0, y1) + r) >> 3)
         candidates = self.nearby.get(key)
@@ -1038,32 +1263,57 @@ class GrenadeArcs:
         ly, hy = min(y0, y1) - r, max(y0, y1) + r
         z0, z1 = centre[2], centre[2] + delta[2]
         lz, hz = min(z0, z1) - r, max(z0, z1) + r
-        best = None
+        dx, dy, dz = delta
+        best, limit = None, 1.0
         polygons = self.polygons
         for index in candidates:
             n, two_sided, points, plow, phigh, edges = polygons[index]
             if phigh[0] < lx or plow[0] > hx or phigh[1] < ly or plow[1] > hy or phigh[2] < lz or plow[2] > hz:
                 continue
             a = points[0]
-            distance = n[0]*(centre[0]-a[0]) + n[1]*(centre[1]-a[1]) + n[2]*(centre[2]-a[2])
-            closing = n[0]*delta[0] + n[1]*delta[1] + n[2]*delta[2]
-            sign = 1
-            if distance < 0:
-                # Behind a one-sided surface: no contact (the engine's frontcontact).
-                if not two_sided:
-                    continue
-                sign, distance, closing = -1, -distance, -closing
-            if closing >= -1e-9:
+            d0 = n[0]*(centre[0]-a[0]) + n[1]*(centre[1]-a[1]) + n[2]*(centre[2]-a[2])
+            d1 = d0 + n[0]*dx + n[1]*dy + n[2]*dz
+            # The sphere never comes within its radius of the polygon's plane in this step.
+            if (d0 > r + slop and d1 > r + slop) or (d0 < -r - slop and d1 < -r - slop):
                 continue
-            t = (distance - r) / -closing
-            if t > 1 or t < -.5:
+            # Behind a one-sided polygon every contact normal faces its back: never a contact.
+            if not two_sided and d0 < 0:
                 continue
-            t = max(t, 0.0)
-            if best is not None and t >= best[0]:
-                continue
-            q = [centre[i] + delta[i]*t - sign*n[i]*min(r, distance) for i in range(3)]
-            if all((q[0]-e[0])*w[0] + (q[1]-e[1])*w[1] + (q[2]-e[2])*w[2] >= -r for e, w in edges):
-                best = (t, tuple(sign*v for v in n))
+            fraction = 0.0
+            for _ in range(24):
+                if fraction > limit:
+                    break
+                px, py, pz = centre[0] + dx*fraction, centre[1] + dy*fraction, centre[2] + dz*fraction
+                d = n[0]*(px-a[0]) + n[1]*(py-a[1]) + n[2]*(pz-a[2])
+                qx, qy, qz = px - n[0]*d, py - n[1]*d, pz - n[2]*d
+                if all((qx-e[0])*w[0] + (qy-e[1])*w[1] + (qz-e[2])*w[2] >= 0 for e, w, _ in edges):
+                    gx, gy, gz = n[0]*d, n[1]*d, n[2]*d
+                else:
+                    gap = None
+                    for e, _, f in edges:
+                        ex, ey, ez = f[0]-e[0], f[1]-e[1], f[2]-e[2]
+                        length = ex*ex + ey*ey + ez*ez
+                        t = 0.0 if length <= small*small else \
+                            max(0.0, min(1.0, ((px-e[0])*ex + (py-e[1])*ey + (pz-e[2])*ez) / length))
+                        cx, cy, cz = px - e[0] - ex*t, py - e[1] - ey*t, pz - e[2] - ez*t
+                        squared = cx*cx + cy*cy + cz*cz
+                        if gap is None or squared < gap[0]:
+                            gap = (squared, cx, cy, cz)
+                    _, gx, gy, gz = gap
+                distance = math.sqrt(gx*gx + gy*gy + gz*gz)
+                if distance > small:
+                    normal = (gx/distance, gy/distance, gz/distance)
+                else:
+                    normal = tuple(-v for v in n) if d < 0 and two_sided else n
+                closing = -(normal[0]*dx + normal[1]*dy + normal[2]*dz)
+                if closing <= small:
+                    break
+                clearance = distance - r
+                if clearance <= slop:
+                    if two_sided or normal[0]*n[0] + normal[1]*n[1] + normal[2]*n[2] >= -small:
+                        best, limit = (fraction, normal), fraction
+                    break
+                fraction += clearance / closing
         return best
 
     def _devices(self, o):
@@ -1073,7 +1323,7 @@ class GrenadeArcs:
         radius = self.RADIUS / p.scale
         feet, height = o[2] - self.EYE, self.EYE
         lo, hi = -1e9, 1e9
-        for ox, oy, oz, c, s, x1, y1, z1, x2, y2, z2, reach in self.boxes:
+        for ox, oy, oz, c, s, x1, y1, z1, x2, y2, z2, reach in self.box_cells.get((int(o[0]) >> 3, int(o[1]) >> 3), ()):
             dx, dy = rx - ox, ry - oy
             if dx*dx + dy*dy > reach*reach:
                 continue
@@ -1152,6 +1402,12 @@ class GrenadeArcs:
                     return tuple(o), clock
                 if clock > limit:
                     return None
+                if ticking and bounced is not None and onfloor and not blocked and \
+                        math.sqrt(sum(v*v for v in vel)) * self.SPEED * 5 / 1000 * 24 < .01:
+                    # All but at rest on a floor: friction takes a 24th of the velocity a 5 ms step, so
+                    # it rolls less than a hundredth of a unit further in all; it goes off where it lies.
+                    end = max(fuse[0], bounced + fuse[1], clock)
+                    return (tuple(o), end) if end <= limit else None
             schedule = [(5, True)] * 50
 
 
@@ -1166,7 +1422,9 @@ class VehicleGround:
     above the floor, following the polygon's slope) and top (`height`) on a ring of `radius` (the
     chassis capsule's radius and a margin), as the engine sweeps two capsules of the vehicle's
     half-width (chassisBlocked). `length` is the distance from the body's centre to the front of
-    its capsules: each step of a route also needs open space that far ahead along the step.
+    its capsules: each step of a route also needs open space that far ahead along the step. Where
+    the floor ends the route may jump (jump): off the surface's slope at speed, under the vehicle's
+    retail-derived gravity, onto floor under both axles (supported).
     Coordinates are campaign units, heights in quarter units, as floor_samples'."""
 
     RING = tuple((math.cos(a * math.pi / 4), math.sin(a * math.pi / 4)) for a in range(8))
@@ -1238,29 +1496,59 @@ class VehicleGround:
             z = max(z, max(ahead) / 4)
         return self.tree.is_open(x, y, z + self.step + .05) and self.tree.is_open(x, y, z + self.height * .7)
 
+    def supported(self, node, ux, uy):
+        """Whether a vehicle standing at `node` (x, y, z4) heading (ux, uy) has floor under both
+        axles: a sample near its height at the front and rear wheels (0.7 of the half length
+        either way, as halo_vehicle.cpp dims places them), so a landing is on floor, not on a
+        strut or beam the chassis's ring of open space happens to fit over."""
+        reach = .7 * self.length
+        rise = 4 * (self.step + 1.25) * max(1.0, reach)
+        for sign in (1, -1):
+            cell = (round(node[0] + sign * ux * reach), round(node[1] + sign * uy * reach))
+            if not any(abs(o - node[2]) <= rise for o in self.samples.get(cell, ())):
+                return False
+        return True
+
     def jump(self, here, back, dx, dy, speed, gravity, drop4):
-        """Where a vehicle driving off the edge at `here` (from `back`, the cell before) at `speed`
-        lands: the engine's car leaves the ground at the rate it was climbing (at most 0.8 of its
-        speed, simulate's launch) and falls at `gravity`; the first floor sample under its path, at
-        least three cells on, with open space above the path. None when it lands nowhere (or falls
-        further than `drop4` quarter units)."""
+        """Where a vehicle driving off the edge at `here` at `speed` lands. It leaves the ground with
+        its velocity along the surface it was on (halo_vehicle.cpp simulate keeps the tangent: the
+        horizontal speed and the vertical rate of the floor under its trailing wheels, the last to
+        leave, at most 0.8 of the speed upwards; a downhill edge keeps its descent): the slope from
+        `back` (a cell about two before, along the route) to `here`. It falls at `gravity` (the
+        retail-derived vehicle gravity, vehicle_gravity in import_halo_campaign.py) and lands on the
+        first floor sample under its path, at least three cells on, with both axles on floor
+        (supported) and open space above the path at its middle and at its front (the chassis's
+        front meets a doorway's lintel first). None when it lands nowhere (or falls further than
+        `drop4` quarter units below the take-off).
+        The engine's car stays on the floor until its rear wheels (0.7 of the half length behind
+        its origin, halo_vehicle.cpp dims) are past the edge too, riding at their floor's height:
+        so the fall starts that far on, past the edge (taken as half a cell past `here`, the last
+        cell with floor), at the edge's height."""
         length = math.hypot(dx, dy)
         ux, uy = dx / length, dy / length
-        rise = (here[2] - back[2]) / 4 if back is not None else 0.0
-        vz = max(0.0, min(.8 * speed, speed * rise / max(math.dist(here[:2], back[:2]) if back is not None else 1.0, 1e-3)))
+        run = math.dist(here[:2], back[:2]) if back is not None else 0.0
+        rise = (here[2] - back[2]) / 4 if back is not None and run > 0 else 0.0
+        vz = max(-speed, min(.8 * speed, speed * rise / run)) if run > 0 else 0.0
+        edge, rollout = .5, .7 * self.length + .5
         x, y, z = float(here[0]), float(here[1]), here[2] / 4
+        slope = vz / speed if speed > 0 else 0.0
         dt, travelled, seen = 1 / 60, 0.0, set()
-        while travelled < 80:
+        while travelled < 160:
             x += ux * speed * dt
             y += uy * speed * dt
-            z += vz * dt
-            vz -= gravity * dt
             travelled += speed * dt
+            if travelled < rollout:
+                # Still on its rear wheels: at the floor's height under them, up to the edge.
+                z = here[2] / 4 + slope * min(travelled, edge)
+            else:
+                z += vz * dt
+                vz -= gravity * dt
             cell = (round(x), round(y))
             if here[2] / 4 - z > drop4 / 4:
                 return None
-            if not self.tree.is_open(x, y, z + self.step + .05) or not self.tree.is_open(x, y, z + self.height * .8):
-                # Into a wall, or down onto something without floor samples there.
+            if not self.tree.is_open(x, y, z + self.step + .05) or not self.tree.is_open(x, y, z + self.height * .8) or \
+                    not self.tree.is_open(x + ux * self.length, y + uy * self.length, z + self.height * .8):
+                # Into a wall (or its front into a lintel), or down onto something without floor samples there.
                 return None
             if cell in seen:
                 continue
@@ -1269,19 +1557,29 @@ class VehicleGround:
                 continue
             for other in self.samples.get(cell, ()):
                 if z - .6 - abs(vz) * dt * 2 <= other / 4 <= z + self.step:
-                    return (cell[0], cell[1], other), travelled
+                    node = (cell[0], cell[1], other)
+                    if not self.supported(node, ux, uy):
+                        # A strut or a beam's edge: the wheels would come down either side of it.
+                        continue
+                    return node, travelled
         return None
 
-    def route(self, start, inside, goal, drop=0, slope_rise=1.25, speed=0.0, gravity=40.0):
+    def route(self, start, inside, goal, drop=0, slope_rise=1.25, speed=0.0, gravity=40.0, jump_drop=None):
         """The cheapest drive from `start` (a sample) to a sample `inside` accepts (x, y, z4), or, with
         none reachable, the one nearest `goal` (campaign point): [(x, y, z4)], with whether it ended
         inside. Eight neighbours a step; a step up may rise `step` plus `slope_rise` units a cell (the
         slope limit already chose the floors); a step down may fall up to `drop` units (the vehicle
         drives off a ledge or down a ramp too steep to stand on: up to eight cells on, open above).
         Cells whose ring of four points at the radius has no floor near the body's height cost more,
-        so the route keeps to the middle of a corridor and off edges."""
+        so the route keeps to the middle of a corridor and off edges. With a `speed`, where the floor
+        ends the vehicle may jump (jump) at that speed under `gravity`, landing up to `jump_drop`
+        units below the take-off (default: `drop`, else a step)."""
         samples, step4 = self.samples, 4 * (self.step + slope_rise)
         drop4 = 4 * drop
+        jump4 = 4 * jump_drop if jump_drop is not None else drop4 or step4
+        # The take-off's slope: over the last two cells, the floor under the trailing axle (the
+        # engine measures it from that floor's normal, halo_vehicle.cpp simulate).
+        takeoff_base = 2.0
         best, parents = {start: 0.0}, {start: None}
         queue = [(0.0, start)]
         done, ahead_ok, edge_cost = set(), {}, {}
@@ -1327,9 +1625,12 @@ class VehicleGround:
                         push(here, (x + dx, y + dy, other), length, dx, dy)
                         ahead = True
                 if speed > 0 and not ahead:
-                    # The floor ends this way: a jump at speed across the gap (the Maw's run).
+                    # The floor ends this way: a jump at speed across the gap (the Maw's run), off
+                    # the slope of the route's last two cells (the surface the trailing wheels were on).
                     back = parents.get(here)
-                    landed = self.jump(here, back, dx, dy, speed, gravity, drop4 or step4)
+                    while back is not None and parents.get(back) is not None and math.dist(here[:2], back[:2]) < takeoff_base:
+                        back = parents[back]
+                    landed = self.jump(here, back, dx, dy, speed, gravity, jump4)
                     if landed is not None:
                         node, travelled = landed
                         before = best.get(node, float('inf'))

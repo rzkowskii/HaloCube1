@@ -143,9 +143,13 @@ unsigned haloscenarioprogramhash();               // FNV-1a of the loaded .hscb 
 unsigned haloscenariofilehash(int mission);       // of packages/halo/<cache>.hscb on disk, 0 when missing
 const char *haloscenarioobjectname(int object);   // a script object's name, "" when none
 bool haloscenariobotsuspended(const playerent *bot);
+// `bot` is an actor ai_attach made of a scripted object (a50's Keyes and freed marines, c10's
+// marine_suicidal): story figures the player's melee from behind does not kill outright (halodamage).
+bool haloscenarioattachedactor(const playerent *bot);
 // QA probes (tests/native): the actors ai_attach made (ATTACH_QA lines), the script's audio
 // (AUDIO_QA: loops, conversations, the loops a Call scene restarts), and a conversation's status.
 void haloscenarioattachdump(const char *label);
+bool haloscenarioqaattachmove(const char *object, float forward, float side);
 void haloscenarioaudiodump(const char *label);
 int haloscenarioconversationstatus(const char *name);
 void haloscenarioremovebot(const playerent *bot);
