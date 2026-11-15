@@ -12,6 +12,7 @@ namespace
 {
     struct vec2 { float x, y; vec2(float x = 0, float y = 0) : x(x), y(y) {} };
     constexpr int formatVersion = 1;
+    constexpr int maxSheets = 4096;         // bitmap ids in hud.txt (the retail HUD uses a few dozen)
     enum Anchor { TOP_LEFT = 0, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT, CENTER };
     enum State { TOTAL_AMMO = 0, LOADED_AMMO, HEAT, AGE };
     enum Role { UNIT_BACKGROUND = 100, SHIELD_BACK, SHIELD_METER, HEALTH_BACK, HEALTH_METER, MOTION_BACK, MOTION_FRONT,
@@ -53,6 +54,13 @@ namespace
 
     float unitScale() { return VIRTH / 480.0f; }
 
+    // What a failed parse left behind.
+    void forget()
+    {
+        sheets.clear(); weapons.clear(); grenades.clear(); unit = Group(); arrows.clear();
+        waypointSheet = counterSheet = sweepSheet = blipSheet = -1;
+    }
+
     bool parsePlacement(std::istringstream &in, Placement &p) { return bool(in >> p.x >> p.y >> p.sx >> p.sy >> p.flags); }
     unsigned hex(std::istringstream &in) { std::string s; in >> s; return unsigned(strtoul(s.c_str(), nullptr, 16)); }
 
@@ -70,8 +78,26 @@ namespace
             std::string key;
             in >> key;
             if(key == "format") { int v = 0; in >> v; versioned = v == formatVersion; continue; }
-            if(key == "bitmap") { int id; in >> id; sheets.resize(max(int(sheets.size()), id + 1)); sheet = &sheets[id]; continue; }
-            if(key == "page" && sheet) { Page p; in >> p.width >> p.height >> p.file; sheet->pages.push_back(p); continue; }
+            if(key == "bitmap")
+            {
+                // A damaged id (negative, or huge) would index outside the sheets or ask for gigabytes.
+                int id = -1;
+                if(!(in >> id) || id < 0 || id >= maxSheets) { conoutf("\f3Halo HUD: invalid line in packages/halo/hud.txt: %s", line.c_str()); return false; }
+                sheets.resize(max(int(sheets.size()), id + 1));
+                sheet = &sheets[id];
+                continue;
+            }
+            if(key == "page" && sheet)
+            {
+                Page p;
+                if(!(in >> p.width >> p.height >> p.file) || p.width <= 0 || p.height <= 0 || p.width > 16384 || p.height > 16384)
+                {
+                    conoutf("\f3Halo HUD: invalid line in packages/halo/hud.txt: %s", line.c_str());
+                    return false;
+                }
+                sheet->pages.push_back(p);
+                continue;
+            }
             if(key == "sequence" && sheet) { sheet->sequences.emplace_back(); continue; }
             if(key == "sprite" && sheet && !sheet->sequences.empty())
             {
@@ -299,9 +325,17 @@ namespace
         }
     }
 
+    bool hasReticle(const Group *g)
+    {
+        if(g) for(const Element &e : g->elements) if(e.kind == 'c' && e.state == AIM) return true;
+        return false;
+    }
+
     void drawWeapon(const HaloHudWeapon &w, int hidden)
     {
         const Group *g = weaponGroup(w.weapon);
+        // Weapons whose HUD tags carry no reticle (the flamethrower) get a plain one.
+        if(w.weapon >= 0 && !(hidden & HALO_HUD_CROSSHAIR) && !hasReticle(g)) halohuddrawreticle(w.locked);
         if(!g) return;
         const bool zoomed = w.zoom > 0;
         // Scoped weapons draw their screen mask over the view first.
@@ -451,10 +485,48 @@ bool halohudload()
     loaded = parse(text);
     delete[] text;
     if(loaded) conoutf("Halo HUD: %d sprite sheets, %d weapon HUDs", int(sheets.size()), int(weapons.size()));
+    else
+    {
+        // Nothing half-parsed is drawn: the fallback HUD (renderhud.cpp) and plain reticles take over.
+        conoutf("\f3Halo HUD: packages/halo/hud.txt is unusable; re-run tools/halo_hud.py (fallback HUD)");
+        forget();
+    }
     return loaded;
 }
 
 bool halohudready() { return halohudload(); }
+
+void halohudweaponparts(int weapon, bool &reticle, bool &ammo)
+{
+    reticle = ammo = false;
+    if(!halohudload()) return;
+    const Group *g = weaponGroup(weapon);
+    reticle = hasReticle(g);
+    if(g) for(const Element &e : g->elements) if(e.kind == 'm' || e.kind == 'n') { ammo = true; break; }
+}
+
+void halohuddrawreticle(bool locked)
+{
+    const float k = unitScale(), r = 11 * k, tick = 5 * k;
+    const float cx = VIRTW / 2.0f, cy = VIRTH / 2.0f;
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    setColour(locked ? 0xffff2020 : 0xff2896ff, .9f);
+    glLineWidth(2);
+    glBegin(GL_LINE_LOOP);
+    loopi(24) glVertex2f(cx + cosf(i * PI2 / 24) * r, cy + sinf(i * PI2 / 24) * r);
+    glEnd();
+    glBegin(GL_LINES);
+    glVertex2f(cx - r - tick, cy); glVertex2f(cx - r + tick * .4f, cy);
+    glVertex2f(cx + r - tick * .4f, cy); glVertex2f(cx + r + tick, cy);
+    glVertex2f(cx, cy - r - tick); glVertex2f(cx, cy - r + tick * .4f);
+    glVertex2f(cx, cy + r - tick * .4f); glVertex2f(cx, cy + r + tick);
+    glEnd();
+    glLineWidth(1);
+    glColor4f(1, 1, 1, 1);
+    glEnable(GL_TEXTURE_2D);
+}
 
 void halohuddraw(const HaloHudWeapon &weapon, const HaloHudUnit &u, const HaloHudBlip *blips, int blipCount)
 {

@@ -7,11 +7,13 @@ from dataclasses import dataclass
 import math
 import mmap
 from pathlib import Path
+import hashlib
 import heapq
+import json
 import re
 
 from import_halo_a30 import HaloMap, ac_yaw, encode_map, entity, LIGHT, PLAYERSTART, AMMO, GRENADE, HEALTH
-from halo_collision import (DoorBlocks, LightBridges, PolygonClearance, floor_samples, lift_ride,
+from halo_collision import (DoorBlocks, LightBridges, PolygonClearance, SightLines, floor_samples, lift_ride, machine_boxes,
                             static_device_surfaces, structure_surfaces, write_structure_collision)
 from halo_map_art import write_world_mesh
 from halo_weapons import actor_weapon, equipment_index, weapon_index
@@ -72,21 +74,24 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   the bottom of lift_a and drops into the lower one (LEDGE_DROPS) beside bridge_a, which is
 #   extended only from its far side. It has not been walked in the game; to put it back on stock
 #   geometry add ('c10', 1) here and re-run `import_halo_campaign.py "$maps" --mission c10 --part 2`;
-# - section 3 (BSP 2, the control room and the x50 scene): section 2 leaves on the lower storey,
-#   which leads only to the lower labs under bayb_trigger (mission_control waits for it before
-#   control_lab_trigger, the x50 scene), 1.9 units below it with no way up; the upper storey's
-#   way in passes post_helmet_door_4, which ini_post_helmet_replace powers only after x50;
-# - section 5 (BSP 3, lift_b to the BSP 4 doorway): bridge_c (flicker_bridge switches it between
-#   0 and 0.5-1 at random) is crossed, but the upper storey's way on to BSP 4 is bsp3_device_15,
-#   an unpowered door nothing drives, and the lower storey's (bsp3_device_bsp4_device_1 to _3)
-#   is behind open doors whose panels lie 0.22 units proud of the floor, more than a step at the
-#   indoor scale (the planner and the engine both stop there);
-# - section 6 (BSP 4, to lift_d): starts at that doorway and gets no further than it (41 steps);
-#   beyond are bridge_d and bridge_e (mission_int_b waits for bridge_e) and lift_d, called down
-#   from lift_d_cont_a.
-# c40 (Two Betrayals) flies a Banshee between the pulse generators, and the engine has no
-# vehicles; the sections that only a flight (or a lift in a BSP that is not a campaign section)
-# leaves stay stock:
+# - section 3 (BSP 2, the control room and the x50 scene): before x50 the way in is the lower
+#   doorway (bsp 1,2 #0; the upper one's post_helmet_door_4 is off until ini_post_helmet_replace),
+#   into hall C, whose floors join neither bay B (bayb_trigger) and the lab (control_lab_trigger)
+#   nor hall D: its only way on is the platform at post_helmet_door_2, 1 unit above the channel
+#   floor and 1.5 units across the channel from the walkways, beyond the engine's jump;
+# - section 5 (BSP 3, lift_b to the BSP 4 doorway): with the folded door leaves walkable
+#   (FLOOR_LEAVES) the lower BSP 3/4 doorway opens and a route exists (start on the landing at the
+#   bottom of lift_b, (-18.0, 23.4, -37.9), a 1.9-unit ledge drop, 490 steps), but it has to cross
+#   bridge_c, which flicker_bridge never holds extended for the 4.2 s the crossing takes (at most
+#   2.5 s, and crossable only at 0.87 of its travel or more); the upper doorway's bsp3_device_15
+#   and _16 and the lower storey's bsp3_device_13 and _14 are off and nothing powers them;
+# - section 6 (BSP 4, to lift_d): from the lower BSP 4/3 doorway (bsp 4,3 #0) the route walks the
+#   lower storey to hall G, but no floor of the upper storey, where bridge_d, bridge_e
+#   (mission_int_b waits for it) and the lift_d room are, is reachable with climbs under 1.25
+#   units; the upper doorway's doors are off. docs/macos-build.md has the details.
+# c40 (Two Betrayals) flies a Banshee between the pulse generators. The sections that only a
+# flight (or a lift in a BSP that is not a campaign section) leaves are flown now: they are in
+# DRIVEN_SECTIONS below (an .hcol, no walking route), no longer here. Why they cannot be walked:
 # - section 1 (BSP 2, the control room to the c bridge): the way on, door_c1 to BSP 10, is on
 #   the c bridge at z 70, 8 units above the canyon floor the walk reaches (z 62) and with no
 #   way up but fly_away_1 to pulse generator 1 (BSP 12, at z 104) or lift_d in the c1 tower
@@ -102,7 +107,8 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   the room with enc3_5b, enc3_6, section4 and bsp 2,3 at z 2) have no walkable connection in the
 #   structure collision (nor in the render geometry): the only floor in between is a fallen beam
 #   (at x -49, under burning_flame scenery; 0.24 to 0.74 units up) that ends under the deck's edge, 0.75 units
-#   below it, and a standing jump at the indoor scale lifts the feet 0.36 units;
+#   below it, and a standing jump at the indoor scale lifts the feet 0.36 units (Halo's crouch jump
+#   reaches the deck; the engine's fixed jump cannot). BSP 2 has no lift or other device between them;
 # - sections 6 to 8 (BSPs 5 to 7) are the Warthog run, 1,200 units driven in the original. The
 #   run starts with a 45 to 65 degree ramp up from the elevator (BSP 5, x -94 to -82 past
 #   no_jeep_test, z 107.6 to 119.4) and drops down ramps as steep in BSP 6 (x 358 to 366) and
@@ -111,15 +117,28 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   scales (1.98, 3.23, 2.24) make the body 1.6 to 2.6 units tall, more than the Maw's corridors
 #   and the elevator landing hold (from section6 only 3 cells of BSP 5 are reachable at its
 #   scale). They are DRIVEN_SECTIONS instead: the player drives them in a Warthog.
-STOCK_SECTIONS = {('c10', 2), ('c10', 4), ('c10', 5), ('c40', 0), ('c40', 3),
-                  ('d40', 2)}
-# Sections played in a vehicle (source/src/halo_vehicle.cpp), not walked: d40's Warthog run.
-# They get an .hcol, which the Warthog drives on (its body is the retail Warthog's size at the
-# section's scale, so it fits where the walking body does not), but no .route: their spawns,
-# markers and route come from the render raster, as on stock geometry. Not driven in the game
-# yet. To put a section back on stock AssaultCube geometry, add it to STOCK_SECTIONS as well
-# (STOCK_SECTIONS wins) and re-run `import_halo_campaign.py "$maps" --mission d40 --part N`.
-DRIVEN_SECTIONS = {('d40', 5), ('d40', 6), ('d40', 7)}
+STOCK_SECTIONS = {('c10', 2), ('c10', 4), ('c10', 5), ('d40', 2)}
+# Sections played in a vehicle (source/src/halo_vehicle.cpp), not walked: d40's Warthog run and
+# c40's Banshee flights. They get an .hcol, which the vehicle drives or flies on (its body is the
+# retail vehicle's size at the section's scale, so it fits where the walking body does not), but
+# no .route: their spawns, markers and route come from the render raster, as on stock geometry.
+# The flown c40 sections are FLOWN_SECTIONS as well. Not driven or flown in the game yet. To put
+# a section back on stock AssaultCube geometry, add it to STOCK_SECTIONS as well (STOCK_SECTIONS
+# wins) and re-run `import_halo_campaign.py "$maps" --mission <cache> --part N` (for c40 also
+# `import_halo_scripts.py "$maps" --mission c40`: FLOWN_EXTENTS widens section 1's projection
+# only while it is flown).
+DRIVEN_SECTIONS = {('d40', 5), ('d40', 6), ('d40', 7), ('c40', 0), ('c40', 3)}
+# Of those, the sections flown in a Banshee (the engine keeps a Banshee the player may take in
+# them, halo.cpp flownSection): c40 section 1 starts in the control room (BSP 2) and walks down
+# to fly_away_1 in the canyon, flies up to pulse generator 1 (pulse_1_trigger, BSP 12, which is
+# not a campaign section and has no collision here: the volume is entered in the air, which
+# powers door_c1), and lands on the c bridge to walk through door_c1; c40 section 4 walks the
+# canyon (BSP 0) and flies to the landing pad, the engine's Banshee standing beside the start
+# (c_banshee_1 is the script's pilot's, e62_a_ban_1 and _2 appear only at the main base).
+FLOWN_SECTIONS = {('c40', 0), ('c40', 3)}
+# Points (volume names) a flown section's map must hold beyond its BSP's bounds, so the flight
+# reaches them: c40 section 1's pulse generator volumes stand 8 units past BSP 2's edge.
+FLOWN_EXTENTS = {('c40', 0): ('pulse_1_trigger', 'e7_trigger_b', 'e8_trigger')}
 INTERIOR = {
     'a10': set(range(7)), 'a50': {1, 2, 3}, 'b30': {1}, 'b40': set(range(3, 13)),
     'c10': {1, 2, 3, 4}, 'c20': set(range(4)), 'c40': set(range(3, 13)),
@@ -224,6 +243,36 @@ SECTION_ANCHORS = {
 }
 
 
+@dataclass(frozen=True)
+class UseControl:
+    """A SECTION_OBJECTIVES step: walk within reach of the control at `point` (retail) and use it
+    until the machine `device` stands at position `value` (route flag 256, `device@value`)."""
+    point: tuple
+    device: str
+    value: float = 1.0
+
+    def __str__(self):
+        return f'use {self.device}'
+
+
+@dataclass(frozen=True)
+class ShootTarget:
+    """A SECTION_OBJECTIVES step: walk to a standing spot from which one of `targets` (damage
+    targets, halo_cast.damage_target: d40's manifold detectors) is in sight with the machine
+    `opened` at position `value` (the piston the control before opened), the line of sight passing
+    through the space that machine leaves at its initial position, and shoot it until its health is
+    at most `health` (route flag 512, `target@health` and the aim point). Stands are searched within
+    `reach` retail units of the target."""
+    targets: tuple
+    opened: str
+    value: float = 1.0
+    health: float = .1
+    reach: float = 14.0
+
+    def __str__(self):
+        return f'sight of {self.targets[0]}'
+
+
 # Volumes a section's script waits for the player to enter before it opens the way on, in
 # order; the route walks through each before heading for the exit.
 # An entry may name the cutscene flag the scene then puts the player at (object_teleport),
@@ -233,9 +282,10 @@ SECTION_ANCHORS = {
 # projection covers its objectives as well as its start and exit.
 SECTION_OBJECTIVES = {
     ('a10', 1): (('bridge_trigger_3', 'chief_basea10'),),   # Keyes's bridge scene (mission_bridge, cinematic_x20)
-    # mission_prison waits for prison_d_switch (cell block D) before the rescue scene, then the
-    # player walks back out. ini_post_rescue's teleport to prison_player0_teleport is a player
-    # object_teleport, which the engine does not perform, so the return starts at the switch.
+    # mission_prison waits for prison_d_switch (cell block D) before the rescue scene (a Call cue
+    # in halo_script.cpp), then the player walks back out. ini_post_rescue's object_teleport puts
+    # the player at prison_player0_teleport, 1.6 units from the switch; the return leg still starts
+    # at the switch, a step the walker covers from there.
     ('a50', 3): (((-15.1, -116.6, -19.0), None),),
     # b40's c1 tower: lift_d waits at the bottom of its shaft. lift_d_control_a, at the top,
     # calls it up and, used again from the platform, rides it down. The platform is not a floor
@@ -280,9 +330,9 @@ SECTION_OBJECTIVES = {
     #   bsp 2,3;
     # - section 5 (BSP 4, the control room): section6 wakes enc6_1 and enc6_2, enc6_2 wakes enc6_3,
     #   and enc6_3 (with no Flood in enc6_3_safe) plays cinematic_captain, after which enc6_5
-    #   powers enc6_5_door1 and _door2 and section7 waits in BSP 3. The scene teleports the
-    #   player to player0_capt_done, 1.6 units away, which the engine does not do (as for a50's
-    #   prison): the walk back to bsp 4,3 starts in enc6_3;
+    #   powers enc6_5_door1 and _door2 and section7 waits in BSP 3. The scene (a Call cue) leaves
+    #   the player at player0_capt_done, 2 units away; the walk back to bsp 4,3 still starts in
+    #   enc6_3, a step the walker covers from there;
     # - section 6 (BSP 3, back through the hangar): section7 wakes enc7_1, enc7_1 wakes enc7_2
     #   (any of enc7_2, enc7_2b, enc7_2c), which brings in the Banshees and wakes enc7_6.
     ('d20', 1): tuple((name, None) for name in ('enc3_1', 'enc3_2', 'enc3_3', 'enc3_4', 'enc3_5', 'enc3_6',
@@ -297,17 +347,26 @@ SECTION_OBJECTIVES = {
     # - section 2 (BSP 1): enc2_1 wakes enc2_2, which opens enc2_1_door2 and enc2_1_door1 (the
     #   Hunters' doors, on the way) once the player is in enc2_2, and wakes enc2_5; enc2_5 waits for enc2_6, then
     #   for its Covenant to die and for cinematic_bridge (the x70 bridge scene), and wakes enc2_6,
-    #   which waits for enc2_6 again and opens enc2_6_door, the way to bsp 1,2. The scene's teleport
-    #   to player0_playon_base, 1.6 units from the volume, is a player object_teleport, which the
-    #   engine does not perform;
+    #   which waits for enc2_6 again and opens enc2_6_door, the way to bsp 1,2. The scene (a Call
+    #   cue) leaves the player at player0_playon_base, 1.7 units from the volume, where the next
+    #   leg is a step on;
     # - section 5 (BSP 4, the engine room): section5 wakes enc5_1 and enc5_2. The four manifolds
     #   are opened from their controls (enc5_1_controls1, _controln1, _controln3, _controls3, on
-    #   the top floor) and destroyed by shooting them; enc5_2 then waits for enc5_2, opens
-    #   enc5_2_door and wakes enc5_3, which raises the elevator once every player is in enc5_3.
+    #   the top floor: each moves its piston, enc5_1_pistons1 and so on, out of its channel, and
+    #   opening one closes the others) and destroyed by shooting a detector in it
+    #   (enc5_1_detector_s1 or _s1b and so on, which enc5_1_destroyed_poll reads with
+    #   unit_get_health; destroy_manifold_* closes the piston again); enc5_2 then waits for every
+    #   manifold and for enc5_2, opens enc5_2_door and wakes enc5_3, which raises the elevator once
+    #   every player is in enc5_3. The route uses each control (UseControl) and walks to a spot that
+    #   sees a detector through the open channel (ShootTarget), where the walker shoots it.
     ('d40', 0): (('section1', None), ('enc1_4', None)),
     ('d40', 1): (('enc2_1', None), ('enc2_2', None), ('enc2_6', None), ('cinematic_bridge', None), ('enc2_6', None)),
-    ('d40', 4): (('section5', None), ('enc5_1_main', None), ((-86.3, 6.62, 7.82), None),
-                 ((-86.28, -10.12, 7.88), None), ((-94.03, -10.14, 7.89), None), ((-94.04, 6.6, 7.89), None),
+    ('d40', 4): (('section5', None), ('enc5_1_main', None),
+                 *((step, None) for manifold, control in (('s1', (-86.3, 6.62, 7.82)), ('n1', (-86.28, -10.12, 7.88)),
+                                                        ('n3', (-94.03, -10.14, 7.89)), ('s3', (-94.04, 6.6, 7.89)))
+                   for step in (UseControl(control, f'enc5_1_piston{manifold}'),
+                                ShootTarget((f'enc5_1_detector_{manifold}', f'enc5_1_detector_{manifold}b'),
+                                            f'enc5_1_piston{manifold}'))),
                  ('enc5_2', None)),
 }
 
@@ -317,6 +376,18 @@ SECTION_OBJECTIVES = {
 # in 0_to_1_transition_trigger, 1 to 4.5 units down the hole Cortana tells the player to jump
 # into (objective_jump); section1 then plays cinematic_drop, the fall into the coolant.
 EXIT_FALLS = {('d20', 0)}
+
+# Sections whose scripted doors the walker waits at on a route row of their own (flag 1024 on the
+# last step before the door, with the door's name and DOOR_OPEN): it stands at the door, inside
+# its opening radius, clears the Covenant, looks round and uses the controls in reach until the
+# door opens, and logs the door's power and position while it waits, instead of backing off and
+# retrying as at other doors. a10 section 5 waits at tunnel_door_2 (powered by mission_tunnel
+# after the tunnel conversations), section 6 at cryo_door_2 (opened by cryo_search, woken after
+# the bridge scene, so only on a walk carried in from the sections before). The rows are in the
+# route file only; the steps are where they were, so the section maps are unchanged.
+DOOR_WAITS = {('a10', 4), ('a10', 5)}
+# The position at which a door the walker waits at counts as open (it walks on as it opens).
+DOOR_OPEN = .5
 
 # Sections whose projection origin is the middle of their height range (section_layout).
 MIDDLE_ORIGIN = {('b40', 5)}
@@ -380,6 +451,13 @@ NEVER_OPEN = {
 # d40 has eight (manual and unpowered): section 1's route used to jump through the hatch on the
 # landing deck at (-49, 35.5) instead of walking round by the open door at (-42.3, 34).
 UNGROUPED_DOORS_SEALED = {'d40'}
+# Missions whose routes walk over door leaves folded flat on the floor (halo_collision.floor_leaf):
+# c10's interior doors (the BSP 3/4 doorway's bsp3_device_bsp4_device_1 to _3, BSP 4's
+# bsp4_device_12 and _17) fold their leaves down into the doorway when open, 0.05 to 0.23 units
+# proud of the floor, more than a step at the indoor scale. Halo's biped walks over them, and the
+# engine lets bodies do the same (Scenario::collideDevices). The other missions' routes keep
+# treating every panel as solid, as they were planned and walked: switching one over needs a re-walk.
+FLOOR_LEAVES = {'c10'}
 
 
 def cutscene_flag(halo, name):
@@ -431,9 +509,74 @@ def exit_target(mission, part):
     return TRANSITIONS.get((mission.cache, bsp, following), f'bsp{bsp},{following}')
 
 
+def damage_targets(halo):
+    """{name: (retail centre, retail position, yaw, box low, box high)} of the scenario's damage
+    targets (halo_cast.damage_target): the objects the walker shoots (ShootTarget)."""
+    from import_halo_scripts import named_objects, Program
+    from halo_cast import damage_target
+    found = {}
+    for name, tag, pose in named_objects(Program(halo)):
+        target = damage_target(halo, tag)
+        if target:
+            _, low, high = target
+            yaw = pose[3]
+            cx, cy, cz = ((a + b) / 2 for a, b in zip(low, high))
+            centre = (pose[0] + cx*math.cos(yaw) - cy*math.sin(yaw), pose[1] + cx*math.sin(yaw) + cy*math.cos(yaw), pose[2] + cz)
+            found[name] = (centre, pose[:3], yaw, low, high)
+    return found
+
+
 def objective_point(halo, objective):
     """A SECTION_OBJECTIVES target in retail space: a volume's centre or a given point."""
+    if isinstance(objective, UseControl):
+        return objective.point
+    if isinstance(objective, ShootTarget):
+        return damage_targets(halo)[objective.targets[0]][0]
     return volume_centers(halo)[objective] if isinstance(objective, str) else objective
+
+
+def shoot_stands(halo, objective, projection, samples, low, sights, opened):
+    """{(x, y, quarter-unit z): (target name, campaign aim point)} for the standing route cells from
+    which a ShootTarget's target is in sight (eye 4.5 units above the feet, as the engine's player)
+    through the space its opened machine leaves, the nearest aim point of each target first.
+    `sights` is a SightLines with the machines in the pose the objective opens; `opened` the
+    machine_boxes entries of the opened machine at its initial position."""
+    targets = damage_targets(halo)
+    scale = projection.scale
+    found = {}
+    aims = []
+    for name in objective.targets:
+        if name not in targets:
+            continue
+        centre, position, yaw, lo, hi = targets[name]
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        half = [(b - a) / 2 for a, b in zip(lo, hi)]
+        middle = [(a + b) / 2 for a, b in zip(lo, hi)]
+        for fx, fy, fz in ((0, 0, 0), (0, 0, .8), (0, 0, -.8), (.6, .6, 0), (-.6, .6, 0), (.6, -.6, 0), (-.6, -.6, 0)):
+            lx, ly, lz = middle[0] + fx*half[0], middle[1] + fy*half[1], middle[2] + fz*half[2]
+            point = (position[0] + lx*cosine - ly*sine, position[1] + lx*sine + ly*cosine, position[2] + lz)
+            aims.append((name, point, projection.point(point)))
+    if not aims:
+        return found
+    reach = objective.reach * scale
+    tx, ty, tz = projection.point(targets[objective.targets[0]][0])
+    from halo_collision import _segment_box
+    for (x, y), levels in samples.items():
+        if (x - tx)**2 + (y - ty)**2 > reach * reach:
+            continue
+        for z in levels:
+            if (x, y, z) in low or abs(z / 4 - tz) > 4 * scale:
+                continue
+            eye = (x, y, z / 4 + 4.5)
+            reye = sights.retail(eye)
+            for name, point, aim in aims:
+                # Only a sight line the opening makes counts: it passes where the opened machine stood.
+                if opened and not any(_segment_box(reye, point, place, box) for _, place, box in opened):
+                    continue
+                if sights.clear(eye, aim):
+                    found[(x, y, z)] = (name, aim)
+                    break
+    return found
 
 
 def objective_test(halo, objective, projection):
@@ -963,6 +1106,14 @@ def section_layout(halo, mission, part):
             points.append(p)
     xmin, xmax = max(xmin,min(p[0] for p in points)-margin), min(xmax,max(p[0] for p in points)+margin)
     ymin, ymax = max(ymin,min(p[1] for p in points)-margin), min(ymax,max(p[1] for p in points)+margin)
+    # A flown section reaches past its BSP (FLOWN_EXTENTS): the map grows to hold those volumes,
+    # 20 units round them. Only while the section is flown (not put back in STOCK_SECTIONS).
+    if (mission.cache, part) not in STOCK_SECTIONS:
+        for name in FLOWN_EXTENTS.get((mission.cache, part), ()):
+            p = volumes.get(name)
+            if p is not None:
+                xmin, xmax = min(xmin, p[0] - 20), max(xmax, p[0] + 20)
+                ymin, ymax = min(ymin, p[1] - 20), max(ymax, p[1] + 20)
     span = max(xmax-xmin,ymax-ymin,1)
     scale = min(8.0 if indoor else 4.1, 980/span)
     factor = max(7, math.ceil(math.log2(span*scale+24)))
@@ -985,7 +1136,46 @@ def section_layout(halo, mission, part):
     return bsp, indoor, (xmin, xmax, ymin, ymax), start, end, actors, factor, projection
 
 
-def make_section(halo, mission, part, output, collision='validated'):
+# Route metrics (`packages/maps/<section>.metrics.json`, git-ignored with the maps): what the
+# stub-route gate (tests/test_route_metrics.py) reads. Written by every import of a section, and
+# by `--metrics-only`, which plans the section as an import would but writes nothing else.
+METRICS_FORMAT = 1
+# A route is a stub (definition of done, roadmap item 3) when it has fewer steps than this, its
+# reachable floor is under this share of the section's floor columns, or it ends more than this
+# many source units from the section's exit point; and a walked route (retail collision) that
+# does not end inside its exit volume (EXIT_FALLS sections end at the edge above it: they count
+# as inside). The reach share is not held against a walked route that ends inside its exit: the
+# planner proved that route connects the entry to the exit, and a low share there only means the
+# section's map window holds floors the route has no reason to visit (a big outdoor BSP).
+STUB_STEPS, STUB_REACH_PCT, STUB_EXIT_OFFSET = 100, 5.0, 25.0
+
+
+def stub_reasons(metrics, exit_falls=False):
+    """Why a section's route counts as a stub (empty: it does not). `exit_falls`: the section is in
+    EXIT_FALLS."""
+    reasons = []
+    walked = metrics['mode'] == 'walked'
+    inside = walked and (metrics['ends_in_exit'] or exit_falls)
+    if metrics['steps'] < STUB_STEPS:
+        reasons.append(f"{metrics['steps']} steps")
+    if not inside and metrics['reach_pct'] < STUB_REACH_PCT:
+        reasons.append(f"reach {metrics['reach_pct']:.1f}%")
+    if metrics['exit_offset'] > STUB_EXIT_OFFSET:
+        reasons.append(f"exit offset {metrics['exit_offset']:.1f}")
+    if walked and metrics['ends_in_exit'] is False and not exit_falls:
+        reasons.append('ends outside its exit volume')
+    return reasons
+
+
+def make_section(halo, mission, part, output, collision='validated', metrics_only=False):
+    # Warnings the route planner prints (a route that ends outside its exit, an objective it cannot
+    # reach) also go into the section's metrics.
+    notes = []
+    def say(text, **_):
+        print(text, flush=True)
+        if 'WARNING' in text or 'no route to' in text:
+            notes.append(text)
+    write = not metrics_only
     weapons = weapon_index(output)
     if not weapons:
         raise ValueError('run tools/halo_weapons.py first to write packages/halo/weapons.txt')
@@ -999,7 +1189,7 @@ def make_section(halo, mission, part, output, collision='validated'):
     # floors) but get the .hcol the vehicle drives on; b30 keeps its authored raster layout.
     driven = retail and (mission.cache, part) in DRIVEN_SECTIONS
     walked = retail and mission.cache != 'b30' and not driven
-    projected, bridges = None, None
+    projected, bridges, doors, test = None, None, None, None
     section_placements = list(section_vehicle_placements(halo, bsp, (xmin, xmax, ymin, ymax)))
     # Parked vehicles (turrets, Ghosts, Wraiths, Banshees) stand in the walk's way: the walked
     # route, and the actors and items placed beside it, go round them (VehicleBlocks).
@@ -1051,7 +1241,8 @@ def make_section(halo, mission, part, output, collision='validated'):
             test = (volume_test(box, projection) if box else
                     None if isinstance(exit_name, str) else objective_test(halo, exit_name, projection))
             doors = DoorBlocks(halo, projection, output, list(baked) + [b['device'] for b in bridges.bridges],
-                               NEVER_OPEN.get(mission.cache, ()), mission.cache in UNGROUPED_DOORS_SEALED)
+                               NEVER_OPEN.get(mission.cache, ()), mission.cache in UNGROUPED_DOORS_SEALED,
+                               mission.cache in FLOOR_LEAVES)
             # Prefer a route that needs no script to open a door; fall back to waiting at one.
             # Open doors still collide with their panels in the open pose.
             def solid(x, y, z):
@@ -1085,30 +1276,77 @@ def make_section(halo, mission, part, output, collision='validated'):
             # wait at costs far more than any detour, crouch or jump.
             # Objective volumes the mission script waits for the player to enter before it opens
             # the way on (a10's bridge, where Keyes's scene plays) are walked through in order.
-            legs = []
+            legs, actions, extra = [], [], []
+            # Machines in a pose a step leaves them in (ShootTarget's opened piston), for sight lines.
+            sight_cache = {}
+            def sights_for(device, value):
+                if (device, value) not in sight_cache:
+                    sight_cache[device, value] = SightLines(surfaces + machines, projection,
+                                                            machine_boxes(halo, output, bsp, {device: value}, baked))
+                return sight_cache[device, value]
+            def pose_blocker(device, value):
+                # A body may not stand in a machine's boxes at that pose (the opened piston's).
+                boxes = [entry for entry in machine_boxes(halo, output, bsp, {device: value}, baked) if entry[0] == device]
+                radius, height = (1.1 + .3) / scale, 5.2 / scale
+                def inside(x, y, z4):
+                    rx, ry = (x - 9) / scale + projection.x0, projection.y0 - (y - 9) / scale
+                    rz = projection.z0 + z4 / 4 / scale
+                    for _, (ox, oy, oz, c, s_), (x1, y1, z1, x2, y2, z2) in boxes:
+                        dx, dy, dz = rx - ox, ry - oy, rz - oz
+                        lx, ly = dx*c + dy*s_, -dx*s_ + dy*c
+                        if x1 - radius < lx < x2 + radius and y1 - radius < ly < y2 + radius and dz < z2 and dz + height > z1:
+                            return True
+                    return False
+                return inside
             for name, flag in SECTION_OBJECTIVES.get((mission.cache, part), ()):
-                legs.append((objective_test(halo, name, projection), projection.point(objective_point(halo, name)),
+                if isinstance(name, ShootTarget):
+                    initial = [entry for entry in machine_boxes(halo, output, bsp, {}, baked) if entry[0] == name.opened]
+                    stands = shoot_stands(halo, name, projection, crouching, low, sights_for(name.opened, name.value), initial)
+                    print(f'{mission.cache} section {part+1}: {len(stands)} cells see {" or ".join(name.targets)} '
+                          f'through {name.opened}', flush=True)
+                    legs.append((lambda x, y, z, stands=stands: (x, y, z) in stands, projection.point(objective_point(halo, name)),
+                                 None, False))
+                    actions.append(('shoot', name, stands))
+                    extra.append((name.opened, pose_blocker(name.opened, name.value)))
+                    continue
+                legs.append((objective_test(halo, name.point if isinstance(name, UseControl) else name, projection),
+                             projection.point(objective_point(halo, name)),
                              flag and projection.point(cutscene_flag(halo, flag) if isinstance(flag, str) else flag),
                              flag is not None and not isinstance(flag, str)))
+                actions.append(('use', name, None) if isinstance(name, UseControl) else None)
+                extra.append(None)
             legs.append((test, projected_end, None, False))
+            actions.append(None)
+            extra.append(None)
             # Route steps the player reaches by riding a lift from the step before (b40's lift_d).
             rides = set()
             # Ledge drops (LEDGE_DROPS) in quarter units of the section's projection.
             drop = round(LEDGE_DROPS.get((mission.cache, part), 0) * scale * 4)
             route, origin, riding = None, projected_start, False
-            names = [name for name, _ in SECTION_OBJECTIVES.get((mission.cache, part), ())] + [exit_target(mission, part)]
+            names = [str(name) for name, _ in SECTION_OBJECTIVES.get((mission.cache, part), ())] + [exit_target(mission, part)]
             for number, (inside, target, teleport, lift) in enumerate(legs):
                 last = number == len(legs) - 1
                 # An objective may be a step or two on from the last (d20's section 2 starts inside
                 # enc3_1): only the whole route needs 16 steps, as a section's single leg always has.
                 minimum = 16 if number == 0 and last else 1
+                # A ShootTarget leg walks with its opened machine moved: out of its first pose (not a
+                # wall there any more) and into the one the step left it in.
+                blocked_here = solid_low if extra[number] is None else \
+                    (lambda x, y, z, moved=extra[number]: doors.sealed_except(x, y, z, moved[0]) or doors.opened_at(x, y, z) or
+                     walls.blocked(x, y, z, True) or parked_at(x, y, z) or moved[1](x, y, z))
                 leg = retail_route(crouching, origin, target, inside, require_exit=True, low=low,
-                                   blocked=solid_low, cost=crawl, tree=tree, crossing=one_sided, over=over_door,
+                                   blocked=blocked_here, cost=crawl, tree=tree, crossing=one_sided, over=over_door,
                                    drop=drop, minimum=minimum, fill=bridgeless) or \
-                    (retail_route(crouching, origin, target, inside, low=low, blocked=solid_low, cost=crawl,
+                    (retail_route(crouching, origin, target, inside, low=low, blocked=blocked_here, cost=crawl,
                                   crossing=one_sided, minimum=minimum, fill=bridgeless) if last else None)
+                if leg is None and actions[number] and actions[number][0] == 'shoot':
+                    # No standing spot in sight of the target can be walked to: the walk goes on
+                    # without shooting it (the section then stays blocked where the script waits).
+                    say(f'{mission.cache} section {part+1}: WARNING no route to {names[number]}: '
+                          f'the walker cannot shoot {" or ".join(actions[number][1].targets)}', flush=True)
+                    continue
                 if leg is None:
-                    print(f'{mission.cache} section {part+1}: no route to {names[number]}', flush=True)
+                    say(f'{mission.cache} section {part+1}: no route to {names[number]}', flush=True)
                     route = None
                     break
                 if route is None:
@@ -1123,6 +1361,18 @@ def make_section(halo, mission, part, output, collision='validated'):
                         rides.add(leg[2][1])
                     route = (floor_, {**cells_, **leg[1]}, path_ + leg[2][1:])
                 end_cell = route[2][-1]
+                if actions[number]:
+                    # The walker acts at the leg's last step: uses the control, or shoots the target.
+                    kind, objective, stands = actions[number]
+                    if kind == 'use':
+                        step = ('use', f'{objective.device}@{objective.value:.2f}', None)
+                    else:
+                        found = stands.get((end_cell[0], end_cell[1], end_cell.z))
+                        if found is None:
+                            say(f'{mission.cache} section {part+1}: WARNING the route stops out of sight of {objective}', flush=True)
+                            found = (objective.targets[0], projection.point(objective_point(halo, objective)))
+                        step = ('shoot', f'{found[0]}@{objective.health:.2f}', found[1])
+                    end_cell.actions = getattr(end_cell, 'actions', ()) + (step,)
                 origin = teleport or (end_cell[0], end_cell[1], end_cell.z / 4)
                 riding = lift
             samples = crouching
@@ -1161,7 +1411,7 @@ def make_section(halo, mission, part, output, collision='validated'):
                 if waits:
                     print(f'{mission.cache} section {part+1}: route waits at scripted doors {", ".join(waits)}', flush=True)
                 if test is not None and not test(path_[-1][0], path_[-1][1], path_[-1].z):
-                    print(f'{mission.cache} section {part+1}: ' + (
+                    say(f'{mission.cache} section {part+1}: ' + (
                         f'route ends at the edge above its exit {exit_name} (EXIT_FALLS)'
                         if (mission.cache, part) in EXIT_FALLS else
                         f'WARNING route ends outside its exit {exit_name}'), flush=True)
@@ -1296,19 +1546,24 @@ def make_section(halo, mission, part, output, collision='validated'):
     output = output / 'packages'
     maps = output / 'maps'
     maps.mkdir(parents=True, exist_ok=True)
-    (maps / f'{name}.cgz').write_bytes(encode_map(native_cubes(floor,ceilings,size),entries,factor,
-                                                  f'{mission.title} | Section {part+1}'.encode()))
-    (maps / f'{name}.cfg').write_text('fog 360\nfogcolour 0x617181\n')
-    write_world_mesh(halo,output,projection.xy,projection.z,(xmin-8,xmax+8,ymin-8,ymax+8),
-                     map_name=name,bsp=bsp,include_sky=not indoor)
+    cgz = encode_map(native_cubes(floor,ceilings,size),entries,factor,f'{mission.title} | Section {part+1}'.encode())
+    cgz_path = maps / f'{name}.cgz'
+    cgz_current = cgz_path.is_file() and cgz_path.read_bytes() == cgz
+    route_text = None
+    if write:
+        cgz_path.write_bytes(cgz)
+        (maps / f'{name}.cfg').write_text('fog 360\nfogcolour 0x617181\n')
+        write_world_mesh(halo,output,projection.xy,projection.z,(xmin-8,xmax+8,ymin-8,ymax+8),
+                         map_name=name,bsp=bsp,include_sky=not indoor)
     hcol, route_file = maps / f'{name}.hcol', maps / f'{name}.route'
     if driven:
         # No walker route: the section is driven (tests/test_maw_drive.py).
-        count = write_structure_collision(halo, bsp, projection, hcol, (machines, baked))
-        route_file.unlink(missing_ok=True)
+        count = write_structure_collision(halo, bsp, projection, hcol, (machines, baked)) if write else '-'
+        if write:
+            route_file.unlink(missing_ok=True)
         print(f'{name} BSP {bsp}: {count} retail collision surfaces, {len(baked)} static machines (driven)', flush=True)
     elif retail:
-        count = write_structure_collision(halo, bsp, projection, hcol, (machines, baked))
+        count = write_structure_collision(halo, bsp, projection, hcol, (machines, baked)) if write else '-'
         # The walkable route in feet coordinates, for tests/test_retail_collision.py.
         # x y z [crouch]: the fourth column marks steps only passable crouching.
         # x y z [flags]: 1 marks steps only passable crouching, 2 a ledge to jump up onto, 4 a lift ride,
@@ -1332,9 +1587,39 @@ def make_section(halo, mission, part, output, collision='validated'):
                     value |= 32
                 crossed.append(bridge['name'])
             return f' {value} {bridge["name"]}@{bridge["value"]:.2f}'
-        rows = [('%d %d %.2f%s\n' % (*xyz(p), flags(previous, p))) for previous, p in zip([None] + path[:-1], path)]
+        # Scripted doors the walker waits at on a row of its own (DOOR_WAITS): the last step before the
+        # door's closed panels, flag 1024 with the door and the position at which it counts as open.
+        door_waits = {}
+        if (mission.cache, part) in DOOR_WAITS and doors is not None:
+            for previous, p in zip(path[:-1], path[1:]):
+                door = doors.scripted_at(p[0], p[1], p.z)
+                if door and not doors.scripted_at(previous[0], previous[1], previous.z) and door not in door_waits.values():
+                    door_waits[id(previous)] = door
+        rows, row_of = [], []
+        for previous, p in zip([None] + path[:-1], path):
+            row_of.append(len(rows))
+            # Actions at a step (UseControl: 256 with device@position; ShootTarget: 512 with
+            # target@health and the aim point, x y z) follow the step's own row, one row each at
+            # the same place; so does a door wait (1024).
+            rows.append('%d %d %.2f%s\n' % (*xyz(p), flags(previous, p)))
+            if id(p) in door_waits:
+                rows.append('%d %d %.2f 1024 %s@%.2f\n' % (*xyz(p), door_waits[id(p)], DOOR_OPEN))
+            for kind, column, aim in getattr(p, 'actions', ()):
+                if kind == 'use':
+                    rows.append('%d %d %.2f 256 %s\n' % (*xyz(p), column))
+                else:
+                    rows.append('%d %d %.2f 512 %s %.2f %.2f %.2f\n' % (*xyz(p), column, *aim))
+        if door_waits:
+            print(f'{name}: route waits on its own rows at doors {", ".join(door_waits.values())}', flush=True)
+        acted = sum(len(getattr(p, 'actions', ())) for p in path)
+        if acted:
+            print(f'{name}: route uses {sum(1 for p in path for a in getattr(p, "actions", ()) if a[0] == "use")} controls and '
+                  f'shoots {sum(1 for p in path for a in getattr(p, "actions", ()) if a[0] == "shoot")} targets', flush=True)
         if crossed:
             print(f'{name}: route crosses light bridges {", ".join(crossed)}', flush=True)
+        # The end of the path's rows (with their action rows), before an exit fall's row: a lift
+        # boarded from the route's end goes here, as it did before action rows existed.
+        path_end = len(rows)
         if (mission.cache, part) in EXIT_FALLS:
             # Walk off the edge towards the exit volume's centre and fall into it (flag 8).
             rows.append('%d %d %.2f 8\n' % (round(projected_end[0]), round(projected_end[1]), projected_end[2]))
@@ -1347,16 +1632,18 @@ def make_section(halo, mission, part, output, collision='validated'):
                     before.z / 4 / scale + projection.z0)
             found = lift_ride(halo, projection, output.parent, lift, near)
             if found is None:
-                print(f'{name}: WARNING no lift deck for {lift}', flush=True)
+                say(f'{name}: WARNING no lift deck for {lift}', flush=True)
             else:
                 board, value, send, call = found
                 bx, by, bz = projection.point(board)
-                rows.insert(len(path) if index is None else index,
+                rows.insert(path_end if index is None else row_of[index],
                             '%d %d %.2f %d %s@%.2f\n' % (round(bx), round(by), bz, 16 | (32 if call else 0) | (64 if send else 0),
                                                          lift, value))
                 print(f'{name}: route boards {lift} at {board[0]:.2f},{board[1]:.2f},{board[2]:.2f} (position {value:.2f}'
                       f'{", called from the landing" if call else ""}{", sent from its control" if send else ""})', flush=True)
-        route_file.write_text(''.join(rows))
+        route_text = ''.join(rows)
+        if write:
+            route_file.write_text(route_text)
         crouched = sum(bool(getattr(p, 'crouch', False)) for p in path)
         jumps = sum(bool(getattr(p, 'jump', False)) for p in path)
         lifts = sum(bool(getattr(p, 'ride', False)) for p in path)
@@ -1365,23 +1652,47 @@ def make_section(halo, mission, part, output, collision='validated'):
             print(f'{name}: {crouched} route steps need crouching, {jumps} jumps' +
                   (f', {lifts} lift rides' if lifts else '') + (f', {falls} ledge drops' if falls else ''), flush=True)
         print(f'{name} BSP {bsp}: {count} retail collision surfaces, {len(baked)} static machines', flush=True)
-    else:
+    elif write:
         # A stale file would switch the engine to collision this section has not been checked against.
         hcol.unlink(missing_ok=True)
         route_file.unlink(missing_ok=True)
+    entry_offset = math.dist(xyz(path[0]), projected_start) / scale
+    exit_offset = math.dist(xyz(path[-1]), projected_end) / scale
     print(f'{name} BSP {bsp}: {len(path)} steps, {len(used)} actors, {placed} weapons, {items} equipment, {vehicles} vehicles, {len(parents)} cells; '
-          f'entry offset {math.dist(xyz(path[0]),projected_start)/scale:.1f}, '
-          f'exit offset {math.dist(xyz(path[-1]),projected_end)/scale:.1f} source units',flush=True)
+          f'entry offset {entry_offset:.1f}, '
+          f'exit offset {exit_offset:.1f} source units',flush=True)
+    mode = ('stock' if not retail else 'flown' if (mission.cache, part) in FLOWN_SECTIONS else 'driven' if driven
+            else 'walked' if walked else 'raster')
+    route_path = maps / f'{name}.route'
+    metrics = {
+        'format': METRICS_FORMAT, 'name': name, 'mission': mission.cache, 'section': part + 1, 'bsp': bsp, 'mode': mode,
+        'steps': len(path), 'route_rows': route_text.count('\n') if route_text is not None else None,
+        'reached_cells': len(parents), 'floor_cells': len(samples),
+        'reach_pct': round(100.0 * len(parents) / max(1, len(samples)), 2),
+        'entry_offset': round(entry_offset, 2), 'exit_offset': round(exit_offset, 2),
+        'ends_in_exit': (bool(test(path[-1][0], path[-1][1], path[-1].z)) if walked and test is not None else None),
+        'actors': len(used), 'weapons': placed, 'equipment': items, 'vehicles': vehicles,
+        'warnings': notes,
+        'cgz_sha1': hashlib.sha1(cgz).hexdigest(),
+        'route_sha1': hashlib.sha1(route_text.encode()).hexdigest() if route_text is not None else None,
+        # Whether the files on disk are what this importer writes (always, after a real import;
+        # with --metrics-only, false means the section needs re-importing).
+        'cgz_current': True if write else cgz_current,
+        'route_current': (True if write else route_path.is_file() and route_path.read_text() == route_text)
+                         if route_text is not None else (write or not route_path.exists()),
+    }
+    metrics['stub'] = stub_reasons(metrics, (mission.cache, part) in EXIT_FALLS)
+    (maps / f'{name}.metrics.json').write_text(json.dumps(metrics, indent=1, sort_keys=True) + '\n')
 
 
 def convert(args):
-    source, output, mission, part, collision = args
+    source, output, mission, part, collision, metrics_only = args
     with (source / f'{mission.cache}.map').open('rb') as file, mmap.mmap(file.fileno(),0,access=mmap.ACCESS_READ) as data:
         halo = HaloMap(data)
         if halo.name != mission.cache:
             raise ValueError(f'Wrong cache in {mission.cache}.map')
         try:
-            make_section(halo,mission,part,output,collision)
+            make_section(halo,mission,part,output,collision,metrics_only)
         except (ValueError, IndexError) as error:
             return f'{mission.cache} section {part+1}: {error}'
     return None
@@ -1395,8 +1706,11 @@ def main():
     parser.add_argument('--part',type=int,help='One-based section number, used with --mission')
     parser.add_argument('--collision',choices=('validated','all','none'),default='validated',
                         help='Which sections get retail BSP collision (.hcol): validated missions (default), all, or none')
+    parser.add_argument('--metrics-only', action='store_true',
+                        help='Plan each section as the import would but write only packages/maps/<section>.metrics.json '
+                             '(the stub-route gate, tests/test_route_metrics.py); the maps, meshes, .hcol and .route stay as they are')
     args = parser.parse_args()
-    jobs = [(args.maps,args.output,m,i,args.collision) for m in MISSIONS if not args.mission or m.cache==args.mission
+    jobs = [(args.maps,args.output,m,i,args.collision,args.metrics_only) for m in MISSIONS if not args.mission or m.cache==args.mission
             for i in range(len(m.sections)) if args.part is None or i+1==args.part]
     if not jobs or (args.part is not None and not args.mission):
         parser.error('Choose a valid mission and section')

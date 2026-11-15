@@ -8,6 +8,7 @@
 #include "halo_ai.h"
 #include "halo_hud.h"
 #include "halo_vehicle.h"
+#include "halo_fx.h"
 #include "bot/bot.h"
 #include "hudgun.h"
 
@@ -1014,6 +1015,9 @@ void weapon::attacksound()
         // cycle), for the player and the actors alike; the three original samples otherwise.
         const HaloWeaponDef *def = haloweaponof(owner, type);
         const char *sample = def ? def->sound(HALO_SOUND_FIRE) : NULL;
+        // A weapon whose only firing sound is a loop (the flamethrower) plays it while the
+        // trigger is held (halo.cpp updateFiringLoop), not a sample per shot.
+        if(!sample && def && def->sound(HALO_SOUND_LOOP) && owner == player1) return;
         if(!sample) sample = type == GUN_ASSAULT ? "ma5b-fire" : type == GUN_PISTOL ? "pistol-fire" :
             type == GUN_SUBGUN || type == GUN_CARBINE ? "plasma-fire" : NULL;
         haloplaysound(sample, info.sound, owner);
@@ -1125,6 +1129,16 @@ void weapon::renderhudmodel(int lastaction, int index)
             basetime = haloActionStart;
         }
         if(type == GUN_ASSAULT) haloupdatecounter(mag);
+        vec offset;
+        if(halohudmodeloffset(type, offset))
+        {
+            // In the view's frame: right, forward (along the aim), up.
+            const float yaw = p->yaw * RAD, pitch = p->pitch * RAD;
+            const vec forward(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
+            const vec right(cosf(yaw), sinf(yaw), 0);
+            const vec up(-sinf(yaw) * sinf(pitch), cosf(yaw) * sinf(pitch), cosf(pitch));
+            wm.pos.add(vec(right).mul(righthanded ? offset.x : -offset.x)).add(vec(forward).mul(offset.y)).add(vec(up).mul(offset.z));
+        }
         const bool emit = (anim&ANIM_INDEX) == ANIM_GUN_SHOOT && lastmillis - lastaction < flashtime();
         rendermodel(imported, anim|ANIM_DYNALLOC|(righthanded ? 0 : ANIM_MIRROR)|(emit ? ANIM_PARTICLE : 0), 0, -1, wm.pos, 0,
             p->yaw+90, p->pitch, 1000.0f/30, basetime, NULL, NULL, 1.0f);
@@ -1908,9 +1922,12 @@ namespace
     struct HaloShot
     {
         playerent *owner;
-        int def, trigger, damage, expire;
+        int def, trigger, expire;
+        // The rolled full-strength damage, the weakest the shot falls to (the jpt! lower bound) and
+        // the shooter's modifier (an actor variant's; 1 for the player); see shotdamage.
+        float full, lower, modifier;
         vec position, direction;
-        float travelled;
+        float travelled;                    // Halo world units
         playerent *target;
     };
     vector<HaloShot> haloShots;
@@ -1943,22 +1960,87 @@ namespace
         return p.category == 10 || p.guided > 0 ? GUN_SUBGUN : fallback;
     }
 
+    // Rolls a shot's damage: the player's full-strength roll as it is; an actor's the same roll
+    // (the jpt! upper bound) times the variant's modifier, kept exact instead of rounded per shot.
+    void rollshot(HaloShot &shot, const HaloProjectileDef &p, playerent *owner)
+    {
+        shot.full = p.damage.roll();
+        shot.lower = p.damage.lower;
+        shot.modifier = owner == player1 ? 1.0f : haloactordamagescale(owner);
+    }
+
+    // What a shot deals at `scale` (1 full strength, 0 the weakest): from the full roll down to the
+    // jpt! lower bound, times the modifier. An actor's shot deals at least 1, the floor its integer
+    // slot damage had (the Sentinel beam's 1 x 0.5 would otherwise halve its damage).
+    float shotdamage(const HaloShot &shot, float scale)
+    {
+        const float weakest = min(shot.lower, shot.full);
+        const float damage = (weakest + (shot.full - weakest) * clamp(scale, 0.0f, 1.0f)) * shot.modifier;
+        return shot.owner == player1 ? damage : max(1.0f, damage);
+    }
+
+    // An impact `distance` world units from the muzzle: full strength up to the near end of the
+    // projectile's air damage range, the lower bound from its far end on.
+    float impactdamage(const HaloShot &shot, const HaloProjectileDef &p, float distance)
+    {
+        return shotdamage(shot, halofalloff(distance, p.rangeStart, p.rangeEnd));
+    }
+
+    // The player's blast on the damage targets it reaches (d40's manifold detectors): `damage`
+    // gives what it deals at a falloff (1 inside the inner radius, 0 at the outer).
+    template<class F> void blasttargets(const vec &centre, float inner, float outer, F damage)
+    {
+        int targets[16];
+        float distances[16];
+        const int count = haloscenariotargetsnear(centre, outer, targets, distances, 16);
+        loopi(count) haloscenariotargetdamage(targets[i], damage(halofalloff(distances[i], inner, outer)));
+    }
+
+    // Area damage (rockets, fuel rods, mortars, the Scorpion's shell): full inside the area's
+    // inner radius, falling to the lower bound at the outer, none beyond.
     void areadamage(const HaloShot &shot, const HaloProjectileDef &p, const vec &centre)
     {
-        const float radius = p.radius * haloscenarioscale();
+        const float scale = haloscenarioscale();
+        const float radius = p.radius * scale, inner = min(p.innerRadius * scale, radius);
         particle_fireball(PART_FIREBALL, centre);
-        loopv(players)
+        halofxblast(centre, radius);
+        auto blast = [&](playerent *victim)
         {
-            playerent *victim = players[i];
-            if(!victim || victim->state != CS_ALIVE) continue;
+            if(!victim || victim->state != CS_ALIVE) return;
             const float distance = victim->o.dist(centre);
-            if(distance < radius) hit(max(1, int(shot.damage * (1 - distance / radius))), victim, shot.owner,
-                                      vec(victim->o).sub(centre).normalize(), GUN_GRENADE, false, 0);
-        }
-        if(player1->state == CS_ALIVE && player1->o.dist(centre) < radius)
-            hit(max(1, int(shot.damage * (1 - player1->o.dist(centre) / radius))), player1, shot.owner,
-                vec(player1->o).sub(centre).normalize(), GUN_GRENADE, false, 0);
+            if(distance >= radius) return;
+            const float damage = shotdamage(shot, halofalloff(distance, inner, radius));
+            vec dir = vec(victim->o).sub(centre);
+            if(dir.iszero()) dir = vec(0, 0, 1);
+            halohit(damage, p.sideEffect, victim, shot.owner, dir.normalize(), GUN_GRENADE, false, 0, &p.damage);
+        };
+        loopv(players) blast(players[i]);
+        blast(player1);
+        if(shot.owner == player1) blasttargets(centre, inner, radius, [&](float falloff) { return shotdamage(shot, falloff); });
+        if(p.sideEffect == HALO_SIDE_EFFECT_EMP) halovehicleemp(centre, radius, -1, HALO_EMP_STUN_MILLIS);
     }
+
+    // An EMP projectile stops on a vehicle's body (other shots pass through vehicles, as before).
+    int empvehicle(const HaloProjectileDef &p, const vec &from, const vec &to)
+    {
+        if(p.sideEffect != HALO_SIDE_EFFECT_EMP) return -1;
+        loopi(4)
+        {
+            const vec at = vec(to).sub(from).mul(i / 3.0f).add(from);
+            const int vehicle = halovehicleat(at, .1f);
+            if(vehicle >= 0) return vehicle;
+        }
+        return -1;
+    }
+}
+
+void halohit(float damage, int sideEffect, playerent *victim, playerent *owner, const vec &dir, int gun, bool gib, int info,
+             const HaloDamage *source)
+{
+    if(!victim || !(damage > 0)) return;
+    halopendinghit(victim, damage, sideEffect, source);
+    hit(max(1, int(damage + .5f)), victim, owner, dir, gun, gib, info);
+    halopendinghit(NULL, 0, 0);
 }
 
 void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int index,
@@ -1992,16 +2074,16 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
     loopi(count)
     {
         const vec dir = halocone(aim, cone + (count > 1 ? t->distribution * 0.5f : 0));
-        // Enemies use their slot's pre-scaled damage; the player rolls a full-strength hit.
-        const int damage = owner == player1 ? max(1, int(p.damage.roll() + .5f))
-                                            : owner->weapons[GUN_SUBGUN]->info.damage;
+        // Every shot rolls the jpt! upper bound; range falloff applies where it lands.
+        HaloShot rolled = HaloShot();
+        rolled.owner = owner;
+        rollshot(rolled, p, owner);
         if(!instant)
         {
             HaloShot &shot = haloShots.add();
-            shot.owner = owner;
+            shot = rolled;
             shot.def = def.index;
             shot.trigger = index;
-            shot.damage = damage;
             shot.position = from;
             shot.direction = dir;
             shot.travelled = 0;
@@ -2012,11 +2094,16 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
         vec end = vec(dir).mul((p.range > 0 ? p.range : 1000) * scale).add(from);
         intersectgeometry(from, end);
         playerent *victim = NULL;
+        int target = -1;
         if(owner == player1)
         {
+            // A damage target in the way (d40's manifold detectors) stops the shot, unless a body
+            // is nearer still.
+            float along;
+            if((target = haloscenariotargettrace(from, end, along)) >= 0) end = vec(end).sub(from).mul(along).add(from);
             float distance;
             int zone;
-            if((victim = intersectclosest(from, end, owner, distance, zone))) shorten(from, end, distance);
+            if((victim = intersectclosest(from, end, owner, distance, zone))) { shorten(from, end, distance); target = -1; }
         }
         else
         {
@@ -2024,7 +2111,9 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
             vec contact;
             if((victim = haloactorhit(owner, from, end, contact))) end = contact;
         }
-        if(victim) hit(damage, victim, owner, dir, halodamagegun(p, fallbackGun), false, 0);
+        if(victim) halohit(impactdamage(rolled, p, from.dist(end) / max(scale, 1e-3f)), p.sideEffect, victim, owner, dir,
+                           halodamagegun(p, fallbackGun), false, 0, &p.damage);
+        else if(target >= 0) haloscenariotargetdamage(target, impactdamage(rolled, p, from.dist(end) / max(scale, 1e-3f)));
         else addbullethole(owner, from, end);
         addshotline(owner, from, end);
         particle_splash(PART_SPARK, 4, 220, end);
@@ -2047,7 +2136,9 @@ void haloaddbolt(playerent *owner, const vec &position, const vec &direction, in
     shot.owner = owner;
     shot.def = def->index;
     shot.trigger = 0;
-    shot.damage = damage;
+    // Its slot damage as it is: no range falloff, no modifier.
+    shot.full = shot.lower = float(damage);
+    shot.modifier = 1;
     shot.position = position;
     shot.direction = direction;
     shot.travelled = 0;
@@ -2087,23 +2178,30 @@ void haloupdatebolts(int elapsed)
         const bool worldHit = intersectgeometry(shot.position, end);
         playerent *victim = NULL;
         vec contact;
+        int target = -1;
         if(shot.owner == player1)
         {
+            float along;
+            if((target = haloscenariotargettrace(shot.position, end, along)) >= 0) end = vec(end).sub(shot.position).mul(along).add(shot.position);
             float distance;
             int zone;
-            if((victim = intersectclosest(shot.position, end, player1, distance, zone))) { contact = end; shorten(shot.position, contact, distance); end = contact; }
+            if((victim = intersectclosest(shot.position, end, player1, distance, zone))) { contact = end; shorten(shot.position, contact, distance); end = contact; target = -1; }
         }
         else if((victim = haloactorhit(shot.owner, shot.position, end, contact))) end = contact;
+        const int vehicle = victim ? -1 : empvehicle(*p, shot.position, end);
         if(p->radius > 0) particle_trail(PART_SMOKE, 300, shot.position, end);
         else if(p->category == 10 || p->guided > 0) particle_trail(PART_PLASMA_BOLT, 34, shot.position, end);
         else addshotline(shot.owner, shot.position, end);
         const bool spent = shot.travelled >= range;
-        if(victim || worldHit || spent)
+        if(victim || worldHit || spent || vehicle >= 0 || target >= 0)
         {
             if(p->radius > 0) areadamage(shot, *p, end);
             else
             {
-                if(victim) hit(shot.damage, victim, shot.owner, shot.direction, halodamagegun(*p, GUN_SUBGUN), false, 0);
+                if(victim) halohit(impactdamage(shot, *p, shot.travelled), p->sideEffect, victim, shot.owner, shot.direction,
+                                   halodamagegun(*p, GUN_SUBGUN), false, 0, &p->damage);
+                else if(target >= 0) haloscenariotargetdamage(target, impactdamage(shot, *p, shot.travelled));
+                if(vehicle >= 0) halovehicleemp(end, 0, vehicle, HALO_EMP_STUN_MILLIS);
                 particle_splash(p->category == 10 || p->guided > 0 ? PART_PLASMA : PART_SPARK, 5, 165, end);
             }
             haloShots.remove(i--);
@@ -2225,7 +2323,7 @@ namespace
         exploded = true;
         timetolive = 0;
         const HaloGrenadeDef *def = halogrenadedef(type);
-        const bool plasma = def && def->sideEffect == 3;
+        const bool plasma = def && def->sideEffect == HALO_SIDE_EFFECT_EMP;
         particle_splash(plasma ? PART_PLASMA : PART_SPARK, 50, 300, o);
         particle_fireball(PART_FIREBALL, o);
         addscorchmark(o);
@@ -2236,13 +2334,19 @@ namespace
             adddynlight(NULL, o, 16, 600, 600, 192, 160, 128);
         }
         haloplaysound(def ? def->sound(HALO_SOUND_EXPLODE) : NULL, S_FEXPLODE, NULL, &o);
+        halofxblast(o, def ? def->outerRadius * haloscenarioscale() : 8.0f);
         if(!def || !owner) return;
         haloactornoise(owner);
-        // Full damage inside the inner radius, falling off to none at the outer; the unit a
-        // sticky grenade is stuck to takes the attached damage as well. Difficulty scales what
-        // reaches the player in halodamage, as it does for every enemy weapon.
+        // Full damage inside the inner radius, falling to the jpt! lower bound at the outer and
+        // none beyond; the unit a sticky grenade is stuck to takes the attached damage as well.
+        // The player's grenades roll the retail full-strength range (120 for both types); an
+        // actor's roll from the lower bound (80 to 120), the balance before the jpt! layout fix.
+        // Difficulty scales what reaches the player in halodamage, as it does for every enemy
+        // weapon. The plasma grenade's EMP drains the shields it reaches (halodamage) and stuns
+        // the vehicles inside its outer radius and the one it is stuck to.
         const float scale = haloscenarioscale();
         const float inner = def->innerRadius * scale, outer = max(def->outerRadius * scale, inner + .1f);
+        const bool thrownByPlayer = owner == player1;
         auto blast = [&](playerent *victim)
         {
             if(!victim || victim->state != CS_ALIVE) return;
@@ -2250,16 +2354,19 @@ namespace
             const float distance = centre.dist(o);
             const bool stuck = victim == stuckTo;
             if(!stuck && (distance >= outer || !raycubelos(o, centre, .3f))) return;
-            const float falloff = stuck || distance <= inner ? 1.0f : 1.0f - (distance - inner) / (outer - inner);
-            int damage = int(def->blast.roll() * falloff + .5f);
-            if(stuck) damage += int(def->attached.roll() + .5f);
+            const float falloff = stuck ? 1.0f : halofalloff(distance, inner, outer);
+            const float full = thrownByPlayer ? def->blast.roll() : def->blast.rollFromLower();
+            float damage = def->blast.scaled(full, falloff);
+            if(stuck) damage += thrownByPlayer ? def->attached.roll() : def->attached.rollFromLower();
             if(damage <= 0) return;
             vec dir = vec(victim->o).sub(o);
             if(dir.iszero()) dir = vec(0, 0, 1);
-            hit(damage, victim, owner, dir.normalize(), GUN_GRENADE, true, int(distance * DMF));
+            halohit(damage, def->sideEffect, victim, owner, dir.normalize(), GUN_GRENADE, true, int(distance * DMF), &def->blast);
         };
         blast(player1);
         loopv(players) blast(players[i]);
+        if(thrownByPlayer) blasttargets(o, inner, outer, [&](float falloff) { return def->blast.scaled(def->blast.roll(), falloff); });
+        if(plasma) halovehicleemp(o, outer, stuckVehicle, HALO_EMP_STUN_MILLIS);
     }
 }
 
@@ -2362,6 +2469,10 @@ void halofrag()
     haloActionEnd = lastmillis + (player1->weaponsel->type == GUN_PISTOL ? 844 : 822);
 }
 
+// The melee lunge (halomelee) and its log line for tests/test_presentation.py.
+VAR(halo_meleelunge, 0, 1, 1);
+VAR(halo_meleetrace, 0, 0, 1);
+
 void halomelee()
 {
     if(!haloactive() || halocinematic() || halodriving() || intermission || editmode || ispaused || menuvisible() || player1->state != CS_ALIVE ||
@@ -2374,9 +2485,44 @@ void halomelee()
     float distance;
     int zone;
     playerent *target = intersectclosest(from, to, player1, distance, zone);
-    if(target) hit(halomeleedamage(), target, player1, direction, GUN_KNIFE, false, 0);
-    // Each weapon's melee animation has its own sound; the MA5B's stands in without the tags.
+    // The lunge: a hostile actor in sight within 1.8 times the blow's reach and 25 degrees of the
+    // aim draws the blow onto it, and the player is pushed towards it by a velocity impulse that
+    // friction takes out again (as a blast's knockback; the movement constants are not touched).
+    if(!target && halo_meleelunge)
+    {
+        const float reach = 4.0f * 1.8f, cone = cosf(25 * RAD);
+        float best = reach;
+        playerent *lunge = NULL;
+        loopv(players)
+        {
+            playerent *p = players[i];
+            if(!p || p->state != CS_ALIVE || !haloisactor(p) || !haloactorhostile(player1, p)) continue;
+            vec body = p->o;
+            body.z -= p->eyeheight * .4f;
+            vec toward = vec(body).sub(from);
+            const float d = toward.magnitude();
+            if(d >= best || d < 1e-3f || toward.div(d).dot(direction) < cone) continue;
+            vec sight = body;
+            if(intersectgeometry(from, sight) && sight.dist(body) > 1.0f) continue;
+            best = d;
+            lunge = p;
+        }
+        if(lunge)
+        {
+            target = lunge;
+            vec push = vec(lunge->o).sub(from);
+            push.z = 0;
+            const float gap = push.magnitude();
+            // About 1.9 units per unit of impulse at the floor's friction: close the gap to 3.
+            if(gap > 3.5f && player1->onfloor) player1->vel.add(push.div(gap).mul(clamp((gap - 3.0f) / 1.9f, 0.0f, 2.0f)));
+            if(halo_meleetrace) conoutf("MELEE_QA lunge target=%s distance=%.2f", lunge->name, best);
+        }
+    }
     const HaloWeaponDef *def = haloweaponof(player1, player1->weaponsel->type);
+    // Through halohit so the melee jpt!'s material modifiers reach Hunters and Sentinels.
+    if(target) halohit(float(halomeleedamage()), HALO_SIDE_EFFECT_NONE, target, player1, direction, GUN_KNIFE, false, 0,
+                       def && def->melee.upperMax > 0 ? &def->melee : NULL);
+    // Each weapon's melee animation has its own sound; the MA5B's stands in without the tags.
     haloplaysound(def && def->sound(HALO_SOUND_MELEE) ? def->sound(HALO_SOUND_MELEE) : "melee", S_KNIFE);
     haloAction = ANIM_GUN_MELEE;
     haloActionStart = lastmillis;

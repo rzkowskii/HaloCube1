@@ -3,11 +3,15 @@
 
 The fixed SOUNDS come from the A30 cache. Every `sound <role> <tag>` line in
 packages/halo/weapons.txt and packages/halo/equipment.txt (tools/halo_weapons.py:
-weapon fire, reload, empty, melee, ready, overheat and pickup sounds, grenade and
-equipment sounds, the interface's shield and health warnings) is decoded from the
-first campaign cache next to the given map that holds the tag, to
-packages/audio/halo/tags/<sample>.wav; source/src/halo_weapons.cpp names the
-samples the same way (halosoundsample).
+weapon fire, reload, empty, melee, ready, overheat, pickup, zoom and firing-loop sounds,
+grenade and equipment sounds, the interface's shield and health warnings),
+packages/halo/vehicles.txt (tools/halo_vehicles.py: engine loops, crash and suspension
+sounds) and packages/halo/effects.txt (tools/halo_effects.py: the script effects'
+sounds) is decoded from the first campaign cache next to the given map that holds
+the tag, to packages/audio/halo/tags/<sample>.wav; source/src/halo_weapons.cpp names
+the samples the same way (halosoundsample). tags/classes.txt lists each decoded
+sample's retail sound class (`<sample> <class>`), which sound_class_set_gain fades
+(source/src/halo_fx.cpp).
 """
 
 import argparse
@@ -116,12 +120,13 @@ def sample_name(tag_name):
 
 
 def table_sounds(root):
-    """Sound tags named by `sound <role> <tag>` lines in the weapon and equipment tables."""
+    """Sound tags named by `sound <role> <tag>` lines in the weapon, equipment, vehicle and
+    effect tables."""
     names = set()
-    for table in ('weapons.txt', 'equipment.txt'):
+    for table in ('weapons.txt', 'equipment.txt', 'vehicles.txt', 'effects.txt'):
         path = root / 'packages/halo' / table
         if not path.exists():
-            print(f'warning: {path} is missing; run tools/halo_weapons.py first', file=sys.stderr)
+            print(f'warning: {path} is missing; run the tool that writes it first (docs/macos-build.md)', file=sys.stderr)
             continue
         for line in path.read_text().splitlines():
             key, _, rest = line.partition(' ')
@@ -164,7 +169,7 @@ def main():
         parser.exit(1, f'Import failed: {error}\n')
 
     # Weapon, grenade, equipment and interface sounds from the tables, from whichever cache has them.
-    wanted, done = table_sounds(args.destination), set()
+    wanted, done, classes = table_sounds(args.destination), set(), {}
     for cache in CAMPAIGN:
         path = maps / f'{cache}.map'
         if not wanted - done or not path.exists():
@@ -180,7 +185,12 @@ def main():
                     print(f'warning: {cache}: {error}', file=sys.stderr)
                     continue
                 write_wav(destination / (sample_name(tag.name) + '.wav'), pcm, channels, rate)
+                classes[sample_name(tag.name)] = halo.tags.read('h', tag.address + 4)[0]
                 done.add(tag.name)
+    (destination / 'tags').mkdir(parents=True, exist_ok=True)
+    (destination / 'tags/classes.txt').write_text(
+        '# <sample> <retail sound class> (tools/import_halo_audio.py)\n' +
+        ''.join(f'{name} {value}\n' for name, value in sorted(classes.items())))
     missing = sorted(wanted - done)
     for name in missing:
         print(f'warning: no decodable {name} in the campaign caches', file=sys.stderr)

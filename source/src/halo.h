@@ -8,9 +8,28 @@ void halodrawhud();
 bool halotitleactive();
 void halodrawtitle();
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun);
+// Exact damage (weapon.cpp): deals `damage` (not rounded) with a jpt! side effect through hit();
+// halodamage applies the exact amount (shields, difficulty, the health fraction carried to the
+// next hit) and the side effect (3, EMP, drains the shield). halopendinghit is its hand-off.
+// `source` is the jpt! damage dealt, whose material modifiers halodamage applies to the bodies
+// with retail collision materials (Hunters, Sentinels, the Monitor, Engineers); null for none.
+struct HaloDamage;
+void halohit(float damage, int sideEffect, playerent *victim, playerent *owner, const vec &dir, int gun, bool gib, int info,
+             const HaloDamage *source = NULL);
+void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source = NULL);
+// Opacity a camouflaged actor is drawn with (rendermodel.cpp), or a negative value for a body
+// drawn as usual.
+float halomodelalpha(const playerent *p);
+// An actor's damage modifier on its weapon's jpt! damage (the variant's, else the default share).
+float haloactordamagescale(const playerent *p);
 bool halopickup(int index, playerent *player);
 const char *haloactormodel(const playerent *player);
+// `name` when that model loads, else `fallback` (tried once per name).
+const char *halomodelor(const char *name, const char *fallback);
 const char *halohudmodel(int gun);
+// The current viewmodel's placement away from its retail animation's (right, forward, up in the
+// view; AssaultCube units), when it has one (the rocket launcher).
+bool halohudmodeloffset(int gun, vec &offset);
 void haloupdatecounter(int rounds);
 Texture *halocountertexture(const char *mesh, Texture *fallback);
 void haloremoveactor(const playerent *player);
@@ -37,6 +56,8 @@ void haloupdatebolts(int elapsed);
 void haloclearbolts();
 void haloaddbolt(playerent *owner, const vec &position, const vec &direction, int damage);
 void haloplaysound(const char *sample, int fallback, physent *actor = NULL, const vec *position = NULL);
+// A decoded tag sample looped from the camera while `active` (a weapon's firing loop); one at a time.
+void haloloopsound(const char *sample, bool active);
 bool halodriving();
 // Retail collision: the player on foot back on the newest of the last floors they stood on that is
 // still clear (logged with `why`), as the fall recovery does; false when there is none.
@@ -47,6 +68,11 @@ bool halorecoverplayer(const char *why);
 // and stall timers and gives the body a second before the wedge check may nudge it. `kept`, when
 // given, is a floor to keep as the one safe spot (where the player got into a seat from).
 void haloplayermoved(const char *why, const vec *kept = NULL);
+// A script moving the player (object_teleport, volume_teleport_players_not_inside, a scene's
+// handoff): to `feet` facing `yaw` (or, with no feet, only turned to it) when the body fits on a
+// floor there (retail collision: standing room on the mesh; stock geometry: clear of the cubes).
+// False, and the player left where they are, otherwise or while seated, dead or in the ending.
+bool haloplayerplace(const vec *feet, float yaw, const char *why);
 // FNV-1a of a file's bytes (the progress file's check), 0 when it cannot be read.
 unsigned halofilehash(const char *path);
 int haloescapemillis();

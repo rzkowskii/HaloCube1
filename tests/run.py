@@ -3,7 +3,8 @@
 
     python3 tests/run.py              quick tier (10 to 15 minutes)
     python3 tests/run.py --slow       quick plus full-speed and keystroke tests
-    python3 tests/run.py devices b30  only tests whose names contain these words
+    python3 tests/run.py --release    quick plus the release tier: damaged-asset robustness, 55-section soak
+    python3 tests/run.py devices b30  only tests whose names contain these words (any tier)
 
 Needs build/macos/halo-ac-qa (configure with -DHALO_BUILD_QA=ON) and the packaged
 app; scripts/test-macos.sh builds both first. Logs go to build/qa/.
@@ -28,20 +29,33 @@ QUICK = [
     'test_retail_collision.py',       # a10 (its default) on retail collision: active, spawn on floor, route walks to the exit
     'test_retail_recovery.py',        # falls below or past the retail mesh and wedges put the player back on floor; teleport grace
     'test_traversal_routes.py',       # lift deck and light-bridge route rows are consistent (route files only)
+    'test_route_metrics.py',          # stub-route gate: importer metrics, the known-bad table may not grow (no game)
     'test_campaign_replay.py',        # all 55 sections complete in one run
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
     'test_combat_equipment.py',       # grenade types, sticky plasma, equipment pickups, overshield, camouflage, weapon sounds
+    'test_damage_model.py',           # jpt! range and blast falloff, actor grenade rolls, exact actor shots, EMP, time to kill
+    'test_damage_targets.py',         # d40's manifold detectors: HSCB 8 targets, placed whole, damage rules, a real shot from the route
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine
     'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands
+    'test_factions.py',               # allegiance matrix and commands, betrayal, Hunters, stealth Elites, flyers, Monitor, Keyes
     'test_campaign_ending.py',        # game_won/game_lost raise the ending, credits, beaten flag
+    'test_mission_exits.py',          # every mission's exit scene and the next mission, a30 variants, script-called scenes
     'test_frontend_progress.py',      # title menu, Continue with the script's state (v3), fallbacks, loadout carry, backup, corruption
     'test_nav_points.py',             # script nav points and HUD show/blink commands, waypoint arrows in hud.txt
     'test_script_coverage.py',        # every sleep_until/if condition command is bound; a10 tutorial, d40 timer
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
     'test_flood.py',                  # squad cap counts living actors; carrier burst, corpse infection, infection leap
     'test_vehicles.py',               # vehicle table and placements, Warthog in/out/drive/flip/gunner, turret, seat commands
+    'test_enemy_vehicles.py',         # Ghost, Wraith, Scorpion, flown Banshee, AI pilots, dropship cargo, Pelican boarding, c40 flown
+    'test_presentation.py',           # script effects, shake, screen effects, flashlight, damage indicator, class gains, lunge, engine loops
     'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
+]
+# Release tier (--release, scripts/ci-macos.sh --release): about 10 and 8 minutes; the ASan/UBSan
+# runs (--asan on each, scripts/ci-macos.sh --asan) take about three times as long.
+RELEASE = [
+    'test_asset_robustness.py',       # missing and damaged tables, .hcol, .hscb, .mesh, .route and progress files: fallback, no crash
+    'test_soak.py',                   # all 55 sections loaded twice in one process: no crash, no sanitizer report, bounded memory
 ]
 SLOW = [
     'test_autumn_opening.py',         # four-minute Autumn opening at normal speed
@@ -52,8 +66,9 @@ SLOW = [
 parser = argparse.ArgumentParser()
 parser.add_argument('filters', nargs='*')
 parser.add_argument('--slow', action='store_true')
+parser.add_argument('--release', action='store_true')
 args = parser.parse_args()
-tests = QUICK + (SLOW if args.slow or args.filters else [])
+tests = QUICK + (SLOW if args.slow or args.filters else []) + (RELEASE if args.release or args.filters else [])
 if args.filters:
     tests = [t for t in tests if any(f in t for f in args.filters)]
 if not tests:

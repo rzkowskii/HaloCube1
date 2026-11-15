@@ -9,9 +9,11 @@ characters and artwork are trademarks and property of their owners.
 
 This repository contains no Halo game data. Maps, textures, models, audio,
 scripts and tables are generated locally by the importers in `tools/` from a copy
-of *Halo: Combat Evolved* (Xbox) that you own, and are git-ignored. Do not commit
-or redistribute the generated `packages/` directory or an app built from it
-(`scripts/check-no-retail.sh` guards the repository). AssaultCube stock data is
+of *Halo: Combat Evolved* (Xbox) that you own, and are git-ignored, the route
+metrics written beside the maps included. Do not commit or redistribute the
+generated `packages/` directory or an app built from it (`scripts/check-no-retail.sh`
+guards the repository; `scripts/package-macos.sh` and `scripts/ci-macos.sh` run it).
+An app built this way is for local use only. AssaultCube stock data is
 read from the AssaultCube release you provide and is covered by its own license
 (`build/runtime/docs/license.html`).
 
@@ -31,6 +33,9 @@ read from the AssaultCube release you provide and is covered by its own license
   dependencies (libpng, libjpeg-turbo, libtiff, libwebp, libavif, libjxl) are
   bundled in `Contents/Frameworks` of a packaged app under their own permissive
   licenses (zlib, BSD, libpng). Install them from Homebrew to read the full texts.
+- The optional ASan/UBSan verification build (`scripts/build-macos.sh --asan`,
+  `build/macos-asan`) links the sanitizer runtime from Apple's Xcode toolchain. It is
+  a local test tool: `scripts/package-macos.sh` refuses to package a sanitized build.
 
 ## Scope
 

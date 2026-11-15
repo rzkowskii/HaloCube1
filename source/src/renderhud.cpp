@@ -3,6 +3,7 @@
 #include "cube.h"
 #include "halo.h"
 #include "halo_script.h"
+#include "halo_fx.h"
 
 void drawicon(Texture *tex, float x, float y, float s, int col, int row, float ts)
 {
@@ -768,6 +769,10 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
     glOrtho(0, VIRTW, VIRTH, 0, -1, 1);
     glEnable(GL_BLEND);
 
+    // The cinematic screen effects (blur, desaturation and tint, the video look) over the 3D view,
+    // under the HUD and the scene's letterbox.
+    if(haloactive() && !editmode) halofxdrawscreen(w, h);
+
     if(halocinematic())
     {
         glEnable(GL_TEXTURE_2D);
@@ -849,7 +854,8 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
     }
 
     // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // without below condition it was always set in drawdmgindicator()
-    if(damageindicatorplayer == p || (is_spect && getclient(player1->followplayercn) == damageindicatorplayer)) drawdmgindicator(p);
+    // The campaign draws its own indicator with the HUD (halo_fx.cpp), shield hits included.
+    if(!campaign && (damageindicatorplayer == p || (is_spect && getclient(player1->followplayercn) == damageindicatorplayer))) drawdmgindicator(p);
 
     if(p->state==CS_ALIVE && !hidehudequipment && !campaign) drawequipicons(p);
 
@@ -863,6 +869,7 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
 
     if(campaign && !showmap && !menu)
     {
+        halofxdrawdamage();
         halodrawhud();
         haloscenariodraw();
     }

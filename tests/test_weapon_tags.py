@@ -36,12 +36,14 @@ def records():
         elif key == 'trigger':
             current['triggers'].append([float(x) for x in rest.split()])
         elif key == 'projectile':
-            # speeds, range, gravity, guided, damage lower, upper min, upper max, category, radius, path
-            parts = rest.split(' ', 10)
-            current['projectiles'].append(None if rest == '-' else [float(x) for x in parts[:10]] + [parts[10]])
+            # speeds, range, gravity, guided, damage lower, upper min, upper max, category, radius,
+            # inner radius, damage range near and far, side effect, path (format 3)
+            parts = rest.split(' ', 15)
+            current['projectiles'].append(None if rest == '-' else [float(x) for x in parts[:15]] + [parts[15]])
     return weapons
 
 
+assert (root / 'packages/halo/weapons.txt').read_text().startswith('format 3\n'), 're-run tools/halo_weapons.py'
 weapons = records()
 by_path = {w['path']: w for w in weapons}
 assert [w['index'] for w in weapons] == list(range(len(weapons)))
@@ -82,6 +84,15 @@ assert ar['melee'] == [40, 50, 60] and pistol['melee'] == [40, 50, 60], (ar['mel
 for w in weapons:
     for p in w['projectiles']:
         assert p is None or p[5] <= p[6] <= p[7], (w['path'], p)
+        assert p is None or (0 <= p[10] <= p[9] and 0 <= p[11] and (p[12] == 0 or p[11] <= p[12])), (w['path'], p)
+
+# Format 3: the area's inner radius, the projectile's air damage range and the side effect.
+assert rocket['projectiles'][0][9:11] == [2, 0.5], ('rocket blast 0.5-2', rocket['projectiles'][0])
+assert shotgun['projectiles'][0][11:13] == [1.5, 3], ('shotgun pellets fall off over 1.5-3', shotgun['projectiles'][0])
+assert plasma['projectiles'][0][11:13] == [20, 50] and plasma['projectiles'][0][13] == 0, plasma['projectiles'][0]
+assert plasma['projectiles'][1][11:14] == [5, 20, 3], ('the charged plasma bolt is EMP', plasma['projectiles'][1])
+assert weapon('plasma rifle')['projectiles'][0][11:13] == [20, 50], weapon('plasma rifle')['projectiles'][0]
+assert ar['projectiles'][0][11:13] == [5, 15] and sniper['projectiles'][0][11:13] == [1000, 1000]
 
 players = [w for w in weapons if w['class'] in ('assault', 'pistol', 'shotgun', 'sniper', 'projectile')]
 assert len(players) == 9, [w['path'] for w in players]

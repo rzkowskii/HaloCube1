@@ -32,6 +32,10 @@ QA client, throwaway profiles. NOT YET RUN: written while testing was on hold.
    script restarted, as before.
 11. A save taken in a vehicle seat (b30 section 1, the beach Warthog at the wheel) continues in
    that seat. Skipped when b30 or vehicles.txt is not imported.
+12. Live play: a death before the first checkpoint of a carried-in section (a10 section 2,
+   entered from section 1) reverts to the script as it came in, as Continue from that section's
+   start does: the script is not loaded again and its clock does not go back to zero.
+13. The warning about a corrupt progress file (item 5) is cleared once New Game starts a game.
 """
 import shutil
 import struct
@@ -306,3 +310,31 @@ else:
     head, _ = vehicle_rows(text, 'continued')
     assert head['seated'] == '1' and head['vehicle'] == str(hog) and head['role'] == '0', head
     print('A save at the wheel of the beach Warthog continued at the wheel.')
+
+# 12. Live play: a death before a carried-in section's first checkpoint keeps the carried script.
+text, profile = run('carried-revert', 'halo_scripttrace 1; halo_difficulty 2; qa_campaign_play 1 1; '
+                    'qa_after_gameplay [qa_halo_finale; sleep 500 [halo_next] 1; sleep 1500 [halo_next] 1; '
+                    'sleep 7000 [qa_hs_state carried; qa_loadout_state carried] 1; sleep 7200 [qa_halo_damage 100000] 1; '
+                    'sleep 8800 [qa_halo_revert] 1; sleep 10500 [qa_hs_state reverted; qa_loadout_state reverted; quit] 1]',
+                    timeout=150)
+assert 'map=halo_a10_02' in rows(text, 'QA_LOADOUT carried')[0], rows(text, 'QA_LOADOUT')
+assert 'HaloScript: a10 resumed on section 2' in text, text[-2000:]
+# A restart on the section would log the script loading again and set its clock back near zero.
+assert text.count('HaloScript: a10 loaded') == 1, ('the revert restarted the script', text[-3000:])
+carried_tick = int(field(rows(text, 'QA_HS_STATE carried')[0], 'tick'))
+reverted = rows(text, 'QA_HS_STATE reverted')[0]
+assert int(field(reverted, 'tick')) > 30, ('the revert went back to the carried script, not tick 0', carried_tick, reverted)
+assert 'map=halo_a10_02' in rows(text, 'QA_LOADOUT reverted')[0], rows(text, 'QA_LOADOUT')
+print('A death in a carried-in section reverted to the script as it came in.')
+
+# 13. The corrupt-file warning is cleared once a game starts.
+profile = scratch('frontend-note-')
+write_progress(profile / (progress_file + '.bak'), ['furthest 2 1', 'beaten 0', 'game 2 1 1 0 0', 'vitals 60 40.000',
+                                                   'grenades 2 0 0', 'current 0', 'stock 1 60 180 12 48'])
+(profile / progress_file).write_text('halo-progress 2\nfurthest 2 1\nbeaten 0\ncheck deadbeef\n')
+text, profile = run('note', 'halo_title; sleep 500 [qa_title_state] 1; sleep 800 [halo_new_game 2] 1; '
+                    'qa_after_gameplay [qa_title_state; sleep 200 [quit] 1]', profile)
+titles = rows(text, 'QA_TITLE')
+assert 'restored from the backup' in titles[0], titles
+assert titles[-1].endswith('note=[]'), ('New Game clears the warning', titles)
+print('The corrupt-file warning was cleared when New Game started.')

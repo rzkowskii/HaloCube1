@@ -61,7 +61,7 @@ print(f'Squad cap: {sum(padded.values())} actors across {sum(v > 0 for v in padd
 
 # 2. A carrier form bursts into 4 to 8 infection forms when killed.
 text, log = run('carrier', 'halo_preview', [
-    (0, 'qa_actor_spawn 7 0 14 0'),
+    (0, 'qa_actor_spawn 7 2 14 0'),
     (1500, 'qa_actor_count before; qa_actor_kill 7'),
     (3000, 'qa_actor_count after'),
     (3300, 'quit'),
@@ -74,7 +74,7 @@ print(f'Carrier: killed form burst into {after["infection"]} infection forms.')
 # 3. An infection form reaching a dead marine turns the body into a Flood combat form.
 text, log = run('infect', 'halo_preview', [
     (0, 'qa_actor_spawn 9 1 8 0'),
-    (1500, 'qa_actor_kill 9; qa_actor_spawn 6 0 6 3'),
+    (1500, 'qa_actor_kill 9; qa_actor_spawn 6 2 6 3'),
     (2300, 'qa_actor_count early'),
     (10000, 'qa_actor_count late'),
     (10300, 'quit'),
@@ -87,7 +87,7 @@ print('Corpse: infection form took a marine body, a Flood combat form rose.')
 
 # 4. Infection forms leap at a target a few strides away.
 text, log = run('leap', 'halo_preview', [
-    (0, 'qa_actor_spawn 6 0 10 0'),
+    (0, 'qa_actor_spawn 6 2 10 0'),
     (5000, 'qa_actor_state leap'),
     (5300, 'quit'),
 ])

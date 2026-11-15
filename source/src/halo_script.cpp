@@ -3,6 +3,7 @@
 #include "halo_campaign.h"
 #include "halo_collision.h"
 #include "halo_script.h"
+#include "halo_fx.h"
 #include "halo_ai.h"
 #include "halo_weapons.h"
 #include "halo_vehicle.h"
@@ -111,6 +112,13 @@ namespace
         std::vector<Flag> markers;
         std::vector<Seat> seats;
         std::string locomotion[3];
+        // Version 8: a damage target (d40's manifold detectors, tools/halo_cast.py damage_target): a
+        // scripted unit with no AI that the player's shots and blasts hurt. `vitality` is its body
+        // vitality (0 for every other object), the box its collision in its own frame, and `placed`
+        // whether it exists from the start (the other scripted objects appear when a script creates them).
+        float vitality = 0;
+        vec targetLow, targetHigh;
+        bool targetPlaced = false;
     };
     struct Animation { int object, graph; std::string clip, model; int ticks; };
     struct Sound { int id, duration, scriptDuration; std::string subtitle; };
@@ -203,7 +211,7 @@ namespace
             Reader r(path);
             if(r.bytes(4) != "HSCB") return false;
             const uint32_t version = r.number<uint32_t>();
-            if(version < 5 || version > 7) return false;
+            if(version < 5 || version > 8) return false;
             auto u8 = [&] { return r.number<uint8_t>(); };
             auto u16 = [&] { return r.number<uint16_t>(); };
             auto i16 = [&] { return r.number<int16_t>(); };
@@ -258,6 +266,14 @@ namespace
                 object.markers = r.rows<Flag>(512, [&] { return Flag{r.text(), pose()}; });
                 object.seats = r.rows<Seat>(64, [&] { return Seat{r.text(), r.text()}; });
                 for(std::string &path : object.locomotion) path = r.text();
+                if(version >= 8)
+                {
+                    object.vitality = f32();
+                    object.targetLow = r.point();
+                    object.targetHigh = r.point();
+                    object.targetPlaced = u8() != 0;
+                    if(!std::isfinite(object.vitality) || object.vitality < 0) object.vitality = 0;
+                }
                 return object;
             });
             animations = r.rows<Animation>(2048, [&] { return Animation{u16(), u16(), r.text(), r.text(), u16()}; });
@@ -354,6 +370,12 @@ namespace
             if(groupFlags.size() != deviceGroups.size()) return false;
             for(const Script &script : scripts) if(!node(script.root)) return false;
             for(const Global &global : globals) if(!node(global.root)) return false;
+            // A machine panel with no frames has no box to collide with (panelBox reads frame 0):
+            // drop it rather than the whole program.
+            for(Device &device : devices)
+                device.panels.erase(std::remove_if(device.panels.begin(), device.panels.end(),
+                                                   [](const DevicePanel &panel) { return panel.frames.empty(); }),
+                                    device.panels.end());
             for(const Projection &projection : projections)
                 if(!std::isfinite(projection.xy) || !std::isfinite(projection.z) || projection.xy <= 0 || projection.z <= 0) return false;
             return true;
@@ -427,6 +449,11 @@ namespace
         bool open = false, hovering = true, collideable = true, enterable = true, suspended = false;
         bool cannotTakeDamage = false, meleeInhibited = false, rangedInhibited = false;
         int squadReference = -1;   // ai_attach: the squad this unit belongs to, -1 when free
+        float damage = 0;          // body damage a damage target has taken (Object::vitality)
+        // unit_set_enterable_by_player true on a vehicle the engine does not drive (a30's
+        // extraction Pelicans): the player may board it with E, and the scripts' seat tests for
+        // the player answer whether they did (halo_script_ai.inc).
+        bool boardable = false;
         std::string permutation;
         size_t input = 0;
         std::string parentMarker, childMarker;
@@ -474,32 +501,63 @@ namespace
         string name;
         sbuffer buffer;
         source channel;
+        float gain = 1;                     // as played, before its sound class's gain (halo_fx.cpp)
+        int soundClass = -1;
+        float applied = -1;                 // the class gain last set on the channel
     };
 
     struct Voice { int id, location, until, scriptUntil; };
     struct Music { int id; const Track *track; int location, until; float gain; bool repeat, ending, alternate; };
     struct Talking { int id, line, wake; };
 
-    enum class SceneTrigger { Entry, Exit, Timeout, Cartographer };
-    struct SceneCue { int mission, section, bsp; const char *script; SceneTrigger trigger; };
+    // Entry, Exit and Timeout scenes play at the route's boundaries, the Cartographer's at its
+    // terminal, and Call scenes when a mission script calls them (the calling thread waits for
+    // the scene to end, as in Halo).
+    enum class SceneTrigger { Entry, Exit, Timeout, Cartographer, Call };
+    // Several Exit rows for one section are variants of one exit (a30's three extractions):
+    // the scene whose `vehicle` the player boarded wins, then the one whose `volume` holds the
+    // player, then the one whose `site` flag is nearest the player.
+    struct SceneCue
+    {
+        int mission, section, bsp;
+        const char *script;
+        SceneTrigger trigger;
+        const char *vehicle = nullptr, *volume = nullptr, *site = nullptr;
+    };
 
     // These join authored cinematic scripts to the playable route's entry,
-    // interaction and exit boundaries. Sections are zero-based.
+    // interaction and exit boundaries, and to the script calls that play scenes in the middle of
+    // a section. Sections are zero-based; -1 is any section of the mission. A Call scene plays only
+    // when the script calls it, as in Halo (it used to be the section's Exit or Entry scene).
+    // tests/test_mission_exits.py checks that every retail scene script is reached from this
+    // table or is listed there as not a scene.
     const SceneCue cues[] = {
         {0, 0, 0, "x10", SceneTrigger::Entry}, {0, 1, 1, "x20", SceneTrigger::Exit}, {0, 6, 6, "x30", SceneTrigger::Exit},
-        {1, 0, 0, "cutscene_intro", SceneTrigger::Entry}, {1, 1, 0, "cutscene_bridge", SceneTrigger::Exit}, {1, 2, 1, "mission_extraction_river_skip", SceneTrigger::Exit},
+        {1, 0, 0, "cutscene_intro", SceneTrigger::Entry}, {1, 1, 0, "cutscene_bridge", SceneTrigger::Exit},
+        // The Pelican comes for the player at the last of the three marine sites they clear.
+        {1, 2, 1, "mission_extraction_river_skip", SceneTrigger::Exit, "foehammer_river", "river_all", "river_hide_flag"},
+        {1, 2, 1, "mission_extraction_cliff_skip", SceneTrigger::Exit, "foehammer_cliff", "cliff_all", "cliff_hide_flag"},
+        {1, 2, 1, "mission_extraction_rubble_skip", SceneTrigger::Exit, "foehammer_rubble", "rubble_all", "rubble_hide_flag"},
         {2, 0, 0, "cutscene_insertion", SceneTrigger::Entry}, {2, 0, 0, "cutscene_energy_lift", SceneTrigger::Exit},
-        {2, 3, 3, "cutscene_rescue", SceneTrigger::Exit}, {2, 4, 2, "cutscene_extraction", SceneTrigger::Exit},
+        // mission_prison calls the rescue once cell block D's switch is thrown; ini_post_rescue
+        // then puts the player by the switch (prison_player0_teleport).
+        {2, 3, 3, "cutscene_rescue", SceneTrigger::Call},
+        {2, 4, 2, "cutscene_extraction", SceneTrigger::Exit},
         {3, 0, 0, "cutscene_insertion", SceneTrigger::Entry}, {3, 1, 1, "cutscene_map", SceneTrigger::Exit},
         {3, 1, 1, "cutscene_map", SceneTrigger::Cartographer},
+        {3, -1, 1, "cutscene_ledge", SceneTrigger::Call}, {3, -1, 0, "cutscene_shaftb_goal", SceneTrigger::Call},
         {3, 2, 0, "cutscene_extraction_exit", SceneTrigger::Exit},
         {4, 0, 3, "cutscene_insertion_a", SceneTrigger::Entry}, {4, 6, 2, "cutscene_extraction", SceneTrigger::Exit},
         {5, 0, 0, "insertion", SceneTrigger::Entry}, {5, 4, 3, "x50", SceneTrigger::Exit}, {5, 6, 5, "cutscene_extraction", SceneTrigger::Exit},
         {6, 0, 0, "cinematic_intro", SceneTrigger::Entry}, {6, 3, 3, "cutscene_extraction", SceneTrigger::Exit},
         {7, 0, 2, "cutscene_insertion", SceneTrigger::Entry}, {7, 4, 5, "cutscene_extraction", SceneTrigger::Exit},
-        {8, 0, 0, "cinematic_intro", SceneTrigger::Entry}, {8, 2, 2, "cinematic_lift", SceneTrigger::Entry},
-        {8, 4, 4, "cinematic_captain", SceneTrigger::Exit}, {8, 5, 3, "cinematic_outro", SceneTrigger::Exit},
-        {9, 0, 0, "cinematic_intro", SceneTrigger::Entry}, {9, 4, 4, "cinematic_bridge", SceneTrigger::Entry},
+        {8, 0, 0, "cinematic_intro", SceneTrigger::Entry}, {8, -1, 1, "cinematic_drop", SceneTrigger::Call},
+        {8, 2, 2, "cinematic_lift", SceneTrigger::Entry},
+        // enc6_3 calls the captain's scene in the control room; the walk back starts at player0_capt_done.
+        {8, 4, 4, "cinematic_captain", SceneTrigger::Call},
+        {8, 5, 3, "cinematic_outro", SceneTrigger::Exit},
+        // enc2_5 calls the x70 bridge scene on the Autumn's bridge (BSP 1); play resumes at player0_playon_base.
+        {9, 0, 0, "cinematic_intro", SceneTrigger::Entry}, {9, 1, 1, "cinematic_bridge", SceneTrigger::Call},
         {9, 7, 7, "cinematic_finale", SceneTrigger::Exit},
         {9, -1, 8, "cinematic_time_up", SceneTrigger::Timeout}
     };
@@ -578,10 +636,30 @@ namespace
         std::vector<int> ridden;
         int riddenUntil = -1;
 
+        // A scene a script called in the middle of a section (SceneTrigger::Call) plays on the
+        // scene stage like any other, so the scripted objects are kept aside for it and put back
+        // after, except those the scene itself created or destroyed (`sceneObjects`, the last
+        // visibility it gave each).
+        std::vector<Actor> callActors;
+        std::unordered_map<int, bool> sceneObjects;
+        // Where the running scene leaves the player (its last object_teleport and object_set_facing
+        // of player0): read from the scene's script when it starts, so a skipped scene leaves the
+        // player there too, and updated as the scene runs.
+        int handoffTeleport = -1, handoffFacing = -1;
+        // A skipped Call scene runs the rest of its script at once (endCue): its waits pass and
+        // game_reverted is true, so cinematic_skip_start passes over the skippable part as Halo's
+        // skip (a revert to the scene's start) does.
+        bool skipping = false;
+
         void start(int m, int s);
         void stop();
-        bool beginCue(SceneTrigger trigger);
+        bool beginCue(SceneTrigger trigger, const char *script = nullptr);
         void endCue(bool skipped);
+        const SceneCue *callCue(const std::string &script) const;
+        bool cueScript(const std::string &script) const;
+        void findHandoff(uint32_t datum, int depth);
+        bool placePlayer(int teleport, int facing, const char *why);
+        bool unitInVolume(int volume, const playerent *unit) const;
         void step(Thread &thread, bool scene);
         void update(int elapsed);
         void startGameplay();
@@ -606,6 +684,26 @@ namespace
         template<class F> void eachUnit(int value, F f);
         bool aiCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
         bool vehicleCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
+        // Dropships and Pelicans, the scenario's vehicles the engine does not drive
+        // (halo_script_ai.inc): the actors riding at their seats, the actors walking to them
+        // (ai_go_to_vehicle), and the player boarded in one.
+        struct Cargo { int vehicle, seat; playerent *unit; bool walking; int until; };
+        std::vector<Cargo> cargo;
+        int boardedVehicle = noObject, boardedSeat = -1;
+        vec boardedAt, boardedFrom;
+        // ai_vehicle_encounter: the squad a vehicle's driver belongs to, applied when one is loaded.
+        std::unordered_map<int, int> vehicleSquads;
+        bool scriptVehicle(int id) const;
+        bool seatWorld(int vehicle, int seat, vec &point) const;
+        int freeSeat(int vehicle, const char *seat) const;
+        bool loadCargo(int vehicle, const char *seat, playerent *unit, bool walking);
+        int unloadCargo(int vehicle, const char *seat);
+        void releaseCargo(Cargo &entry);
+        void updateCargo();
+        int boardCandidate(int &seat) const;
+        bool board();
+        void unboard(bool keepPlace);
+        void clearCargo();
         void configureActor(playerent *bot, int encounter, int squad, const SquadStart &start);
         void updatePlatoons();
         int actorListFor(int reference);
@@ -637,6 +735,12 @@ namespace
         void renderDevices() const;
         bool collideDevices(physent *entity, float &hi, float &lo, int *blocking = nullptr) const;
         bool traceDevices(const vec &from, const vec &to, HaloCollisionHit &hit) const;
+        // Damage targets (Object::vitality): the first one a segment passes through, the ones a blast
+        // reaches, and the damage the player deals them.
+        int traceTargets(const vec &from, const vec &to, float &fraction) const;
+        int targetsNear(const vec &centre, float radius, int *targets, float *distances, int capacity) const;
+        bool damageTarget(int target, float amount);
+        vec targetCentre(int target) const;
         bool useDevice();
         void setWorld(int bsp);
         void setCamera(int index, int duration, int object);
@@ -743,7 +847,8 @@ namespace
 
     void Scenario::step(Thread &thread, bool scene)
     {
-        for(int budget = 0; budget < 2048 && !thread.stack.empty() && !thread.disabled && thread.wake <= tick; ++budget)
+        // A gameplay thread that started a scene waits for it to end, then carries on after the call.
+        for(int budget = 0; budget < 2048 && !thread.stack.empty() && !thread.disabled && thread.wake <= tick && (scene || !cue); ++budget)
         {
             Frame &frame = thread.stack.back();
             const Node &node = *program.node(frame.expression);
@@ -756,13 +861,12 @@ namespace
                 if(!frame.phase++)
                 {
                     const Script *script = at(program.scripts, node.opcode);
-                    bool deferred = false;
-                    if(script && !scene)
-                    {
-                        for(const SceneCue &candidate : cues)
-                            if(candidate.mission == mission && script->name == candidate.script) deferred = true;
-                    }
-                    if(deferred && cartographerInterior() && script->name == "cutscene_map")
+                    // Scenes in the cue table play on the scene stage: a Call scene now, the
+                    // others at the route's boundary (the call itself is passed over).
+                    const bool deferred = script && !scene && cueScript(script->name);
+                    if(deferred && callCue(script->name) && player1->state == CS_ALIVE && !intermission)
+                        beginCue(SceneTrigger::Call, script->name.c_str());
+                    else if(deferred && cartographerInterior() && script->name == "cutscene_map")
                         beginCue(SceneTrigger::Cartographer);
                     else if(script && script->kind != 4 && !deferred) push(thread, script->root);
                     continue;
@@ -875,7 +979,7 @@ namespace
                     }
                     else if(frame.phase == 3)
                     {
-                        if(!condition || (frame.deadline >= 0 && tick >= frame.deadline))
+                        if(!condition || skipping || (frame.deadline >= 0 && tick >= frame.deadline))
                             complete(thread, {});
                         else
                         {
@@ -1226,6 +1330,18 @@ namespace
         return insideVolume(*volume, point);
     }
 
+    // An actor's body in a trigger volume: its middle, as for the player (playerPoint).
+    bool Scenario::unitInVolume(int index, const playerent *unit) const
+    {
+        if(unit == player1) return testVolume(index);
+        const Volume *volume = at(program.volumes, index);
+        if(!volume || !projection || !unit || unit->state != CS_ALIVE) return false;
+        const Projection &p = *projection;
+        const vec point(p.origin.x + (unit->o.x - p.margin) / p.xy, p.origin.y - (unit->o.y - p.margin) / p.xy,
+                        p.origin.z + (unit->o.z - .45f * unit->eyeheight) / p.z);
+        return insideVolume(*volume, point);
+    }
+
     bool Scenario::switchBsp(int bsp, const char *trigger)
     {
         const Projection *next = at(program.projections, section + 1);
@@ -1335,6 +1451,11 @@ namespace
         return {vec(panel.frames[a].low).mul(1 - alpha).add(vec(panel.frames[b].low).mul(alpha)),
                 vec(panel.frames[a].high).mul(1 - alpha).add(vec(panel.frames[b].high).mul(alpha))};
     }
+
+    // A door leaf lying flat on the floor in the door's current pose (Scenario::collideDevices): its
+    // top at most this high above the door's base and the panel at most this thick, in retail units.
+    // tools/halo_collision.py floor_leaf uses the same limits for the route planner.
+    const float kDoorLeafTop = .25f, kDoorLeafThickness = .3f;
 
     bool abovePanel(const vec &p, const DeviceBox &box, float radius)
     {
@@ -1522,6 +1643,11 @@ namespace
                 if(panel.frames.empty()) continue;
                 DeviceBox box = panelBox(d, panel, devices[i]);
                 if(!abovePanel(local, box, radius)) continue;
+                // A door leaf folded flat on the floor (c10's interior doors open their lower leaves
+                // into the doorway, 0.05 to 0.23 units proud of the floor): bodies walk over it, as
+                // Halo's biped does (tools/halo_collision.py floor_leaf; the route planner does the same).
+                if(d.kind == 0 && d.elevator < 0 && box.high.z <= kDoorLeafTop && box.high.z - box.low.z <= kDoorLeafThickness)
+                    continue;
                 float bottom = (box.low.z + d.pose.position.z - p.origin.z) * p.z;
                 float top = (box.high.z + d.pose.position.z - p.origin.z) * p.z;
                 if(feet >= top - .23f * p.z) lo = max(lo, top);
@@ -1563,6 +1689,71 @@ namespace
             }
         }
         return found;
+    }
+
+    // A damage target's frame: a world point in retail units relative to the object, unrotated.
+    vec targetLocal(const Projection &p, const Pose &pose, const vec &point)
+    {
+        vec local(p.origin.x + (point.x - p.margin) / p.xy, p.origin.y - (point.y - p.margin) / p.xy, p.origin.z + point.z / p.z);
+        local.sub(pose.position).rotate_around_z(-pose.yaw);
+        return local;
+    }
+
+    int Scenario::traceTargets(const vec &from, const vec &to, float &fraction) const
+    {
+        if(!loaded || !projection || cue || editmode) return -1;
+        int found = -1;
+        for(size_t i = 0; i < actors.size(); ++i)
+        {
+            const Object &object = program.objects[i];
+            if(object.vitality <= 0 || !actors[i].visible) continue;
+            const Pose pose = currentActor(int(i));
+            const vec local = targetLocal(*projection, pose, from), delta = targetLocal(*projection, pose, to).sub(local);
+            vec normal;
+            if(tracePanel({object.targetLow, object.targetHigh}, local, delta, fraction, normal)) found = int(i);
+        }
+        return found;
+    }
+
+    vec Scenario::targetCentre(int target) const
+    {
+        const Object &object = program.objects[target];
+        const Pose pose = currentActor(target);
+        vec centre = vec(object.targetLow).add(object.targetHigh).mul(.5f);
+        centre.rotate_around_z(pose.yaw);
+        return toWorld(*projection, centre.add(pose.position));
+    }
+
+    int Scenario::targetsNear(const vec &centre, float radius, int *targets, float *distances, int capacity) const
+    {
+        if(!loaded || !projection || cue || editmode) return 0;
+        int count = 0;
+        for(size_t i = 0; i < actors.size() && count < capacity; ++i)
+        {
+            const Object &object = program.objects[i];
+            if(object.vitality <= 0 || !actors[i].visible) continue;
+            // The distance from the blast to the nearest point of the target's box, in world units.
+            const vec local = targetLocal(*projection, currentActor(int(i)), centre);
+            vec gap;
+            loopk(3) gap[k] = max(max(object.targetLow[k] - local[k], local[k] - object.targetHigh[k]), 0.0f);
+            const float distance = vec(gap.x * projection->xy, gap.y * projection->xy, gap.z * projection->z).magnitude();
+            if(distance >= radius) continue;
+            targets[count] = int(i);
+            distances[count++] = distance;
+        }
+        return count;
+    }
+
+    bool Scenario::damageTarget(int target, float amount)
+    {
+        if(!at(actors, target) || !(amount > 0)) return false;
+        const Object &object = program.objects[target];
+        Actor &actor = actors[target];
+        if(object.vitality <= 0 || !actor.visible || actor.cannotTakeDamage) return false;
+        actor.damage = min(object.vitality, actor.damage + amount);
+        if(halo_scripttrace) conoutf("Halo target: %s took %.1f, health %.2f", object.name.c_str(), amount,
+                                     max(0.0f, 1 - actor.damage / object.vitality));
+        return true;
     }
 
     bool Scenario::useDevice()
@@ -1635,7 +1826,11 @@ namespace
         if(!channel.buffer(playback->buffer.id)) return 0;
         channel.sourcerelative(!position);
         channel.position(position ? *position : vec());
-        channel.gain(clamp(gain, 0.0f, 1.0f));
+        // sound_class_set_gain fades the sound's retail class (music, ambience, dialogue).
+        playback->gain = clamp(gain, 0.0f, 1.0f);
+        playback->soundClass = halofxsoundclass(cache, id);
+        playback->applied = halofxclassgain(playback->soundClass);
+        channel.gain(playback->gain * playback->applied);
         channel.looping(loop);
         if(!channel.play()) return 0;
         int token = ++nextChannel;
@@ -1733,6 +1928,15 @@ namespace
 
     void Scenario::updateSound()
     {
+        // Class gains fading (sound_class_set_gain) reach the channels already playing.
+        for(auto &entry : channels)
+        {
+            Playback &playback = *entry.second;
+            const float classGain = halofxclassgain(playback.soundClass);
+            if(fabsf(classGain - playback.applied) < .002f) continue;
+            playback.applied = classGain;
+            playback.channel.gain(playback.gain * classGain);
+        }
         voices.erase(std::remove_if(voices.begin(), voices.end(), [&](const Voice &voice)
         {
             if(voice.until <= tick) stopLocation(voice.location);
@@ -1781,6 +1985,15 @@ namespace
             actors[id].pose = program.objects[id].pose;
         }
         actors[id].visible = visible;
+        if(cue && cue->trigger == SceneTrigger::Call) sceneObjects[id] = visible;
+        // A dropship destroyed with actors aboard sets them down where they are; a destroyed
+        // Pelican the player boarded lets them out.
+        if(!visible)
+        {
+            for(Cargo &entry : cargo) if(entry.vehicle == id) releaseCargo(entry);
+            cargo.erase(std::remove_if(cargo.begin(), cargo.end(), [id](const Cargo &entry) { return entry.vehicle == id; }), cargo.end());
+            if(boardedVehicle == id) unboard(true);
+        }
         int device = objectDevices[id];
         if(device >= 0) devices[device].visible = visible;
         // A vehicle the engine drives for this object (halo_vehicle.cpp) is created and destroyed with it.
@@ -1868,6 +2081,7 @@ namespace
         {
             if(!scene)
             {
+                HaloScriptDamage scripted;
                 for(SquadBot &bot : squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
                 haloclearflood();
             }
@@ -1964,8 +2178,11 @@ namespace
             if(p) return result(p->state == CS_ALIVE ? haloactorhealthfraction(p) : -1.0f);
             // A scripted unit without an AI body (a10's Keyes on the bridge) cannot be hurt
             // here: unhurt while it exists. Reporting -1 made a10 think the player shot Keyes.
+            // Damage targets (d40's manifold detectors) report what the player's shots left.
             const int value = index(0);
-            return result(value >= 0 && at(actors, value) && actors[value].visible ? 1.0f : -1.0f);
+            if(value < 0 || !at(actors, value) || !actors[value].visible) return result(-1.0f);
+            const Object &unit = program.objects[value];
+            return result(unit.vitality > 0 ? max(0.0f, 1 - actors[value].damage / unit.vitality) : 1.0f);
         }
         if(is("objects_can_see_object") || is("objects_can_see_flag"))
         {
@@ -1995,7 +2212,7 @@ namespace
         // the waits that depend on boarding them move on instead of hanging.
         if(is("vehicle_test_seat_list") || is("vehicle_test_seat")) return result(true);
         if(is("ai_going_to_vehicle")) return result(0);
-        if(is("ai_go_to_vehicle") || is("ai_allegiance") || is("ai_vehicle_encounter") || is("ai_vehicle_enterable_distance"))
+        if(is("ai_go_to_vehicle") || is("ai_vehicle_encounter") || is("ai_vehicle_enterable_distance"))
             return {};
         if(is("ai_migrate"))
         {
@@ -2012,12 +2229,35 @@ namespace
             return result(is("random_range") ? floor(selected) : selected);
         }
         if(is("game_difficulty_get") || is("game_difficulty_get_real")) return result(halodifficulty());
-        if(is("game_is_cooperative") || is("game_saving") || is("game_reverted")) return result(0);
-        if(is("game_safe_to_speak") || is("game_all_quiet")) return result(1);
+        if(is("game_reverted")) return result(skipping);
+        if(is("game_is_cooperative") || is("game_saving")) return result(0);
+        // Quiet: no hostile actor is fighting (the test game_safe_to_save makes, the player alive or not).
+        if(is("game_all_quiet"))
+        {
+            for(const SquadBot &bot : squadBots)
+                if(bot.bot && bot.bot->state == CS_ALIVE && !bot.suspended && !haloteamfriendly(haloactorteam(bot.bot)) &&
+                   !haloactorpassive(bot.bot) && haloactorstatus(bot.bot) >= 6) return result(0);
+            return result(1);
+        }
+        // Safe to speak: no scripted line or conversation is still playing, so a new one does not talk over it.
+        if(is("game_safe_to_speak"))
+        {
+            if(!talking.empty()) return result(0);
+            for(const Voice &voice : voices) if(voice.until > tick) return result(0);
+            return result(1);
+        }
         if(is("cinematic_skip_stop_internal")) return result(1);
-        if(is("volume_test_object")) return result(testVolume(index(0), object(1)));
-        if(is("volume_test_objects") || is("volume_test_objects_all") || is("volume_test_objects_any"))
-            return result(index(1) == playerList && testVolume(index(0)));
+        if(is("volume_teleport_players_not_inside"))
+        {
+            // (volume_teleport_players_not_inside volume flag): a player outside the volume (or a
+            // volume the scenario does not have, such as "null") goes to the flag.
+            if(!testVolume(index(0)) && at(program.flags, index(1)))
+            {
+                if(!scene) placePlayer(index(1), -1, name);
+                else if(cue) { handoffTeleport = index(1); handoffFacing = -1; }
+            }
+            return {};
+        }
         if(is("structure_bsp_index")) return result(scene ? world : projection ? projection->bsp : -1);
         if(is("switch_bsp"))
         {
@@ -2027,7 +2267,8 @@ namespace
         }
         if(is("game_save") || is("game_save_no_timeout") || is("game_save_totally_unsafe"))
         {
-            if((!scene || (cue && cue->trigger == SceneTrigger::Cartographer)) && !is("game_save_totally_unsafe"))
+            if((!scene || (cue && (cue->trigger == SceneTrigger::Cartographer || cue->trigger == SceneTrigger::Call))) &&
+               !is("game_save_totally_unsafe"))
                 pendingCheckpoint = true;
             return {};
         }
@@ -2137,6 +2378,28 @@ namespace
         {
             const Flag *flag = at(program.flags, index(1));
             int id = object(0);
+            const bool teleport = is("object_teleport");
+            if(flag && (id == playerObject || id == playerList))
+            {
+                // The player: a scene keeps the place for its end (the player is off stage
+                // meanwhile); a gameplay script moves them now.
+                if(scene && cue)
+                {
+                    if(teleport) { handoffTeleport = index(1); handoffFacing = -1; }
+                    else handoffFacing = index(1);
+                }
+                else if(!scene) placePlayer(teleport ? index(1) : -1, teleport ? -1 : index(1), name);
+                return {};
+            }
+            if(flag && !scene && projection)
+                if(playerent *unit = actorFromValue(id))
+                {
+                    // An actor (list_get of ai_actors): moved to the flag, facing its way.
+                    if(teleport) haloenemymove(unit, toWorld(*projection, flag->pose.position));
+                    unit->yaw = 90 - flag->pose.yaw / RAD;
+                    if(unit->type == ENT_BOT) static_cast<botent *>(unit)->targetyaw = unit->yaw;
+                    return {};
+                }
             if(flag && at(actors, id))
             {
                 if(is("object_teleport"))
@@ -2394,8 +2657,8 @@ namespace
         {
             if(player1->state != CS_ALIVE) return answer(0);
             for(const SquadBot &bot : squadBots)
-                if(bot.bot && bot.bot->state == CS_ALIVE && !bot.suspended && haloactorteam(bot.bot) == HALO_TEAM_COVENANT &&
-                   haloactorstatus(bot.bot) >= 6) return answer(0);
+                if(bot.bot && bot.bot->state == CS_ALIVE && !bot.suspended && !haloteamfriendly(haloactorteam(bot.bot)) &&
+                   !haloactorpassive(bot.bot) && haloactorstatus(bot.bot) >= 6) return answer(0);
             return answer(1);
         }
         if(is("game_save_cancel")) { pendingCheckpoint = false; return handled(); }
@@ -2475,17 +2738,69 @@ namespace
             return answer(ready && args.size() > 1 && ready->path == args[1].text);
         }
 
+        // Presentation (halo_fx.cpp): the effects, camera shake, cinematic screen effects and sound
+        // class gains. A scene's flags and objects are in the scene's frame, not the section's: there
+        // an effect only plays its sound.
+        auto index = [&](size_t i) { return i < args.size() ? args[i].integer() : -1; };
+        auto text = [&](size_t i) { return i < args.size() ? args[i].text : ""; };
+        auto object = [&](size_t i) { const int id = named(program.objects, text(i)); return id >= 0 ? id : index(i); };
+        if(is("effect_new") || is("effect_new_on_object_marker"))
+        {
+            vec point(0, 0, 0);
+            bool found = false;
+            if(is("effect_new"))
+            {
+                const Flag *flag = at(program.flags, index(1));
+                if(flag && projection && !scene) { point = toWorld(*projection, flag->pose.position); found = true; }
+            }
+            else if(!scene) found = objectPosition(object(1), point);
+            if(found || scene) halofxeffect(text(0), point, found);
+            return handled();
+        }
+        if(is("player_effect_set_max_translation")) { halofxshakelimit(0, float(value(0)), float(value(1)), float(value(2))); return handled(); }
+        if(is("player_effect_set_max_rotation")) { halofxshakelimit(1, float(value(0)), float(value(1)), float(value(2))); return handled(); }
+        if(is("player_effect_set_max_rumble")) { halofxshakelimit(2, float(value(0)), float(value(1)), 0); return handled(); }
+        if(is("player_effect_start")) { halofxshakestart(float(value(0, 1)), float(value(1))); return handled(); }
+        if(is("player_effect_stop")) { halofxshakestop(float(value(0))); return handled(); }
+        if(is("player_effect_impact") || is("player_effect_rumble"))
+        {
+            halofxshakeimpulse(float(value(0, 1)), int(value(1, .5) * 1000));
+            return handled();
+        }
+        if(is("cinematic_screen_effect_start")) { halofxscreenstart(args.empty() || truth(0)); return handled(); }
+        if(is("cinematic_screen_effect_stop")) { halofxscreenstop(); return handled(); }
+        if(is("cinematic_screen_effect_set_convolution"))
+        {
+            // iterations, mode, radius from, radius to, seconds
+            halofxconvolution(index(0), float(value(2)), float(value(3)), float(value(4)));
+            return handled();
+        }
+        if(is("cinematic_screen_effect_set_filter"))
+        {
+            // desaturation from, to, tint from, to, (additive), seconds
+            halofxfilter(float(value(0)), float(value(1)), float(value(2)), float(value(3)), float(value(5)));
+            return handled();
+        }
+        if(is("cinematic_screen_effect_set_filter_desaturation_tint")) { halofxfiltertint(float(value(0, 1)), float(value(1, 1)), float(value(2, 1))); return handled(); }
+        if(is("cinematic_screen_effect_set_video")) { halofxvideo(index(0), float(value(1, 1))); return handled(); }
+        if(is("sound_class_set_gain"))
+        {
+            halofxsetclassgain(text(0), float(value(1, 1)), float(value(2)) / ticksPerSecond);
+            return handled();
+        }
+
         // Nothing to show, change or free in this engine.
         static const char *const quiet[] = {
             "player_enable_input", "player_camera_control", "players_unzoom_all", "garbage_collect_now", "inspect", "render_lights",
-            "player_effect_impact", "player_effect_rumble", "player_effect_set_max_rotation", "player_effect_set_max_rumble",
-            "player_effect_set_max_translation", "player_effect_start", "player_effect_stop", "sound_class_set_gain",
             "display_scenario_help", "enable_hud_help_flash", "preload_textures", "object_pvs_activate", "object_pvs_set_object",
-            "cinematic_screen_effect_start", "cinematic_screen_effect_stop", "cinematic_screen_effect_set_convolution",
-            "cinematic_screen_effect_set_filter", "cinematic_screen_effect_set_filter_desaturation_tint",
-            "cinematic_screen_effect_set_video"};
+            // Presentation the engine does not have: breakable glass, scenery and list animations,
+            // the death camera, scene BSP object suppression, the locked-door shader. `ai` (on or
+            // off) is only used by scenes, during which the engine's actors are held anyway.
+            "breakable_surfaces_enable", "breakable_surfaces_reset", "scenery_animation_start",
+            "scenery_animation_start_at_frame", "custom_animation_list", "camera_set_dead",
+            "cinematic_suppress_bsp_object_creation", "device_set_never_appears_locked", "ai"};
         for(const char *quietName : quiet) if(is(quietName)) return handled();
-        if(!strncmp(name, "rasterizer_", 11) || !strncmp(name, "effect_new", 10)) return handled();
+        if(!strncmp(name, "rasterizer_", 11)) return handled();
         return false;
     }
 
@@ -2542,13 +2857,17 @@ namespace
             haloactorcommand(bot, &commandPrograms[start.commandList]);
     }
 
-    // Encounters on the default team take the side of their actors: marines and
-    // crew fight for the player. Teams 1 and 2 are the player's side explicitly.
+    // The encounter's team (retail numbering: 1 player, 2 human, 3 covenant, 4 flood, 5 sentinel,
+    // 6-9 unused); on the default team (0) the actors take their unit's default team from
+    // actors.txt (marines and crew human, the Flood flood, Sentinels and the Monitor sentinel).
     int teamFor(const Encounter &encounter, const SquadStart &start)
     {
-        if(encounter.team == 1 || encounter.team == 2) return HALO_TEAM_HUMAN;
+        const int team = haloteamfromretail(encounter.team, HALO_TEAM_DEFAULT);
+        if(team != HALO_TEAM_DEFAULT) return team;
         const HaloActorDef *def = haloactordef(start.variant);
-        return def && def->kind == 9 ? HALO_TEAM_HUMAN : HALO_TEAM_COVENANT;
+        if(def) return haloactordefaultteam(def, HALO_TEAM_COVENANT);
+        // A start without a variant: its body decides (halo.cpp kindTeam).
+        return HALO_TEAM_DEFAULT;
     }
 
     size_t Scenario::livingBots() const
@@ -2704,6 +3023,7 @@ namespace
 
     void Scenario::eraseSquads(int reference)
     {
+        HaloScriptDamage scripted;
         for(SquadBot &bot : squadBots)
             if(bot.bot && bot.bot->state == CS_ALIVE && matchesSquad(reference, bot.encounter, bot.squad))
                 dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
@@ -2721,7 +3041,7 @@ namespace
                       (p.origin.y - start.point.y) * p.xy + p.margin,
                       (start.point.z - p.origin.z) * p.z);
             const Encounter *encounter = at(program.encounters, saved.encounter);
-            const int team = encounter ? teamFor(*encounter, start) : HALO_TEAM_COVENANT;
+            const int team = encounter ? teamFor(*encounter, start) : HALO_TEAM_DEFAULT;
             saved.bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD, start.variant, team);
             if(saved.bot)
             {
@@ -2736,8 +3056,13 @@ namespace
     void Scenario::stop()
     {
         stopSounds();
+        clearCargo();
+        vehicleSquads.clear();
         loaded = false;
         cue = nullptr;
+        callActors.clear();
+        sceneObjects.clear();
+        handoffTeleport = handoffFacing = -1;
         projection = nullptr;
         worldName.clear();
         paused = false;
@@ -2768,23 +3093,38 @@ namespace
         wake(named(program.scripts, "save_shafta_ante_enter"));
     }
 
+    // Landing craft the engine brings in itself, where the script that would is part of a scene
+    // the route skips: b30's extraction Pelican on retail collision, which the player boards with
+    // E (halo.cpp). Each starts at its flag on its recording and hovers where that ends; the
+    // script that would wait for the player instead is held. Elsewhere the scripts fly their
+    // dropships and Pelicans themselves (recording_play_and_hover), and those carry actors and
+    // the player through the Cargo code (halo_script_ai.inc).
+    struct EngineApproach { int mission, section; const char *object, *flag, *recording, *held; };
+    const EngineApproach approaches[] = {
+        {3, 2, "extraction_pelican", "extraction_pelican_flag_1", "extraction_pelican_1", "obj_shafta_goal"},
+    };
+
     void Scenario::startPelicanApproach()
     {
-        if(mission != 3 || section != 2 || !halocollisionactive()) return;
-        const int id = named(program.objects, "extraction_pelican");
-        const Flag *entry = at(program.flags, named(program.flags, "extraction_pelican_flag_1"));
-        const Recording *approach = at(program.recordings, named(program.recordings, "extraction_pelican_1"));
-        if(!at(actors, id) || !entry || !approach || approach->inputs.empty()) return;
-        setActor(id, true, true);
-        Actor &pelican = actors[id];
-        pelican.pose = entry->pose;
-        pelican.recording = approach;
-        pelican.recordingStart = tick;
-        pelican.recordingEnd = tick + approach->ticks;
-        pelican.recordingHover = true;
-        // The outdoor route boards with the normal interact action.
-        const int goal = named(program.scripts, "obj_shafta_goal");
-        if(goal >= 0) threads[goal].disabled = true;
+        if(!halocollisionactive()) return;
+        for(const EngineApproach &a : approaches)
+        {
+            if(a.mission != mission || a.section != section) continue;
+            const int id = named(program.objects, a.object);
+            const Flag *entry = at(program.flags, named(program.flags, a.flag));
+            const Recording *approach = at(program.recordings, named(program.recordings, a.recording));
+            if(!at(actors, id) || !entry || !approach || approach->inputs.empty()) continue;
+            setActor(id, true, true);
+            Actor &craft = actors[id];
+            craft.pose = entry->pose;
+            craft.recording = approach;
+            craft.recordingStart = tick;
+            craft.recordingEnd = tick + approach->ticks;
+            craft.recordingHover = true;
+            // The outdoor route boards with the normal interact action.
+            const int goal = named(program.scripts, a.held);
+            if(goal >= 0) threads[goal].disabled = true;
+        }
     }
 
     bool Scenario::pelicanReady() const
@@ -2802,6 +3142,9 @@ namespace
         ridden.clear();
         riddenUntil = -1;
         stop();
+        // A mission (or a section entered afresh) starts from the default allegiances, even when
+        // its script is missing; a carried-in section keeps what the scripts set.
+        if(!continuing) haloallegiancereset();
         cache = haloMissions[m].cache;
         if(mission != m || program.scripts.empty())
         {
@@ -2810,7 +3153,8 @@ namespace
             if(!program.load(cache))
             {
                 program = {};
-                conoutf("Halo: no retail scenario program for %s", cache);
+                conoutf("Halo: no retail scenario program for %s (packages/halo/%s.hscb is missing or unreadable; "
+                        "run tools/import_halo_scripts.py): the section plays without its mission script", cache, cache);
                 return;
             }
             defformatstring(file)("packages/halo/%s.hscb", cache);
@@ -2852,6 +3196,14 @@ namespace
         threads.assign(program.scripts.size(), {});
         globals.assign(program.globals.size(), {});
         actors.assign(program.objects.size(), {});
+        // Damage targets placed in the scenario exist from the start, as in Halo; without this they
+        // read as destroyed (unit_get_health -1), which ended d40's manifold fight before it began.
+        for(size_t i = 0; i < actors.size(); ++i)
+            if(program.objects[i].vitality > 0 && program.objects[i].targetPlaced)
+            {
+                actors[i].pose = program.objects[i].pose;
+                actors[i].visible = true;
+            }
         conversationStatus.assign(program.conversations.size(), 0);
         savedGlobals.clear();
         savedThreads.clear();
@@ -2878,6 +3230,8 @@ namespace
         }
         unsupported.clear();
         haloaisetgrenades(true);
+        // A new mission starts from the default allegiances; its startup script sets its own.
+        haloallegiancereset();
         objective.clear();
         help.clear();
         showHelp = false;
@@ -2914,46 +3268,169 @@ namespace
         startPelicanApproach();
     }
 
-    bool Scenario::beginCue(SceneTrigger trigger)
+    // Whether a script is one the cue table plays (and so is not run inline by a gameplay thread).
+    bool Scenario::cueScript(const std::string &script) const
+    {
+        for(const SceneCue &candidate : cues)
+            if(candidate.mission == mission && script == candidate.script) return true;
+        return false;
+    }
+
+    // The Call row that plays this script in this section, if any.
+    const SceneCue *Scenario::callCue(const std::string &script) const
+    {
+        for(const SceneCue &candidate : cues)
+            if(candidate.mission == mission && candidate.trigger == SceneTrigger::Call &&
+               (candidate.section < 0 || candidate.section == section) && script == candidate.script) return &candidate;
+        return nullptr;
+    }
+
+    // The last object_teleport and object_set_facing of player0 in a scene's script, in the
+    // order the script runs them, following its calls into other static scripts.
+    void Scenario::findHandoff(uint32_t datum, int depth)
+    {
+        const Node *node = program.node(datum);
+        if(!node || (node->flags & 1) || depth > 8) return;
+        const Node *head = program.node(node->data);
+        if(!head) return;
+        if(node->flags & 2)
+        {
+            const Script *script = at(program.scripts, node->opcode);
+            if(script && script->kind == 3 && script->name != "player0" && script->name != "player1") findHandoff(script->root, depth + 1);
+            return;
+        }
+        const char *name = program.text(head->text);
+        const bool teleport = !strcmp(name, "object_teleport"), facing = !strcmp(name, "object_set_facing");
+        if(teleport || facing)
+        {
+            const Node *unit = program.node(head->next);
+            const Node *flag = unit ? program.node(unit->next) : nullptr;
+            const Node *unitHead = unit && !(unit->flags & 1) ? program.node(unit->data) : nullptr;
+            if(unitHead && flag && (flag->flags & 1) && !strcmp(program.text(unitHead->text), "player0"))
+            {
+                int index = named(program.flags, program.text(flag->text));
+                if(index < 0) index = literal(*flag).integer();
+                if(at(program.flags, index))
+                {
+                    if(teleport) { handoffTeleport = index; handoffFacing = -1; }
+                    else handoffFacing = index;
+                }
+            }
+            return;
+        }
+        for(uint32_t it = head->next; const Node *arg = program.node(it); it = arg->next) findHandoff(it, depth);
+    }
+
+    // Puts the player at a cutscene flag (or turns them to its facing), when the flag is on a
+    // floor of this section's map (halo.cpp checks the body fits there). False, and the player
+    // left where they are, otherwise: flags of other BSPs fall outside the section's map.
+    bool Scenario::placePlayer(int teleport, int facing, const char *why)
+    {
+        const Flag *to = at(program.flags, teleport), *face = at(program.flags, facing >= 0 ? facing : teleport);
+        if(!face) face = to;
+        if(!projection || !face) return false;
+        const float yaw = fmodf(450.0f - face->pose.yaw / RAD, 360.0f);
+        if(!to)
+        {
+            if(!haloplayerplace(nullptr, yaw, why)) return false;
+            if(halo_scripttrace) conoutf("Halo script: player turned to %s (%s)", face->name.c_str(), why);
+            return true;
+        }
+        const vec feet = toWorld(*projection, to->pose.position);
+        if(!haloplayerplace(&feet, yaw, why))
+        {
+            conoutf("Halo script: %s (%s) has no floor in this section's map (or the player is seated or dead); the player stays where they are",
+                    to->name.c_str(), why);
+            return false;
+        }
+        conoutf("Halo script: player placed at %s (%s)", to->name.c_str(), why);
+        return true;
+    }
+
+    bool Scenario::beginCue(SceneTrigger trigger, const char *script)
     {
         if(!loaded || cue || (trigger == SceneTrigger::Exit && exitPlayed)) return false;
         if(trigger == SceneTrigger::Exit && cartographerInterior()) return false;
+        // The rows that could play here; several Exit rows are variants of one exit.
+        std::vector<const SceneCue *> matches;
         for(const SceneCue &candidate : cues)
         {
             if(candidate.mission != mission || (candidate.section >= 0 && candidate.section != section) || candidate.trigger != trigger) continue;
-            int index = named(program.scripts, candidate.script);
-            if(index < 0) continue;
-            const int boardedPelican = pelicanReady() ? named(program.objects, "extraction_pelican") : -1;
-            stopSounds();
-            cue = &candidate;
-            director = {};
-            sceneThreads.clear();
-            director.stack.emplace_back(program.scripts[index].root);
-            chapter = -1;
-            nearClip = .0625f;
-            fade = {vec(), 1, 1, tick, tick};
-            letterbox = cameraControl = true;
-            camera = {};
-            for(size_t i = 0; i < actors.size(); ++i)
-            {
-                if(int(i) == boardedPelican) continue;
-                actors[i] = {};
-                actors[i].pose = program.objects[i].pose;
-            }
-            setWorld(candidate.bsp);
-            player1->attacking = false;
-            player1->stopmoving();
-            conoutf("Halo scene: %s start", candidate.script);
-            return true;
+            if(script && strcmp(script, candidate.script)) continue;
+            if(named(program.scripts, candidate.script) < 0) continue;
+            matches.push_back(&candidate);
         }
-        return false;
+        if(matches.empty()) return false;
+        const SceneCue *chosen = matches.front();
+        if(matches.size() > 1)
+        {
+            // The variant the player boarded, else the one whose site they are in, else the nearest site.
+            vec point;
+            const bool placed = playerPoint(point);
+            float best = 1e30f;
+            const SceneCue *inside = nullptr, *boarded = nullptr, *nearest = nullptr;
+            for(const SceneCue *candidate : matches)
+            {
+                if(candidate->vehicle && boardedVehicle != noObject && boardedVehicle == named(program.objects, candidate->vehicle)) boarded = candidate;
+                if(candidate->volume && !inside && testVolume(named(program.volumes, candidate->volume))) inside = candidate;
+                const Flag *site = candidate->site ? at(program.flags, named(program.flags, candidate->site)) : nullptr;
+                if(site && placed && site->pose.position.dist(point) < best) { best = site->pose.position.dist(point); nearest = candidate; }
+            }
+            chosen = boarded ? boarded : inside ? inside : nearest ? nearest : chosen;
+            conoutf("Halo scene: %s chosen for the exit (%s)", chosen->script,
+                    boarded ? "the Pelican boarded" : inside ? "the player's site" : nearest ? "the site nearest the player" : "the first");
+        }
+        const int index = named(program.scripts, chosen->script);
+        const int boardedPelican = pelicanReady() ? named(program.objects, "extraction_pelican") : -1;
+        stopSounds();
+        cue = chosen;
+        director = {};
+        sceneThreads.clear();
+        director.stack.emplace_back(program.scripts[index].root);
+        chapter = -1;
+        nearClip = .0625f;
+        fade = {vec(), 1, 1, tick, tick};
+        letterbox = cameraControl = true;
+        camera = {};
+        // A scene in the middle of a section borrows the scripted objects and gives them back.
+        sceneObjects.clear();
+        if(trigger == SceneTrigger::Call) callActors = actors;
+        else callActors.clear();
+        for(size_t i = 0; i < actors.size(); ++i)
+        {
+            if(int(i) == boardedPelican) continue;
+            actors[i] = {};
+            actors[i].pose = program.objects[i].pose;
+        }
+        handoffTeleport = handoffFacing = -1;
+        findHandoff(program.scripts[index].root, 0);
+        setWorld(chosen->bsp);
+        player1->attacking = false;
+        player1->stopmoving();
+        conoutf("Halo scene: %s start", chosen->script);
+        return true;
     }
 
     void Scenario::endCue(bool skipped)
     {
         if(!cue) return;
         conoutf("Halo scene: %s %s at tick %d", cue->script, skipped ? "skipped" : "finished", tick);
+        if(skipped && cue->trigger == SceneTrigger::Call && !director.done && !director.disabled)
+        {
+            // A scene called mid-section keeps what it does for the play after it (b30's
+            // cutscene_shaftb_goal opens shafta_lock_door, which it first closed): the rest of
+            // its script runs now, with no waits. A bounded number of passes, so a loop cannot hold it.
+            skipping = true;
+            for(int pass = 0; pass < 1024 && !director.done && !director.disabled && !director.stack.empty(); ++pass)
+            {
+                director.wake = tick;
+                step(director, true);
+            }
+            skipping = false;
+            if(!director.done && !director.disabled) conoutf("Halo scene: %s did not run to its end when skipped", cue->script);
+        }
         const SceneTrigger trigger = cue->trigger;
+        const char *const played = cue->script;
         cue = nullptr;
         worldName.clear();
         world = projection->bsp;
@@ -2966,18 +3443,25 @@ namespace
         player1->attacking = false;
         player1->stopmoving();
         resetcamera();
-        if(trigger == SceneTrigger::Cartographer)
+        if(trigger == SceneTrigger::Call)
         {
-            // The scene's original handoff places the player next to the terminal.
-            const Flag *done = at(program.flags, named(program.flags, "player0_map_done"));
-            if(done)
+            // The scripted objects as gameplay left them, but for those the scene created or
+            // destroyed. The calling thread carries on after the call on its next step.
+            if(callActors.size() == actors.size())
             {
-                const vec old = player1->o;
-                player1->o = toWorld(*projection, done->pose.position).add(vec(0, 0, player1->eyeheight));
-                if(collide(player1, true)) player1->o = old;
-                else player1->yaw = fmodf(450.0f - done->pose.yaw / RAD, 360.0f);
-                player1->resetinterp();
+                std::vector<Actor> after = std::move(actors);
+                actors = std::move(callActors);
+                for(const auto &changed : sceneObjects) if(at(after, changed.first)) actors[changed.first] = after[changed.first];
             }
+            callActors.clear();
+            sceneObjects.clear();
+            placePlayer(handoffTeleport, handoffFacing, played);
+        }
+        else if(trigger == SceneTrigger::Cartographer)
+        {
+            // The scene's original handoff places the player next to the terminal (player0_map_done).
+            if(handoffTeleport < 0) handoffTeleport = named(program.flags, "player0_map_done");
+            placePlayer(handoffTeleport, handoffFacing, played);
             pendingCheckpoint = true;
         }
         else if(trigger == SceneTrigger::Exit) exitPlayed = completeExit = true;
@@ -2993,14 +3477,16 @@ namespace
             }
             startGameplay();
         }
-        // A scene can leave the player somewhere else (the Cartographer's handoff above): the
-        // fall and wedge recovery forgets the floors from before it.
+        handoffTeleport = handoffFacing = -1;
+        // A scene can leave the player somewhere else (the handoffs above): the fall and wedge
+        // recovery forgets the floors from before it.
         haloplayermoved("after a cutscene");
     }
 
     void Scenario::update(int elapsed)
     {
         if(!loaded || elapsed <= 0 || paused) return;
+        if(!cue) updateCargo();
         accumulator += clamp(elapsed, 0, 250) * ticksPerSecond;
         while(accumulator >= 1000)
         {
@@ -3127,18 +3613,41 @@ namespace
         glColor4ub(255, 255, 255, 255);
     }
 
+    // Named story figures the scripts create during play, outside any scene (a50's Keyes sitting
+    // in his cell, the Monitor or Cortana where a script places them): drawn with their scene
+    // model. A figure the script attached to a squad stands for an actor and is drawn only while
+    // a custom animation poses it (the engine does not turn scripted objects into actors).
+    bool storyFigure(const Object &object, const Actor &actor)
+    {
+        static const char *const prefixes[] = {"keyes", "captain_keyes", "cortana", "monitor"};
+        const std::string &name = object.name;
+        bool named = false;
+        for(const char *prefix : prefixes) if(!name.compare(0, strlen(prefix), prefix)) { named = true; break; }
+        if(!named || name.find("chip") != std::string::npos || name.find("effect") != std::string::npos ||
+           name.find("teleport") != std::string::npos) return false;
+        return actor.squadReference < 0 || actor.animation != nullptr;
+    }
+
     void Scenario::render()
     {
         renderDevices();
         const int landingPelican = !cue && mission == 3 && section == 2 && halocollisionactive()
             ? named(program.objects, "extraction_pelican") : -1;
-        if(!cue && landingPelican < 0) return;
+        if(!cue && !projection) return;
         for(size_t i = 0; i < actors.size(); ++i)
         {
-            if(!cue && int(i) != landingPelican) continue;
             const Actor &actor = actors[i];
             const Object &object = program.objects[i];
-            if(!actor.visible || object.model.empty() || objectDevices[i] >= 0) continue;
+            // Outside scenes: b30's landing Pelican, the story figures, and the vehicles the engine
+            // does not drive (dropships, Pelicans, cinematic Banshees) while a recording or a
+            // parent moves them, after one has (hovering where it set them down), or while
+            // someone rides in them.
+            const bool flown = object.kind >= 0 && !halovehiclebound(int(i)) &&
+                               (actor.recording || actor.parent >= 0 || actor.recordingEnd > 0 || boardedVehicle == int(i) ||
+                                std::any_of(cargo.begin(), cargo.end(), [i](const Cargo &entry) { return entry.vehicle == int(i) && !entry.walking; }));
+            if(!cue && int(i) != landingPelican && !(actor.visible && (storyFigure(object, actor) || flown))) continue;
+            // Damage targets are invisible in Halo (d40's manifold detectors).
+            if(!actor.visible || object.model.empty() || objectDevices[i] >= 0 || object.vitality > 0) continue;
             Pose pose = currentActor(int(i));
             if(!std::isfinite(pose.position.x) || !std::isfinite(pose.position.y) || !std::isfinite(pose.position.z)) continue;
             vec point(pose.position.x * 4, -pose.position.y * 4, pose.position.z * 4);
@@ -3232,6 +3741,7 @@ double haloscenariocallv(const char *command, const double *values, const char *
 }
 
 int haloscenarioobject(const char *name) { return scenario.loaded ? named(scenario.program.objects, name) : -1; }
+int haloscenarioflag(const char *name) { return scenario.loaded ? named(scenario.program.flags, name) : -1; }
 
 double haloscenarioobjectstate(const char *what, int id)
 {
@@ -3271,6 +3781,21 @@ double haloscenarioqaglobal(const char *name, bool set, double value)
     if(index < 0 || size_t(index) >= scenario.globals.size()) return -1;
     if(set) scenario.globals[index].number = value;
     return scenario.globals[index].number;
+}
+
+bool haloscenarioqacue(const char *script)
+{
+    if(!scenario.loaded || scenario.cue || !scenario.callCue(script)) return false;
+    return scenario.beginCue(SceneTrigger::Call, script);
+}
+
+bool haloscenarioflagpoint(const char *flag, vec &feet, float &yaw)
+{
+    const Flag *f = scenario.loaded && scenario.projection ? at(scenario.program.flags, named(scenario.program.flags, flag)) : nullptr;
+    if(!f) return false;
+    feet = toWorld(*scenario.projection, f->pose.position);
+    yaw = fmodf(450.0f - f->pose.yaw / RAD, 360.0f);
+    return true;
 }
 
 void haloscenarioqastate(int &tick, int &started, int &visible)
@@ -3325,12 +3850,26 @@ void haloscenariocheckpoint()
     scenario.savedChapter = scenario.chapter;
     scenario.savedChapterStart = scenario.chapterStart;
     scenario.savedTick = scenario.tick;
+    haloallegiancecheckpoint();
 }
 
 void haloscenariorevert()
 {
     if(!scenario.loaded) return;
+    // A revert during a scene a script called (not expected: the actors are held meanwhile) ends
+    // it without handing back the objects or moving the player: the checkpoint's state replaces both.
+    if(scenario.cue && scenario.cue->trigger == SceneTrigger::Call)
+    {
+        scenario.director = {};
+        scenario.callActors.clear();
+        scenario.sceneObjects.clear();
+        scenario.handoffTeleport = scenario.handoffFacing = -1;
+        scenario.endCue(false);
+    }
     scenario.stopSounds();
+    halofxrevert();
+    // The actors aboard were respawned with the revert; the player is put back on foot.
+    scenario.clearCargo();
     if(!scenario.savedThreads.empty())
     {
         scenario.globals = scenario.savedGlobals;
@@ -3347,6 +3886,7 @@ void haloscenariorevert()
         scenario.hudBlinking = scenario.savedHudBlinking;
         scenario.chapter = scenario.savedChapter;
         scenario.chapterStart = scenario.savedChapterStart;
+        haloallegiancerevert();
         scenario.restoreSquads();
         scenario.tick = scenario.savedTick;
         scenario.accumulator = 0;
@@ -3394,7 +3934,11 @@ namespace
         const std::string &strings = scenario.program.strings;
         long long offset = -1;
         if(v.text >= strings.c_str() && v.text < strings.c_str() + strings.size()) offset = v.text - strings.c_str();
-        halostatef(out, " %.17g %d %lld", v.number, v.type, offset);
+        // The state reader refuses "nan" and "inf" (a damaged record): a script value that went
+        // non-finite (a division by zero) is saved as the largest finite number, or 0 for NaN, so
+        // Continue still restores the script instead of restarting it.
+        const double number = std::isfinite(v.number) ? v.number : std::isnan(v.number) ? 0.0 : v.number > 0 ? 1.7976931348623157e308 : -1.7976931348623157e308;
+        halostatef(out, " %.17g %d %lld", number, v.type, offset);
     }
 
     Value readValue(HaloStateReader &r)
@@ -3449,7 +3993,7 @@ namespace
         a.animation = animation >= 0 ? &p.animations[size_t(animation)] : nullptr;
         a.input = size_t(input);
         // A recording's input index past its end would read out of range.
-        if(a.recording && a.input > a.recording->inputs.size()) return false;
+        if(a.recording && (a.recording->inputs.empty() || a.input >= a.recording->inputs.size())) return false;
         return true;
     }
 
@@ -3576,6 +4120,12 @@ namespace
         writeInts(out, "flipped", scenario.flipped);
         const HudTimer &timer = scenario.hudTimer;
         halostatef(out, "s timer %d %d %d %d\n", timer.shown, timer.running, timer.remaining, timer.end);
+        // ai_allegiance and betrayals: allied and broken team pairs (halo_ai.cpp's bit masks), as
+        // the checkpoint keeps them when the checkpoint's state is written, else as they are now.
+        // Optional on reading, so a save written before it still loads (default allegiances).
+        unsigned allied = 0, broken = 0;
+        haloallegianceget(allied, broken, v.threads == &scenario.savedThreads);
+        halostatef(out, "s allegiance %u %u\n", allied, broken);
     }
 
     // Everything a state block restores, read in full before any of it is applied.
@@ -3596,6 +4146,8 @@ namespace
         std::vector<std::pair<int, int>> links;
         std::set<int> migrations, maneuvered, flipped;
         HudTimer timer;
+        bool allegiance = false;
+        unsigned allied = 0, broken = 0;
     };
 
     bool parseState(const std::vector<std::string> &records, ParsedState &s, std::string &why)
@@ -3748,6 +4300,14 @@ namespace
             else if(r.key("migrations")) { if(!readInts(r, [&](int v) { s.migrations.insert(v); })) return fail("bad migrations", line); }
             else if(r.key("maneuvered")) { if(!readInts(r, [&](int v) { s.maneuvered.insert(v); })) return fail("bad platoon state", line); }
             else if(r.key("flipped")) { if(!readInts(r, [&](int v) { s.flipped.insert(v); })) return fail("bad platoon state", line); }
+            else if(r.key("allegiance"))
+            {
+                const long long allied = r.integer(), broken = r.integer();
+                if(!r.ok || allied < 0 || broken < 0 || allied > 0xffffffffll || broken > 0xffffffffll) return fail("bad allegiances", line);
+                s.allied = unsigned(allied);
+                s.broken = unsigned(broken);
+                s.allegiance = true;
+            }
             else if(r.key("timer"))
             {
                 s.timer.shown = r.b(); s.timer.running = r.b(); s.timer.remaining = r.i(); s.timer.end = r.i();
@@ -3815,6 +4375,8 @@ bool haloscenariostaterestore(const std::vector<std::string> &records, bool comm
     s.flipped = std::move(parsed.flipped);
     s.hudTimer = parsed.timer;
     haloaisetgrenades(parsed.grenades);
+    if(parsed.allegiance) haloallegianceput(parsed.allied, parsed.broken);
+    else haloallegiancereset();
     return true;
 }
 
@@ -4004,6 +4566,43 @@ bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit)
     return scenario.traceDevices(from, to, hit) || structure;
 }
 
+int haloscenariotargettrace(const vec &from, const vec &to, float &fraction)
+{
+    fraction = 1;
+    if(from == to || !std::isfinite(vec(to).sub(from).squaredlen()) || !std::isfinite(from.squaredlen())) return -1;
+    return scenario.traceTargets(from, to, fraction);
+}
+
+bool haloscenariotargetdamage(int target, float damage) { return scenario.damageTarget(target, damage); }
+
+int haloscenariotargetsnear(const vec &centre, float radius, int *targets, float *distances, int capacity)
+{
+    if(!std::isfinite(centre.squaredlen()) || !(radius > 0) || capacity <= 0) return 0;
+    int found = scenario.targetsNear(centre, radius, targets, distances, capacity), kept = 0;
+    // A blast reaches a target it can see: not through a wall or a closed piston (d40's manifolds).
+    for(int i = 0; i < found; ++i)
+    {
+        HaloCollisionHit hit;
+        const vec to = scenario.targetCentre(targets[i]);
+        if(halocollisionactive() && haloscenariotrace(centre, to, hit) && hit.fraction < .98f) continue;
+        targets[kept] = targets[i];
+        distances[kept++] = distances[i];
+    }
+    return kept;
+}
+
+bool haloscenariotargetstate(const char *name, vec &centre, float &health, bool &damageable)
+{
+    if(!scenario.loaded || !scenario.projection || !name) return false;
+    const int id = named(scenario.program.objects, name);
+    if(id < 0 || scenario.program.objects[id].vitality <= 0) return false;
+    const Actor &actor = scenario.actors[id];
+    centre = scenario.targetCentre(id);
+    health = actor.visible ? max(0.0f, 1 - actor.damage / scenario.program.objects[id].vitality) : -1;
+    damageable = actor.visible && !actor.cannotTakeDamage;
+    return true;
+}
+
 COMMANDF(halo_script_status, "", ()
 {
     if(!scenario.loaded) return;
@@ -4067,7 +4666,7 @@ bool haloscenarioobjectvisible(int object)
     return actor && actor->visible;
 }
 
-bool haloscenarioobjectcarried(int object, vec &feet, float &yaw)
+bool haloscenarioobjectcarried(int object, vec &feet, float &yaw, float *pitch)
 {
     if(!scenario.loaded || scenario.cue || !scenario.projection) return false;
     const Actor *actor = at(scenario.actors, object);
@@ -4075,5 +4674,72 @@ bool haloscenarioobjectcarried(int object, vec &feet, float &yaw)
     const Pose pose = scenario.currentActor(object);
     feet = toWorld(*scenario.projection, pose.position);
     yaw = 90 - pose.yaw / RAD;
+    if(pitch) *pitch = renderAngles(pose).y;
     return true;
+}
+
+bool haloscenariocarried(const playerent *unit)
+{
+    if(!scenario.loaded || !unit) return false;
+    for(const auto &entry : scenario.cargo) if(entry.unit == unit && !entry.walking) return true;
+    return false;
+}
+
+bool haloscenarioboard() { return scenario.loaded && !scenario.cue && scenario.board(); }
+
+void haloscenariocargodump(const char *label)
+{
+    fflush(stdout);
+    if(!scenario.loaded) { conoutf("CARGO_QA %s loaded=0", label); fflush(stdout); return; }
+    const Scenario &sc = scenario;
+    conoutf("CARGO_QA %s loaded=1 cargo=%d boarded=%s seat=%d player=%.2f,%.2f,%.2f", label, int(sc.cargo.size()),
+            at(sc.program.objects, sc.boardedVehicle) ? sc.program.objects[sc.boardedVehicle].name.c_str() : "-", sc.boardedSeat,
+            player1->o.x, player1->o.y, player1->o.z);
+    for(const auto &entry : sc.cargo)
+    {
+        const Object &o = sc.program.objects[entry.vehicle];
+        conoutf("CARGO_QA %s rider=%s vehicle=%s seat=%s walking=%d pos=%.2f,%.2f,%.2f alive=%d", label, entry.unit ? entry.unit->name : "-",
+                o.name.c_str(), at(o.seats, entry.seat) ? o.seats[entry.seat].name.c_str() : "-", entry.walking,
+                entry.unit ? entry.unit->o.x : 0.0f, entry.unit ? entry.unit->o.y : 0.0f, entry.unit ? entry.unit->o.z : 0.0f,
+                livingUnit(entry.unit));
+    }
+    for(size_t i = 0; i < sc.actors.size(); ++i)
+    {
+        const Actor &a = sc.actors[i];
+        const Object &o = sc.program.objects[i];
+        if(!a.visible || o.kind < 0) continue;
+        vec at = sc.projection ? toWorld(*sc.projection, sc.currentActor(int(i)).position) : vec(0, 0, 0);
+        conoutf("CARGO_QA %s object=%s kind=%d bound=%d recording=%d flown=%d boardable=%d seats=%d model=%d pos=%.2f,%.2f,%.2f", label,
+                o.name.c_str(), o.kind, halovehiclebound(int(i)), a.recording != nullptr, a.recordingEnd > 0, a.boardable,
+                int(o.seats.size()), !o.model.empty(), at.x, at.y, at.z);
+    }
+    fflush(stdout);
+}
+
+bool haloscenarioqaboardpoint(const char *object, vec &feet)
+{
+    if(!scenario.loaded) return false;
+    const int id = named(scenario.program.objects, object);
+    const Object *o = at(scenario.program.objects, id);
+    if(!o || !scenario.scriptVehicle(id)) return false;
+    for(size_t i = 0; i < o->seats.size(); ++i)
+    {
+        if(!seatNamed(o->seats[i], "rider") && !seatNamed(o->seats[i], "passenger")) continue;
+        if(!scenario.seatWorld(id, int(i), feet)) continue;
+        return true;
+    }
+    return false;
+}
+bool haloscenarioboarded() { return scenario.loaded && scenario.boardedVehicle != noObject; }
+
+const char *haloscenarioboardprompt()
+{
+    if(!scenario.loaded || scenario.cue || scenario.boardedVehicle != noObject || player1->state != CS_ALIVE) return nullptr;
+    int seat;
+    const int id = scenario.boardCandidate(seat);
+    if(id < 0) return nullptr;
+    static string prompt;
+    const std::string &name = scenario.program.objects[id].name;
+    formatstring(prompt)("E  Board the %s", name.find("pelican") != std::string::npos || name.find("foehammer") != std::string::npos ? "Pelican" : "dropship");
+    return prompt;
 }

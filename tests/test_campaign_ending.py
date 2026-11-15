@@ -3,7 +3,7 @@
 QA client, fresh profiles, real campaign play (not previews):
 - The Maw's last section: game_won raises the ending, the campaign is marked beaten
   in config/halo-progress.txt (with no game left to continue) and the credits finish
-  into the Halo menu.
+  into the title menu (menu "Halo", the title screen behind it).
 - The same ending arrives when the finale cue plays out on that section.
 - game_won on an earlier section is ignored; game_lost reverts the player.
 """
@@ -39,6 +39,7 @@ rows = ending_rows(text)
 assert 'Halo ending reached' in text, text[-2000:]
 assert len(rows) == 2 and 'ending=1 done=0 beaten=1' in rows[0], rows
 assert 'ending=1 done=1' in rows[1] and 'Halo credits finished' in text, rows
+assert 'title=1' in rows[1], ('the credits return to the title menu', rows)
 progress = read_progress(profile)
 assert progress['furthest'] == ['9', '7'] and progress['beaten'] == ['1'] and 'game' not in progress, progress
 print('game_won on The Maw raised the ending, marked the campaign beaten and finished the credits.')
@@ -54,6 +55,7 @@ assert progress['furthest'] == ['9', '7'] and progress['beaten'] == ['1'], progr
 rows = ending_rows(text)
 assert 'ending=0' in rows[0] and 'cinematic=1' in rows[0], rows
 assert 'ending=1 done=0 beaten=1' in rows[1] and 'ending=1 done=1' in rows[2], rows
+assert 'title=1' in rows[2], ('the credits return to the title menu', rows)
 print('The finale cue ending raised the ending state.')
 
 # 3. game_won before the last section is ignored; game_lost reverts the player.

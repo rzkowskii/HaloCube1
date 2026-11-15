@@ -1,7 +1,7 @@
 """Difficulty: halo_difficulty selects squad sizes, game_difficulty_get and enemy scaling.
 
 The importer stores each squad's Easy, Normal, Hard and Impossible start counts
-(HSCB version 7). On a30 section 2 the lz_search encounter is placed at each
+(HSCB version 7 or 8). On a30 section 2 the lz_search encounter is placed at each
 difficulty: the starts the engine selects equal the sum of the tags' counts for that
 level (Normal: the normal counts), Easy and Impossible differ monotonically, the actors
 actually placed never exceed that (some starts have no walkable floor), game_difficulty_get returns the cvar, enemy health and the
@@ -23,8 +23,10 @@ require(root / 'packages/halo/a30.hscb', 'run tools/import_halo_scripts.py')
 from import_halo_a30 import HaloMap  # noqa: E402
 from import_halo_scripts import difficulty_counts, squad_rows  # noqa: E402
 
-assert (root / 'packages/halo/a30.hscb').read_bytes()[4:8] == (7).to_bytes(4, 'little'), \
-    'a30.hscb is not version 7; rerun tools/import_halo_scripts.py'
+# Version 8 adds the damage targets' vitality and box to each object row; the squad counts are
+# those of version 7.
+assert int.from_bytes((root / 'packages/halo/a30.hscb').read_bytes()[4:8], 'little') in (7, 8), \
+    'a30.hscb is older than version 7; rerun tools/import_halo_scripts.py'
 
 # Expected sizes from the retail tags, through the importer.
 with (HALO_SOURCE / 'a30.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:

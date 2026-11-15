@@ -20,12 +20,17 @@ for (cache, title, sections), mission in zip(rows, MISSIONS):
     expected = (mission.cache, mission.title, len(mission.sections) + extra.get(mission.cache, 0))
     assert (cache, title, int(sections)) == expected, ((cache, title, sections), expected)
 
-# Cinematic cues name zero-based sections, or -1 for the escape timeout.
+# Cinematic cues name zero-based sections, or -1 (any section) for the escape timeout and for
+# scenes a script calls; an exit variant adds its vehicle, volume and site flag.
 script = (root / 'source/src/halo_script.cpp').read_text()
-cues = re.findall(r'\{(\d+), (-?\d+), (\d+), "(\w+)", SceneTrigger::(\w+)\}', script)
+cues = re.findall(r'\{(\d+), (-?\d+), (\d+), "(\w+)", SceneTrigger::(\w+)(?:, "\w+", "\w+", "\w+")?\}', script)
 assert cues, 'cue table not found'
 for mission, section, bsp, name, trigger in cues:
     m, s = int(mission), int(section)
     assert m < len(MISSIONS), (name, m)
-    assert s == -1 if trigger == 'Timeout' else 0 <= s < int(rows[m][2]), (name, m, s)
+    assert trigger in ('Entry', 'Exit', 'Timeout', 'Cartographer', 'Call'), (name, trigger)
+    if trigger == 'Timeout':
+        assert s == -1, (name, m, s)
+    else:
+        assert (s == -1 and trigger == 'Call') or 0 <= s < int(rows[m][2]), (name, m, s)
 print(f'{len(rows)} missions and {len(cues)} cinematic cues agree with the importer.')

@@ -4,9 +4,29 @@ project(HaloInAssaultCube LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 option(HALO_BUILD_QA "Build the halo-ac-qa verification client used by tests/" OFF)
+# AddressSanitizer and UndefinedBehaviorSanitizer for the soak and robustness tests
+# (tests/test_soak.py --asan). Everything in the build tree is instrumented, the shared engine
+# objects included, so configure it in its own directory (scripts/build-macos.sh --asan uses
+# build/macos-asan) and never package it: scripts/package-macos.sh refuses a sanitized build.
+option(HALO_SANITIZE "Instrument the build with ASan and UBSan (needs HALO_BUILD_QA; use a separate build directory)" OFF)
 
 if(NOT APPLE)
     message(FATAL_ERROR "This build targets macOS.")
+endif()
+
+if(HALO_SANITIZE)
+    if(NOT HALO_BUILD_QA)
+        message(FATAL_ERROR "HALO_SANITIZE is for the halo-ac-qa client: configure with -DHALO_BUILD_QA=ON too.")
+    endif()
+    # -fno-sanitize=function,vptr: the stock engine calls console commands through generic
+    # function pointers (command.cpp), which the function check reports on every call; vptr adds
+    # nothing the engine's plain structs need. -fno-sanitize-recover=address stops at the first
+    # memory error; UBSan reports and goes on, and the soak test fails on any report.
+    set(HALO_SANITIZE_FLAGS -fsanitize=address,undefined -fno-sanitize=function,vptr
+        -fno-omit-frame-pointer -fno-optimize-sibling-calls -g)
+    add_compile_options(${HALO_SANITIZE_FLAGS})
+    add_link_options(-fsanitize=address,undefined)
+    message(STATUS "HALO_SANITIZE: ASan and UBSan build (not for packaging)")
 endif()
 
 find_package(SDL2 CONFIG REQUIRED)
@@ -52,6 +72,7 @@ set(CLIENT_SOURCES
     entities.cpp
     halo_collision.cpp
     halo_counter.cpp
+    halo_fx.cpp
     halo_script.cpp
     halo_vehicle.cpp
     halo_ai.cpp
@@ -110,7 +131,7 @@ add_executable(halo-ac source/src/halo.cpp)
 target_link_libraries(halo-ac PRIVATE halo-engine)
 
 if(HALO_BUILD_QA)
-    add_executable(halo-ac-qa source/src/halo.cpp tests/native/b30_trace_qa.cpp)
+    add_executable(halo-ac-qa source/src/halo.cpp tests/native/b30_trace_qa.cpp tests/native/qa_memory.cpp)
     target_compile_definitions(halo-ac-qa PRIVATE HALO_QA)
     target_include_directories(halo-ac-qa PRIVATE tests/native)
     target_link_libraries(halo-ac-qa PRIVATE halo-engine)

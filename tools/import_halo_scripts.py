@@ -12,7 +12,7 @@ import unicodedata
 
 from halo_map_art import write_world_mesh
 from halo_actors import actor_index
-from halo_cast import cast_metadata
+from halo_cast import cast_metadata, damage_target
 from halo_devices import device_rows
 from halo_recordings import decode
 from import_halo_a30 import HaloMap, ORIGIN_X, ORIGIN_Y, SOURCE_FLOOR, HORIZONTAL_SCALE, VERTICAL_SCALE, MARGIN
@@ -194,6 +194,22 @@ def named_objects(program):
         yield name, tag, pose
 
 
+def object_not_placed(program):
+    """Each named object's placement not-placed flags (1: a script creates it), or 1 for an object with
+    no placement of its own, in named_objects order."""
+    t, s = program.halo.tags, program.halo.scenario
+    objects = t.block(s + 516, 36)
+    for p in objects:
+        kind, index = t.read('hh', p + 32)
+        flags = 1
+        if kind in OBJECT_BLOCKS and index >= 0:
+            placements, stride, _ = OBJECT_BLOCKS[kind]
+            points = t.block(s + placements, stride)
+            if index < len(points) and t.read('h', points[index] + 2)[0] == (p - objects.start) // objects.step:
+                flags, = t.read('H', points[index] + 4)
+        yield flags
+
+
 def title_rows(halo):
     t, s = halo.tags, halo.scenario
     help_tag = halo.reference(t, s + 1412, 'ustr')
@@ -319,7 +335,7 @@ def write_program(program, mission, output, objects, animations, sounds, convers
     path = output / f'{mission.cache}.hscb'
     out = Writer(path.with_suffix('.tmp'))
     try:
-        out.write('4sI', b'HSCB', 7)
+        out.write('4sI', b'HSCB', 8)
         table(out, program.nodes, lambda *v: out.write('4H3I', *v))
         out.write('I', len(program.strings))
         out.file.write(program.strings)
@@ -343,7 +359,7 @@ def write_program(program, mission, output, objects, animations, sounds, convers
         table(out, recordings, lambda name, ticks, samples:
               (out.text(name), out.write('H', ticks), table(out, samples, lambda *v: out.write('HBH8f', *v))))
 
-        def write_object(name, model, pose, metadata, locomotion):
+        def write_object(name, model, pose, metadata, locomotion, target):
             kind, rates, center, markers, seats = metadata
             out.text(name)
             out.text(model)
@@ -352,6 +368,12 @@ def write_program(program, mission, output, objects, animations, sounds, convers
             table(out, seats, lambda name, marker: (out.text(name), out.text(marker)))
             for path in locomotion:
                 out.text(path)
+            # Version 8: a damage target's body vitality and collision box (halo_cast.damage_target),
+            # zero for every other object, and whether its placement exists when the mission starts
+            # (not-placed flag 1 clear: the engine shows it from the start; the other scripted objects
+            # appear when a script creates them).
+            vitality, low, high, placed = target or (0.0, (0.0,) * 3, (0.0,) * 3, False)
+            out.write('7fB', vitality, *low, *high, int(placed))
 
         table(out, objects, write_object)
         table(out, animations, lambda obj, graph, clip, model, ticks:
@@ -467,6 +489,7 @@ def export_cast(program, output, rebuild):
         idle = idle_cache[graph_tag.name]
         return idle if idle and all(node in idle for node, _ in model.nodes) else None
     objects, clips = [], []
+    not_placed = list(object_not_placed(program))
     for obj, (name, tag, pose) in enumerate(named_objects(program)):
         path, model = '', None
         locomotion = ('', '', '')
@@ -536,7 +559,9 @@ def export_cast(program, output, rebuild):
                     clips.append((obj, graph_id, clip, f'halo/scene/{halo.name}/{animation}', ticks))
                 except (IndexError, KeyError, ValueError, struct.error, ZeroDivisionError, StopIteration):
                     continue
-        objects.append((name, path, pose, cast_metadata(halo, tag, model), locomotion))
+        target = damage_target(halo, tag)
+        objects.append((name, path, pose, cast_metadata(halo, tag, model), locomotion,
+                        target and (*target, not not_placed[obj] & 1)))
     return objects, clips
 
 

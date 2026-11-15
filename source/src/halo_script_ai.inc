@@ -6,6 +6,8 @@
 // actors, dormancy, emotions, dialogue triggers) are accepted and recorded so
 // the scripts that gate on them keep moving; see docs/macos-build.md.
 
+    bool seatNamed(const Seat &seat, const char *text);     // below, with the dropships
+
     Actor *Scenario::scripted(int id)
     {
         return id >= 0 && size_t(id) < actors.size() ? &actors[id] : nullptr;
@@ -90,6 +92,25 @@
         // The players are objects, not calls with arguments of their own; the second seat is empty.
         if(is("player0")) return answer(playerObject);
         if(is("player1")) return answer(noObject);
+
+        // Volume tests of the player (players, or list_get of it), the living actors of a list
+        // (ai_actors), one actor (list_get of a list) or a scripted object. _all needs every one
+        // of them inside (so an empty list of actors passes, as in Halo); the others any one.
+        if(is("volume_test_object") || is("volume_test_objects") || is("volume_test_objects_all") || is("volume_test_objects_any"))
+        {
+            const int volume = index(0), value = *text(1) ? object(1) : index(1);
+            int tested = 0, inside = 0;
+            if(value == playerObject || value == playerList) { ++tested; inside += testVolume(volume); }
+            else if(isUnit(value))
+                eachUnit(value, [&](playerent *unit)
+                {
+                    if(!unit || unit->state != CS_ALIVE) return;
+                    ++tested;
+                    inside += unitInVolume(volume, unit);
+                });
+            else { ++tested; inside += testVolume(volume, value); }
+            return answer(is("volume_test_objects_all") ? inside == tested : inside > 0);
+        }
 
         // --- Encounter switches and orders -------------------------------------
         if(is("ai_berserk"))
@@ -219,9 +240,23 @@
         }
         // Actors do not drive or board vehicles; these are accepted so the scripts that order it go on.
         if(is("ai_exit_vehicle") || is("ai_vehicle_enterable_actor_type") || is("ai_vehicle_enterable_disable") ||
-           is("ai_reconnect") || is("ai_timer_expire") || is("ai_dialogue_triggers") || is("ai_allegiance_remove"))
+           is("ai_reconnect") || is("ai_timer_expire") || is("ai_dialogue_triggers"))
             return handled();
-        if(is("ai_allegiance_broken")) return answer(0);
+
+        // --- Allegiances ---------------------------------------------------------
+        // Team literals carry the retail game team (1 player, 2 human, 3 covenant, 4 flood,
+        // 5 sentinel); halo_ai.cpp keeps the allegiance matrix the actors' targeting reads.
+        if(is("ai_allegiance") || is("ai_allegiance_remove"))
+        {
+            const int a = haloteamfromretail(index(0), HALO_TEAM_DEFAULT), b = haloteamfromretail(index(1), HALO_TEAM_DEFAULT);
+            if(a != HALO_TEAM_DEFAULT && b != HALO_TEAM_DEFAULT) haloallegianceset(a, b, is("ai_allegiance"));
+            return handled();
+        }
+        if(is("ai_allegiance_broken"))
+        {
+            const int a = haloteamfromretail(index(0), HALO_TEAM_DEFAULT), b = haloteamfromretail(index(1), HALO_TEAM_DEFAULT);
+            return answer(a != HALO_TEAM_DEFAULT && b != HALO_TEAM_DEFAULT && haloallegiancebroken(a, b));
+        }
 
         // --- Dialogue ------------------------------------------------------------
         if(is("ai_conversation_advance"))
@@ -332,6 +367,7 @@
             const std::string effect = text(0);
             auto lethal = [&](const char *word) { return effect.find(word) != std::string::npos; };
             const int damage = lethal("guaranteed") || lethal("doom") || lethal("plummet") || lethal("death") ? INT_MAX : 40;
+            HaloScriptDamage scripted;
             auto hurt = [&](playerent *unit) { if(unit && unit->state == CS_ALIVE) dodamage(damage, unit, unit == player1 ? unit : player1, GUN_GRENADE); };
             if(is("damage_object")) eachUnit(index(1), hurt);
             else
@@ -352,9 +388,11 @@
     }
 
     // --- Vehicles the engine drives (halo_vehicle.cpp) ---------------------------------
-    // The Warthogs and turrets placed in this section answer the boarding and seat commands for
-    // their scenario objects. Everything else (Pelicans, dropships, Banshees, Ghosts, and the
-    // scripted cargo carried by them) falls through to the stand-ins and the attach code.
+    // The vehicles placed in this section (Warthogs, turrets, Ghosts, Wraiths, Scorpions and
+    // Banshees) answer the boarding and seat commands for their scenario objects. Dropships and
+    // Pelicans carry the actors the scripts load into them (Cargo, below) and take the player
+    // aboard once a script makes them enterable; for the rest (and the seat tests of actors in
+    // them) the stand-ins and the attach code still answer.
     bool Scenario::vehicleCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out)
     {
         if(strncmp(name, "vehicle_", 8) && strncmp(name, "unit_", 5) && strncmp(name, "ai_", 3)) return false;
@@ -392,6 +430,13 @@
                 // A Warthog or a turret that is not in this section: nobody (but the escape
                 // Warthog's driver) is in it.
                 if(o && (o->kind == 1 || o->kind == 6)) return answer(inside);
+                // A Pelican the script made enterable: whether the player boarded it, in a seat
+                // of that name (a30's extraction waits for p-riderlf or p-riderrf).
+                if(scriptVehicle(id) && actors[id].boardable && std::find(list.begin(), list.end(), player1) != list.end())
+                {
+                    const Seat *seat = at(o->seats, boardedSeat);
+                    return answer(boardedVehicle == id && (!*text(1) || (seat && seatNamed(*seat, text(1)))));
+                }
                 return false;
             }
             for(playerent *unit : list) inside |= halovehicleseattest(id, text(1), unit);
@@ -402,21 +447,44 @@
             // (unit_enter_vehicle unit vehicle seat), (vehicle_load_magic vehicle seat units)
             const bool enter = is("unit_enter_vehicle");
             const int id = object(enter ? 1 : 0);
-            if(!halovehiclebound(id)) return false;
+            if(!halovehiclebound(id))
+            {
+                // A dropship or Pelican: the actors ride at its seats until vehicle_unload.
+                if(scene || !scriptVehicle(id)) return false;
+                bool loaded = false;
+                for(playerent *unit : units(index(enter ? 0 : 2))) if(unit != player1) loaded |= loadCargo(id, text(enter ? 2 : 1), unit, false);
+                return loaded ? answer(1) : false;
+            }
             bool loaded = false;
             for(playerent *unit : units(index(enter ? 0 : 2))) loaded |= halovehicleload(id, text(enter ? 2 : 1), unit);
+            // ai_vehicle_encounter named the squad its pilot fights with (c40's Wraiths).
+            const auto squad = vehicleSquads.find(id);
+            playerent *driver = halovehicledriverof(id);
+            if(loaded && squad != vehicleSquads.end() && driver && driver != player1)
+                if(SquadBot *bot = squadBotOf(driver)) migrateBot(*bot, squad->second);
             return loaded ? answer(1) : false;
         }
         if(is("unit_exit_vehicle"))
         {
             bool released = false;
-            for(playerent *unit : units(index(0))) released |= halovehicleunseat(unit);
+            for(playerent *unit : units(index(0)))
+            {
+                released |= halovehicleunseat(unit);
+                // Out of a dropship or Pelican too.
+                for(size_t i = 0; i < cargo.size(); ++i)
+                    if(cargo[i].unit == unit && !scene) { releaseCargo(cargo[i]); cargo.erase(cargo.begin() + i); released = true; break; }
+            }
             return released ? answer(1) : false;
         }
         if(is("vehicle_unload"))
         {
             const int id = object(0);
-            return halovehiclebound(id) ? answer(halovehicleunload(id, text(1))) : false;
+            if(halovehiclebound(id)) return answer(halovehicleunload(id, text(1)));
+            // A dropship sets down the actors in the seats named (a30's cd-passengerl01 ...). The
+            // attach code below still runs, so the objects carried at those seats (b40's Ghosts
+            // under c_dropship_b) are let go by the same call (vehicle_unload returns nothing).
+            if(!scene) unloadCargo(id, text(1));
+            return false;
         }
         if(is("vehicle_riders"))
         {
@@ -442,7 +510,27 @@
         {
             // Recorded on the object as well (aiCommand).
             if(halovehiclebound(object(0))) halovehicleenterable(object(0), truth(1));
+            else if(scriptVehicle(object(0))) actors[object(0)].boardable = truth(1);
             return false;
+        }
+        if(is("ai_vehicle_encounter"))
+        {
+            // (ai_vehicle_encounter vehicle squad): its pilot fights with that squad, now or once
+            // a script loads one.
+            const int id = object(0);
+            if(scene || id < 0) return handled();
+            vehicleSquads[id] = index(1);
+            playerent *driver = halovehiclebound(id) ? halovehicledriverof(id) : nullptr;
+            if(driver && driver != player1) if(SquadBot *bot = squadBotOf(driver)) migrateBot(*bot, index(1));
+            return handled();
+        }
+        if(is("ai_going_to_vehicle"))
+        {
+            const int id = object(0);
+            if(halovehiclebound(id)) return answer(halovehicleaigoing(id));
+            int walking = 0;
+            for(const Cargo &entry : cargo) walking += entry.vehicle == id && entry.walking;
+            return answer(walking);
         }
         if(is("ai_vehicle_enterable_distance") || is("ai_vehicle_enterable_actor_type") || is("ai_vehicle_enterable_disable"))
         {
@@ -463,6 +551,17 @@
         {
             // (ai_go_to_vehicle squad vehicle seat)
             const int id = object(1);
+            if(!scene && !halovehiclebound(id) && scriptVehicle(id))
+            {
+                // A Pelican or dropship: one actor of the squad per free seat of that name walks
+                // to it (a30's marines to their extraction Pelican) and rides once there.
+                eachActor(index(0), [&](SquadBot &bot, int)
+                {
+                    for(const Cargo &entry : cargo) if(entry.unit == bot.bot) return;
+                    if(freeSeat(id, text(2)) >= 0) loadCargo(id, text(2), bot.bot, true);
+                });
+                return handled();
+            }
             if(scene || !halovehiclebound(id)) return false;
             std::vector<playerent *> list;
             eachActor(index(0), [&](SquadBot &bot, int) { list.push_back(bot.bot); });
@@ -471,8 +570,257 @@
         }
         if(is("ai_exit_vehicle"))
         {
-            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { halovehicleunseat(bot.bot); });
+            if(!scene) eachActor(index(0), [&](SquadBot &bot, int)
+            {
+                halovehicleunseat(bot.bot);
+                for(size_t i = 0; i < cargo.size(); ++i)
+                    if(cargo[i].unit == bot.bot) { releaseCargo(cargo[i]); cargo.erase(cargo.begin() + i); break; }
+            });
             return false;
         }
         return false;
     }
+
+    // --- Dropships and Pelicans -------------------------------------------------------
+    // The scenario's vehicles the engine does not drive move on their recordings (and parents)
+    // in the script (updateRecordings) and are drawn while they do (render). Actors loaded into
+    // them ride at a seat marker, pinned there every frame, until vehicle_unload sets them down
+    // (they drop to the floor), the vehicle is destroyed, or a revert respawns them. Actors told
+    // to walk to one (ai_go_to_vehicle) ride once they reach it. The player boards one with E once
+    // a script makes it enterable (a30's extraction Pelicans), rides at its seat, and E gets them
+    // out again; game_won while boarded ends the section (halo.cpp).
+
+    // Case-insensitive: whether a seat's name or marker holds `text` (Halo matches seat labels
+    // by part: "passenger" loads every CD-passenger seat, "rider" every P-rider seat).
+    bool seatNamed(const Seat &seat, const char *text)
+    {
+        if(!text || !*text) return true;
+        auto holds = [text](const std::string &name)
+        {
+            std::string a = name, b = text;
+            for(char &c : a) c = char(tolower(c));
+            for(char &c : b) c = char(tolower(c));
+            return a.find(b) != std::string::npos;
+        };
+        return holds(seat.name) || holds(seat.marker);
+    }
+
+    // Whether an actor pointer still names a living bot (cargo outlives nothing: a revert or a
+    // removal leaves stale pointers behind).
+    bool livingUnit(const playerent *unit)
+    {
+        if(!unit) return false;
+        loopv(players) if(players[i] == unit) return unit->state == CS_ALIVE;
+        return false;
+    }
+
+    // A unit vehicle object (kind 0 and up) the engine does not drive in this section.
+    bool Scenario::scriptVehicle(int id) const
+    {
+        const Object *o = at(program.objects, id);
+        return o && at(actors, id) && o->kind >= 0 && !halovehiclebound(id) && projection;
+    }
+
+    bool Scenario::seatWorld(int vehicle, int seat, vec &point) const
+    {
+        if(!projection || !at(actors, vehicle) || !at(program.objects, vehicle)) return false;
+        const Object &object = program.objects[vehicle];
+        Pose pose = currentActor(vehicle);
+        vec local(0, 0, 0);
+        if(const Seat *s = at(object.seats, seat))
+            if(const Flag *marker = at(object.markers, named(object.markers, s->marker.c_str())))
+                local = vec(marker->pose.position).mul(actors[vehicle].scale);
+        pose.position.add(poseOffset(local, pose));
+        point = toWorld(*projection, pose.position);
+        return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+    }
+
+    // The first seat of that name nobody rides in or walks to (or -1). A vehicle without seats
+    // in the table takes one rider at its middle (seat -1) per call.
+    int Scenario::freeSeat(int vehicle, const char *seat) const
+    {
+        const Object *o = at(program.objects, vehicle);
+        if(!o) return -1;
+        for(size_t i = 0; i < o->seats.size(); ++i)
+        {
+            if(!seatNamed(o->seats[i], seat) || (boardedVehicle == vehicle && boardedSeat == int(i))) continue;
+            bool taken = false;
+            for(const Cargo &entry : cargo) taken |= entry.vehicle == vehicle && entry.seat == int(i);
+            if(!taken) return int(i);
+        }
+        return -1;
+    }
+
+    bool Scenario::loadCargo(int vehicle, const char *seat, playerent *unit, bool walking)
+    {
+        if(!unit || unit == player1 || unit->state != CS_ALIVE || !scriptVehicle(vehicle)) return false;
+        cargo.erase(std::remove_if(cargo.begin(), cargo.end(), [unit](const Cargo &entry) { return entry.unit == unit; }), cargo.end());
+        const Object &o = program.objects[vehicle];
+        int index = freeSeat(vehicle, seat);
+        // No free seat of that name: share the first one that matches (more actors than seats).
+        if(index < 0) for(size_t i = 0; i < o.seats.size() && index < 0; ++i) if(seatNamed(o.seats[i], seat)) index = int(i);
+        cargo.push_back({vehicle, index, unit, walking, lastmillis + 30000});
+        if(halo_scripttrace)
+            conoutf("Halo cargo: %s %s %s (%s)", unit->name, walking ? "walks to" : "rides in", o.name.c_str(),
+                    at(o.seats, index) ? o.seats[index].name.c_str() : "-");
+        return true;
+    }
+
+    // Out of the vehicle: from its seat, a step outward, falling to the floor below.
+    void Scenario::releaseCargo(Cargo &entry)
+    {
+        playerent *unit = entry.unit;
+        if(!livingUnit(unit)) return;
+        haloactorgoto(unit, nullptr);
+        if(entry.walking) return;
+        vec seat;
+        if(!seatWorld(entry.vehicle, entry.seat, seat)) return;
+        vec centre = toWorld(*projection, currentActor(entry.vehicle).position), out = vec(seat).sub(centre);
+        out.z = 0;
+        if(!out.iszero()) out.normalize().mul(unit->radius * 2 + .5f);
+        unit->o = vec(seat).add(out).add(vec(0, 0, unit->eyeheight));
+        unit->vel = vec(0, 0, 0);
+        unit->resetinterp();
+        if(halo_scripttrace) conoutf("Halo cargo: %s set down by %s", unit->name, program.objects[entry.vehicle].name.c_str());
+    }
+
+    int Scenario::unloadCargo(int vehicle, const char *seat)
+    {
+        const Object *o = at(program.objects, vehicle);
+        if(!o) return 0;
+        int released = 0;
+        for(size_t i = 0; i < cargo.size();)
+        {
+            Cargo &entry = cargo[i];
+            const Seat *s = at(o->seats, entry.seat);
+            if(entry.vehicle != vehicle || (*seat && s && !seatNamed(*s, seat)) || (*seat && !s && entry.seat >= 0)) { ++i; continue; }
+            releaseCargo(entry);
+            if(!entry.walking) ++released;
+            cargo.erase(cargo.begin() + i);
+        }
+        return released;
+    }
+
+    // Every frame: riders held at their seats, walkers seated on arrival, the boarded player
+    // carried with the vehicle (held where it was last seen once it is gone).
+    void Scenario::updateCargo()
+    {
+        for(size_t i = 0; i < cargo.size();)
+        {
+            Cargo &entry = cargo[i];
+            const bool alive = livingUnit(entry.unit);
+            const Actor *vehicle = at(actors, entry.vehicle);
+            vec seat;
+            if(!alive || !vehicle || !vehicle->visible || !seatWorld(entry.vehicle, entry.seat, seat) || (entry.walking && lastmillis > entry.until))
+            {
+                if(alive && vehicle) releaseCargo(entry);
+                cargo.erase(cargo.begin() + i);
+                continue;
+            }
+            playerent *unit = entry.unit;
+            if(entry.walking)
+            {
+                // Within a few world units of its seat (the hull is in the way of the marker itself).
+                const vec feet = vec(unit->o).sub(vec(0, 0, unit->eyeheight));
+                if(feet.distxy(seat) < 4.0f * projection->xy && fabsf(feet.z - seat.z) < 4.0f * projection->xy)
+                {
+                    entry.walking = false;
+                    haloactorgoto(unit, nullptr);
+                    if(halo_scripttrace) conoutf("Halo cargo: %s boards %s", unit->name, program.objects[entry.vehicle].name.c_str());
+                }
+                else if(tick % 15 == 0) haloactorgoto(unit, &seat);
+                if(entry.walking) { ++i; continue; }
+            }
+            unit->o = vec(seat).add(vec(0, 0, unit->eyeheight * .45f));
+            unit->vel = vec(0, 0, 0);
+            unit->onfloor = true;
+            unit->resetinterp();
+            ++i;
+        }
+        if(boardedVehicle != noObject)
+        {
+            vec seat;
+            const Actor *vehicle = at(actors, boardedVehicle);
+            if(vehicle && vehicle->visible && seatWorld(boardedVehicle, boardedSeat, seat)) boardedAt = seat;
+            if(player1->state != CS_ALIVE) { boardedVehicle = noObject; boardedSeat = -1; return; }
+            player1->o = vec(boardedAt).add(vec(0, 0, player1->eyeheight * .45f));
+            player1->vel = vec(0, 0, 0);
+            player1->onfloor = true;
+            player1->timeinair = 0;
+            player1->resetinterp();
+        }
+    }
+
+    // The enterable Pelican whose rider seat is nearest the player, within reach of it: Halo's
+    // player seats are the front riders (P-riderLF, P-riderRF), so those come first.
+    int Scenario::boardCandidate(int &seat) const
+    {
+        seat = -1;
+        if(!projection || player1->state != CS_ALIVE || halovehicleseated()) return -1;
+        const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        const float reach = 4.5f * projection->xy;
+        int best = -1;
+        float bestScore = 1e9f;
+        for(size_t id = 0; id < actors.size(); ++id)
+        {
+            const Actor &actor = actors[id];
+            if(!actor.visible || !actor.boardable || actor.recording || !scriptVehicle(int(id))) continue;
+            const Object &o = program.objects[id];
+            for(size_t i = 0; i < o.seats.size(); ++i)
+            {
+                const Seat &candidate = o.seats[i];
+                if(!seatNamed(candidate, "rider") && !seatNamed(candidate, "passenger")) continue;
+                vec point;
+                if(!seatWorld(int(id), int(i), point)) continue;
+                const float distance = feet.distxy(point);
+                if(distance > reach || fabsf(feet.z - point.z) > reach) continue;
+                std::string name = candidate.name;
+                for(char &c : name) c = char(tolower(c));
+                const bool front = name.size() >= 2 && (!name.compare(name.size() - 2, 2, "lf") || !name.compare(name.size() - 2, 2, "rf"));
+                const float score = distance - (front ? 1e6f : 0);
+                if(score < bestScore) { bestScore = score; best = int(id); seat = int(i); }
+            }
+        }
+        return best;
+    }
+
+    bool Scenario::board()
+    {
+        if(boardedVehicle != noObject) { unboard(false); return true; }
+        int seat;
+        const int id = boardCandidate(seat);
+        if(id < 0) return false;
+        boardedFrom = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        if(!seatWorld(id, seat, boardedAt)) return false;
+        boardedVehicle = id;
+        boardedSeat = seat;
+        player1->attacking = false;
+        player1->stopmoving();
+        haloplayermoved("into a script vehicle seat", &boardedFrom);
+        conoutf("Halo: player aboard %s (%s)", program.objects[id].name.c_str(), program.objects[id].seats[seat].name.c_str());
+        return true;
+    }
+
+    // Out again: back where they got in (`keepPlace`: where the seat last was, the vehicle gone).
+    void Scenario::unboard(bool keepPlace)
+    {
+        if(boardedVehicle == noObject) return;
+        const vec feet = keepPlace ? boardedAt : boardedFrom;
+        boardedVehicle = noObject;
+        boardedSeat = -1;
+        if(player1->state != CS_ALIVE) return;
+        player1->o = vec(feet).add(vec(0, 0, player1->eyeheight));
+        player1->vel = vec(0, 0, 0);
+        player1->resetinterp();
+        haloplayermoved("out of a script vehicle seat");
+        conoutf("Halo: player out of the script vehicle");
+    }
+
+    void Scenario::clearCargo()
+    {
+        for(Cargo &entry : cargo) if(livingUnit(entry.unit)) haloactorgoto(entry.unit, nullptr);
+        cargo.clear();
+        boardedVehicle = noObject;
+        boardedSeat = -1;
+    }
+

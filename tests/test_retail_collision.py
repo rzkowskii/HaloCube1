@@ -25,7 +25,8 @@ For every section that has an imported packages/maps/<section>.hcol this checks 
     follower's speed on every straight it walks must be too.
 A mission's walk stops at the first section without an .hcol (stock geometry, reported and
 skipped, not failed). A missing .route or a route that stalls fails the section; the walk
-logs go to build/qa/. Lift rides, light-bridge waits and the engine's fall and wedge recoveries
+logs go to build/qa/. Lift rides, light-bridge waits, the actions of control, shoot and door rows
+(route flags 256, 512 and 1024: `RETAIL_QA act ...`) and the engine's fall and wedge recoveries
 are printed under each section; PENDING_WALK lists the sections they are expected to make pass
 that have not been walked yet.
 """
@@ -54,22 +55,25 @@ NOMINAL_SPEED = 16.0
 # Sections whose walk is known to stop at a script-gated door (docs/macos-build.md). They are
 # walked and reported every time, but only fail the test once they pass (so the list is pruned).
 KNOWN_BLOCKED = {
-    'halo_a10_05': 'tunnel_door_2 stays shut after mission_tunnel powers it',
+    'halo_a10_05': 'tunnel_door_2 stayed shut on the last walk (mission_tunnel powers it after the tunnel conversations)',
     'halo_a10_06': 'reached only through section 5; on its own cryo_search never opens cryo_door_2',
-    # The route rides lift_d down the c1 tower (flag 4); the walker does not work lift controls yet.
-    'halo_b40_06': 'lift_d ride (route flag 4): the walker does not call and ride lifts',
+    # The route rides lift_d down the c1 tower (flag 4). These reasons are what stopped the last walk,
+    # made before the walker rode lifts (route flags 16 to 128); PENDING_WALK says what should pass now.
+    'halo_b40_06': 'lift_d ride (route flag 4): last walked before the walker rode lifts',
     # c10 leaves these sections half way down a lift shaft (bsp 0,1 and bsp 1,3): the route ends
     # beside the lift's control, and the section ends only once the player rides it down.
-    'halo_c10_01': 'lift_a ride to bsp 0,1: the walker does not call and ride lifts',
-    'halo_c10_04': 'lift_b ride to bsp 1,3: the walker does not call and ride lifts',
+    'halo_c10_01': 'lift_a ride to bsp 0,1: last walked before the walker rode lifts',
+    'halo_c10_04': 'lift_b ride to bsp 1,3: last walked before the walker rode lifts',
     # c20 leaves its first three sections half way up a platform shaft (bsp 0,1, 1,2, 2,3): the
     # route ends beside the platform, which rises once the player stands on it.
-    'halo_c20_01': 'platform1 ride to bsp 0,1: the walker does not board lifts',
-    'halo_c20_02': 'platform2 ride to bsp 1,2: the walker does not board lifts',
-    'halo_c20_03': 'platform3 ride to bsp 2,3: the walker does not board lifts',
+    'halo_c20_01': 'platform1 ride to bsp 0,1: last walked before the walker boarded lifts',
+    'halo_c20_02': 'platform2 ride to bsp 1,2: last walked before the walker boarded lifts',
+    'halo_c20_03': 'platform3 ride to bsp 2,3: last walked before the walker boarded lifts',
     # d40's engine room: enc5_2_door opens only once the four manifolds are opened from their
     # controls and shot, and the section ends on the elevator, which enc5_3 raises to bsp 4,5.
-    'halo_d40_05': 'manifolds to open and shoot, then the elevator ride to bsp 4,5: the walker does neither',
+    # The route uses all four controls (256 rows) and shoots the detectors of s1, n1 and n3 (512
+    # rows); no walkable spot sees s3's detectors (docs/macos-build.md), so enc5_2_door stays shut.
+    'halo_d40_05': "s3's detectors are out of sight of every walkable spot: enc5_2_door stays shut",
 }
 # Sections the lift and light-bridge machinery (route flags 16, 32, 64 and 128: the walker
 # boards, calls and sends lifts, and waits for bridges; the engine carries every body on a lift
@@ -84,6 +88,11 @@ PENDING_WALK = {
     'halo_c20_01': 'boards platform1 (0.38 units up: the engine lets a body step onto a lift deck) and rides up',
     'halo_c20_02': 'boards platform2 and rides up',
     'halo_c20_03': 'boards platform3 and rides up',
+    # Door rows (1024, DOOR_WAITS): the walker stands at the door until it opens and logs its power
+    # and position while it waits; a chained walk from section 1 carries cryo_search's open
+    # cryo_door_2 into section 6.
+    'halo_a10_05': 'waits at tunnel_door_2 on its door row until mission_tunnel powers it',
+    'halo_a10_06': 'waits at cryo_door_2 on its door row (open when carried in from section 5)',
 }
 
 
@@ -170,7 +179,8 @@ def report_traversal(name, log):
     end = re.search(rf'RETAIL_QA (PASS|FAIL) \S+ map={name}\b.*', log[start:])
     body = log[start:start + end.end()] if end else log[start:]
     lines = [line for line in body.splitlines()
-             if line.startswith(('RETAIL_QA ride', 'RETAIL_QA bridge', 'RETAIL_QA recover', 'Halo recovery:', 'Halo lift:'))]
+             if line.startswith(('RETAIL_QA ride', 'RETAIL_QA bridge', 'RETAIL_QA recover', 'RETAIL_QA act ', 'Halo recovery:',
+                                 'Halo lift:', 'Halo target:'))]
     for line in lines[:12]:
         print('   ', line)
     if len(lines) > 12:
@@ -187,12 +197,15 @@ def walk_run(mission, walk):
     profile = scratch(f'retail-{first}-')
     logfile = SCRATCH / f'retail-collision-{first}{"-" + str(walk[-1]) if len(walk) > 1 else ""}.log'
     routes = [str(maps / f'{section_name(mission, n)}.route') for n in walk]
+    # Long routes (d40's engine room walks every manifold's bay: 5,000 rows) get more time, as the
+    # walker's own deadline does (90 ms a row past 3,000).
+    extra = sum(max(0, len(Path(route).read_text().splitlines()) - 3000) * .09 for route in routes if Path(route).is_file())
     with logfile.open('w') as output:
         try:
             result = subprocess.run(
                 [QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600',
                  f'-ehalo_scripttrace 1; maxfps 120; halo_difficulty {args.difficulty}; sleep 600 [qa_retail_start {mission_index} {engine_section}] 1'],
-                cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=args.timeout * len(walk),
+                cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=args.timeout * len(walk) + extra,
                 env={**os.environ, 'HALOQA_RETAIL_ROUTE': routes[0], 'HALOQA_RETAIL_CHAIN': '\n'.join(routes[1:])})
             code = result.returncode
         except subprocess.TimeoutExpired:
@@ -218,7 +231,7 @@ def walk_run(mission, walk):
             for line in log.splitlines():
                 if line.startswith('RETAIL_QA') and (f'map={name}' in line or not re.search(r'map=\S+', line)) and \
                    any(w in line for w in ('PASS', 'FAIL', 'stuck', 'floorless', 'audit', 'feel', 'blocked', 'waiting',
-                                           'crouching', 'squeezing', 'ride', 'bridge', 'recover')):
+                                           'crouching', 'squeezing', 'ride', 'bridge', 'recover', 'act ')):
                     print('   ', line)
             report_traversal(name, log)
             print(f'    log {logfile}', flush=True)

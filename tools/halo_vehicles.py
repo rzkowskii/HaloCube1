@@ -22,24 +22,35 @@ from import_halo_a30 import HaloMap
 from halo_cast import cast_metadata
 
 CAMPAIGN = ('d40', 'b40', 'a30', 'b30', 'c40', 'a50', 'c10', 'd20', 'a10', 'c20')
-FORMAT = 1
+FORMAT = 2
 EXPORT_SCALE = 4
+# vehi: the vehicle section follows the object (380) and unit (372) sections; its suspension and
+# crash sounds are at 192 and 208 in it (warthog_suspension, jeep_hit_solid). The engine's loop is
+# the first looping sound among the object's attachments (warthog_7_engine, ghost, banshee_engine).
+VEHICLE_SECTION = 380 + 372
+SUSPENSION_SOUND, CRASH_SOUND = VEHICLE_SECTION + 192, VEHICLE_SECTION + 208
+OBJECT_ATTACHMENTS, ATTACHMENT_STRIDE = 320, 72
 
-# name, tag, engine class, vehicle weapon. `car` is driven by the player (the Warthog),
-# `turret` is a fixed gun with a gunner seat, `prop` stands where the scenario placed it
-# (no player Ghost, Banshee, Scorpion or Wraith yet). Indices are stored in the maps.
+# name, tag, engine class, vehicle weapon, whether the player may take the driver's seat.
+# `car` drives on wheels (the Warthog), `turret` is a fixed gun with a gunner seat, `hover`
+# floats over the ground and strafes (the Ghost, the Wraith), `tank` turns on its tracks (the
+# Scorpion), `flyer` flies when piloted and lands when empty (the Banshee). The driver fires the
+# vehicle weapon of a hover, tank or flyer (its first trigger; the second, the Banshee's fuel rod
+# and the Scorpion's machine gun, on the secondary key). The Wraith is enemy-only in Halo's
+# campaign. Indices are stored in the maps.
 VEHICLES = (
-    ('warthog', r'vehicles\warthog\warthog', 'car', r'vehicles\warthog\warthog gun'),
-    ('turret', r'vehicles\c gun turret\c gun turret', 'turret', r'vehicles\c gun turret\c gun turret gun'),
-    ('ghost', r'vehicles\ghost\ghost', 'prop', r'vehicles\ghost\ghost gun'),
-    ('scorpion', r'vehicles\scorpion\scorpion', 'prop', r'vehicles\scorpion\scorpion cannon'),
-    ('banshee', r'vehicles\banshee\banshee', 'prop', r'vehicles\banshee\banshee gun'),
-    ('wraith', r'vehicles\wraith\wraith', 'prop', r'vehicles\wraith\wraith mortar'),
+    ('warthog', r'vehicles\warthog\warthog', 'car', r'vehicles\warthog\warthog gun', True),
+    ('turret', r'vehicles\c gun turret\c gun turret', 'turret', r'vehicles\c gun turret\c gun turret gun', True),
+    ('ghost', r'vehicles\ghost\ghost', 'hover', r'vehicles\ghost\ghost gun', True),
+    ('scorpion', r'vehicles\scorpion\scorpion', 'tank', r'vehicles\scorpion\scorpion cannon', True),
+    ('banshee', r'vehicles\banshee\banshee', 'flyer', r'vehicles\banshee\banshee gun', True),
+    ('wraith', r'vehicles\wraith\wraith', 'hover', r'vehicles\wraith\wraith mortar', False),
 )
 
 FIELDS = '''# vehicle <index> <name>
 # path <tag>                   retail vehi tag
-# class car|turret|prop
+# class car|turret|hover|tank|flyer|prop
+# player 0|1                   whether the player may drive it (format 2)
 # model <model>|- <scale>      under packages/models, AssaultCube units per Halo unit at scale 1
 # motion <kind> <forward> <reverse> <accel> <decel> <turn> <slide>   per 30 Hz tick
 # bounds <x0> <y0> <z0> <x1> <y1> <z1>   model frame, Halo units (x forward, y left, z up)
@@ -47,12 +58,14 @@ FIELDS = '''# vehicle <index> <name>
 # weapon <tag>|-
 # seat <name> <marker> <x> <y> <z> <enter x> <enter y> <enter z>   marker positions in the model frame
 # camera <x> <y> <z>           first camera marker, or the bounds' top centre
+# sound <role> <snd! tag>      engine (looped while driven), crash, suspension (a hard landing);
+#                              older games skip these lines
 '''
 
 
 def vehicle_type(path):
     """Index of a vehicle tag in VEHICLES, or None for vehicles the engine leaves out."""
-    for index, (_, tag, _, _) in enumerate(VEHICLES):
+    for index, (_, tag, _, _, _) in enumerate(VEHICLES):
         if tag == path:
             return index
     return None
@@ -76,7 +89,7 @@ def model_bounds(model):
     return tuple(low), tuple(high)
 
 
-def record(halo, tag, index, name, kind, weapon, output):
+def record(halo, tag, index, name, kind, weapon, player, output):
     from import_halo_models import Model, export
 
     t = halo.tags
@@ -101,14 +114,34 @@ def record(halo, tag, index, name, kind, weapon, output):
         rows.append((seat.replace(' ', '_'), label.replace(' ', '_'), *at, *enter))
     camera = next((marker[n] for n in ('camera driver', 'camera', 'driver camera', 'camera gunner') if n in marker),
                   ((low[0] + high[0]) / 2, 0., high[2]))
-    lines = [f'vehicle {index} {name}', f'path {tag.name}', f'class {kind}',
+    lines = [f'vehicle {index} {name}', f'path {tag.name}', f'class {kind}', f'player {int(player)}',
              f'model {path} {EXPORT_SCALE}',
              'motion %d %s' % (motion, ' '.join(f'{r:.6g}' for r in rates)),
              'bounds ' + ' '.join(f'{v:.4f}' for v in low + high),
              f'radius {radius:.4f}', f'weapon {weapon or "-"}']
     lines += ['seat %s %s %.4f %.4f %.4f %.4f %.4f %.4f' % row for row in rows]
-    lines += ['camera %.4f %.4f %.4f' % tuple(camera), 'end']
+    lines += ['camera %.4f %.4f %.4f' % tuple(camera)]
+    lines += [f'sound {role} {sound}' for role, sound in vehicle_sounds(halo, tag)]
+    lines.append('end')
     return lines
+
+
+def vehicle_sounds(halo, tag):
+    """(role, snd! tag) pairs: the engine loop, the crash and the suspension sounds."""
+    from halo_weapons import effect_sound
+    t, found = halo.tags, []
+    for attachment in t.block(tag.address + OBJECT_ATTACHMENTS, ATTACHMENT_STRIDE):
+        loop = halo.reference(t, attachment)
+        if loop and loop.group == 'lsnd':
+            name = effect_sound(halo, loop)
+            if name:
+                found.append(('engine', name))
+                break
+    for role, offset in (('crash', CRASH_SOUND), ('suspension', SUSPENSION_SOUND)):
+        sound = effect_sound(halo, halo.reference(t, tag.address + offset))
+        if sound:
+            found.append((role, sound))
+    return found
 
 
 def main():
@@ -127,16 +160,16 @@ def main():
         with source.open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
             tags = {tag.name: tag for tag in halo.directory if tag.group == 'vehi'}
-            for name, path, kind, weapon in wanted:
+            for name, path, kind, weapon, player in wanted:
                 if path in tags:
-                    records[path] = record(halo, tags[path], vehicle_type(path), name, kind, weapon, args.output)
+                    records[path] = record(halo, tags[path], vehicle_type(path), name, kind, weapon, player, args.output)
     missing = [v[1] for v in VEHICLES if v[1] not in records]
     if missing:
         raise SystemExit(f'vehicle tags not found in the campaign caches: {", ".join(missing)}')
     target = args.output / 'packages/halo/vehicles.txt'
     target.parent.mkdir(parents=True, exist_ok=True)
     body = [f'format {FORMAT}', f'# {len(VEHICLES)} vehicles from the Xbox campaign caches', FIELDS.rstrip('\n')]
-    for _, path, _, _ in VEHICLES:
+    for _, path, _, _, _ in VEHICLES:
         body += records[path]
     target.write_text('\n'.join(body) + '\n', encoding='ascii')
     print(f'{len(VEHICLES)} vehicles -> {target}')

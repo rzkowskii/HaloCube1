@@ -5,6 +5,7 @@
 
 #include "cube.h"
 #include "halo.h"
+#include "halo_ai.h"
 #include "halo_collision.h"
 #include "halo_script.h"
 #include "halo_vehicle.h"
@@ -319,6 +320,8 @@ static bool retailmove(physent *d, vec delta, float gravity)
     const vec original = d->o;
     vec feet = retailfeet(d);
     const bool actor = d->type == ENT_PLAYER || d->type == ENT_BOT;
+    // Flying actors (Sentinels, the Monitor, Engineers) are not pulled onto the floor.
+    const bool flyer = d->type == ENT_BOT && halohovering((const playerent *)d);
     const bool grounded = d->onfloor;
     const bool rising = d->vel.z > 0.05f;
     if(!grounded || rising || !actor) delta.z -= gravity;
@@ -358,7 +361,7 @@ static bool retailmove(physent *d, vec delta, float gravity)
         if(inward < 0) delta.sub(vec(hit.normal).mul(inward));
     }
 
-    if(actor && !rising && !floor)
+    if(actor && !flyer && !rising && !floor)
     {
         const vec down(0, 0, grounded ? -max(.30f, gravity) : -.06f);
         HaloCollisionHit hit;
@@ -644,6 +647,8 @@ void moveplayer(physent *pl, int moveres, bool local, int curtime)
     const bool editfly = pl->state==CS_EDITING;
     const bool specfly = pl->type==ENT_PLAYER && ((playerent *)pl)->spectatemode==SM_FLY;
     const bool isfly = editfly || specfly;
+    // A flying actor (halohovering): no gravity, no jumping or landing; its brain sets vel.z.
+    const bool hover = pl->type==ENT_BOT && halohovering((const playerent *)pl);
 
     vec d;      // vector of direction we ideally want to move in
 
@@ -691,7 +696,7 @@ void moveplayer(physent *pl, int moveres, bool local, int curtime)
         const bool crouching = pl->crouching || (pl->eyeheight < pl->maxeyeheight && pl->eyeheight > 1.1f);
         const float maxspeed = pl == player1 && halodriving() ? pl->maxspeed : min(pl->maxspeed, 16.0f);
         const float speed = curtime/(water ? 2000.0f : 1000.0f)*maxspeed*(crouching && pl->state != CS_EDITING ? chspeed : 1.0f)*(pl==player1 && isfly ? flyspeed : 1.0f);
-        const float friction = water ? 20.0f : (pl->onfloor || isfly ? 6.0f : (pl->onladder ? 1.5f : 30.0f));
+        const float friction = water ? 20.0f : (pl->onfloor || isfly || hover ? 6.0f : (pl->onladder ? 1.5f : 30.0f));
         const float fpsfric = max(friction/curtime*20.0f, 1.0f);
 
         d.x = (float)(move*cosf(RAD*(pl->yaw-90)));
@@ -741,7 +746,12 @@ void moveplayer(physent *pl, int moveres, bool local, int curtime)
         {
             if(pl->type!=ENT_CAMERA)
             {
-                if(pl->onladder)
+                if(hover)
+                {
+                    pl->timeinair = 0;
+                    pl->jumpnext = false;
+                }
+                else if(pl->onladder)
                 {
                     const float climbspeed = 1.0f;
 
@@ -804,7 +814,7 @@ void moveplayer(physent *pl, int moveres, bool local, int curtime)
             if(water) { dropf = 5; pl->timeinair = 0; }            // float slowly down in water
             if(pl->onladder) { dropf = 0; pl->timeinair = 0; }
 
-            drop = dropf*curtime/gravity/100/moveres;              // at high fps, gravity kicks in too fast
+            drop = hover ? 0 : dropf*curtime/gravity/100/moveres;  // at high fps, gravity kicks in too fast
             rise = speed/moveres/1.2f;                             // extra smoothness when lifting up stairs
         }
     }
@@ -1108,6 +1118,7 @@ void jumpn(bool on)
     static bool wason = false;
     player1->jumpnext = on && !wason && !player1->crouching && !intermission && !player1->isspectating() && !ispaused;
     wason = on;
+    halovehiclejump(on);    // held: a piloted Banshee climbs (halo_vehicle.cpp)
     if(player1->isspectating())
     {
         if(lastmillis - player1->lastdeath > 1000 && on) togglespect();
@@ -1128,6 +1139,7 @@ void crouch(bool on)
 {
     if(player1->isspectating() && on) return;
     player1->trycrouch = on;
+    halovehiclecrouch(on);  // held: a piloted Banshee descends
 }
 
 COMMAND(backward, "d");

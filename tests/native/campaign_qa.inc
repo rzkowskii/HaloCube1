@@ -448,8 +448,11 @@ static void qaActorSpawn(int kind, int team, float forward, float side)
     const float s = haloscenarioscale();
     vec at = player1->o;
     at.add(vec(sinf(yaw), -cosf(yaw), 0).mul(forward * s)).add(vec(cosf(yaw), sinf(yaw), 0).mul(side * s));
-    // Allies face the way the player looks; hostiles face the player.
-    botent *bot = spawnEnemy(ActorKind(clamp(kind, 0, int(ACTOR_COUNT) - 1)), at, player1->yaw + (team ? 0 : 180), -1, -1, team);
+    // Allies face the way the player looks; hostiles face the player. team -1: the body's own
+    // side (kindTeam); 0 covenant, 1 human, 2 flood, 3 sentinel (halo_ai.h).
+    const ActorKind k = ActorKind(clamp(kind, 0, int(ACTOR_COUNT) - 1));
+    const bool friendly = haloteamfriendly(team >= 0 ? team : kindTeam(k));
+    botent *bot = spawnEnemy(k, at, player1->yaw + (friendly ? 0 : 180), -1, -1, team);
     conoutf("ACTOR_SPAWN %s %d hp=%d", bot ? bot->name : "-", bot ? team : -1, bot ? bot->health : 0);
     fflush(stdout);
 }
@@ -572,8 +575,38 @@ COMMANDF(qa_hs_script, "si", (const char *name, int *action)
 COMMANDF(qa_halo_finale, "", () { if(haloactive()) finishSection(); });
 COMMANDF(qa_halo_ending, "", ()
 {
-    conoutf("QA_ENDING ending=%d done=%d beaten=%d won=%d finished=%d cinematic=%d alive=%d",
-        ending, endingDone, campaignBeaten, winPending, campaignFinished, halocinematic(), player1->state == CS_ALIVE);
+    conoutf("QA_ENDING ending=%d done=%d beaten=%d won=%d finished=%d cinematic=%d alive=%d title=%d",
+        ending, endingDone, campaignBeaten, winPending, campaignFinished, halocinematic(), player1->state == CS_ALIVE,
+        titleScreen && menuvisible());
+    fflush(stdout);
+});
+
+// ---- Mission exits and script scenes (tests/test_mission_exits.py)
+// qa_hs_cue cinematic_captain plays a scene as the mission script's call does (a Call cue row).
+COMMANDF(qa_hs_cue, "s", (const char *script)
+{
+    conoutf("QA_CUE %s %d", script, haloscenarioqacue(script));
+    fflush(stdout);
+});
+// qa_halo_flag river_hide_flag stands the player at a cutscene flag (unchecked, as a QA teleport).
+COMMANDF(qa_halo_flag, "s", (const char *flag)
+{
+    vec feet;
+    float yaw;
+    const bool found = haloscenarioflagpoint(flag, feet, yaw);
+    if(found)
+    {
+        qaPlaceFeet(feet);
+        player1->yaw = yaw;
+    }
+    conoutf("QA_FLAG %s %d", flag, found);
+    fflush(stdout);
+});
+// One QA_PLAYER line: the map, the player's feet and whether a scene is playing.
+COMMANDF(qa_halo_where, "", ()
+{
+    conoutf("QA_PLAYER map=%s feet=%.2f,%.2f,%.2f yaw=%.1f cinematic=%d alive=%d", getclientmap(), player1->o.x, player1->o.y,
+            player1->o.z - player1->eyeheight, player1->yaw, halocinematic(), player1->state == CS_ALIVE);
     fflush(stdout);
 });
 // Queues a section as real campaign play (not a standalone preview): 1-based mission and section.

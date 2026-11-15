@@ -409,6 +409,15 @@ def removed_devices(program):
     return names.__contains__
 
 
+def floor_leaf(frame):
+    """Whether a door panel box (x1, y1, z1, x2, y2, z2, relative to the door's origin) lies flat
+    on the floor: c10's interior doors fold their leaves down into the doorway when open, 0.05 to
+    0.23 units proud of the floor, and players walk over them in Halo. The engine
+    (Scenario::collideDevices, kDoorLeafTop and kDoorLeafThickness) lets bodies walk over such a
+    panel of a door (device kind 0); keep the two limits in step."""
+    return frame[5] <= .25 and frame[5] - frame[2] <= .3
+
+
 class DoorBlocks:
     """Scenario doors and lifts that stand in the player's way, in campaign coordinates.
 
@@ -419,7 +428,7 @@ class DoorBlocks:
     position group is sealed instead: no script names it and no control or group drives it.
     """
 
-    def __init__(self, halo, projection, output, skip=(), never_open=(), ungrouped_sealed=False):
+    def __init__(self, halo, projection, output, skip=(), never_open=(), ungrouped_sealed=False, floor_leaves=False):
         from halo_devices import device_rows
         from import_halo_scripts import model_pack_scale, named_objects, Program
         self.projection = projection
@@ -494,6 +503,10 @@ class DoorBlocks:
             cosine, sine = math.cos(yaw), math.sin(yaw)
             for (bucket, frame), (_, frames) in ((pose_, panel) for pose_ in poses for panel in panels):
                 x1, y1, z1, x2, y2, z2 = frames[frame]
+                if floor_leaves and kind == 0 and floor_leaf(frames[frame]):
+                    # A door leaf folded flat on the floor in this pose: bodies walk over it
+                    # (Scenario::collideDevices skips it), as Halo's biped does.
+                    continue
                 # Axis-aligned extent of the rotated box in campaign cells.
                 corners = []
                 for lx in (x1, x2):
@@ -542,6 +555,16 @@ class DoorBlocks:
                 front = (rx - ox)*c + (ry - oy)*s > 0
                 return (label, label in self.reopened) if front else None
         return None
+
+    def sealed_except(self, x, y, z4, name):
+        """Like sealed_at, but a device named `name` (one a step has moved out of the way: d40's
+        opened piston) does not count."""
+        panels = self.sealed.get((int(x) >> 4, int(y) >> 4))
+        if not panels or all(label == name for *_, label in panels):
+            return self._hits(self.platforms, x, y, z4 / 4, .23)
+        kept = {key: [entry for entry in entries if entry[2] != name] for key, entries in self.sealed.items()
+                if key == (int(x) >> 4, int(y) >> 4)}
+        return self._hits(kept, x, y, z4 / 4) or self._hits(self.platforms, x, y, z4 / 4, .23)
 
     def sealed_at(self, x, y, z4):
         # The engine stands a body on a device top within 0.23 units of its feet.
@@ -788,3 +811,121 @@ class PolygonClearance:
                 if self._distance((x, y, z + level), normal, points) < self.RADIUS:
                     return True
         return False
+
+
+def machine_boxes(halo, output, bsp, poses=None, skip=()):
+    """The panel boxes of the scenario machines and doors in BSP `bsp` (not controls, not the
+    baked machines in `skip`), each in the pose of its initial position or of the position `poses`
+    gives its name: [(name, (ox, oy, oz, cosine, sine), (x1, y1, z1, x2, y2, z2))] in retail units,
+    the box relative to the device, rotated by its yaw. Machines a script creates are left out."""
+    rows, _, groups, _ = _device_table(halo, output)
+    poses = poses or {}
+    boxes = []
+    for device, (name, row) in enumerate(rows):
+        position, flags, not_placed, mask, control, kind = row[2], row[4], row[6], row[8], row[9], row[10]
+        pose, panels = row[-2], row[-1]
+        if control or kind == 2 or not panels or device in skip or not mask >> bsp & 1 or not_placed & 1:
+            continue
+        value = poses.get(name, groups[position] if 0 <= position < len(groups) else (1 if flags & 1 else 0))
+        ox, oy, oz, yaw = pose[:4]
+        for _, frames in panels:
+            reversed_value = 1 - value if flags & 8 else value
+            frame = frames[min(len(frames) - 1, max(0, round(reversed_value * (len(frames) - 1))))]
+            boxes.append((name, (ox, oy, oz, math.cos(yaw), math.sin(yaw)), frame))
+    return boxes
+
+
+def _segment_box(a, b, place, box):
+    """Whether the retail segment a-b passes through a device box (machine_boxes entry parts)."""
+    ox, oy, oz, cosine, sine = place
+    def local(p):
+        dx, dy = p[0] - ox, p[1] - oy
+        return (dx*cosine + dy*sine, -dx*sine + dy*cosine, p[2] - oz)
+    la, lb = local(a), local(b)
+    t0, t1 = 0.0, 1.0
+    for i in range(3):
+        d = lb[i] - la[i]
+        low, high = box[i], box[i + 3]
+        if abs(d) < 1e-9:
+            if not low < la[i] < high:
+                return False
+            continue
+        u, v = (low - la[i]) / d, (high - la[i]) / d
+        if u > v:
+            u, v = v, u
+        t0, t1 = max(t0, u), min(t1, v)
+        if t0 > t1:
+            return False
+    return True
+
+
+class SightLines:
+    """Lines of sight through the structure collision polygons (and the static machines baked into
+    the .hcol) and machine boxes, as the engine's shots see them (haloscenariotrace: every surface,
+    two-sided ones included, and the devices' boxes in their current pose).
+
+    Points are in the route planner's campaign coordinates (Projection.point); `boxes` are
+    machine_boxes entries in retail units."""
+
+    def __init__(self, surfaces, projection, boxes=()):
+        self.projection, self.boxes = projection, list(boxes)
+        self.polygons, self.buckets = [], {}
+        for normal, _, _, _, points in surfaces:
+            low = [min(p[i] for p in points) for i in range(3)]
+            high = [max(p[i] for p in points) for i in range(3)]
+            index = len(self.polygons)
+            self.polygons.append((normal, points, low, high))
+            for gx in range(int(low[0]) >> 3, (int(high[0]) >> 3) + 1):
+                for gy in range(int(low[1]) >> 3, (int(high[1]) >> 3) + 1):
+                    self.buckets.setdefault((gx, gy), []).append(index)
+
+    def retail(self, point):
+        p = self.projection
+        return ((point[0] - 9) / p.scale + p.x0, p.y0 - (point[1] - 9) / p.scale, p.z0 + point[2] / p.scale)
+
+    @staticmethod
+    def _crosses(a, b, normal, points):
+        d = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        denominator = normal[0]*d[0] + normal[1]*d[1] + normal[2]*d[2]
+        if abs(denominator) < 1e-9:
+            return False
+        p0 = points[0]
+        t = (normal[0]*(p0[0] - a[0]) + normal[1]*(p0[1] - a[1]) + normal[2]*(p0[2] - a[2])) / denominator
+        if not 1e-4 < t < 1 - 1e-4:
+            return False
+        hit = (a[0] + d[0]*t, a[1] + d[1]*t, a[2] + d[2]*t)
+        sign = None
+        for u, v in zip(points, points[1:] + points[:1]):
+            e = (v[0] - u[0], v[1] - u[1], v[2] - u[2])
+            w = (hit[0] - u[0], hit[1] - u[1], hit[2] - u[2])
+            c = (e[1]*w[2] - e[2]*w[1], e[2]*w[0] - e[0]*w[2], e[0]*w[1] - e[1]*w[0])
+            s = c[0]*normal[0] + c[1]*normal[1] + c[2]*normal[2]
+            if abs(s) < 1e-9:
+                continue
+            if sign is None:
+                sign = s > 0
+            elif sign != (s > 0):
+                return False
+        return True
+
+    def clear(self, a, b):
+        """Whether nothing stands between campaign points a and b."""
+        steps = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) / 4) + 1
+        seen = set()
+        low = [min(a[i], b[i]) for i in range(3)]
+        high = [max(a[i], b[i]) for i in range(3)]
+        for k in range(steps + 1):
+            x, y = a[0] + (b[0] - a[0]) * k / steps, a[1] + (b[1] - a[1]) * k / steps
+            for gx in range((int(x) >> 3) - 1, (int(x) >> 3) + 2):
+                for gy in range((int(y) >> 3) - 1, (int(y) >> 3) + 2):
+                    for index in self.buckets.get((gx, gy), ()):
+                        if index in seen:
+                            continue
+                        seen.add(index)
+                        normal, points, plow, phigh = self.polygons[index]
+                        if any(phigh[i] < low[i] or plow[i] > high[i] for i in range(3)):
+                            continue
+                        if self._crosses(a, b, normal, points):
+                            return False
+        ra, rb = self.retail(a), self.retail(b)
+        return not any(_segment_box(ra, rb, place, box) for _, place, box in self.boxes)

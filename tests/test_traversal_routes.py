@@ -12,6 +12,13 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
     a section's light-bridge rows come in runs whose first row follows a floor row,
   * the sections in STOCK_SECTIONS have neither an .hcol nor a .route, and the DRIVEN_SECTIONS
     (d40's Warthog run) have an .hcol and no .route,
+  * action rows (written while testing was on hold, not yet run): a row with flag 256 (use a
+    control) names the machine and the position it waits for, 512 (shoot a damage target) the
+    target, the health it shoots it down to and an aim point (eight columns), 1024 (wait at a
+    scripted door) the door; each repeats the position of the step row before it. d40 section 5
+    uses its four manifold controls (enc5_1_pistons1, _pistonn1, _pistonn3, _pistons3, in that
+    order) and shoots the detectors of s1, n1 and n3 (no walkable spot sees s3's); a10 section 5
+    waits at tunnel_door_2 and section 6 at cryo_door_2 on rows of their own (DOOR_WAITS),
   * no route row stands inside a vehicle parked when the section starts (the section map's
     PLAYERSTART team 102 placements that no script creates, with their box from
     packages/halo/vehicles.txt as halo_vehicle.cpp sizes it): the importer's planner goes round
@@ -39,7 +46,7 @@ def rows(path):
         fields = line.split()
         if not fields:
             continue
-        if not 3 <= len(fields) <= 5:
+        if not 3 <= len(fields) <= 8 or len(fields) in (6, 7):
             raise ValueError(f'{path.name}:{number}: {line!r}')
         x, y, z = map(float, fields[:3])
         flags = int(fields[3]) if len(fields) > 3 else 0
@@ -47,8 +54,12 @@ def rows(path):
         if len(fields) > 4:
             device, _, value = fields[4].rpartition('@')
             value = float(value)
-        if flags & (16 | 128) and not device:
+        if flags & (16 | 128 | 256 | 512 | 1024) and not device:
             raise ValueError(f'{path.name}:{number}: flag {flags} without a device')
+        if bool(flags & 512) != (len(fields) == 8):
+            raise ValueError(f'{path.name}:{number}: a shoot row (512) has an aim point, and only it: {line!r}')
+        if flags & (256 | 512 | 1024) and (not result or result[-1][0] != (x, y, z)):
+            raise ValueError(f'{path.name}:{number}: action row {flags} not at the step row before it')
         result.append(((x, y, z), flags, device, value))
     return result
 
@@ -103,6 +114,22 @@ for mission in MISSIONS:
         for i, (_, flags, device, _) in enumerate(table):
             if flags & 128 and (not i or not table[i - 1][1] & 128) and (not i or table[i - 1][1] & 16):
                 problems.append(f'{name}: light bridge {device} starts at row {i} after a deck row')
+        uses = [device for _, flags, device, _ in table if flags & 256]
+        shots = [device for _, flags, device, _ in table if flags & 512]
+        waits = [device for _, flags, device, _ in table if flags & 1024]
+        expected_actions = {
+            'halo_d40_05': (['enc5_1_pistons1', 'enc5_1_pistonn1', 'enc5_1_pistonn3', 'enc5_1_pistons3'],
+                            ['enc5_1_detector_s1', 'enc5_1_detector_n1', 'enc5_1_detector_n3'], []),
+            'halo_a10_05': ([], [], ['tunnel_door_2']),
+            'halo_a10_06': ([], [], ['cryo_door_2']),
+        }.get(name, ([], [], []))
+        if uses != expected_actions[0]:
+            problems.append(f'{name}: use rows {uses}, expected {expected_actions[0]}')
+        # Either detector of a manifold destroys it (enc5_1_destroyed_poll): s1 or s1b, and so on.
+        if [shot[:-1] if shot.endswith('b') else shot for shot in shots] != expected_actions[1]:
+            problems.append(f'{name}: shoot rows {shots}, expected {expected_actions[1]} (or their b detectors)')
+        if [wait for wait in waits if wait in expected_actions[2]] != expected_actions[2]:
+            problems.append(f'{name}: door rows {waits}, expected {expected_actions[2]} among them')
 
 
 

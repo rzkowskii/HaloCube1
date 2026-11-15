@@ -7,7 +7,12 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 partial=0
 args=()
 for arg in "$@"; do
-    if [[ "$arg" == "--partial" ]]; then partial=1; else args+=("$arg"); fi
+    if [[ "$arg" == "--partial" ]]; then partial=1
+    elif [[ "$arg" == "--asan" ]]; then
+        # build-macos.sh --asan builds elsewhere (build/macos-asan); the app is copied from build/macos.
+        printf 'package-macos.sh packages build/macos; the --asan build is never packaged.\n' >&2
+        exit 1
+    else args+=("$arg"); fi
 done
 packages="${HALO_PACKAGES_DIR:-$root/packages}"
 "$root/scripts/check-no-retail.sh" "$root"
@@ -25,7 +30,7 @@ for asset in ('maps/halo_a30.cgz', 'maps/halo_a30.cfg', 'maps/halo_a30.mesh',
     if not (packages / asset).is_file():
         missing.append(asset)
 if not partial:
-    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'vehicles.txt'):
+    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'vehicles.txt', 'effects.txt'):
         if not (packages / 'halo' / table).is_file():
             missing.append(f'halo/{table}')
     for mission in MISSIONS:
@@ -44,7 +49,14 @@ if missing:
     raise SystemExit(f'Incomplete asset import in {packages}: missing {shown}.\n'
                      'Run scripts/import-macos-assets.sh (docs/macos-build.md), or pass --partial for a development package.')
 PYTHON
-"$root/scripts/build-macos.sh" ${args[@]+"${args[@]}"}
+# The app is copied from build/macos, so that is the directory built (not a HALO_BUILD_DIR override).
+HALO_BUILD_DIR="$root/build/macos" "$root/scripts/build-macos.sh" ${args[@]+"${args[@]}"}
+# A sanitized build (HALO_SANITIZE, meant for build/macos-asan) is slow and links the
+# sanitizer runtimes from Xcode: never ship it.
+if grep -q '^HALO_SANITIZE:BOOL=ON' "$root/build/macos/CMakeCache.txt" 2>/dev/null; then
+    printf 'build/macos is configured with HALO_SANITIZE=ON; reconfigure it with -DHALO_SANITIZE=OFF before packaging.\n' >&2
+    exit 1
+fi
 
 app="$root/build/Halo in AssaultCube.app"
 temp="$(mktemp -d "$root/build/.app.XXXXXX")"

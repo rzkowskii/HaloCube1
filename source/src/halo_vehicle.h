@@ -4,14 +4,17 @@
 #include <string>
 #include <vector>
 
-// Campaign vehicles (halo_vehicle.cpp): the player-driven Warthog, fixed gun turrets with a
-// gunner seat, and the other scenario vehicles as parked props. Definitions come from
-// packages/halo/vehicles.txt (tools/halo_vehicles.py); the section maps place them as
-// PLAYERSTART entities with team 102 (tools/import_halo_campaign.py). Sizes and speeds are the
-// retail vehicle's in Halo units, scaled to the section (haloscenarioscale()); the handling is
-// plausibly Halo, not the retail physics.
+// Campaign vehicles (halo_vehicle.cpp): the Warthog (a car), fixed gun turrets with a gunner
+// seat, the Ghost and the Wraith (hover craft), the Scorpion (a tank) and the Banshee (a flyer).
+// Definitions come from packages/halo/vehicles.txt (tools/halo_vehicles.py); the section maps
+// place them as PLAYERSTART entities with team 102 (tools/import_halo_campaign.py). Sizes and
+// speeds are the retail vehicle's in Halo units, scaled to the section (haloscenarioscale());
+// the handling is plausibly Halo, not the retail physics. The player drives all but the Wraith;
+// actors drive and fly them when a script seats them at the controls (AI drivers below).
 
-enum HaloVehicleClass { HALO_VEHICLE_CAR, HALO_VEHICLE_TURRET, HALO_VEHICLE_PROP };
+// The values of the first three are kept (saved progress and the HUD use them).
+enum HaloVehicleClass { HALO_VEHICLE_CAR, HALO_VEHICLE_TURRET, HALO_VEHICLE_PROP, HALO_VEHICLE_HOVER, HALO_VEHICLE_TANK,
+                        HALO_VEHICLE_FLYER };
 enum HaloSeatRole { HALO_SEAT_DRIVER, HALO_SEAT_GUNNER, HALO_SEAT_PASSENGER };
 
 // Map lifetime: clear on map start, add each placement entity, then restart once the section
@@ -36,12 +39,29 @@ bool halovehicleuse(float weaponDistance);             // E: exit, flip a vehicl
 const char *halovehicleprompt(float weaponDistance);   // the E prompt on foot, or null
 void halovehicledrive(int curtime);                    // movelocalplayer while seated
 void halovehiclesupdate(int elapsed);                  // haloupdate: other vehicles, riders, AI gunners
+void halovehiclessounds();                             // the engine loops (halovehiclesupdate; stops them while paused)
 bool halovehiclecamera(physent &camera);
-int halovehicledamage(int damage);                     // what reaches a seated player
+float halovehicledamage(float damage);                 // what reaches a seated player
+// EMP (jpt! side effect 3: a plasma grenade's blast, the charged plasma bolt): vehicles whose body
+// lies within `radius` of `centre`, and vehicle `stuck` (one a plasma grenade is stuck to, or -1),
+// are stunned for `millis`: a car's engine cuts out (it coasts and steers, the throttle does
+// nothing) and the seat's gun cannot fire, the player's or an actor gunner's. Returns how many.
+int halovehicleemp(const vec &centre, float radius, int stuck, int millis);
+bool halovehicleriderstunned(const playerent *unit);    // `unit` sits in a stunned vehicle's gun seat
+// The secondary trigger while seated (halo_zoom, Mouse 2 or Z): the second trigger of the seat's
+// gun, the Banshee's fuel rod and the Scorpion's machine gun.
+void halovehiclesecondary(bool down);
+// The jump and crouch keys held (physics.cpp jumpn, crouch): a piloted Banshee climbs and descends.
+void halovehiclejump(bool down);
+void halovehiclecrouch(bool down);
 // The Maw: seat the player in a Warthog at a section start (an unused one nearby, or a new one).
 bool halovehicleescape(const vec &feet, float yaw);
 // The Maw on foot: a free Warthog within `radius` of `feet`, or a new one beside them.
 void halovehicleensure(const vec &feet, float yaw, float radius);
+// Flown sections (c40 sections 1 and 4): a vehicle of vehicles.txt type `name` the player may
+// take, anywhere in the section (standing, or placed and not created by the script yet), else a
+// new one beside the player. Returns the vehicle, or -1.
+int halovehicleensuretype(const char *name, const vec &feet, float yaw);
 // halo.cpp's recovery found no floor for the player on foot: if they were thrown out of a vehicle
 // with no room for the body in the last 15 s, back into its seat (the vehicle righted, or moved to
 // the nearest spot where it fits or its last safe spot). False otherwise.
@@ -52,7 +72,10 @@ struct HaloVehicleStatus
     const char *name = "";
     int vehicleClass = HALO_VEHICLE_CAR, role = HALO_SEAT_DRIVER;
     float speed = 0;          // Halo world units per second
+    float altitude = -1;      // a flying Banshee's height over the floor below, Halo units (-1: none in reach)
     bool flipped = false, airborne = false;
+    bool driverFires = false; // the driver works the gun (Ghost, Banshee, Scorpion)
+    bool secondary = false;   // the gun has a second trigger (fuel rod, machine gun)
     int weapon = -1;          // packages/halo/weapons.txt index of the seat's gun, or -1
     float heat = 0;
     bool overheated = false, firing = false;
@@ -87,6 +110,14 @@ int halovehicleunload(int object, const char *seat);
 bool halovehicleescapeseat(int object, const char *seat, const playerent *unit);
 bool halovehicleunseat(const playerent *unit);         // ai_exit_vehicle, unit_exit_vehicle
 bool halovehicleinside(const playerent *unit);
+// `unit` (an actor) sits in a seat that works the vehicle's gun: the driver of a Ghost, Wraith,
+// Scorpion or Banshee, a Warthog's gunner, a turret's gunner. The vehicle fires for it, aimed by
+// its brain's target (halo_ai.cpp keeps the actor's own weapon quiet).
+bool halovehiclearmedseat(const playerent *unit);
+// Whoever sits in the driver's seat of the vehicle standing for scenario object `object`, or null.
+playerent *halovehicledriverof(int object);
+// ai_going_to_vehicle: actors still walking to a seat of the vehicle for `object`.
+int halovehicleaigoing(int object);
 void halovehicleenterable(int object, bool player);
 void halovehicleaiboard(int object, float distance, int actorKind, bool disabled);
 bool halovehicleaigoto(int object, const char *seat, playerent *const *units, int count);
@@ -94,8 +125,15 @@ void halovehicleforget(const playerent *unit);         // an actor is gone
 
 // QA (tests/native/vehicle_qa.inc).
 int halovehiclecount();
+int halovehicledefcount();                              // vehicles.txt records (1: the built-in Warthog)
+int halovehicleengineloops();                           // engine loops playing now (presentation)
 void halovehicledump(const char *label);
 void halovehicleqainput(float throttle, float steer, int millis);
+// Flight input for a piloted Banshee: throttle, strafe and climb (-1..1) held for `millis`; the
+// camera's yaw and pitch still aim the nose.
+void halovehicleqaflight(float throttle, float strafe, float climb, int millis);
+// Seats actor `unit` at the controls of vehicle `vehicle` (its driver's seat, else `seat` by name).
+bool halovehicleqapilot(int vehicle, playerent *unit, const char *seat);
 bool halovehicleqaenter(int vehicle, int role);
 bool halovehicleqaflip(int vehicle);
 int halovehicleqaspawn(int type, float forward);

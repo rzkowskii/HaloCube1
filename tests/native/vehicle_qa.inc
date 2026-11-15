@@ -208,3 +208,77 @@ COMMANDF(qa_vehicle_throw, "i", (int *vehicle)
     conoutf("VEHICLE_QA throw vehicle=%d ok=%d", *vehicle, halovehicleqathrow(*vehicle));
     fflush(stdout);
 });
+
+// Enemy and flying vehicles (tests/test_enemy_vehicles.py). qa_vehicle_flight holds a piloted
+// Banshee's throttle, strafe and climb (-1..1) for `ms` (the camera still aims the nose:
+// qa_vehicle_look sets it); qa_vehicle_pilot puts a new actor of KIND (0 Grunt, 1 Elite, ...,
+// halo.cpp ActorKind) on TEAM (0 Covenant) at the controls of vehicle N (its driver's seat, or
+// SEAT by name), or with KIND -1 the nearest living actor not in a seat; qa_vehicle_secondary
+// holds or releases the secondary trigger.
+COMMANDF(qa_vehicle_flight, "fffi", (float *throttle, float *strafe, float *climb, int *ms) { halovehicleqaflight(*throttle, *strafe, *climb, *ms); });
+COMMANDF(qa_vehicle_look, "ff", (float *yaw, float *pitch)
+{
+    player1->yaw = *yaw;
+    player1->pitch = clamp(*pitch, -89.0f, 89.0f);
+});
+COMMANDF(qa_vehicle_secondary, "i", (int *on) { halovehiclesecondary(*on != 0); });
+COMMANDF(qa_vehicle_pilot, "iiis", (int *vehicle, int *kind, int *team, const char *seat)
+{
+    playerent *unit = NULL;
+    if(*kind >= 0)
+    {
+        vec feet;
+        if(halovehicleqaentry(*vehicle, HALO_SEAT_DRIVER, feet) || halovehicleqaentry(*vehicle, HALO_SEAT_GUNNER, feet))
+        {
+            const ActorKind k = ActorKind(clamp(*kind, 0, int(ACTOR_COUNT) - 1));
+            unit = spawnEnemy(k, vec(feet).add(vec(0, 0, profiles[k].eyeheight + .5f)), player1->yaw + 180, -1, -1, *team);
+        }
+    }
+    else
+    {
+        float best = 1e9f;
+        loopv(players)
+        {
+            playerent *p = players[i];
+            if(!p || p->state != CS_ALIVE || halovehicleinside(p) || p->o.dist(player1->o) >= best) continue;
+            best = p->o.dist(player1->o);
+            unit = p;
+        }
+    }
+    const bool ok = unit && halovehicleqapilot(*vehicle, unit, seat);
+    if(ok) haloactorsetflag(unit, HALO_AI_MAGIC_SIGHT, true);
+    conoutf("VEHICLE_QA pilot vehicle=%d ok=%d name=%s armed=%d", *vehicle, ok, unit ? unit->name : "-", ok && halovehiclearmedseat(unit));
+    fflush(stdout);
+});
+// Dropships and Pelicans (halo_script_ai.inc): CARGO_QA lines, boarding with E (the hook calls
+// what E does on foot) and the player put beside a script vehicle's first rider seat.
+COMMANDF(qa_cargo_state, "s", (const char *label) { haloscenariocargodump(label); });
+COMMANDF(qa_cargo_board, "", ()
+{
+    const char *prompt = haloscenarioboardprompt();
+    const bool ok = haloscenarioboard();
+    conoutf("CARGO_QA board prompt=%s ok=%d boarded=%d driving=%d", prompt ? prompt : "-", ok, haloscenarioboarded(), halodriving());
+    fflush(stdout);
+});
+COMMANDF(qa_cargo_approach, "s", (const char *object)
+{
+    vec feet;
+    const bool ok = haloscenarioqaboardpoint(object, feet);
+    if(ok)
+    {
+        if(halodriving()) execute("halo_use");
+        player1->o = vec(feet).add(vec(1.5f * haloscenarioscale(), 0, player1->eyeheight + .2f));
+        player1->vel = vec(0, 0, 0);
+        player1->resetinterp();
+        haloplayermoved("QA teleport");
+    }
+    const char *prompt = haloscenarioboardprompt();
+    conoutf("CARGO_QA approach object=%s ok=%d prompt=%s", object, ok, prompt ? prompt : "-");
+    fflush(stdout);
+});
+// The flown sections' Banshee (halo.cpp flownSection): whether the engine keeps one.
+COMMANDF(qa_vehicle_flown, "", ()
+{
+    conoutf("VEHICLE_QA flown mission=%d section=%d flown=%d", mission + 1, section + 1, flownSection());
+    fflush(stdout);
+});

@@ -1,0 +1,5 @@
+# UndefinedBehaviorSanitizer suppressions for the ASan/UBSan QA client (tests/test_soak.py --asan,
+# tests/test_asset_robustness.py --asan). One `<check>:<source file pattern>` per line, for example
+#   alignment:source/src/rendercubes.cpp
+# Empty until the first sanitized run has been triaged (testing is on hold). Only add stock
+# AssaultCube engine findings that are understood and harmless; fix findings in the halo_* files.

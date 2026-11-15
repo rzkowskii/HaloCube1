@@ -19,8 +19,22 @@ ACTORS = {
         ('infection', 'flood_infection', 'stand unarmed idle', 'stand unarmed move-front', 'stand unarmed melee'),
         ('carrier', 'floodcarrier', 'stand unarmed idle', 'stand unarmed move-front%0', 'stand unarmed melee'),
         ('sentinel', 'sentinel', 'stand fixed idle%0', 'stand fixed idle%0', 'alert fixed idle%0'),
+        # 343 Guilty Spark: its graph has only the idle; it floats, so the idle serves throughout.
+        ('monitor', 'monitor', 'stand unarmed idle', 'stand unarmed idle', 'stand unarmed idle'),
+    ),
+    # Named and passive bodies (halo.cpp haloactormodel): Captain Keyes for the captain and
+    # captain_ingame variants, the Engineer (b30's cache is the only one that carries it).
+    'a50': (
+        ('keyes', 'captain', 'stand unarmed idle%1', 'stand unarmed move-front', 'alert unarmed idle%1'),
+    ),
+    'b30': (
+        ('engineer', 'engineer', 'stand unarmed idle%1', 'stand unarmed move-front', 'alert unarmed idle%1'),
     ),
 }
+# Bodies whose graph has no landing-dead clip die on their idle.
+NO_DEATH = {'monitor', 'engineer'}
+# Bodies exported in their bind pose when their animation tracks cannot be read.
+STATIC_FALLBACK = {'engineer'}
 
 
 def main():
@@ -45,11 +59,20 @@ def main():
                 path = rf'characters\{folder}\{folder}'
                 model = Model(halo, path, 'biped')
                 graph = AnimationGraph(halo, path)
-                clips = [('idle', idle), ('run', walk), ('death', 'stand landing-dead'), ('lying dead', 'stand landing-dead')]
+                death = idle if name in NO_DEATH else 'stand landing-dead'
+                clips = [('idle', idle), ('run', walk), ('death', death), ('lying dead', death)]
                 kind, = graph.tags.read('H', graph.animations[attack] + 32)
                 clips.append(('attack', (attack, idle) if kind == 1 else attack))
                 markers = [('tag_head', 'head')] if 'head' in model.markers else []
-                export(halo, directory, name, [model], graph, clips, 5.6, markers)
+                try:
+                    export(halo, directory, name, [model], graph, clips, 5.6, markers)
+                except ValueError as error:
+                    if name not in STATIC_FALLBACK:
+                        raise
+                    # A graph whose tracks the exporter cannot read (b30's Engineer): the body
+                    # in its bind pose, which still floats and turns in the game.
+                    print(f'{name}: {error}; exported in its bind pose')
+                    export(halo, directory, name, [model], None, (), 5.6, markers)
 
 
 if __name__ == '__main__':

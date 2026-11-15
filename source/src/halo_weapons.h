@@ -14,7 +14,10 @@ enum HaloWeaponClass { HALO_WC_ASSAULT, HALO_WC_PISTOL, HALO_WC_SHOTGUN, HALO_WC
 // Sound roles of the `sound <role> <tag>` lines in weapons.txt and equipment.txt.
 enum HaloSoundRole { HALO_SOUND_FIRE, HALO_SOUND_CHARGED, HALO_SOUND_EMPTY, HALO_SOUND_CYCLE, HALO_SOUND_RELOAD,
                      HALO_SOUND_RELOAD_EMPTY, HALO_SOUND_MELEE, HALO_SOUND_READY, HALO_SOUND_OVERHEAT, HALO_SOUND_PICKUP,
-                     HALO_SOUND_THROW, HALO_SOUND_EXPLODE, HALO_SOUND_ARMED, HALO_SOUND_ROLES };
+                     HALO_SOUND_THROW, HALO_SOUND_EXPLODE, HALO_SOUND_ARMED,
+                     // The weapon tag's zoom sounds and a looping sound held while firing (the
+                     // flamethrower's fire, the plasma pistol's charge hum).
+                     HALO_SOUND_ZOOM_IN, HALO_SOUND_ZOOM_OUT, HALO_SOUND_LOOP, HALO_SOUND_ROLES };
 
 // The sample tools/import_halo_audio.py decodes a sound tag to, for haloplaysound():
 // "sound\sfx\weapons\needler\fire" is "tags/sfx-weapons-needler-fire".
@@ -30,22 +33,47 @@ struct HaloSounds
 };
 
 // A jpt! tag's damage (tools/halo_weapons.py, JPT_* layout): a full-strength hit deals a random
-// amount in [upperMin, upperMax]; `lower` is what Halo scales a weakened hit down to (range and
-// area falloff). The engine does not model that floor yet: its area falloff goes to none.
+// amount in [upperMin, upperMax]; `lower` is what Halo scales a weakened hit down to. A hit at
+// scale s (1 full strength, 0 weakest: the far end of a projectile's damage range, the outer
+// edge of a blast) deals lower + (full - lower) * s.
+enum { HALO_DAMAGE_MATERIALS = 33 };
+
 struct HaloDamage
 {
     float lower = 0, upperMin = 0, upperMax = 0;
+    // The jpt! damage modifier per retail material type (the `materials` line after the damage's
+    // line in weapons.txt or equipment.txt): 12 hunter armor, 13 hunter skin, 25 sentinel,
+    // 26 monitor, 32 hunter shield and so on. Without the line every modifier is 1.
+    bool hasMaterials = false;
+    float materials[HALO_DAMAGE_MATERIALS] = {};
+    float material(int type) const { return hasMaterials && type >= 0 && type < HALO_DAMAGE_MATERIALS ? materials[type] : 1.0f; }
     // A full-strength hit.
     float roll() const;
+    // [lower, upperMax]: what actors' grenades roll (the balance grenades had before the
+    // jpt! layout was corrected); the player's roll the retail range.
+    float rollFromLower() const;
+    // A hit of full-strength amount `full` at `scale`.
+    float scaled(float full, float scale) const;
 };
+
+// Halo's falloff: 1 up to `start`, 0 from `end` on, linear between; 1 when `end` is 0 (no falloff).
+float halofalloff(float distance, float start, float end);
+
+// jpt! side effects. EMP (the plasma grenade, the charged plasma bolt): the shield a hit reaches
+// is drained after the hit, the overshield's layers too (halodamage), and the vehicles it reaches
+// are stunned for HALO_EMP_STUN_MILLIS (halovehicleemp). The tags' stun fields are all zero, so
+// the duration is the engine's. "Lethal to the unsuspecting" (every weapon's melee) is not modelled.
+enum { HALO_SIDE_EFFECT_NONE = 0, HALO_SIDE_EFFECT_HARMLESS = 1, HALO_SIDE_EFFECT_UNSUSPECTING = 2, HALO_SIDE_EFFECT_EMP = 3 };
+const int HALO_EMP_STUN_MILLIS = 2000;
 
 struct HaloProjectileDef
 {
     bool valid = false;
     float speed = 0, finalSpeed = 0, range = 0, gravity = 0, guided = 0;
     HaloDamage damage;
-    float radius = 0;
-    int category = -1;
+    float radius = 0, innerRadius = 0;      // area damage: full inside the inner, the lower bound at the outer
+    float rangeStart = 0, rangeEnd = 0;     // air damage range: impacts fall to the lower bound across it
+    int category = -1, sideEffect = 0;      // side effect 3: EMP (the charged plasma bolt)
     std::string path;
 };
 

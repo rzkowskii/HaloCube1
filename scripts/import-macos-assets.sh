@@ -21,5 +21,8 @@ python3 tools/halo_vehicles.py "$maps"
 python3 tools/import_halo_campaign.py "$maps"
 python3 tools/import_halo_models.py "$maps/a30.map" "$root"
 python3 tools/import_halo_campaign_actors.py "$maps" "$root"
+# The script effects, the flashlight and the sound classes; the audio import decodes the effects'
+# sounds and the vehicles' engine, crash and suspension sounds the tables name.
+python3 tools/halo_effects.py "$maps"
 python3 tools/import_halo_audio.py "$maps/a30.map" "$root"
 python3 tools/import_halo_scripts.py "$maps"

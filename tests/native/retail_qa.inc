@@ -44,6 +44,13 @@ namespace
     float qaRideLast = -1;
     int qaBridgeStep = -1, qaBridgeCleared = -1, qaBridgeSince = 0, qaBridgeUses = 0, qaBridgeUsed = 0;
     int qaRetailRecoveries = 0;
+    // Action rows (tools/import_halo_campaign.py UseControl, ShootTarget and DOOR_WAITS): 256 uses the
+    // control in reach until the named device stands at the position after the @, 512 shoots the named
+    // damage target (aim point in the sixth to eighth columns) until its health is at most the value
+    // after the @, 1024 waits at a scripted door until it is open that far. Each follows the step row
+    // it stands on.
+    vector<vec> qaRetailAim;
+    int qaAct = -1, qaActDone = -1, qaActSince = 0, qaActUsed = 0, qaActLogged = 0, qaActShots = 0, qaActFire = 0;
     vec qaRetailLastFeet;
     bool qaRetailHaveFeet = false;
 
@@ -398,6 +405,7 @@ namespace
     bool qaRetailLoad(const std::string &file)
     {
         qaRetailRoute.setsize(0);
+        qaRetailAim.setsize(0);
         qaRetailCrouch.setsize(0);
         qaRetailJump.setsize(0);
         qaRetailFlags.setsize(0);
@@ -407,21 +415,28 @@ namespace
         std::string line;
         while(std::getline(input, line))
         {
-            // x y z [flags [device@position]]: 1 crouch, 2 jump, 16 lift deck, 128 light bridge
-            vec point;
+            // x y z [flags [device@position [ax ay az]]]: 1 crouch, 2 jump, 16 lift deck, 128 light
+            // bridge, 256 use a control, 512 shoot a target at the aim point, 1024 wait at a door
+            vec point, aim(0, 0, 0);
             int flags = 0;
             char device[96] = "";
-            const int fields = sscanf(line.c_str(), "%f %f %f %d %95s", &point.x, &point.y, &point.z, &flags, device);
+            const int fields = sscanf(line.c_str(), "%f %f %f %d %95s %f %f %f", &point.x, &point.y, &point.z, &flags, device,
+                                      &aim.x, &aim.y, &aim.z);
             if(fields < 3)
             {
                 if(line.find_first_not_of(" \t\r") != std::string::npos) return false;
                 continue;
             }
             if(fields < 4) flags = 0;
+            // sscanf takes "nan" and "inf": a damaged row would aim the walker at nothing.
+            if(!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
+               !std::isfinite(aim.x) || !std::isfinite(aim.y) || !std::isfinite(aim.z) || flags < 0) return false;
             float value = 0;
             if(char *at = strrchr(device, '@')) { value = float(atof(at + 1)); *at = 0; }
-            if((flags & (16 | 128)) && !*device) return false;
+            if((flags & (16 | 128 | 256 | 512 | 1024)) && !*device) return false;
+            if((flags & 512) && fields < 8) return false;
             qaRetailRoute.add(point);
+            qaRetailAim.add(aim);
             qaRetailCrouch.add((flags & 1) != 0);
             qaRetailJump.add((flags & 2) != 0);
             qaRetailFlags.add(flags);
@@ -455,6 +470,7 @@ namespace
         for(int i = qaRetailNext; i < qaRetailRoute.length() && i <= qaRetailNext + 10; ++i)
         {
             if(qaRetailFlags[i] & 16) return i;
+            if((qaRetailFlags[i] & (256 | 512 | 1024)) && i > qaActDone) return i;
             if((qaRetailFlags[i] & 128) && (!i || !(qaRetailFlags[i - 1] & 128)) && i != qaBridgeCleared) return i;
         }
         return INT_MAX;
@@ -588,6 +604,128 @@ namespace
         return true;
     }
 
+    float qaRetailHealth(const std::string &name)
+    {
+        const int id = haloscenarioobject(name.c_str());
+        return id < 0 ? -1.0f : float(haloscenariocall("unit_get_health", id, 0));
+    }
+
+    // One tick of an action row (256, 512, 1024) at the follower's waypoint; false when there is none.
+    bool qaRetailAct(const vec &feet)
+    {
+        const int row = qaRetailNext;
+        if(row >= qaRetailRoute.length() || !(qaRetailFlags[row] & (256 | 512 | 1024)) || row <= qaActDone) return false;
+        const int flags = qaRetailFlags[row];
+        const char *what = qaRetailDevice[row].c_str();
+        const float value = qaRetailValue[row];
+        const char *kind = flags & 256 ? "use" : flags & 512 ? "shoot" : "door";
+        if(qaAct != row)
+        {
+            qaAct = row;
+            qaActSince = qaActLogged = lastmillis;
+            qaActUsed = qaActShots = qaActFire = 0;
+            conoutf("RETAIL_QA act %s %s at waypoint %d (position %.2f, health %.2f)", kind, what, row, qaDevicePosition(what), qaRetailHealth(what));
+        }
+        qaRetailHold();
+        auto done = [&](const char *how)
+        {
+            attack(false);
+            conoutf("RETAIL_QA act %s %s %s after %d ms", kind, what, how, lastmillis - qaActSince);
+            qaActDone = row;
+            qaRetailNext = row + 1;
+            qaRetailClosest = 1e9f;
+            qaRetailProgress = lastmillis;
+            qaWalkStretchFrom = -1;
+            return true;
+        };
+        // Stand on the row first (it repeats the step the follower just reached).
+        const vec to = vec(qaRetailRoute[row]).sub(feet);
+        if(to.magnitudexy() > .6f && lastmillis - qaActSince < 6000)
+        {
+            player1->yaw = qaRetailHeading(to);
+            player1->pitch = 0;
+            forward(true);
+            return true;
+        }
+        const int elapsed = lastmillis - qaActSince;
+        // Covenant, Flood and Sentinels near the spot are fought as the player would (removed), so
+        // they neither stop the action nor take the aim assist.
+        if(elapsed < 200 || (elapsed / 1000) % 5 == 0)
+            loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && !haloteamfriendly(enemies[i].team) &&
+                              !haloactorpassive(enemies[i].bot) && enemies[i].bot->o.dist(player1->o) < 30.0f)
+                dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
+        if(flags & 256)
+        {
+            const float position = qaDevicePosition(what);
+            if(value > .5f ? position >= value - .02f : position <= value + .02f) return done("reached");
+            if(!qaActUsed || lastmillis - qaActUsed > 1500)
+            {
+                execute("halo_use");
+                qaActUsed = lastmillis;
+                conoutf("RETAIL_QA act use presses use for %s (position %.2f)", what, position);
+            }
+            // The script may hold the control (a manifold already destroyed): carry on.
+            if(elapsed > 20000) return done("timed-out");
+            return true;
+        }
+        if(flags & 512)
+        {
+            const float health = qaRetailHealth(what);
+            if(health >= 0 && health <= value) return done("destroyed");
+            // Aim at the point the importer saw the target at, from the eye.
+            const vec look = vec(qaRetailAim[row]).sub(player1->o);
+            player1->yaw = qaRetailHeading(look);
+            player1->pitch = atan2f(look.z, max(look.magnitudexy(), .01f)) / RAD;
+            // Short bursts keep the spread down; the magazine is refilled as it runs dry, as a
+            // player would reload and pick up ammunition from the many weapons on the floor.
+            if(player1->weaponsel && player1->weaponsel->mag <= 0)
+            {
+                player1->weaponsel->ammo = max(player1->weaponsel->ammo, 120);
+                tryreload(player1);
+            }
+            const bool firing = elapsed > 400 && (lastmillis / 100) % 5 < 2;
+            if(firing && !qaActFire) ++qaActShots;
+            qaActFire = firing;
+            attack(firing);
+            if(lastmillis - qaActLogged > 5000)
+            {
+                qaActLogged = lastmillis;
+                bool damageable = false;
+                vec centre;
+                float probe = -1;
+                haloscenariotargetstate(what, centre, probe, damageable);
+                conoutf("RETAIL_QA act shoot %s health %.2f damageable %d bursts %d", what, health, damageable, qaActShots);
+            }
+            if(elapsed > 45000) { attack(false); qaRetailStop("FAIL target-not-destroyed"); }
+            return true;
+        }
+        // 1024: a scripted door. The follower stands at it, inside its opening radius.
+        const float position = qaDevicePosition(what);
+        if(position >= value) return done("opened");
+        if(elapsed > 3000) player1->yaw = fmodf(player1->yaw + 1.5f, 360.0f);   // tutorial scripts wait for a look
+        if(!qaActUsed || lastmillis - qaActUsed > 6000)
+        {
+            execute("halo_use");
+            qaActUsed = lastmillis;
+        }
+        if(lastmillis - qaActLogged > 20000)
+        {
+            qaActLogged = lastmillis;
+            const int id = haloscenarioobject(what);
+            conoutf("RETAIL_QA act door %s waiting: power %.2f position %.2f", what,
+                    id < 0 ? -1.0f : float(haloscenariocall("device_get_power", id, 0)), position);
+            execute("halo_script_status");
+        }
+        if(elapsed > qaRetailWaitLimit)
+        {
+            const int id = haloscenarioobject(what);
+            conoutf("RETAIL_QA act door %s never opened: power %.2f position %.2f", what,
+                    id < 0 ? -1.0f : float(haloscenariocall("device_get_power", id, 0)), position);
+            qaRetailStop("FAIL door-never-opened");
+        }
+        return true;
+    }
+
     // The engine put the player back after a fall or a wedge (Halo recovery): carry on from the
     // route row nearest to where they now stand, and wait for a bridge again if one is ahead.
     void qaRetailResync(const vec &feet)
@@ -604,6 +742,10 @@ namespace
         qaRetailNext = best;
         qaBridgeCleared = qaBridgeStep = -1;
         qaRide = RIDE_NONE;
+        // An action cut short (a fall or revert while shooting) stops firing and starts afresh,
+        // with its own timers, when the follower is back on its row.
+        attack(false);
+        qaAct = -1;
         qaRetailClosest = 1e9f;
         qaRetailProgress = lastmillis;
     }
@@ -628,6 +770,7 @@ namespace
         qaRideStep = qaBridgeStep = qaBridgeCleared = -1;
         qaRetailRecoveries = 0;
         qaRetailHaveFeet = false;
+        qaAct = qaActDone = -1;
         qaTrialPhase = TRIAL_NONE;
         qaWalkStretchFrom = -1;
         qaWalkSpeedMin = 1e9f;
@@ -638,7 +781,9 @@ namespace
 
     void qaRetailStep()
     {
-        if(lastmillis - qaRetailStarted > 480000) { qaRetailStop("FAIL deadline"); return; }
+        // Eight minutes a section; a long route (d40's engine room walks every manifold's bay, 5,000
+        // rows) gets 90 ms more for each row past 3,000.
+        if(lastmillis - qaRetailStarted > 480000 + max(0, int(qaRetailRoute.length()) - 3000) * 90) { qaRetailStop("FAIL deadline"); return; }
         addsleep(12, "qa_retail_step", true);
         if(qaRetailStuckAt)
         {
@@ -748,7 +893,7 @@ namespace
         if(qaRetailHaveFeet && feet.dist(qaRetailLastFeet) > 6.0f && qaRide != RIDE_ON) qaRetailResync(feet);
         qaRetailLastFeet = feet;
         qaRetailHaveFeet = true;
-        if(qaRetailRide(feet) || qaRetailBridge(feet)) return;
+        if(qaRetailRide(feet) || qaRetailBridge(feet) || qaRetailAct(feet)) return;
         if(!qaRetailDetour.empty() || qaRetailRetreat >= 0) player1->strafe = 0;
         if(!qaRetailDetour.empty())
         {
@@ -883,7 +1028,8 @@ namespace
                 // ally has walked up to them, so clear the hostiles and step back out of the way.
                 if(!qaRetailWaited) conoutf("RETAIL_QA waiting for device %s at waypoint %d", deviceName ? deviceName : "?", qaRetailNext);
                 qaRetailWaitAt = qaRetailNext;
-                loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && enemies[i].team != HALO_TEAM_HUMAN)
+                loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && !haloteamfriendly(enemies[i].team) &&
+                                  !haloactorpassive(enemies[i].bot))
                     dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
                 // Doors that are not automatic open from a control beside them: press use.
                 execute("halo_use");
@@ -918,8 +1064,8 @@ namespace
         player1->strafe = lastmillis - qaRetailProgress > 2500 ? ((lastmillis / 900) & 1 ? 1 : -1) : 0;
         // Covenant standing in the way are fought, as the player would: they are removed.
         if(lastmillis - qaRetailProgress > 2500)
-            loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && enemies[i].team != HALO_TEAM_HUMAN &&
-                              enemies[i].bot->o.dist(player1->o) < 10.0f)
+            loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && !haloteamfriendly(enemies[i].team) &&
+                              !haloactorpassive(enemies[i].bot) && enemies[i].bot->o.dist(player1->o) < 10.0f)
                 dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
         // Crouch through the steps the route marks (a jammed bulkhead), from two steps before.
         bool low = qaRetailNext <= qaRetailCrouchUntil;

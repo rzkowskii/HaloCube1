@@ -41,6 +41,13 @@ bool halohudload();
 bool halohudready();
 // Draws everything; call inside the 2D HUD pass (glOrtho over VIRTW x VIRTH).
 void halohuddraw(const HaloHudWeapon &weapon, const HaloHudUnit &unit, const HaloHudBlip *blips, int blipCount);
+// What a weapon's retail HUD group draws: an aim reticle, and its ammunition (meters or counters).
+// A weapon with no reticle (the flamethrower's group is empty) gets halohuddrawreticle from
+// halohuddraw; halo.cpp shows the rounds or battery as text when the group has no ammunition.
+void halohudweaponparts(int weapon, bool &reticle, bool &ammo);
+// A plain reticle at the screen centre (a circle and four ticks) in the retail HUD's blue, red on an
+// aim-assist target; it needs no HUD tags. Call inside the 2D HUD pass.
+void halohuddrawreticle(bool locked);
 // Draws nav points with the retail waypoint arrows (hud globals, `waypoint`/`arrow` lines in
 // hud.txt): the on-screen marker over the point, or the off-screen arrow at the screen edge
 // pointing towards it. Without those lines, plain diamonds in the arrow type's colour.

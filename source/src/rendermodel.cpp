@@ -606,6 +606,14 @@ batchedmodel &addbatchedmodel(model *m)
     return b->batched.add();
 }
 
+// The opacity a translucent model is drawn with: a camouflaged Halo actor's own (halomodelalpha),
+// else the model's.
+static float modeltranslucency(const model *m, const playerent *d)
+{
+    const float alpha = d ? halomodelalpha(d) : -1;
+    return alpha >= 0 ? alpha : m->translucency;
+}
+
 void renderbatchedmodel(model *m, batchedmodel &b)
 {
     modelattach *a = NULL;
@@ -639,7 +647,7 @@ void renderbatchedmodel(model *m, batchedmodel &b)
 
         GLfloat color[4];
         glGetFloatv(GL_CURRENT_COLOR, color);
-        glColor4f(color[0], color[1], color[2], m->translucency);
+        glColor4f(color[0], color[1], color[2], modeltranslucency(m, b.d));
     }
 
     m->render(b.anim, b.varseed, b.speed, b.basetime, b.o, b.roll, b.yaw, b.pitch, b.d, a, b.scale);
@@ -865,7 +873,7 @@ void rendermodel(const char *mdl, int anim, int tex, float rad, const vec &o, fl
 
         GLfloat color[4];
         glGetFloatv(GL_CURRENT_COLOR, color);
-        glColor4f(color[0], color[1], color[2], m->translucency);
+        glColor4f(color[0], color[1], color[2], modeltranslucency(m, d));
     }
 
     m->render(anim, varseed, speed, basetime, o, roll, yaw, pitch, d, a, scale);
@@ -1009,6 +1017,12 @@ void renderclient(playerent *d, const char *mdlname, const char *vwepname, int t
     if(player1->isspectating() && d->clientnum == player1->followplayercn && player1->spectatemode == SM_FOLLOW3RD_TRANSPARENT)
     {
         anim |= ANIM_TRANSLUCENT; // see through followed player
+        if(stenciling) return;
+    }
+    // Halo actors under active camouflage (stealth Elites) are drawn as a faint shimmer.
+    if(d->state == CS_ALIVE && halomodelalpha(d) >= 0)
+    {
+        anim |= ANIM_TRANSLUCENT;
         if(stenciling) return;
     }
     rendermodel(mdlname, anim|ANIM_DYNALLOC, tex, 1.5f, o, 0, d->yaw+90, d->pitch/4, speed, basetime, d, a);

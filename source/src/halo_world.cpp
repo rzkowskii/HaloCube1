@@ -127,8 +127,10 @@ namespace
             for(HaloWorldVertex &vertex : batch.vertices)
             {
                 lilswap(&vertex.x, 5);
+                // Positions also index the ground grid (groundCell): keep them in a sane range.
                 if(!std::isfinite(vertex.x) || !std::isfinite(vertex.y) || !std::isfinite(vertex.z) ||
-                   !std::isfinite(vertex.u) || !std::isfinite(vertex.v)) return false;
+                   !std::isfinite(vertex.u) || !std::isfinite(vertex.v) ||
+                   fabsf(vertex.x) > 1e6f || fabsf(vertex.y) > 1e6f || fabsf(vertex.z) > 1e6f) return false;
             }
             batches.push_back(std::move(batch));
         }
@@ -203,7 +205,12 @@ namespace
                     textureload("packages/textures/halo_a30/bsp/detail_grass.png") : NULL;
                 conoutf("Loaded Halo BSP geometry");
             }
-            else haloWorld.clear();
+            else
+            {
+                haloWorld.clear();
+                if(!strncmp(map, "halo_", 5))
+                    conoutf("\f3Halo: packages/maps/%s.mesh is missing or unreadable; drawing the section's cube geometry", map);
+            }
         }
         return !haloWorld.empty();
     }
@@ -353,6 +360,36 @@ namespace
         glDisableClientState(GL_COLOR_ARRAY);
         glColor4ub(255, 255, 255, 255);
     }
+}
+
+// A light pass over the solid and cutout surfaces (the flashlight, halo_fx.cpp): each batch's own
+// texture on unit 0 with its coordinates; the caller sets the colour, the blending and unit 1.
+void haloworlddrawlight()
+{
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisable(GL_CULL_FACE);
+    for(const HaloWorldBatch &batch : haloWorld)
+    {
+        const bool cutout = batch.flags == HALO_CUTOUT || batch.flags == HALO_FOLIAGE;
+        if(batch.flags != HALO_SOLID && !cutout) continue;
+        if(cutout)
+        {
+            glEnable(GL_ALPHA_TEST);
+            glAlphaFunc(GL_GREATER, 0.4f);
+        }
+        else glDisable(GL_ALPHA_TEST);
+        glBindTexture(GL_TEXTURE_2D, batch.texture->id);
+        const HaloWorldVertex &v = batch.vertices.front();
+        glVertexPointer(3, GL_FLOAT, sizeof(v), &v.x);
+        glTexCoordPointer(2, GL_FLOAT, sizeof(v), &v.u);
+        glDrawArrays(GL_TRIANGLES, 0, GLsizei(batch.vertices.size()));
+    }
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_CULL_FACE);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
 }
 
 bool haloworldready() { return hasHaloWorld(); }

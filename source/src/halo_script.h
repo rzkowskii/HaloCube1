@@ -35,20 +35,51 @@ int haloscenarioencounter(const char *name);
 double haloscenariocall(const char *command, double first, double second);
 double haloscenariocallv(const char *command, const double *values, const char *const *texts, int count);
 int haloscenarioobject(const char *name);
+int haloscenarioflag(const char *name);           // a cutscene flag's index, -1 when the section has none by that name
 double haloscenarioobjectstate(const char *what, int id);
 double haloscenarioqascript(const char *name, int action);
 double haloscenarioqaglobal(const char *name, bool set, double value);
 void haloscenarioqastate(int &tick, int &started, int &visible);
+// QA (tests/test_mission_exits.py): plays a scene the way a script's call does (its Call cue row);
+// and a cutscene flag's place in the section's map (feet) and the player's yaw facing its way.
+bool haloscenarioqacue(const char *script);
+bool haloscenarioflagpoint(const char *flag, vec &feet, float &yaw);
 bool haloscenariocollide(physent *entity, float &hi, float &lo);
 // How far below a lift deck top `lo` (world units) a grounded body may step onto it; 0 if `lo` is not one.
 float haloscenarioliftboard(physent *entity, float lo);
 const char *haloscenarioblockingdevice(physent *entity);
 struct HaloCollisionHit;
 bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit);
+// Damage targets: scripted units with no AI the player hurts by shooting them (d40's manifold
+// detectors, which enc5_1_destroyed_poll reads with unit_get_health; tools/halo_cast.py damage_target).
+// The first target the segment passes through (its fraction along it in `fraction`), or -1; the
+// player's damage to it (false when it cannot take damage: object_cannot_take_damage, destroyed);
+// the targets a blast at `centre` within `radius` world units sees, with their distances; and a QA
+// probe of a target by name (its box centre in world units, health 0 to 1, whether it takes damage).
+int haloscenariotargettrace(const vec &from, const vec &to, float &fraction);
+bool haloscenariotargetdamage(int target, float damage);
+int haloscenariotargetsnear(const vec &centre, float radius, int *targets, float *distances, int capacity);
+bool haloscenariotargetstate(const char *name, vec &centre, float &health, bool &damageable);
 // A scripted object's state, for the vehicles bound to it (halo_vehicle.cpp): created by the script,
 // and carried by another object or a recording (with its world position and AssaultCube yaw).
 bool haloscenarioobjectvisible(int object);
-bool haloscenarioobjectcarried(int object, vec &feet, float &yaw);
+// `pitch`, when given, gets the carried pose's pitch in degrees (nose up positive): a Banshee on a
+// recorded flight climbs and dives with it.
+bool haloscenarioobjectcarried(int object, vec &feet, float &yaw, float *pitch = nullptr);
+// Dropships and Pelicans (the scenario's vehicles the engine does not drive): actors the scripts
+// load into them (vehicle_load_magic, unit_enter_vehicle, ai_go_to_vehicle) ride at their seat
+// markers until vehicle_unload sets them down. Whether `unit` rides in one now.
+bool haloscenariocarried(const playerent *unit);
+// The player boarded one with E (a30's extraction Pelicans, once the script makes them enterable):
+// E gets out again. haloscenarioboardprompt is the prompt on foot, or null.
+bool haloscenarioboard();
+const char *haloscenarioboardprompt();
+bool haloscenarioboarded();
+// QA (tests/native/vehicle_qa.inc): one CARGO_QA line per rider or walker and per scripted vehicle
+// object that is visible (drawn, boardable, on a recording); and the feet beside the best rider
+// seat of `object` for a boarding test.
+void haloscenariocargodump(const char *label);
+bool haloscenarioqaboardpoint(const char *object, vec &feet);
 bool haloscenarioescapetimeout();
 bool haloscenarioescapefailed();
 bool halocinematicskip();
@@ -70,7 +101,8 @@ void haloscenariorender();
 void haloscenariopausestate(bool paused);
 void haloscenariocheckpoint();
 void haloscenarioplayersave();
-playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int actorIndex = -1, int team = 0);
+// team: an engine team (halo_ai.h HALO_TEAM_*), or -1 (HALO_TEAM_DEFAULT) for the variant's own.
+playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int actorIndex = -1, int team = -1);
 // Saved games (halo.cpp, config/halo-progress.txt version 3). haloscenariostatesave appends the
 // mission script's state as "s ..." records: what the last checkpoint keeps for a revert, or with
 // `live` the state now (a section's start, the script carried in from the section before); false

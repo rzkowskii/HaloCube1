@@ -1,13 +1,20 @@
 // Campaign vehicles: the Warthog the player drives (The Maw's escape run and wherever the
-// scenario parks one), the Covenant gun turrets with a gunner seat, and the other scenario
-// vehicles standing where they were placed. See halo_vehicle.h and docs/macos-build.md.
+// scenario parks one), the Covenant gun turrets with a gunner seat, the Ghost and Wraith hover
+// craft, the Scorpion tank and the Banshee, which flies. See halo_vehicle.h and
+// docs/macos-build.md.
 //
 // A vehicle is a body the size of the retail vehicle at the section's scale. It drives on the
 // retail collision when the section has one (four wheel traces and two chassis capsules) and on
-// the stock cube grid otherwise. The handling is an arcade car: throttle and brakes along the
-// heading, strong lateral grip with some slide, steering towards the camera (or the strafe
-// keys), gravity, jumps off crests, pitch and roll following the ground, and flips when it lands
-// or stands too far over; E flips it back. None of it is the retail physics.
+// the stock cube grid otherwise. The Warthog's handling is an arcade car: throttle and brakes
+// along the heading, strong lateral grip with some slide, steering towards the camera (or the
+// strafe keys), gravity, jumps off crests, pitch and roll following the ground, and flips when
+// it lands or stands too far over; E flips it back. Hover craft float a little over the same
+// ground, turn on the spot towards the camera, strafe and slide; the tank turns on its tracks
+// and barely slides; neither flips. A piloted Banshee flies: no gravity, the nose follows the
+// camera, the throttle pushes along it, strafe and the jump and crouch keys move it sideways and
+// up and down, and with no throttle it hovers; empty, it falls and lands. Actors at the controls
+// drive and fly with simple steering (aiGround, aiFlight) and fire the vehicle's gun at their
+// brain's target. None of it is the retail physics.
 #include "cube.h"
 #include "halo.h"
 #include "halo_collision.h"
@@ -16,6 +23,7 @@
 #include "halo_ai.h"
 #include "halo_vehicle.h"
 #include "halo_state.h"
+#include "halo_fx.h"
 #include <algorithm>
 #include <sstream>
 #include <string>
@@ -28,10 +36,14 @@ VARP(halo_vehiclesteer, 0, 0, 1);
 VAR(halo_vehiclecollide, 0, 1, 1);
 // Logs vehicle spawns, seats and flips.
 VAR(halo_vehicletrace, 0, 0, 1);
+// Actors at the controls drive and fly their vehicles (0: they sit still, for checking).
+VAR(halo_vehicleai, 0, 1, 1);
 
 namespace
 {
-    constexpr int formatVersion = 1;
+    // Format 2 names the hover, tank and flyer classes and says which vehicles the player may
+    // drive; format 1 tables still load (their props take a class from their motion kind).
+    constexpr int formatVersion = 2;
     constexpr int maxSeats = 6;
     constexpr float gravity = 40.0f;            // AssaultCube units per s², as bounce entities fall
     constexpr float minimumTopSpeed = 36.0f;    // the escape's old foot speed: the timer was tuned for it
@@ -59,6 +71,10 @@ namespace
         std::vector<SeatDef> seats;
         int modelState = 0;                     // 0 unchecked, 1 loads, -1 missing
         std::string displayName;
+        bool player = true;                     // the player may drive it (not the Wraith)
+        // The tag's sounds (`sound` lines): the engine's loop while someone drives (a turret's
+        // while its gunner turns it), the crash and the suspension's thump on a hard landing.
+        std::string engineSound, crashSound, suspensionSound;
     };
 
     struct Vehicle
@@ -77,8 +93,15 @@ namespace
         int aiKind = -1;
         playerent *riders[maxSeats] = {};
         float aimYaw = 0, aimPitch = 0;
-        HaloWeaponState gun;
-        int nextShot = 0;
+        HaloWeaponState gun, gun2;              // the gun's first and second trigger
+        int nextShot = 0, nextShot2 = 0;
+        int stunnedUntil = 0;                   // EMP (halovehicleemp): no throttle, no gun
+        // An actor at the controls (aiGround, aiFlight, aiFire): the Banshee's strafing run
+        // phase, the way it circles a target, backing off when stuck, and its bursts.
+        int aiPhase = 0, aiPhaseUntil = 0, aiOrbitUntil = 0, aiStuckSince = 0, aiReverseUntil = 0;
+        int aiBurstUntil = 0, aiNextBurst = 0, aiNextSecondary = 0;
+        float aiOrbit = 1;
+        vec aiGoal = vec(0, 0, 0);
         // Stuck recovery (updateStuck): the last spots it stood on upright, clear and grounded on
         // structure floor (newest last), and the fall, wedge and stall timers.
         vec safePos[safeSpotCount];
@@ -87,6 +110,10 @@ namespace
         int airSince = 0, embeddedSince = 0, stalledSince = 0, lastRecovery = 0;
         vec stalledAt = vec(0, 0, 0);
         float stillZ = 0;
+        int lastImpact = 0;                     // the crash and landing sounds' cooldown
+        float loopYaw = 0;                      // a turret's yaw when its turning loop last checked
+        int loopYawAt = 0, loopTurnedAt = 0;    // when it last checked, and last turned fast enough
+        float loopLevel = 0;                    // how fast it turned then (0.3..1)
     };
 
     std::vector<VehicleDef> defs;
@@ -111,6 +138,18 @@ namespace
     // forced exit): halovehiclereclaim puts them back in it rather than leaving them wedged.
     int thrownVehicle = -1, thrownSeat = -1, thrownAt = 0;
     bool qaForceThrow = false;              // halovehicleqathrow: skip the exit spots
+    // The secondary trigger, jump and crouch keys while seated, and the QA flight input.
+    bool secondaryHeld = false, jumpHeld = false, crouchHeld = false;
+    float qaStrafe = 0, qaClimb = 0;
+    bool qaFlight = false;
+    // ai_go_to_vehicle: actors walking to a seat (halo_ai.cpp haloactorgoto), seated on arrival.
+    struct Boarding { playerent *unit; int vehicle, seat, since, until; };
+    std::vector<Boarding> boardings;
+
+    // What drives a vehicle for one step: the player's keys or an actor's steering. -1..1 each;
+    // `aimYaw` and `aimPitch` (degrees) are where a flyer's nose turns; `piloted` keeps a
+    // Banshee flying (empty, it falls).
+    struct Drive { float throttle = 0, steer = 0, strafe = 0, climb = 0, aimYaw = 0, aimPitch = 0; bool piloted = false; };
 
     int seatRole(const std::string &name, const std::string &marker)
     {
@@ -161,12 +200,27 @@ namespace
         return d;
     }
 
+    bool finiteValue(float f) { return std::isfinite(f); }
+    bool finiteValue(const vec &v) { return finiteValue(v.x) && finiteValue(v.y) && finiteValue(v.z); }
+
+    // The numbers the drive, collision and camera code divide by or scale with.
+    bool sane(const VehicleDef &d)
+    {
+        if(!finiteValue(d.modelScale) || d.modelScale <= 0 || !finiteValue(d.radius) || d.radius < 0) return false;
+        for(float f : {d.forward, d.reverse, d.acceleration, d.deceleration, d.turn, d.slide}) if(!finiteValue(f)) return false;
+        if(!finiteValue(d.low) || !finiteValue(d.high) || !finiteValue(d.camera)) return false;
+        loopi(3) if(d.high[i] <= d.low[i] || d.high[i] - d.low[i] > 100) return false;
+        for(const SeatDef &s : d.seats) if(!finiteValue(s.at) || !finiteValue(s.enter)) return false;
+        return true;
+    }
+
     bool parse(const char *text)
     {
         std::istringstream lines(text);
         std::string line;
         VehicleDef *def = nullptr;
         bool versioned = false;
+        int version = 0;
         while(std::getline(lines, line))
         {
             if(line.empty() || line[0] == '#') continue;
@@ -174,7 +228,7 @@ namespace
             std::string key;
             in >> key;
             bool ok = true;
-            if(key == "format") { int version = 0; in >> version; ok = versioned = version == formatVersion; }
+            if(key == "format") { in >> version; ok = versioned = version == formatVersion || version == 1; }
             else if(key == "vehicle")
             {
                 defs.emplace_back();
@@ -187,8 +241,11 @@ namespace
             {
                 std::string kind;
                 in >> kind;
-                def->vehicleClass = kind == "car" ? HALO_VEHICLE_CAR : kind == "turret" ? HALO_VEHICLE_TURRET : HALO_VEHICLE_PROP;
+                def->vehicleClass = kind == "car" ? HALO_VEHICLE_CAR : kind == "turret" ? HALO_VEHICLE_TURRET :
+                                    kind == "hover" ? HALO_VEHICLE_HOVER : kind == "tank" ? HALO_VEHICLE_TANK :
+                                    kind == "flyer" ? HALO_VEHICLE_FLYER : HALO_VEHICLE_PROP;
             }
+            else if(key == "player") { int player = 1; ok = bool(in >> player); def->player = player != 0; }
             else if(key == "model") ok = bool(in >> def->model >> def->modelScale) && def->modelScale > 0;
             else if(key == "motion") ok = bool(in >> def->kind >> def->forward >> def->reverse >> def->acceleration
                                                 >> def->deceleration >> def->turn >> def->slide);
@@ -203,8 +260,30 @@ namespace
                 if(ok && def->seats.size() < size_t(maxSeats)) def->seats.push_back(s);
             }
             else if(key == "camera") ok = bool(in >> def->camera.x >> def->camera.y >> def->camera.z);
+            else if(key == "sound")
+            {
+                // Unknown roles are skipped, so a newer table still loads.
+                std::string role, tag;
+                in >> role;
+                std::getline(in >> std::ws, tag);
+                std::string *slot = role == "engine" ? &def->engineSound : role == "crash" ? &def->crashSound :
+                                    role == "suspension" ? &def->suspensionSound : nullptr;
+                if(slot && !tag.empty()) *slot = halosoundsample(tag);
+            }
             else if(key == "end")
             {
+                // A record whose sizes or speeds are not finite, or whose box is inside out, would
+                // put NaN into every vehicle's position: refuse the table (the built-in Warthog).
+                ok = sane(*def);
+                // A format 1 table parked the Ghost, Scorpion, Banshee and Wraith as props: their
+                // retail motion kind says what they are (4 hover, 0 tank, 5 airborne).
+                if(def->vehicleClass == HALO_VEHICLE_PROP && version == 1)
+                {
+                    if(def->kind == 4) def->vehicleClass = HALO_VEHICLE_HOVER;
+                    else if(def->kind == 0) def->vehicleClass = HALO_VEHICLE_TANK;
+                    else if(def->kind == 5) def->vehicleClass = HALO_VEHICLE_FLYER;
+                    if(def->name == "wraith") def->player = false;
+                }
                 def->displayName = def->vehicleClass == HALO_VEHICLE_TURRET ? "Covenant Turret" : titleCase(def->name);
                 def = nullptr;
             }
@@ -215,6 +294,14 @@ namespace
                 return false;
             }
         }
+        // A table cut short inside a record (no `end`) is refused too.
+        if(def)
+        {
+            conoutf("\f3Halo vehicles: packages/halo/vehicles.txt ends inside the %s record", def->name.c_str());
+            defs.clear();
+            return false;
+        }
+        if(!versioned) conoutf("\f3Halo vehicles: packages/halo/vehicles.txt has no format %d line", formatVersion);
         return versioned && !defs.empty();
     }
 
@@ -229,7 +316,8 @@ namespace
         {
             defs.clear();
             defs.push_back(builtinWarthog());
-            conoutf("Halo vehicles: packages/halo/vehicles.txt is missing; run tools/halo_vehicles.py (built-in Warthog only)");
+            if(text) conoutf("\f3Halo vehicles: packages/halo/vehicles.txt is unusable; re-run tools/halo_vehicles.py (built-in Warthog only)");
+            else conoutf("Halo vehicles: packages/halo/vehicles.txt is missing; run tools/halo_vehicles.py (built-in Warthog only)");
         }
         delete[] text;
     }
@@ -262,10 +350,25 @@ namespace
         return d.modelState > 0;
     }
 
+    bool drivenClass(int c) { return c == HALO_VEHICLE_CAR || c == HALO_VEHICLE_HOVER || c == HALO_VEHICLE_TANK || c == HALO_VEHICLE_FLYER; }
+    // The driver works the gun: the Ghost's and Banshee's bolts, the Wraith's mortar, the Scorpion's cannon.
+    bool driverFires(const VehicleDef &d)
+    {
+        return d.vehicleClass == HALO_VEHICLE_HOVER || d.vehicleClass == HALO_VEHICLE_TANK || d.vehicleClass == HALO_VEHICLE_FLYER;
+    }
+    // A hover craft floats this far (Halo units) over the floor under it.
+    constexpr float hoverGap = .12f;
+    // How far the model's origin stands above the vehicle's floor point: a hover craft's model
+    // reaches below its origin (the Ghost's by 0.14 Halo units), and it floats over the ground.
+    float liftOf(const VehicleDef &d, float s)
+    {
+        return d.vehicleClass == HALO_VEHICLE_HOVER ? (max(0.0f, -d.low.z) + hoverGap) * s : 0.0f;
+    }
+
     // Dimensions in AssaultCube units at the section's scale.
     struct Dims
     {
-        float s, length, width, height, centre, halfL, halfW, step, wheelFront, wheelRear, wheelSide, wheelbase, track;
+        float s, length, width, height, centre, halfL, halfW, step, wheelFront, wheelRear, wheelSide, wheelbase, track, lift;
     };
 
     Dims dims(const Vehicle &v)
@@ -275,7 +378,8 @@ namespace
         r.s = vehicleScale();
         r.length = max(.2f, d.high.x - d.low.x) * r.s;
         r.width = max(.2f, d.high.y - d.low.y) * r.s;
-        r.height = max(.2f, d.high.z - max(0.0f, d.low.z)) * r.s;
+        r.lift = liftOf(d, r.s);
+        r.height = max(.2f, d.high.z - max(0.0f, d.low.z)) * r.s + r.lift;
         r.centre = (d.high.x + d.low.x) * .5f * r.s;
         r.halfL = r.length * .5f;
         r.halfW = r.width * .5f;
@@ -291,11 +395,41 @@ namespace
     vec forwardOf(float yaw) { return vec(sinf(yaw * RAD), -cosf(yaw * RAD), 0); }
     vec rightOf(float yaw) { return vec(cosf(yaw * RAD), sinf(yaw * RAD), 0); }
 
-    // A point of the model frame (x forward, y left, z up; Halo units) in the world, yaw only.
+    // A point of the model frame (x forward, y left, z up; Halo units) in the world, yaw only;
+    // a hover craft's model stands its lift above the floor point.
     vec modelPoint(const Vehicle &v, const vec &local, float s)
     {
         const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
-        return vec(v.pos).add(vec(f).mul(local.x * s)).sub(vec(r).mul(local.y * s)).add(vec(0, 0, local.z * s));
+        const VehicleDef *d = defOf(v);
+        const float lift = d ? liftOf(*d, s) : 0;
+        return vec(v.pos).add(vec(f).mul(local.x * s)).sub(vec(r).mul(local.y * s)).add(vec(0, 0, local.z * s + lift));
+    }
+
+    float yawTo(const vec &from, const vec &to)
+    {
+        const float yaw = atan2f(to.x - from.x, -(to.y - from.y)) / RAD;
+        return yaw < 0 ? yaw + 360 : yaw;
+    }
+
+    // Top speed in AssaultCube units per second: the retail speed at the section's scale, and
+    // never below the Warthog's 36 (the Maw's timer was set for it) scaled by the vehicle's
+    // retail speed against the Warthog's, so a Ghost still outruns the player on foot. A Banshee
+    // is given a third more.
+    float topSpeed(const VehicleDef &def, float s)
+    {
+        if(def.vehicleClass == HALO_VEHICLE_CAR) return max(minimumTopSpeed, def.forward * 30 * s);
+        const float floor = minimumTopSpeed * clamp(def.forward / .255f, .3f, 1.5f) * (def.vehicleClass == HALO_VEHICLE_FLYER ? 1.3f : 1.0f);
+        return max(floor, def.forward * 30 * s);
+    }
+
+    // Degrees per second a hover craft or a tank turns on the spot: the tag's turn rate when it
+    // has one, else the Ghost's 150, slower for the heavier and slower ones (the Wraith about 60,
+    // the Scorpion about 45).
+    float turnRate(const VehicleDef &def)
+    {
+        if(def.turn > .001f) return def.turn * 30 / RAD;
+        const float rate = 150 * powf(clamp(def.forward / .225f, .3f, 1.0f), 1.5f);
+        return def.vehicleClass == HALO_VEHICLE_TANK ? rate * .6f : rate;
     }
 
     float wrap180(float a)
@@ -503,7 +637,7 @@ namespace
         {
             vec push;
             if(!clear || trappedIn(b, index) || !bodyInside(v, d, b, push, .05f)) return;
-            if(!isPlayer && index == playerVehicle && def.vehicleClass == HALO_VEHICLE_CAR && speed > 8 &&
+            if(!isPlayer && index == playerVehicle && drivenClass(def.vehicleClass) && speed > 8 &&
                std::find(struck.begin(), struck.end(), b) == struck.end())
             {
                 struck.push_back(b);
@@ -528,18 +662,38 @@ namespace
         if(halo_vehicletrace) conoutf("Halo vehicle %d flipped", index);
     }
 
-    // One physics step of `dt` seconds. `throttle` and `steer` are -1..1.
-    void simulate(Vehicle &v, int index, float dt, float throttle, float steer)
+    void fly(Vehicle &v, int index, float dt, const Drive &in);
+
+    // One physics step of `dt` seconds. A piloted Banshee flies (fly); everything else drives on
+    // the ground, or falls and lands.
+    // A crash or a hard landing: the tag's sound where it happened (at most one in 0.4 s), and a
+    // knock of the camera for the player's own vehicle.
+    void impact(Vehicle &v, int index, const std::string &sample, float strength)
+    {
+        if(lastmillis - v.lastImpact < 400) return;
+        v.lastImpact = lastmillis;
+        const vec at = v.pos;
+        if(!sample.empty()) haloplaysound(sample.c_str(), S_NULL, NULL, &at);
+        if(index == playerVehicle) halofxshakeimpulse(clamp(strength, .2f, 1.0f), 350);
+        if(halo_vehicletrace) conoutf("Halo vehicle: impact %d strength %.2f%s", index, strength, sample.empty() ? " (no sound)" : "");
+    }
+
+    void simulate(Vehicle &v, int index, float dt, const Drive &in)
     {
         const VehicleDef &def = *defOf(v);
+        if(def.vehicleClass == HALO_VEHICLE_FLYER && in.piloted && !v.flipped) { fly(v, index, dt, in); return; }
         const Dims d = dims(v);
-        if(def.vehicleClass != HALO_VEHICLE_CAR) throttle = steer = 0;
-        const float top = max(minimumTopSpeed, def.forward * 30 * d.s);
+        float throttle = in.throttle, steer = in.steer, strafe = in.strafe;
+        // An empty Banshee (or one whose pilot is out) only falls and lands; props and turrets stand.
+        if(!drivenClass(def.vehicleClass) || def.vehicleClass == HALO_VEHICLE_FLYER) throttle = steer = strafe = 0;
+        const bool car = def.vehicleClass == HALO_VEHICLE_CAR;
+        const float top = topSpeed(def, d.s);
         const float reverseTop = max(top * .4f, def.reverse * 30 * d.s);
         const float accelTime = clamp(def.acceleration > 0 ? def.forward / def.acceleration / 30 : 2.0f, 1.2f, 3.0f);
         const float accel = top / accelTime, brake = accel * 2.5f, coast = accel * .35f;
         vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
         float vf = v.vel.dot(f), vr = v.vel.dot(r);
+        const float speedBefore = vec(v.vel.x, v.vel.y, 0).magnitude();
         if(v.flipped)
         {
             vf *= max(0.0f, 1 - dt * 4);
@@ -557,21 +711,41 @@ namespace
             // stopped on a slope it can stand on, the brakes hold it.
             if(!throttle && fabsf(vf) < .8f && fabsf(v.pitch) < 35) vf = 0;
             else vf -= gravity * .5f * sinf(v.pitch * RAD) * dt;
-            // Steering: the turn rate is the speed over the wheelbase, capped by grip at speed.
-            v.steer += clamp(steer - v.steer, -dt * 5, dt * 5);
-            const float speed = fabsf(vf);
             const vec moving = vec(f).mul(vf).add(vec(r).mul(vr));
-            if(speed > .2f)
+            if(car)
             {
-                const float rate = min(speed / max(d.wheelbase, .5f) * .577f, 1.25f * top / max(speed, 1.0f));
-                v.yaw = fmodf(v.yaw + v.steer * rate * (vf >= 0 ? 1 : -1) * dt / RAD + 360.0f, 360.0f);
+                // Steering: the turn rate is the speed over the wheelbase, capped by grip at speed.
+                v.steer += clamp(steer - v.steer, -dt * 5, dt * 5);
+                const float speed = fabsf(vf);
+                if(speed > .2f)
+                {
+                    const float rate = min(speed / max(d.wheelbase, .5f) * .577f, 1.25f * top / max(speed, 1.0f));
+                    v.yaw = fmodf(v.yaw + v.steer * rate * (vf >= 0 ? 1 : -1) * dt / RAD + 360.0f, 360.0f);
+                }
+                // The body turns under its momentum: the new heading's sideways share is the slide,
+                // which the tyres take out quickly.
+                f = forwardOf(v.yaw);
+                r = rightOf(v.yaw);
+                vf = moving.dot(f);
+                vr = moving.dot(r) * expf(-8.0f * dt);
             }
-            // The body turns under its momentum: the new heading's sideways share is the slide,
-            // which the tyres take out quickly.
-            f = forwardOf(v.yaw);
-            r = rightOf(v.yaw);
-            vf = moving.dot(f);
-            vr = moving.dot(r) * expf(-8.0f * dt);
+            else
+            {
+                // A hover craft or a tank turns on the spot at its own rate, whatever its speed.
+                v.steer += clamp(steer - v.steer, -dt * 6, dt * 6);
+                v.yaw = fmodf(v.yaw + v.steer * turnRate(def) * dt + 360.0f, 360.0f);
+                f = forwardOf(v.yaw);
+                r = rightOf(v.yaw);
+                vf = moving.dot(f);
+                vr = moving.dot(r);
+                if(def.vehicleClass == HALO_VEHICLE_HOVER)
+                {
+                    // It strafes, and slides: what it carries sideways fades slowly.
+                    if(strafe) vr += clamp(strafe * top * .6f - vr, -accel * .8f * dt, accel * .8f * dt);
+                    else vr *= expf(-2.5f * dt);
+                }
+                else vr *= expf(-20.0f * dt);   // tracks barely slide
+            }
         }
         v.vel = vec(f).mul(vf).add(vec(r).mul(vr)).add(vec(0, 0, v.vel.z));
 
@@ -685,8 +859,11 @@ namespace
             {
                 if(!v.grounded)
                 {
-                    // Landing: on its back or side it has flipped.
-                    if(fabsf(v.roll) > 75 || fabsf(v.pitch) > 75) setFlipped(v, index, fabsf(v.roll) > 120 ? 180.0f : copysignf(100.0f, v.roll));
+                    // A hard landing thumps the suspension.
+                    if(v.vel.z < -14) impact(v, index, def.suspensionSound, -v.vel.z / 40);
+                    // Landing: on its back or side a Warthog has flipped (the others come down
+                    // on their skids, hulls or tracks).
+                    if(car && (fabsf(v.roll) > 75 || fabsf(v.pitch) > 75)) setFlipped(v, index, fabsf(v.roll) > 120 ? 180.0f : copysignf(100.0f, v.roll));
                     v.grounded = true;
                     v.vel.z = 0;
                 }
@@ -701,14 +878,124 @@ namespace
                     v.roll += (rollTarget - v.roll) * min(1.0f, dt * 12);
                     v.pitchVel = (v.pitch - previousPitch) / max(dt, 1e-3f);
                     v.rollVel = (v.roll - previousRoll) / max(dt, 1e-3f);
-                    // Standing too far over tips it onto its side.
-                    if(fabsf(rollTarget) > 58 || fabsf(pitchTarget) > 80) setFlipped(v, index, copysignf(100.0f, rollTarget));
+                    // Standing too far over tips a Warthog onto its side.
+                    if(car && (fabsf(rollTarget) > 58 || fabsf(pitchTarget) > 80)) setFlipped(v, index, copysignf(100.0f, rollTarget));
                 }
                 v.vel.z = 0;
             }
         }
         if(v.flipped && v.grounded) { v.vel.x *= max(0.0f, 1 - dt * 3); v.vel.y *= max(0.0f, 1 - dt * 3); }
         v.smoothZ = fabsf(v.pos.z - v.smoothZ) > 3 ? v.pos.z : v.smoothZ + (v.pos.z - v.smoothZ) * min(1.0f, dt * 18);
+        // A crash: most of the speed lost in one step against a wall, a body or another vehicle.
+        const float lost = speedBefore - vec(v.vel.x, v.vel.y, 0).magnitude();
+        if(speedBefore > top * .25f && lost > max(8.0f, top * .35f)) impact(v, index, def.crashSound, lost / max(top, 1.0f));
+    }
+
+    // Whether a flying body can move by `delta` (any direction) from `pos`: the structure, the
+    // machines and the other vehicles. `normal` gets the face it meets on retail collision, or the
+    // way back on the cube grid.
+    bool flightBlocked(int self, const Vehicle &v, const Dims &d, const vec &pos, const vec &delta, vec &normal)
+    {
+        normal = vec(0, 0, 0);
+        const vec to = vec(pos).add(delta);
+        vec back = vec(delta).mul(-1);
+        if(!back.iszero()) back.normalize();
+        if(overlapsVehicle(self, to, v.yaw, d) && !overlapsVehicle(self, pos, v.yaw, d)) { normal = back; return true; }
+        const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
+        const float radius = max(.3f, min(d.halfW, d.halfL) * .9f), height = max(2 * radius, d.height * .9f);
+        const float offset = max(0.0f, d.halfL - radius);
+        bool blocked = false;
+        if(halocollisionactive())
+        {
+            float best = 2;
+            for(float along : {offset, -offset})
+            {
+                const vec feet = vec(pos).add(vec(f).mul(d.centre + along)).add(vec(0, 0, .05f));
+                HaloCollisionHit hit;
+                if(!delta.iszero() && halocollisionsweep(feet, delta, radius, height, hit))
+                {
+                    // Already embedded (spawned on a seam): let it move out rather than stick.
+                    HaloCollisionHit inside;
+                    if(hit.fraction <= 0 && halocollisionoverlap(feet, radius, height, inside) && inside.penetration > .05f) continue;
+                    blocked = true;
+                    if(hit.fraction < best) { best = hit.fraction; normal = hit.normal; }
+                }
+                physent probe;
+                probe.type = ENT_BOUNCE;
+                probe.radius = radius;
+                probe.eyeheight = height;
+                probe.aboveeye = 0;
+                probe.o = vec(feet).add(delta).add(vec(0, 0, height));
+                float hi = 1e9f, lo = -1e9f;
+                if(haloscenariocollide(&probe, hi, lo)) { blocked = true; if(normal.iszero()) normal = back; }
+            }
+            if(!normal.iszero()) normal.normalize();
+            return blocked;
+        }
+        // The cube grid: the footprint's corners, edges and middle against solid cubes, floors
+        // above the body's top and ceilings below it.
+        for(float a : {-1.0f, 0.0f, 1.0f}) for(float b : {-1.0f, 0.0f, 1.0f})
+        {
+            const vec p = vec(to).add(vec(f).mul(d.centre + a * d.halfL * .9f)).add(vec(r).mul(b * d.halfW * .9f));
+            float z;
+            bool wall;
+            // A floor higher than a step into the body is a wall too (a lower one it rests on).
+            const bool floor = groundAt(p.x, p.y, to.z + d.height, -1e9f, z, wall);
+            if(wall || (floor && z > to.z + d.step)) { normal = back; return true; }
+            if(stockCeiling(p.x, p.y) < to.z + d.height) { normal = vec(0, 0, -1); return true; }
+        }
+        return false;
+    }
+
+    // One flight step of a piloted Banshee: no gravity; the heading and the nose follow the aim
+    // at the Banshee's turn rates, it banks into turns, the throttle pushes along the nose (it
+    // hovers with none), strafe and climb move it sideways and up. It slides along what it
+    // meets and may rest on the floor, never sink into it. An EMP cuts its engines: it sinks.
+    void fly(Vehicle &v, int index, float dt, const Drive &in)
+    {
+        const VehicleDef &def = *defOf(v);
+        const Dims d = dims(v);
+        const float top = topSpeed(def, d.s);
+        const bool stunned = lastmillis < v.stunnedUntil;
+        const float turn = clamp(wrap180(in.aimYaw - v.yaw), -100 * dt, 100 * dt);
+        v.yaw = fmodf(v.yaw + turn + 360.0f, 360.0f);
+        v.pitch += clamp(clamp(in.aimPitch, -55.0f, 55.0f) - v.pitch, -70 * dt, 70 * dt);
+        const float bank = clamp(turn / max(dt, 1e-3f) * .35f + in.strafe * 25, -45.0f, 45.0f);
+        v.roll += (bank - v.roll) * min(1.0f, dt * 4);
+        v.pitchVel = v.rollVel = v.steer = v.climb = 0;
+        const float yaw = v.yaw * RAD, pitch = v.pitch * RAD;
+        const vec nose(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
+        vec want(0, 0, 0);
+        if(!stunned)
+            want = vec(nose).mul(in.throttle > 0 ? in.throttle * top : in.throttle * top * .25f)
+                       .add(vec(rightOf(v.yaw)).mul(in.strafe * top * .35f)).add(vec(0, 0, in.climb * top * .35f));
+        vec change = vec(want).sub(v.vel);
+        const float most = top / 1.6f * dt * (want.magnitude() < v.vel.magnitude() ? 1.4f : 1.0f);
+        if(change.magnitude() > most) change.normalize().mul(most);
+        v.vel.add(change);
+        if(stunned) v.vel.z -= gravity * .5f * dt;
+        vec delta = vec(v.vel).mul(dt);
+        for(int pass = 0; pass < 3 && !delta.iszero(); ++pass)
+        {
+            vec normal;
+            if(!flightBlocked(index, v, d, v.pos, delta, normal)) break;
+            if(normal.iszero() || pass == 2) { delta = vec(0, 0, 0); v.vel.mul(.5f); break; }
+            const float into = delta.dot(normal);
+            if(into < 0) delta.sub(vec(normal).mul(into * 1.05f));
+            const float against = v.vel.dot(normal);
+            if(against < 0) v.vel.sub(vec(normal).mul(against));
+        }
+        v.pos.add(delta);
+        if(!delta.iszero() && !shoveBodies(v, index, d)) { v.pos.sub(delta); v.vel.mul(.5f); }
+        float ground;
+        bool wall;
+        if(groundAt(v.pos.x, v.pos.y, v.pos.z + d.step, v.pos.z - .05f, ground, wall) && ground > v.pos.z)
+        {
+            v.pos.z = ground;
+            if(v.vel.z < 0) v.vel.z = 0;
+        }
+        v.grounded = false;
+        v.smoothZ = v.pos.z;
     }
 
     bool outOfWorld(const Vehicle &v)
@@ -812,6 +1099,94 @@ namespace
         return -1;
     }
 
+    // The rider at the controls: the first driver-role seat that is taken (the Ghost has two,
+    // its own and an Elite's), alive.
+    playerent *driverOf(const Vehicle &v)
+    {
+        const VehicleDef *d = defOf(v);
+        if(!d) return nullptr;
+        for(int i = 0; i < int(d->seats.size()) && i < maxSeats; ++i)
+            if(d->seats[i].role == HALO_SEAT_DRIVER && v.riders[i] && v.riders[i]->state == CS_ALIVE) return v.riders[i];
+        return nullptr;
+    }
+
+    // Someone flies or drives it: a Banshee with a pilot stays up.
+    bool piloted(const Vehicle &v) { return driverOf(v) != nullptr; }
+
+    // Engine loops: one per vehicle somebody drives, from the driver (or a turret's gunner while
+    // it turns), its pitch rising with the speed, at the vehicle_engine class's gain. The ones
+    // playing last frame that nobody drives now stop.
+    struct EngineLoop { physent *owner; int sound; };
+    std::vector<EngineLoop> engineLoops;
+
+    int loopSound(const std::string &sample)
+    {
+        if(sample.empty()) return -1;
+        defformatstring(name)("halo/%s", sample.c_str());
+        defformatstring(file)("packages/audio/%s.wav", name);
+        if(!fileexists(findfile(file, "rb"), "rb")) return -1;
+        int id = audiomgr.findsound(name, 220, gamesounds);
+        if(id < 0) id = audiomgr.addsound(name, 220, -1, true, gamesounds, true, 0);
+        return id;
+    }
+
+    void stopEngineLoop(const EngineLoop &e)
+    {
+        physentreference ref(e.owner);
+        if(location *l = audiomgr.locations.find(e.sound, &ref, gamesounds)) l->drop();
+    }
+
+    void updateEngineLoops()
+    {
+        std::vector<EngineLoop> now;
+        if(haloactive() && !halocinematic() && !ispaused) loopv(vehicles)
+        {
+            Vehicle &v = vehicles[i];
+            const VehicleDef *d = defOf(v);
+            if(!v.exists || !d || d->engineSound.empty()) continue;
+            playerent *owner = nullptr;
+            float level = 0;
+            if(d->vehicleClass == HALO_VEHICLE_TURRET)
+            {
+                // The turning rate over at least 50 ms (degrees per second), held for 250 ms, so
+                // the loop does not start and stop with the frame rate.
+                playerent *gunner = v.riders[0] && v.riders[0]->state == CS_ALIVE ? v.riders[0] : nullptr;
+                if(!gunner || lastmillis < v.loopYawAt) { v.loopYaw = v.yaw; v.loopYawAt = lastmillis; v.loopTurnedAt = 0; }
+                else if(lastmillis - v.loopYawAt >= 50)
+                {
+                    const float rate = fabsf(wrap180(v.yaw - v.loopYaw)) * 1000.0f / float(lastmillis - v.loopYawAt);
+                    v.loopYaw = v.yaw;
+                    v.loopYawAt = lastmillis;
+                    if(rate > 15) { v.loopTurnedAt = lastmillis; v.loopLevel = clamp(rate / 240, .3f, 1.0f); }
+                }
+                if(gunner && v.loopTurnedAt && lastmillis - v.loopTurnedAt < 250) { owner = gunner; level = v.loopLevel; }
+            }
+            else if(drivenClass(d->vehicleClass) && !v.flipped)
+            {
+                owner = driverOf(v);
+                level = clamp(v.vel.magnitude() / max(topSpeed(*d, dims(v).s), 1.0f), 0.0f, 1.0f);
+            }
+            if(!owner) continue;
+            const int id = loopSound(d->engineSound);
+            if(id < 0) continue;
+            // Counted whether or not a channel is free (or sound is on at all): QA reads the count.
+            now.push_back({owner, id});
+            physentreference ref(owner);
+            location *l = audiomgr.locations.find(id, &ref, gamesounds);
+            if(!l) l = audiomgr._playsound(id, ref, SP_NORMAL, 0, true);
+            if(!l) continue;
+            l->pitch(.8f + .5f * level);
+            l->setvolume(halofxclassgain(HALO_SOUND_CLASS_VEHICLE_ENGINE) * (.65f + .35f * level));
+        }
+        for(const EngineLoop &old : engineLoops)
+        {
+            bool kept = false;
+            for(const EngineLoop &e : now) if(e.owner == old.owner && e.sound == old.sound) { kept = true; break; }
+            if(!kept) stopEngineLoop(old);
+        }
+        engineLoops.swap(now);
+    }
+
     void placePlayerOnSeat()
     {
         if(playerVehicle < 0) return;
@@ -858,6 +1233,7 @@ namespace
         playerVehicle = index;
         playerSeat = seat;
         v.riders[seat] = player1;
+        secondaryHeld = false;
         // Seated again: an earlier forced exit no longer calls for a reclaim.
         thrownVehicle = thrownSeat = -1;
         v.sleeping = false;
@@ -887,6 +1263,7 @@ namespace
         v.riders[playerSeat] = nullptr;
         const int seat = playerSeat, index = playerVehicle;
         playerVehicle = playerSeat = -1;
+        secondaryHeld = false;
         const float clear = player1->radius + .4f;
         std::vector<vec> candidates;
         const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
@@ -1131,7 +1508,10 @@ namespace
         if(v.carried) { clearStuck(v); return; }
         const VehicleDef &def = *defOf(v);
         const Dims d = dims(v);
-        const bool car = def.vehicleClass == HALO_VEHICLE_CAR;
+        // Everything that drives keeps safe spots and gets the wedge and stall checks; a flying
+        // Banshee neither stalls (it hovers) nor falls for want of floor below (it flies).
+        const bool car = drivenClass(def.vehicleClass);
+        const bool flying = def.vehicleClass == HALO_VEHICLE_FLYER && piloted(v);
         if(car) trackSafe(v, index, d);
         const char *why = nullptr;
         bool falling = false;
@@ -1141,6 +1521,7 @@ namespace
         {
             if(v.grounded) v.airSince = 0;
             else if(!v.airSince) v.airSince = lastmillis;
+            if(flying) v.airSince = v.stalledSince = 0;
             HaloCollisionHit hit;
             // In the air for two seconds with neither structure nor device below: a hole in the mesh.
             if(v.airSince && lastmillis - v.airSince > fallTime && !haloscenariotrace(v.pos, vec(v.pos.x, v.pos.y, low.z - 8), hit))
@@ -1151,10 +1532,10 @@ namespace
             else if(car)
             {
                 // Wedged: the chassis in the structure, and the vehicle not getting out of it.
-                if(!chassisEmbedded(v, d) || vec(v.vel.x, v.vel.y, 0).magnitude() > 2) v.embeddedSince = 0;
+                if(flying || !chassisEmbedded(v, d) || vec(v.vel.x, v.vel.y, 0).magnitude() > 2) v.embeddedSince = 0;
                 else if(!v.embeddedSince) v.embeddedSince = lastmillis;
                 // Hung in mid-air (caught on an edge or in a crease) without moving at all.
-                if(v.grounded || v.pos.dist(v.stalledAt) > .05f) { v.stalledSince = 0; v.stalledAt = v.pos; }
+                if(v.grounded || flying || v.pos.dist(v.stalledAt) > .05f) { v.stalledSince = 0; v.stalledAt = v.pos; }
                 else if(!v.stalledSince) v.stalledSince = lastmillis;
                 if(v.embeddedSince && lastmillis - v.embeddedSince >= wedgeTime) why = "wedged in the collision";
                 else if(v.stalledSince && lastmillis - v.stalledSince >= stallTime) why = "stuck in mid-air";
@@ -1301,6 +1682,13 @@ namespace
             const Vehicle &v = vehicles[i];
             const VehicleDef *d = defOf(v);
             if(!v.exists || !d || d->vehicleClass == HALO_VEHICLE_PROP || v.carried || (!v.enterable && !v.flipped)) continue;
+            // The Wraith is the Covenant's alone; a vehicle a hostile drives cannot be taken (Halo
+            // CE has no boarding). With a friendly driver (a marine at a Warthog's wheel) the free
+            // gunner seat is still the player's; the driver's seat is taken, so the loop below
+            // skips it.
+            if(!d->player && !v.flipped) continue;
+            const playerent *driver = driverOf(v);
+            if(driver && driver != player1 && !v.flipped && !haloteamfriendly(haloactorteam(driver))) continue;
             const Dims dm = dims(v);
             if(feet.z > v.pos.z + dm.height + 2 || feet.z + player1->eyeheight < v.pos.z - 1) continue;
             const float reach = playerReach(v);
@@ -1315,6 +1703,8 @@ namespace
             {
                 const SeatDef &s = d->seats[j];
                 if(s.role == HALO_SEAT_PASSENGER || v.riders[j]) continue;
+                // One driver's seat for the player: the Ghost's second is the Elite's.
+                if(s.role == HALO_SEAT_DRIVER && j != seatByRole(*d, HALO_SEAT_DRIVER)) continue;
                 const float dd = feet.distxy(modelPoint(v, s.enter, dm.s));
                 if(dd < reach && dd < distance) { distance = dd; best = i; seat = j; }
             }
@@ -1342,36 +1732,437 @@ namespace
             recoverVehicle(v, index, "flipped over where it cannot be righted", false, false);
     }
 
-    // The seat's gun, fired at the crosshair while the player holds the trigger.
-    void fireGun(Vehicle &v, int elapsed)
-    {
-        const VehicleDef &d = *defOf(v);
-        const HaloWeaponDef *gun = haloweapon(v.gun.def);
-        if(!gun) return;
-        v.gun.tick(*gun, elapsed);
-        const HaloTriggerDef *t = gun->trigger();
-        if(!t || !player1->attacking || lastmillis < v.nextShot || !v.gun.canfire(*gun) || halocinematic()) return;
-        if(!gun->usesBattery() && v.gun.loaded <= 0 && gun->magazine()) v.gun.loaded = max(1, gun->magazine()->loaded);
-        const Dims dm = dims(v);
-        const float yaw = player1->yaw * RAD, pitch = player1->pitch * RAD;
-        const vec aim(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
-        vec from = d.vehicleClass == HALO_VEHICLE_TURRET ? vec(v.pos).add(vec(0, 0, dm.height * .75f)).add(vec(aim).mul(dm.halfL))
-                                                        : seatPoint(v, playerSeat).add(vec(0, 0, dm.height * .25f)).add(vec(aim).mul(dm.halfW));
-        vec to = worldpos;
-        if(vec(to).sub(from).dot(aim) <= .5f) to = vec(from).add(vec(aim).mul(200));
-        halofiretrigger(player1, *gun, v.gun, 0, from, to);
-        v.nextShot = lastmillis + v.gun.delay(*t);
-        lastFire = lastmillis;
-        ++shotsFired;
-        player1->lastaction = lastmillis;
-        audiomgr.playsound(d.vehicleClass == HALO_VEHICLE_TURRET ? S_SUBGUN : S_ASSAULT, SP_HIGH);
-    }
-
     playerent *aliveBot(playerent *p)
     {
         if(!p || p == player1) return nullptr;
         loopv(players) if(players[i] == p) return p->state == CS_ALIVE ? p : nullptr;
         return nullptr;
+    }
+
+    // The seats that work the vehicle's gun: a turret's or a Warthog's gunner, the driver of a
+    // Ghost, Wraith, Scorpion or Banshee.
+    bool armedSeat(const VehicleDef &d, int seat)
+    {
+        if(seat < 0 || seat >= int(d.seats.size()) || d.weaponPath.empty()) return false;
+        const int role = d.seats[seat].role;
+        if(d.vehicleClass == HALO_VEHICLE_TURRET) return role == HALO_SEAT_GUNNER;
+        if(d.vehicleClass == HALO_VEHICLE_CAR) return role == HALO_SEAT_GUNNER;
+        return driverFires(d) && role == HALO_SEAT_DRIVER;
+    }
+
+    // Guns fixed in the hull fire along the nose: the Ghost's and the Banshee's bolts (not a
+    // lobbed mortar, the tank's turret or a gunner's mount).
+    bool fixedGun(const VehicleDef &d, const HaloTriggerDef *t)
+    {
+        return (d.vehicleClass == HALO_VEHICLE_HOVER || d.vehicleClass == HALO_VEHICLE_FLYER) && !(t && t->projectile.gravity > 0);
+    }
+
+    // Milliseconds between shots of a trigger: its rate, or for a trigger fired as fast as it is
+    // pulled (rate 0: the Scorpion's cannon, the Banshee's fuel rod) a pause that keeps an
+    // explosive round from leaving every frame.
+    int triggerDelay(const HaloWeaponState &state, const HaloTriggerDef &t)
+    {
+        if(t.rate + t.finalRate > .02f) return state.delay(t);
+        return t.projectile.radius > 0 ? 1500 : 400;
+    }
+
+    vec noseOf(const Vehicle &v)
+    {
+        const float yaw = v.yaw * RAD, pitch = v.pitch * RAD;
+        return vec(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
+    }
+
+    // Where the seat's shots leave: a turret's barrel, the front of a hover craft or a Banshee,
+    // the top of the tank's turret, a Warthog gunner's mount.
+    vec muzzle(const Vehicle &v, const Dims &dm, int seat, const vec &aim)
+    {
+        const VehicleDef &d = *defOf(v);
+        if(d.vehicleClass == HALO_VEHICLE_TURRET) return vec(v.pos).add(vec(0, 0, dm.height * .75f)).add(vec(aim).mul(dm.halfL));
+        if(driverFires(d) && seat >= 0 && seat < int(d.seats.size()) && d.seats[seat].role == HALO_SEAT_DRIVER)
+        {
+            const bool tank = d.vehicleClass == HALO_VEHICLE_TANK;
+            return vec(v.pos).add(vec(forwardOf(v.yaw)).mul(dm.centre + (tank ? 0 : dm.halfL * .9f)))
+                       .add(vec(0, 0, dm.height * (tank ? .8f : .45f))).add(vec(aim).mul(tank ? dm.halfL : dm.halfW * .3f));
+        }
+        return seatPoint(v, seat).add(vec(0, 0, dm.height * .25f)).add(vec(aim).mul(dm.halfW));
+    }
+
+    // The vehicle's gun from weapons.txt (seating the player sets it; an actor's vehicle gets it
+    // on its first shot), or null.
+    const HaloWeaponDef *gunOf(Vehicle &v)
+    {
+        if(!haloweapon(v.gun.def))
+        {
+            const VehicleDef *d = defOf(v);
+            const HaloWeaponDef *w = d && !d->weaponPath.empty() ? haloweaponfind(d->weaponPath.c_str()) : nullptr;
+            if(!w) return nullptr;
+            v.gun.reset(w);
+        }
+        return haloweapon(v.gun.def);
+    }
+
+    // One shot of trigger `trigger` (0 or 1) of the vehicle's gun by `owner` in `seat`, towards
+    // `target`. A gun fixed in the hull fires within 25 degrees of the nose, else along it.
+    bool shoot(Vehicle &v, playerent *owner, int seat, int trigger, const vec &target)
+    {
+        const HaloWeaponDef *gun = gunOf(v);
+        if(!gun) return false;
+        HaloWeaponState &state = trigger ? v.gun2 : v.gun;
+        int &next = trigger ? v.nextShot2 : v.nextShot;
+        if(state.def != gun->index) state.reset(gun);
+        const HaloTriggerDef *t = gun->trigger(trigger);
+        if(!t || !t->projectile.valid || lastmillis < next || !state.canfire(*gun) || lastmillis < v.stunnedUntil) return false;
+        if(!gun->usesBattery() && state.loaded <= 0 && gun->magazine()) state.loaded = max(1, gun->magazine()->loaded);
+        const Dims dm = dims(v);
+        const VehicleDef &d = *defOf(v);
+        vec aim = vec(target).sub(v.pos);
+        if(aim.iszero()) aim = noseOf(v);
+        aim.normalize();
+        const vec from = muzzle(v, dm, seat, aim);
+        aim = vec(target).sub(from);
+        if(aim.iszero()) aim = noseOf(v);
+        aim.normalize();
+        if(fixedGun(d, t))
+        {
+            // Turn the shot back inside the cone round the nose.
+            const float yaw = atan2f(aim.x, -aim.y) / RAD, off = wrap180(yaw - v.yaw);
+            if(fabsf(off) > 25)
+            {
+                const float clamped = (v.yaw + clamp(off, -25.0f, 25.0f)) * RAD, pitch = asinf(clamp(aim.z, -1.0f, 1.0f));
+                aim = vec(sinf(clamped) * cosf(pitch), -cosf(clamped) * cosf(pitch), sinf(pitch));
+            }
+        }
+        const float reach = max(from.dist(target), 1.0f);
+        halofiretrigger(owner, *gun, state, trigger, from, vec(from).add(vec(aim).mul(reach)));
+        next = lastmillis + triggerDelay(state, *t);
+        const char *sample = trigger && gun->sound(HALO_SOUND_CHARGED) ? gun->sound(HALO_SOUND_CHARGED) : gun->sound(HALO_SOUND_FIRE);
+        haloplaysound(sample, d.vehicleClass == HALO_VEHICLE_TURRET || driverFires(d) ? S_SUBGUN : S_ASSAULT, owner);
+        return true;
+    }
+
+    // The player's seat gun, fired at the crosshair while the trigger is held; the secondary key
+    // fires its second trigger.
+    void fireGun(Vehicle &v, int elapsed)
+    {
+        const HaloWeaponDef *gun = haloweapon(v.gun.def);
+        if(!gun) return;
+        v.gun.tick(*gun, elapsed);
+        if(v.gun2.def == gun->index) v.gun2.tick(*gun, elapsed);
+        if(halocinematic()) return;
+        const float yaw = player1->yaw * RAD, pitch = player1->pitch * RAD;
+        const vec aim(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
+        const vec eye = seatPoint(v, playerSeat);
+        vec to = worldpos;
+        if(vec(to).sub(eye).dot(aim) <= .5f) to = vec(eye).add(vec(aim).mul(200));
+        bool fired = player1->attacking && shoot(v, player1, playerSeat, 0, to);
+        if(secondaryHeld && gun->trigger(1)) fired |= shoot(v, player1, playerSeat, 1, to);
+        if(!fired) return;
+        lastFire = lastmillis;
+        ++shotsFired;
+        player1->lastaction = lastmillis;
+    }
+
+    // An actor in an armed seat fires the vehicle's gun at its brain's target: within the gun's
+    // range, within the nose's cone for a fixed gun, in bursts for an automatic gun, leading the
+    // target and lobbing a mortar on its high arc. A Banshee's pilot adds a fuel rod now and then.
+    void aiFire(Vehicle &v, playerent *unit, int seat, int elapsed)
+    {
+        HaloActorIntent in;
+        const HaloWeaponDef *gun = gunOf(v);
+        if(!gun || !haloactorintent(unit, in)) return;
+        v.gun.tick(*gun, elapsed);
+        if(v.gun2.def == gun->index) v.gun2.tick(*gun, elapsed);
+        const HaloTriggerDef *t = gun->trigger();
+        if(!in.mayFire || !in.target || !t || !t->projectile.valid || halocinematic()) return;
+        const VehicleDef &d = *defOf(v);
+        const Dims dm = dims(v);
+        const float s = dm.s;
+        vec target = vec(in.target->o).sub(vec(0, 0, in.target->eyeheight * .4f));
+        const float distance = v.pos.dist(target);
+        const float range = (t->projectile.range > 0 ? t->projectile.range : 100) * s;
+        if(distance > range * .95f) return;
+        if(fixedGun(d, t))
+        {
+            if(fabsf(wrap180(yawTo(v.pos, target) - v.yaw)) > 25) return;
+            if(d.vehicleClass == HALO_VEHICLE_FLYER)
+            {
+                const float pitch = atan2f(target.z - v.pos.z, max(.01f, v.pos.distxy(target))) / RAD;
+                if(fabsf(pitch - v.pitch) > 35) return;
+            }
+        }
+        const bool automatic = t->rate + t->finalRate > .02f;
+        if(automatic)
+        {
+            if(lastmillis >= v.aiNextBurst && lastmillis >= v.aiBurstUntil)
+            {
+                v.aiBurstUntil = lastmillis + 900 + rnd(900);
+                v.aiNextBurst = v.aiBurstUntil + 700 + rnd(800);
+            }
+            if(lastmillis >= v.aiBurstUntil) return;
+        }
+        // Lead the target by most of the shot's flight time, and miss by the variant's error.
+        const float speed = max(1.0f, t->projectile.speed * s);
+        target.add(vec(in.target->vel).mul(.7f * distance / speed));
+        if(in.error > 0)
+        {
+            const float spread = tanf(in.error) * distance;
+            target.add(vec(rndscale(2 * spread) - spread, rndscale(2 * spread) - spread, (rndscale(2 * spread) - spread) * .5f));
+        }
+        vec to = target;
+        if(t->projectile.gravity > 0)
+        {
+            // The mortar's launch angle for the flat distance (the height difference is ignored).
+            // The engine's projectiles keep their speed and only bend under gravity * 3.22 world
+            // units/s² (haloupdatebolts), so the heading turns at g cos(angle) / speed and a shot
+            // comes back to its height after 2 * angle * speed² / g: the angle is the distance
+            // times g over twice the speed squared (at most 80 degrees, about 85 world units for
+            // the Wraith's 10 units a second).
+            const float g = t->projectile.gravity * 3.22f, flat = v.pos.distxy(target) / max(s, 1e-3f);
+            const float angle = clamp(flat * g / max(2 * t->projectile.speed * t->projectile.speed, 1e-3f), .05f, 1.4f);
+            vec across = vec(target).sub(v.pos);
+            across.z = 0;
+            if(across.iszero()) across = forwardOf(v.yaw);
+            across.normalize();
+            to = vec(v.pos).add(vec(across).mul(cosf(angle) * 100)).add(vec(0, 0, sinf(angle) * 100 + dm.height));
+        }
+        // A semi-automatic gun (the mortar, the cannon) waits a little longer between rounds.
+        if(shoot(v, unit, seat, 0, to) && !automatic) v.nextShot += 400 + rnd(900);
+        if(d.vehicleClass == HALO_VEHICLE_FLYER && gun->trigger(1) && lastmillis >= v.aiNextSecondary && distance < 35 * s)
+        {
+            if(shoot(v, unit, seat, 1, target)) v.aiNextSecondary = lastmillis + 5000 + rnd(4000);
+        }
+    }
+
+    // Whether the chassis would run into something (or off a drop) within `reach` along `yaw`.
+    bool aheadBlocked(int index, const Vehicle &v, const Dims &d, float yaw, float reach)
+    {
+        vec normal;
+        const vec delta = vec(forwardOf(yaw)).mul(reach);
+        if(chassisBlocked(index, v, d, v.pos, delta, normal)) return true;
+        const vec end = vec(v.pos).add(delta);
+        float z;
+        bool wall;
+        return !groundAt(end.x, end.y, v.pos.z + d.step, v.pos.z - max(d.step * 3, 2 * d.s), z, wall);
+    }
+
+    // An actor at the wheel (or the controls of a hover craft or tank): towards its brain's goal
+    // when it fights nobody; against a target, a Warthog runs it down, a Ghost closes to its
+    // range, faces it and strafes round it, and the tank and the Wraith keep their distance and
+    // circle. It steers round what blocks the way ahead and backs off when stuck.
+    Drive aiGround(Vehicle &v, int index, const Dims &d, const HaloActorIntent &in)
+    {
+        const VehicleDef &def = *defOf(v);
+        const float s = d.s;
+        Drive out;
+        out.piloted = true;
+        const HaloWeaponDef *gun = gunOf(v);
+        const HaloTriggerDef *t = gun ? gun->trigger() : nullptr;
+        const bool lobs = t && t->projectile.gravity > 0;
+        const bool car = def.vehicleClass == HALO_VEHICLE_CAR;
+        vec goal;
+        float arrive = 3 * s;
+        const playerent *face = nullptr;
+        if(in.target)
+        {
+            const vec at = vec(in.target->o).sub(vec(0, 0, in.target->eyeheight));
+            const float distance = v.pos.distxy(at);
+            const bool standoff = lobs || def.vehicleClass == HALO_VEHICLE_TANK;
+            const float nearest = (standoff ? 12 : car ? 0 : 6) * s, farthest = (standoff ? 28 : car ? 4 : 18) * s;
+            if(lastmillis >= v.aiOrbitUntil) { v.aiOrbit = rnd(2) ? 1 : -1; v.aiOrbitUntil = lastmillis + 3000 + rnd(4000); }
+            vec away = vec(v.pos).sub(at);
+            away.z = 0;
+            if(away.iszero()) away = vec(1, 0, 0);
+            away.normalize();
+            if(distance > farthest) goal = at;
+            else if(distance < nearest) goal = vec(at).add(vec(away).mul(nearest + 4 * s));
+            else
+            {
+                vec round = away;
+                round.rotate_around_z(35 * RAD * v.aiOrbit);
+                goal = vec(at).add(round.mul(max(distance, nearest + s)));
+            }
+            arrive = s;
+            if(def.vehicleClass == HALO_VEHICLE_HOVER && !lobs) face = in.target;
+        }
+        else if(in.hasGoal) { goal = in.goal; if(in.commanded) arrive = 2 * s; }
+        else return out;
+        const float distance = v.pos.distxy(goal);
+        float heading = yawTo(v.pos, goal);
+        out.throttle = distance <= arrive ? 0 : clamp(distance / (10 * s), in.commanded && !in.target ? .2f : .35f, 1.0f);
+        if(face && v.pos.distxy(face->o) < 30 * s)
+        {
+            // In range, a Ghost faces its target (its guns are fixed) and strafes round it.
+            heading = yawTo(v.pos, face->o);
+            const vec rel = vec(goal).sub(v.pos);
+            out.strafe = clamp(rel.dot(rightOf(heading)) / (6 * s), -1.0f, 1.0f);
+            out.throttle = clamp(rel.dot(forwardOf(heading)) / (6 * s), -1.0f, 1.0f);
+        }
+        const float off = wrap180(heading - v.yaw);
+        out.steer = clamp(off / 25, -1.0f, 1.0f);
+        if(car && fabsf(off) > 100) out.throttle *= .5f;
+        if(def.vehicleClass == HALO_VEHICLE_TANK && fabsf(off) > 45) out.throttle *= .3f;   // turn on the spot first
+        const float speed = vec(v.vel.x, v.vel.y, 0).magnitude();
+        if(out.throttle > 0)
+        {
+            const float reach = d.halfL + max(d.halfL, speed * .5f);
+            if(aheadBlocked(index, v, d, v.yaw, reach))
+            {
+                const bool left = !aheadBlocked(index, v, d, v.yaw - 45, reach), right = !aheadBlocked(index, v, d, v.yaw + 45, reach);
+                if(left || right) { out.steer = left && (!right || off < 0) ? -1 : 1; out.throttle = .5f; }
+                else v.aiReverseUntil = max(v.aiReverseUntil, lastmillis + 900);
+            }
+        }
+        if(out.throttle > .3f && speed < 1)
+        {
+            if(!v.aiStuckSince) v.aiStuckSince = lastmillis;
+            else if(lastmillis - v.aiStuckSince > 1500) { v.aiReverseUntil = lastmillis + 1100; v.aiStuckSince = 0; v.aiOrbit = -v.aiOrbit; }
+        }
+        else v.aiStuckSince = 0;
+        if(lastmillis < v.aiReverseUntil) { out.throttle = -.8f; out.steer = car ? -out.steer : out.steer; out.strafe = 0; }
+        return out;
+    }
+
+    // An actor flying a Banshee. Against a target it makes strafing runs: out wide and up, a
+    // dive with the nose on the target (aiFire shoots), then a pull out over and past it, and
+    // round again. Otherwise it flies to its brain's goal a little above it and hovers there.
+    // It keeps off the floor and climbs over what lies ahead.
+    Drive aiFlight(Vehicle &v, int index, const Dims &d, const HaloActorIntent &in)
+    {
+        const float s = d.s;
+        Drive out;
+        out.piloted = true;
+        out.aimYaw = v.yaw;
+        vec goal;
+        bool haveGoal = false, attacking = false;
+        if(in.target)
+        {
+            const vec at = vec(in.target->o).sub(vec(0, 0, in.target->eyeheight * .4f));
+            vec back = vec(v.pos).sub(at);
+            back.z = 0;
+            if(back.iszero()) back = vec(1, 0, 0);
+            back.normalize();
+            if(v.aiPhase == 0)
+            {
+                goal = vec(at).add(vec(back).mul(30 * s)).add(vec(0, 0, 12 * s));
+                if(v.pos.dist(goal) < 8 * s || lastmillis > v.aiPhaseUntil) { v.aiPhase = 1; v.aiPhaseUntil = lastmillis + 7000; }
+            }
+            else if(v.aiPhase == 1)
+            {
+                goal = at;
+                attacking = true;
+                if(v.pos.distxy(at) < 9 * s || lastmillis > v.aiPhaseUntil)
+                {
+                    v.aiPhase = 2;
+                    v.aiGoal = vec(at).add(vec(forwardOf(v.yaw)).mul(35 * s)).add(vec(0, 0, 14 * s));
+                    v.aiPhaseUntil = lastmillis + 3500;
+                }
+            }
+            else
+            {
+                goal = v.aiGoal;
+                if(v.pos.dist(goal) < 8 * s || lastmillis > v.aiPhaseUntil) { v.aiPhase = 0; v.aiPhaseUntil = lastmillis + 10000; }
+            }
+            haveGoal = true;
+        }
+        else
+        {
+            v.aiPhase = 0;
+            v.aiPhaseUntil = lastmillis + 10000;
+            // A command list's points are where the scenario wants the Banshee (a30's lz_banshee
+            // lists): it flies to them; any other goal (a position on foot) it hovers above.
+            if(in.hasGoal) { goal = in.commanded ? in.goal : vec(in.goal).add(vec(0, 0, 6 * s)); haveGoal = true; }
+        }
+        if(haveGoal)
+        {
+            const vec rel = vec(goal).sub(v.pos);
+            const float flat = rel.magnitudexy(), distance = rel.magnitude();
+            const float arrive = (in.commanded && !in.target ? 1.5f : 4.0f) * s;
+            if(flat > s) out.aimYaw = yawTo(v.pos, goal);
+            out.aimPitch = clamp(atan2f(rel.z, max(flat, .01f)) / RAD, -45.0f, 45.0f);
+            out.throttle = attacking ? 1 : distance < arrive ? 0 : clamp(distance / (15 * s), .2f, 1.0f);
+            if(fabsf(wrap180(out.aimYaw - v.yaw)) > 60) out.throttle *= .4f;    // turn before speeding off
+            if(!out.throttle) { out.climb = clamp(rel.z / (3 * s), -1.0f, 1.0f); out.aimPitch = 0; }
+        }
+        // Off the floor, and over what lies ahead.
+        float floor;
+        bool wall;
+        if(groundAt(v.pos.x, v.pos.y, v.pos.z + d.step, v.pos.z - 3 * s, floor, wall) || wall)
+        {
+            out.aimPitch = max(out.aimPitch, 20.0f);
+            out.climb = 1;
+        }
+        vec normal;
+        const float speed = v.vel.magnitude();
+        if(out.throttle > 0 && flightBlocked(index, v, d, v.pos, vec(noseOf(v)).mul(max(2 * d.halfL, speed * .6f)), normal))
+        {
+            out.climb = 1;
+            out.aimPitch = max(out.aimPitch, 30.0f);
+        }
+        return out;
+    }
+
+    // What an actor at the controls does this frame (braindead: it holds where it is).
+    Drive aiDrive(Vehicle &v, int index, playerent *pilot)
+    {
+        HaloActorIntent in;
+        Drive hold;
+        hold.piloted = true;
+        hold.aimYaw = v.yaw;
+        if(!haloactorintent(pilot, in) || !in.active) return hold;
+        const Dims d = dims(v);
+        Drive out = defOf(v)->vehicleClass == HALO_VEHICLE_FLYER ? aiFlight(v, index, d, in) : aiGround(v, index, d, in);
+        // Stunned by EMP: the engine is out for an actor at the controls too (a Banshee sinks, fly).
+        if(lastmillis < v.stunnedUntil) out.throttle = out.strafe = 0;
+        return out;
+    }
+
+    // Every armed seat an actor holds fires (the player's seat is fireGun's).
+    void aiFireSeats(Vehicle &v, int elapsed)
+    {
+        const VehicleDef &d = *defOf(v);
+        loopi(min(maxSeats, int(d.seats.size())))
+        {
+            playerent *p = aliveBot(v.riders[i]);
+            if(p && armedSeat(d, i)) aiFire(v, p, i, elapsed);
+        }
+    }
+
+    // ai_go_to_vehicle: each walking actor is seated once it reaches its seat's entry point (or
+    // comes close and has walked a while: a body cannot stand on a Ghost's seat marker), and
+    // gives up after 30 s or when the seat is taken or the vehicle gone.
+    void updateBoardings()
+    {
+        for(size_t i = 0; i < boardings.size();)
+        {
+            Boarding &b = boardings[i];
+            playerent *p = aliveBot(b.unit);
+            Vehicle *v = vehicles.inrange(b.vehicle) ? &vehicles[b.vehicle] : nullptr;
+            const VehicleDef *d = v ? defOf(*v) : nullptr;
+            bool done = !p || !v || !v->exists || !d || b.seat >= int(d->seats.size()) || (v->riders[b.seat] && v->riders[b.seat] != p) ||
+                        lastmillis > b.until || halovehicleinside(p);
+            if(!done)
+            {
+                const Dims dm = dims(*v);
+                const vec entry = modelPoint(*v, d->seats[b.seat].enter, dm.s);
+                const vec feet = vec(p->o).sub(vec(0, 0, p->eyeheight));
+                const float reach = max(dm.halfL, dm.halfW) + p->radius + 2;
+                const float distance = feet.distxy(entry);
+                if(distance < reach * .5f || (lastmillis - b.since > 12000 && distance < reach * 2))
+                {
+                    v->riders[b.seat] = p;
+                    v->sleeping = false;
+                    if(halo_vehicletrace) conoutf("Halo vehicle: %s boards the %s (%s)", p->name, d->displayName.c_str(), d->seats[b.seat].name.c_str());
+                    done = true;
+                }
+                else haloactorgoto(p, &entry);
+            }
+            if(done)
+            {
+                if(p) haloactorgoto(p, nullptr);
+                boardings.erase(boardings.begin() + i);
+            }
+            else ++i;
+        }
     }
 
     void updateRiders(Vehicle &v)
@@ -1381,11 +2172,18 @@ namespace
             playerent *p = v.riders[i];
             if(!p || p == player1) continue;
             if(!aliveBot(p)) { v.riders[i] = nullptr; continue; }
-            // Actors ride where their seat is (a turret gunner keeps firing its own weapon).
+            // Actors ride where their seat is; the vehicle fires for one in an armed seat (aiFire).
             p->o = seatPoint(v, i).add(vec(0, 0, .45f * p->eyeheight));
             p->vel = vec(0, 0, 0);
             p->onfloor = true;
             p->resetinterp();
+            // A driver with nobody to fight looks where it is going (its vision cone follows).
+            const VehicleDef *d = defOf(v);
+            if(d && i < int(d->seats.size()) && d->seats[i].role == HALO_SEAT_DRIVER && drivenClass(d->vehicleClass) && !haloactortarget(p))
+            {
+                p->yaw = v.yaw;
+                if(p->type == ENT_BOT) static_cast<botent *>(p)->targetyaw = v.yaw;
+            }
         }
     }
 
@@ -1422,6 +2220,8 @@ namespace
 void halovehiclesclear()
 {
     loadDefs();
+    for(const EngineLoop &e : engineLoops) stopEngineLoop(e);
+    engineLoops.clear();
     vehicles.shrink(0);
     saved.clear();
     savedValid = restoredFromCheckpoint = false;
@@ -1430,6 +2230,7 @@ void halovehiclesclear()
     qaUntil = 0;
     trapped.clear();
     struck.clear();
+    boardings.clear();
     thrownVehicle = thrownSeat = -1;
 }
 
@@ -1447,6 +2248,9 @@ void halovehiclesrestart(bool checkpoint)
     playerVehicle = playerSeat = -1;
     qaUntil = 0;
     trapped.clear();
+    // The actors walking to seats were respawned (or are gone) with the revert.
+    boardings.clear();
+    secondaryHeld = jumpHeld = crouchHeld = false;
     thrownVehicle = thrownSeat = -1;
     restoredFromCheckpoint = checkpoint && savedValid;
     if(restoredFromCheckpoint)
@@ -1473,7 +2277,15 @@ void halovehiclesrestart(bool checkpoint)
         }
     }
     // The fall, wedge and stall timers start afresh; the safe spots stay (a checkpoint's are good).
-    loopv(vehicles) { vehicles[i].airSince = vehicles[i].embeddedSince = vehicles[i].stalledSince = vehicles[i].lastRecovery = 0; vehicles[i].stalledAt = vehicles[i].pos; }
+    loopv(vehicles)
+    {
+        Vehicle &v = vehicles[i];
+        v.airSince = v.embeddedSince = v.stalledSince = v.lastRecovery = v.stunnedUntil = 0;
+        v.stalledAt = v.pos;
+        v.aiPhase = v.aiPhaseUntil = v.aiOrbitUntil = v.aiStuckSince = v.aiReverseUntil = 0;
+        v.aiBurstUntil = v.aiNextBurst = v.aiNextSecondary = v.nextShot = v.nextShot2 = 0;
+        v.gun2 = HaloWeaponState();
+    }
     int seated = -1, seat = -1;
     loopv(vehicles) loopj(maxSeats)
     {
@@ -1606,7 +2418,24 @@ int halovehicleplayervehicle() { return halovehicleseated() ? playerVehicle : -1
 bool halovehicleuse(float weaponDistance)
 {
     if(!haloactive() || halocinematic() || player1->state != CS_ALIVE) return false;
-    if(halovehicleseated()) { unseatPlayer(vehicles[playerVehicle].flipped); return true; }
+    if(halovehicleseated())
+    {
+        Vehicle &v = vehicles[playerVehicle];
+        const VehicleDef &d = *defOf(v);
+        // A flying Banshee's pilot stays in until it is near the floor: land first.
+        if(d.vehicleClass == HALO_VEHICLE_FLYER && !v.flipped && driverOf(v) == player1)
+        {
+            float floor;
+            bool wall;
+            if(!groundAt(v.pos.x, v.pos.y, v.pos.z + .1f, v.pos.z - 1.5f * vehicleScale(), floor, wall))
+            {
+                conoutf("Halo vehicle: the %s is in the air, land to get out", d.displayName.c_str());
+                return true;
+            }
+        }
+        unseatPlayer(v.flipped);
+        return true;
+    }
     int seat;
     float distance;
     const int index = nearestSeat(seat, distance, true);
@@ -1627,7 +2456,7 @@ const char *halovehicleprompt(float weaponDistance)
     if(vehicles[index].flipped) formatstring(prompt)("E  Flip the %s", d.displayName.c_str());
     else if(d.seats[seat].role == HALO_SEAT_GUNNER)
         formatstring(prompt)(d.vehicleClass == HALO_VEHICLE_TURRET ? "E  Man the %s" : "E  %s gunner", d.displayName.c_str());
-    else formatstring(prompt)("E  Drive the %s", d.displayName.c_str());
+    else formatstring(prompt)(d.vehicleClass == HALO_VEHICLE_FLYER ? "E  Fly the %s" : "E  Drive the %s", d.displayName.c_str());
     return prompt;
 }
 
@@ -1638,31 +2467,62 @@ void halovehicledrive(int curtime)
     Vehicle &v = vehicles[playerVehicle];
     const VehicleDef &d = *defOf(v);
     const int role = d.seats[playerSeat].role;
-    float throttle = 0, steer = 0;
+    Drive in;
+    const bool qa = lastmillis < qaUntil;
     if(role == HALO_SEAT_DRIVER && !v.flipped)
     {
-        throttle = clamp(float(player1->move), -1.0f, 1.0f);
+        in.piloted = true;
+        in.throttle = clamp(float(player1->move), -1.0f, 1.0f);
         const float keys = -clamp(float(player1->strafe), -1.0f, 1.0f);
-        steer = keys;
-        if(!keys && !halo_vehiclesteer)
+        // Turn towards where the camera looks, as the retail vehicles do.
+        const float camera = clamp(wrap180(player1->yaw - v.yaw) / 30.0f, -1.0f, 1.0f);
+        const float forwardSpeed = v.vel.dot(forwardOf(v.yaw));
+        if(d.vehicleClass == HALO_VEHICLE_FLYER)
         {
-            // Turn towards where the camera looks, as the retail Warthog does, reversing included.
-            const float forwardSpeed = v.vel.dot(forwardOf(v.yaw));
-            if(throttle || fabsf(forwardSpeed) > 2)
-                steer = clamp(wrap180(player1->yaw - v.yaw) / 30.0f, -1.0f, 1.0f) * (forwardSpeed < -1 ? -1 : 1);
+            // The nose follows the camera; A and D strafe, jump climbs and crouch descends.
+            in.strafe = keys;
+            in.climb = float(jumpHeld) - float(crouchHeld);
+            in.aimYaw = player1->yaw;
+            in.aimPitch = player1->pitch;
+            if(qa && qaFlight) { in.throttle = qaThrottle; in.strafe = qaStrafe; in.climb = qaClimb; }
         }
-        // QA input; a steer outside -1..1 keeps the camera steering.
-        if(lastmillis < qaUntil) { throttle = qaThrottle; if(fabsf(qaSteer) <= 1) steer = qaSteer; }
+        else if(d.vehicleClass == HALO_VEHICLE_HOVER)
+        {
+            // A hover craft turns to the camera even standing still; A and D strafe.
+            in.strafe = keys;
+            in.steer = halo_vehiclesteer ? 0 : clamp(wrap180(player1->yaw - v.yaw) / 20.0f, -1.0f, 1.0f);
+            if(halo_vehiclesteer) { in.steer = keys; in.strafe = 0; }
+            if(qa) { in.throttle = qaThrottle; if(fabsf(qaSteer) <= 1) in.steer = qaSteer; }
+        }
+        else
+        {
+            // The Warthog and the tank: A and D steer; with neither, towards the camera when
+            // moving, reversing included (the tank turns on the spot with the keys alone).
+            in.steer = keys;
+            if(!keys && !halo_vehiclesteer && (in.throttle || fabsf(forwardSpeed) > 2))
+                in.steer = camera * (forwardSpeed < -1 ? -1 : 1);
+            // QA input; a steer outside -1..1 keeps the camera steering.
+            if(qa) { in.throttle = qaThrottle; if(fabsf(qaSteer) <= 1) in.steer = qaSteer; }
+        }
+        // Stunned by EMP: the engine is out, the car coasts (a Banshee sinks, fly).
+        // A hover craft's strafe is its engine too.
+        if(lastmillis < v.stunnedUntil) in.throttle = in.strafe = 0;
+    }
+    else if(playerent *pilot = aliveBot(driverOf(v)))
+    {
+        // A Warthog's gunner or passenger with an actor at the wheel: it drives.
+        if(halo_vehicleai) in = aiDrive(v, playerVehicle, pilot);
+        else in.piloted = true;
     }
     player1->strafe = 0;
     player1->jumpnext = false;
     player1->trycrouch = false;
     if(role != HALO_SEAT_DRIVER) { v.aimYaw = player1->yaw; v.aimPitch = player1->pitch; }
-    if(d.vehicleClass == HALO_VEHICLE_CAR || !v.grounded)
+    if(drivenClass(d.vehicleClass) || !v.grounded)
     {
         // Fixed 8 ms steps keep wall contacts and landings stable at any frame rate.
         for(int left = min(curtime, 100); left > 0; left -= 8)
-            simulate(v, playerVehicle, min(left, 8) / 1000.0f, throttle, steer);
+            simulate(v, playerVehicle, min(left, 8) / 1000.0f, in);
     }
     if(d.vehicleClass == HALO_VEHICLE_TURRET) v.yaw = v.aimYaw;
     // Falls, wedges and stalls; actors in the way were shoved or run down in simulate.
@@ -1691,22 +2551,27 @@ void halovehiclesupdate(int elapsed)
         if(!v.exists || !d) continue;
         // Carried by a scripted object (a Pelican's cargo hook) or moved by a recording.
         vec carriedAt;
-        float carriedYaw;
-        if(v.object >= 0 && haloscenarioobjectcarried(v.object, carriedAt, carriedYaw))
+        float carriedYaw, carriedPitch = 0;
+        if(v.object >= 0 && haloscenarioobjectcarried(v.object, carriedAt, carriedYaw, &carriedPitch))
         {
+            // A recorded flight (a Banshee's flyby) climbs and dives with the recording; when it
+            // ends, the vehicle carries on from there (an actor at the controls takes over).
             v.carried = true;
             v.pos = carriedAt;
             v.smoothZ = v.pos.z;
             v.yaw = carriedYaw;
+            v.pitch = d->vehicleClass == HALO_VEHICLE_FLYER ? clamp(carriedPitch, -60.0f, 60.0f) : 0;
+            v.roll = 0;
             v.vel = vec(0, 0, 0);
             v.grounded = v.sleeping = false;
+            updateRiders(v);
             continue;
         }
         v.carried = false;
         if(i == playerVehicle)
         {
             followPlayer();
-            if(d->seats[playerSeat].role != HALO_SEAT_DRIVER || d->vehicleClass == HALO_VEHICLE_TURRET) fireGun(v, elapsed);
+            if(armedSeat(*d, playerSeat)) fireGun(v, elapsed);
             if(v.flipped && lastmillis - v.flippedAt > flipEject)
             {
                 conoutf("Halo vehicle: the %s is over, player thrown out", d->displayName.c_str());
@@ -1716,9 +2581,20 @@ void halovehiclesupdate(int elapsed)
                 if(!unseatPlayer(false) && !recoverVehicle(v, i, "over with no room to get out", false)) unseatPlayer(true);
             }
         }
+        else if(playerent *pilot = halo_vehicleai && !halocinematic() && drivenClass(d->vehicleClass) && !v.flipped ? aliveBot(driverOf(v)) : nullptr)
+        {
+            // An actor at the controls drives or flies it (aiGround, aiFlight).
+            v.sleeping = false;
+            v.stillSince = 0;
+            const Drive in = aiDrive(v, i, pilot);
+            for(int left = min(elapsed, 100); left > 0; left -= 8) simulate(v, i, min(left, 8) / 1000.0f, in);
+            updateStuck(v, i);
+            if(!v.exists) continue;
+            v.stillZ = v.pos.z;
+        }
         else if(!v.sleeping && !halocinematic())
         {
-            for(int left = min(elapsed, 100); left > 0; left -= 8) simulate(v, i, min(left, 8) / 1000.0f, 0, 0);
+            for(int left = min(elapsed, 100); left > 0; left -= 8) simulate(v, i, min(left, 8) / 1000.0f, Drive());
             updateStuck(v, i);
             if(!v.exists) continue;
             // Asleep once still. Not on a lift deck or a light bridge (it moves or vanishes): a
@@ -1733,9 +2609,12 @@ void halovehiclesupdate(int elapsed)
         }
         if(d->vehicleClass == HALO_VEHICLE_TURRET && v.riders[0] && v.riders[0] != player1) v.yaw = v.riders[0]->yaw;
         updateRiders(v);
+        if(!halocinematic()) aiFireSeats(v, elapsed);
         if(boardTick) aiBoard(v);
     }
+    if(boardTick) updateBoardings();
     depenetrate();
+    updateEngineLoops();
 }
 
 bool halovehiclecamera(physent &camera)
@@ -1745,7 +2624,10 @@ bool halovehiclecamera(physent &camera)
     const VehicleDef &d = *defOf(v);
     const Dims dm = dims(v);
     const int role = d.seats[playerSeat].role;
-    const float yaw = player1->yaw * RAD, pitch = clamp(player1->pitch, -40.0f, 35.0f) * RAD;
+    // A Banshee's pilot looks further up and down (the nose follows the camera).
+    const bool flyer = d.vehicleClass == HALO_VEHICLE_FLYER && role == HALO_SEAT_DRIVER;
+    const float lowest = flyer ? -70.0f : -40.0f, highest = flyer ? 70.0f : 35.0f;
+    const float yaw = player1->yaw * RAD, pitch = clamp(player1->pitch, lowest, highest) * RAD;
     const vec view(sinf(yaw) * cosf(pitch), -cosf(yaw) * cosf(pitch), sinf(pitch));
     vec pivot;
     float distance;
@@ -1772,17 +2654,66 @@ bool halovehiclecamera(physent &camera)
     if(length > 1) target = vec(pivot).add(back.mul((length - .5f) / length));
     camera.o = target;
     camera.yaw = player1->yaw;
-    camera.pitch = clamp(player1->pitch, -40.0f, 35.0f) - (role == HALO_SEAT_DRIVER ? 6 : 0);
+    camera.pitch = clamp(player1->pitch, lowest, highest) - (role == HALO_SEAT_DRIVER ? 6 : 0);
     camera.roll = 0;
     return true;
 }
 
-int halovehicledamage(int damage)
+float halovehicledamage(float damage)
 {
-    if(!halovehicleseated() || damage <= 0 || damage == INT_MAX) return damage;
+    if(!halovehicleseated() || damage <= 0) return damage;
     const VehicleDef &d = *defOf(vehicles[playerVehicle]);
-    // The Warthog's body takes some of the fire; a turret's gunner sits in the open.
-    return d.vehicleClass == HALO_VEHICLE_CAR ? max(1, int(damage * .8f + .5f)) : damage;
+    // The Warthog's body and the Banshee's canopy take some of the fire and the tank's hull more;
+    // a turret's gunner and a Ghost's rider sit in the open.
+    switch(d.vehicleClass)
+    {
+        case HALO_VEHICLE_CAR: case HALO_VEHICLE_FLYER: return damage * .8f;
+        case HALO_VEHICLE_TANK: return damage * .5f;
+        default: return damage;
+    }
+}
+
+int halovehicleemp(const vec &centre, float radius, int stuck, int millis)
+{
+    if(!haloactive() || millis <= 0) return 0;
+    int count = 0;
+    loopv(vehicles)
+    {
+        Vehicle &v = vehicles[i];
+        if(!v.exists || !defOf(v)) continue;
+        bool reached = i == stuck;
+        if(!reached && radius > 0)
+        {
+            // The nearest point of the body's box (yaw only) to the centre.
+            const Dims dm = dims(v);
+            const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
+            const vec rel = vec(centre).sub(vec(v.pos).add(vec(f).mul(dm.centre)));
+            const float along = max(0.0f, fabsf(rel.dot(f)) - dm.halfL), side = max(0.0f, fabsf(rel.dot(r)) - dm.halfW);
+            const float top = v.pos.z + (v.flipped ? dm.height * .6f : dm.height);
+            const float up = centre.z > top ? centre.z - top : centre.z < v.pos.z ? v.pos.z - centre.z : 0;
+            reached = along * along + side * side + up * up <= radius * radius;
+        }
+        if(!reached) continue;
+        v.stunnedUntil = max(v.stunnedUntil, lastmillis + millis);
+        v.sleeping = false;
+        ++count;
+        if(halo_vehicletrace) conoutf("Halo vehicle %d stunned by EMP for %d ms", i, millis);
+    }
+    return count;
+}
+
+bool halovehicleriderstunned(const playerent *unit)
+{
+    if(!unit) return false;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        const VehicleDef *d = defOf(v);
+        if(!v.exists || !d || lastmillis >= v.stunnedUntil) continue;
+        // Only the gun seat: a passenger fires its own weapon, which an EMP on the car leaves alone.
+        loopj(maxSeats) if(v.riders[j] == unit) return j < int(d->seats.size()) && d->seats[j].role == HALO_SEAT_GUNNER;
+    }
+    return false;
 }
 
 namespace
@@ -1939,9 +2870,18 @@ bool halovehiclestatus(HaloVehicleStatus &status)
     status.role = d.seats[playerSeat].role;
     status.speed = playerSpeed(v);
     status.flipped = v.flipped;
-    status.airborne = !v.grounded && d.vehicleClass == HALO_VEHICLE_CAR;
-    const HaloWeaponDef *gun = status.role != HALO_SEAT_DRIVER || d.vehicleClass == HALO_VEHICLE_TURRET ? haloweapon(v.gun.def) : nullptr;
+    status.airborne = !v.grounded && (d.vehicleClass == HALO_VEHICLE_CAR || d.vehicleClass == HALO_VEHICLE_HOVER || d.vehicleClass == HALO_VEHICLE_TANK);
+    status.driverFires = driverFires(d);
+    const HaloWeaponDef *gun = armedSeat(d, playerSeat) ? haloweapon(v.gun.def) : nullptr;
     status.weapon = gun ? gun->index : -1;
+    status.secondary = gun && gun->trigger(1) && gun->trigger(1)->projectile.valid;
+    if(d.vehicleClass == HALO_VEHICLE_FLYER)
+    {
+        float floor;
+        bool wall;
+        const float s = vehicleScale(), reach = 60 * s;
+        if(groundAt(v.pos.x, v.pos.y, v.pos.z + .1f, v.pos.z - reach, floor, wall)) status.altitude = (v.pos.z - floor) / max(s, 1e-3f);
+    }
     status.heat = gun && gun->heatOverheat > 0 ? clamp(v.gun.heat / gun->heatOverheat, 0.0f, 1.0f) : 0;
     status.overheated = v.gun.overheated;
     status.firing = gun && lastmillis - lastFire < 150;
@@ -1969,7 +2909,9 @@ void halovehiclesrender()
         const float roll = atan2f(ru.dot(rr), ru.dot(lu));
         // Turrets turn with their gunner.
         const float renderHeading = d->vehicleClass == HALO_VEHICLE_TURRET ? (90 - v.yaw) * RAD : heading;
-        const vec at(v.pos.x, v.pos.y, v.smoothZ);
+        // A hover craft floats over its floor point, bobbing a little.
+        const float lift = liftOf(*d, s), bob = lift > 0 ? sinf(lastmillis / 300.0f + i) * .02f * s : 0;
+        const vec at(v.pos.x, v.pos.y, v.smoothZ + lift + bob);
         rendermodel(d->model.c_str(), ANIM_MAPMODEL, 0, -1, at, roll / RAD, 180 - renderHeading / RAD, pitch / RAD, 0, 0,
                     nullptr, nullptr, s / d->modelScale);
     }
@@ -2092,6 +3034,9 @@ void halovehicleteleport(int object, const vec &feet, float yaw)
     Vehicle &v = vehicles[index];
     const bool keepPlayer = index == playerVehicle;
     settle(v, feet);
+    // A Banshee keeps the flag's height (a30's lz_banshee flags are in the air): with a pilot it
+    // flies from there, empty it falls.
+    if(defOf(v)->vehicleClass == HALO_VEHICLE_FLYER) { v.pos = feet; v.smoothZ = feet.z; v.stillZ = feet.z; v.grounded = false; }
     v.yaw = yaw;
     if(keepPlayer) placePlayerOnSeat();
 }
@@ -2203,18 +3148,33 @@ bool halovehicleaigoto(int object, const char *seat, playerent *const *units, in
     const VehicleDef &d = *defOf(v);
     const int s = seatByName(d, seat);
     if(!v.exists || s < 0 || v.riders[s]) return true;
-    // No pathing: the nearest of the squad boards if it is within the enterable distance.
+    for(const Boarding &b : boardings) if(b.vehicle == index && b.seat == s) return true;
+    // The nearest of the squad boards at once if it is within the enterable distance; else the
+    // nearest one walks there (haloactorgoto) and boards on arrival (updateBoardings).
     const float range = max(v.aiDistance, 3.0f) * vehicleScale() + dims(v).halfL;
     playerent *best = nullptr;
-    float distance = range;
+    float distance = 1e9f;
     loopi(count)
     {
         playerent *p = units[i];
         if(!p || p->state != CS_ALIVE || halovehicleinside(p)) continue;
+        bool walking = false;
+        for(const Boarding &b : boardings) walking |= b.unit == p;
+        if(walking) continue;
         const float dd = p->o.dist(seatPoint(v, s));
         if(dd < distance) { distance = dd; best = p; }
     }
-    if(best) v.riders[s] = best;
+    if(!best) return true;
+    if(distance <= range)
+    {
+        v.riders[s] = best;
+        v.sleeping = false;
+        return true;
+    }
+    boardings.push_back({best, index, s, lastmillis, lastmillis + 30000});
+    const vec entry = modelPoint(v, d.seats[s].enter, vehicleScale());
+    haloactorgoto(best, &entry);
+    if(halo_vehicletrace) conoutf("Halo vehicle: %s walks to the %s (%s)", best->name, d.displayName.c_str(), d.seats[s].name.c_str());
     return true;
 }
 
@@ -2223,11 +3183,75 @@ void halovehicleforget(const playerent *unit)
     if(!unit || unit == player1) return;
     loopv(vehicles) for(playerent *&p : vehicles[i].riders) if(p == unit) p = nullptr;
     for(Vehicle &v : saved) for(playerent *&p : v.riders) if(p == unit) p = nullptr;
+    boardings.erase(std::remove_if(boardings.begin(), boardings.end(), [unit](const Boarding &b) { return b.unit == unit; }), boardings.end());
     trapped.erase(std::remove_if(trapped.begin(), trapped.end(), [unit](const Trap &t) { return t.body == unit; }), trapped.end());
     struck.erase(std::remove(struck.begin(), struck.end(), static_cast<const physent *>(unit)), struck.end());
 }
 
+bool halovehiclearmedseat(const playerent *unit)
+{
+    if(!unit || unit == player1) return false;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        const VehicleDef *d = defOf(v);
+        if(!v.exists || !d) continue;
+        loopj(min(maxSeats, int(d->seats.size()))) if(v.riders[j] == unit) return armedSeat(*d, j);
+    }
+    return false;
+}
+
+playerent *halovehicledriverof(int object)
+{
+    const int index = find(object);
+    return index >= 0 && vehicles[index].exists ? driverOf(vehicles[index]) : nullptr;
+}
+
+int halovehicleaigoing(int object)
+{
+    const int index = find(object);
+    int count = 0;
+    for(const Boarding &b : boardings) count += b.vehicle == index && index >= 0;
+    return count;
+}
+
+void halovehiclesecondary(bool down) { secondaryHeld = down && halovehicleseated(); }
+void halovehiclejump(bool down) { jumpHeld = down; }
+void halovehiclecrouch(bool down) { crouchHeld = down; }
+
+int halovehicleensuretype(const char *name, const vec &feet, float yaw)
+{
+    loadDefs();
+    int type = -1;
+    for(const VehicleDef &d : defs) if(d.name == name) type = d.index;
+    if(type < 0 || !defs[type].player) return -1;
+    const int driver = seatByRole(defs[type], HALO_SEAT_DRIVER);
+    // One standing in the section that the player may take. Placements the script has not
+    // created yet are left to the script: it gives some of them to its own pilots (c40's
+    // c_banshee_1), so the flight gets a Banshee of the engine's own instead.
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        if(v.exists && v.type == type && !v.carried && v.enterable && !v.flipped && !driverOf(v) && !(driver >= 0 && v.riders[driver]))
+            return i;
+    }
+    const int index = add(type, feet, yaw, -1, 0);
+    if(index < 0) return -1;
+    Vehicle &v = vehicles[index];
+    const Dims d = dims(v);
+    v.spawnFeet = vec(feet).add(vec(rightOf(yaw)).mul(d.halfW + player1->radius + 1.5f));
+    respawn(v, true);
+    placeClear(v, index, v.spawnFeet);
+    v.spawnFeet = v.pos;
+    conoutf("Halo vehicle: a %s for the flight at %.1f,%.1f,%.1f", defs[type].displayName.c_str(), v.pos.x, v.pos.y, v.pos.z);
+    return index;
+}
+
+int halovehicleengineloops() { return int(engineLoops.size()); }
+void halovehiclessounds() { updateEngineLoops(); }
+
 int halovehiclecount() { return vehicles.length(); }
+int halovehicledefcount() { loadDefs(); return int(defs.size()); }
 
 void halovehicledump(const char *label)
 {
@@ -2244,10 +3268,15 @@ void halovehicledump(const char *label)
         const VehicleDef *d = defOf(v);
         int riders = 0;
         for(const playerent *p : v.riders) riders += p != nullptr;
+        const playerent *pilot = driverOf(v);
         conoutf("VEHICLE_QA %s vehicle=%d type=%s object=%d exists=%d pos=%.2f,%.2f,%.2f yaw=%.1f pitch=%.1f roll=%.1f "
-                "speed=%.2f grounded=%d flipped=%d riders=%d escape=%d placed=%d safe=%d length=%.2f",
+                "speed=%.2f grounded=%d flipped=%d riders=%d escape=%d placed=%d safe=%d length=%.2f stunned=%d class=%d "
+                "pilot=%s phase=%d target=%s carried=%d shots=%d",
                 label, i, d ? d->name.c_str() : "?", v.object, v.exists, v.pos.x, v.pos.y, v.pos.z, v.yaw, v.pitch, v.roll,
-                playerSpeed(v), v.grounded, v.flipped, riders, v.escape, v.placed, v.safeCount, d ? dims(v).length : 0.0f);
+                playerSpeed(v), v.grounded, v.flipped, riders, v.escape, v.placed, v.safeCount, d ? dims(v).length : 0.0f,
+                max(0, v.stunnedUntil - lastmillis), d ? d->vehicleClass : -1, pilot ? (pilot == player1 ? "player" : pilot->name) : "-",
+                v.aiPhase, pilot && pilot != player1 && haloactortarget(pilot) ? haloactortarget(pilot)->name : "-", v.carried,
+                v.gun.lastShot ? 1 : 0);
     }
     fflush(stdout);
 }
@@ -2257,6 +3286,30 @@ void halovehicleqainput(float throttle, float steer, int millis)
     qaThrottle = clamp(throttle, -1.0f, 1.0f);
     qaSteer = fabsf(steer) > 1.5f ? 2.0f : clamp(steer, -1.0f, 1.0f);
     qaUntil = lastmillis + max(0, millis);
+    qaFlight = false;
+}
+
+void halovehicleqaflight(float throttle, float strafe, float climb, int millis)
+{
+    qaThrottle = clamp(throttle, -1.0f, 1.0f);
+    qaStrafe = clamp(strafe, -1.0f, 1.0f);
+    qaClimb = clamp(climb, -1.0f, 1.0f);
+    qaSteer = 2;
+    qaUntil = lastmillis + max(0, millis);
+    qaFlight = true;
+}
+
+bool halovehicleqapilot(int vehicle, playerent *unit, const char *seat)
+{
+    if(!vehicles.inrange(vehicle) || !vehicles[vehicle].exists || !unit || unit == player1 || unit->state != CS_ALIVE) return false;
+    Vehicle &v = vehicles[vehicle];
+    const VehicleDef &d = *defOf(v);
+    const int s = seat && *seat ? seatByName(d, seat) : seatByRole(d, HALO_SEAT_DRIVER);
+    if(s < 0 || (v.riders[s] && v.riders[s] != unit)) return false;
+    halovehicleunseat(unit);
+    v.riders[s] = unit;
+    v.sleeping = false;
+    return true;
 }
 
 bool halovehicleqaenter(int vehicle, int role)

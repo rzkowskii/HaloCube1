@@ -10,5 +10,8 @@ bool haloworldhasnozzles();
 void haloworlddraw(HaloSurface pass);
 void haloworlddrawnozzles();
 void haloworlddrawcoronas(const vec &right, const vec &up, const vec &forward);
+// The solid and cutout surfaces again with only their own textures (unit 0), for a light pass:
+// the caller sets the colour, blending, fog and any second texture unit (halo_fx.cpp).
+void haloworlddrawlight();
 
 #endif

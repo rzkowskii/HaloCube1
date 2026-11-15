@@ -7,9 +7,13 @@
 #include "halo_weapons.h"
 #include "halo_ai.h"
 #include "halo_hud.h"
+#include "halo_fx.h"
 #include "halo_vehicle.h"
 #include "halo_state.h"
+#include <cmath>
 #include <string>
+#include <utility>
+#include <vector>
 
 extern void startgame(const char *name, int mode, int minutes, bool notify);
 extern int halo_scripttrace;     // halo_script.cpp: trace logging
@@ -84,7 +88,9 @@ namespace
     const float markerRadius = 8.0f, firstContactRadius = 62.0f;
 
     enum MissionStage { INSERTION, FIRST_CONTACT, REACH_PASS, SECOND_CONTACT, EXTRACTION, COMPLETE };
-    enum ActorKind { GRUNT, ELITE, JACKAL, HUNTER, FLOOD_ELITE, FLOOD_HUMAN, INFECTION, CARRIER, SENTINEL, MARINE, ACTOR_COUNT };
+    // MONITOR and ENGINEER (tools/halo_actors.py KINDS 10 and 11) fly and never fight.
+    enum ActorKind { GRUNT, ELITE, JACKAL, HUNTER, FLOOD_ELITE, FLOOD_HUMAN, INFECTION, CARRIER, SENTINEL, MARINE, MONITOR, ENGINEER,
+                     ACTOR_COUNT };
 
     struct ActorProfile
     {
@@ -105,6 +111,8 @@ namespace
         {"Carrier Form", "halo/carrier", 50, 0, 900, 36, 2.7f, 0.95f, true},
         {"Sentinel", "halo/sentinel", 65, 0, 225, 7, 3.8f, 0.95f, false},
         {"Marine", "halo/marine", 45, 24, 300, 6, 3.6f, 1.0f, false},
+        {"343 Guilty Spark", "halo/monitor", 200, 0, 1000, 0, 1.4f, 0.7f, true},
+        {"Engineer", "halo/engineer", 30, 0, 1000, 0, 2.4f, 1.0f, true},
     };
 
     struct HaloEnemy
@@ -116,7 +124,19 @@ namespace
         HaloWeaponState weapon;
         int team;
         float shieldMax;
+        // The variant's damage modifier on its weapon's jpt! damage (halofiretrigger), and the
+        // fraction of a health point the exact hits on it have left over (halodamage).
+        float damageScale = 0.5f, healthCarry = 0;
+        // When the actor was last hurt, which makes active camouflage flicker (haloactorcloak).
+        int hurtAt = -100000;
     };
+
+    // The hit weapon.cpp is dealing (halohit): its exact amount and jpt! side effect, which
+    // halodamage uses in place of the whole number hit() carries.
+    struct PendingHit { const playerent *target = NULL; float damage = 0; int sideEffect = 0; const HaloDamage *source = NULL; };
+    PendingHit pendingHit;
+    // The fraction of a health point exact hits on the player have left over.
+    float playerHealthCarry = 0;
 
     // A weapon lying in the world: scenario placements and drops.
     struct GroundWeapon
@@ -407,6 +427,7 @@ namespace
         shield = shieldCap;
         shieldHit = 0;
         shieldRecharging = false;
+        playerHealthCarry = 0;
         // Before the section's first checkpoint a revert returns to what the player brought into
         // the section (from the section before, or a continued game), not the default loadout.
         if(!atCheckpoint) applyLoadout(sectionLoadout);
@@ -449,8 +470,21 @@ namespace
         recordProgress(true);
     }
 
+    // The side a body fights on when neither the scenario nor the variant names one.
+    int kindTeam(ActorKind kind)
+    {
+        switch(kind)
+        {
+            case MARINE: return HALO_TEAM_HUMAN;
+            case FLOOD_ELITE: case FLOOD_HUMAN: case INFECTION: case CARRIER: return HALO_TEAM_FLOOD;
+            case SENTINEL: case MONITOR: return HALO_TEAM_SENTINEL;
+            default: return HALO_TEAM_COVENANT;
+        }
+    }
+
+    // team HALO_TEAM_DEFAULT: the variant's unit team (actors.txt), else the body's.
     botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw, int weaponIndex = -1, int actorIndex = -1,
-                       int team = HALO_TEAM_COVENANT)
+                       int team = HALO_TEAM_DEFAULT)
     {
         const ActorProfile &profile = profiles[kind];
         // Script-spawned actors arrive without a variant; give them their usual weapon.
@@ -458,15 +492,16 @@ namespace
             "weapons\\plasma pistol\\plasma pistol", "weapons\\plasma rifle\\plasma rifle",
             "weapons\\plasma pistol\\plasma pistol", "weapons\\fuel rod gun\\hunter fuel rod",
             "weapons\\plasma rifle\\plasma rifle", "weapons\\assault rifle\\assault rifle", NULL, NULL,
-            "characters\\sentinel\\sentinel", "weapons\\assault rifle\\assault rifle",
+            "characters\\sentinel\\sentinel", "weapons\\assault rifle\\assault rifle", NULL, NULL,
         };
         const HaloActorDef *actor = haloactordef(actorIndex);
         if(actor && actor->weapon >= 0) weaponIndex = actor->weapon;
         const HaloWeaponDef *def = profile.melee ? nullptr :
             weaponIndex >= 0 ? haloweapon(weaponIndex) : usual[kind] ? haloweaponfind(usual[kind]) : nullptr;
         if(!actor) actor = haloactordefault(kind, def ? def->index : -1);
+        if(team < 0 || team >= HALO_TEAM_COUNT) team = haloactordefaultteam(actor, kindTeam(kind));
         defformatstring(name)("%.12s %d", profile.name, enemies.length() + 1);
-        const bool human = team == HALO_TEAM_HUMAN;
+        const bool human = team == HALO_TEAM_HUMAN || team == HALO_TEAM_PLAYER;
         botent *bot = BotManager.CreateBot(human ? "RVSF" : "CLA", kind == ELITE ? "worse" : "bad", name);
         if(!bot) return nullptr;
         // The variant's vitality overrides the body defaults when it sets one.
@@ -484,21 +519,30 @@ namespace
         bot->pitch = bot->roll = 0;
         entinmap(bot);
         bot->targetyaw = bot->yaw;
-        const int gun = profile.melee ? GUN_KNIFE : GUN_SUBGUN;
+        // Variants that cannot use ranged weapons (the energy sword Elites) fight in melee.
+        const bool meleeOnly = profile.melee || (actor && actor->meleeOnly());
+        const int gun = meleeOnly ? GUN_KNIFE : GUN_SUBGUN;
         bot->setprimary(gun);
         bot->setnextprimary(gun);
         bot->selectweapon(gun);
         bot->nextweaponsel = bot->weaponsel;
         bot->weaponchanging = 0;
         loopj(NUMGUNS) bot->mag[j] = bot->ammo[j] = 0;
-        // Damage is the low end of the retail projectile's full-strength range (the jpt! upper
-        // bound's min, the value this balance was set with), scaled by the variant's damage
-        // modifier; the variant's rate of fire sets the cadence inside a burst.
+        // Each shot rolls the retail projectile's full-strength range (the jpt! upper bound) with
+        // its range falloff, times the variant's damage modifier, in halofiretrigger (exact, not
+        // rounded per shot). The slot keeps the nominal damage (the upper bound's min times the
+        // modifier) for the plain bolt of an actor without weapon data. The variant's rate of
+        // fire sets the cadence inside a burst.
         const HaloTriggerDef *t = def ? def->trigger() : nullptr;
         const float damageScale = actor && actor->damageScale > 0 ? actor->damageScale : aiDamageScale;
-        const int damage = t && t->projectile.valid ? max(1, int(t->projectile.damage.upperMin * damageScale + .5f)) : profile.damage;
-        const int delay = actor && actor->rate > 0 ? int(1000 / actor->rate) :
-                          t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
+        enemies.last().damageScale = damageScale;
+        // A melee-only variant strikes with its weapon's melee jpt! (the sword's 151) times the modifier.
+        const int damage = meleeOnly && def && def->melee.upperMin > 0 ? max(1, int(def->melee.upperMin * damageScale + .5f)) :
+                           t && t->projectile.valid ? max(1, int(t->projectile.damage.upperMin * damageScale + .5f)) : profile.damage;
+        int delay = actor && actor->rate > 0 ? int(1000 / actor->rate) :
+                    t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
+        // A sword swing every 1.2 s at most (the slot's ranged cadence would swing five times a second).
+        if(meleeOnly && !profile.melee) delay = max(delay, 1200);
         campaignWeapon(bot, gun, 100, delay, 0, damage, kind == ELITE ? 36 : 56);
         bot->mag[gun] = 100;
         haloactorattach(bot, actor, team);
@@ -510,7 +554,7 @@ namespace
         loopv(waveStarts[wave])
         {
             entity &start = ents[waveStarts[wave][i]];
-            const ActorKind kind = start.attr4 < ACTOR_COUNT ? ActorKind(start.attr4) : GRUNT;
+            const ActorKind kind = start.attr4 >= 0 && start.attr4 < ACTOR_COUNT ? ActorKind(start.attr4) : GRUNT;
             spawnEnemy(kind, position(start), start.attr1 / 10.0f, start.attr5 - 1);
         }
         if(!waveStarts[wave].empty()) conoutf("Halo: encounter %d", wave + 1);
@@ -519,7 +563,8 @@ namespace
     int remaining()
     {
         int count = 0;
-        loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && enemies[i].team != HALO_TEAM_HUMAN) ++count;
+        loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && !haloteamfriendly(enemies[i].team) &&
+                          !haloactorpassive(enemies[i].bot)) ++count;
         return count;
     }
 
@@ -547,6 +592,9 @@ namespace
     }
 
     bool escapeRun() { return mission == 9 && section >= 5; }
+    // Two Betrayals' sections 1 and 4 on retail collision are flown, not walked: their way on is
+    // up to a pulse generator or a landing pad (DRIVEN_SECTIONS in tools/import_halo_campaign.py).
+    bool flownSection() { return mission == 7 && (section == 0 || section == 3) && halocollisionactive(); }
     bool retailCartographer() { return mission == 3 && halocollisionactive(); }
 
     const char *sectionInteraction()
@@ -671,7 +719,7 @@ namespace
         {
             if(lastmillis < floodSpawns[i].at) continue;
             const FloodSpawn spawn = floodSpawns.remove(i);
-            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, HALO_TEAM_COVENANT);
+            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, HALO_TEAM_FLOOD);
             if(placed) conoutf("Halo: flood %s rises", profiles[spawn.kind].name);
         }
     }
@@ -693,6 +741,28 @@ namespace
         g.state.zoom = 0;
         g.state.charged = false;
         g.state.chargeStart = 0;
+    }
+
+    // The weapon's firing loop (weapons.txt `sound loop`): the flamethrower's fire while the trigger
+    // is held and it can fire, the plasma pistol's hum once a charge has built for a moment.
+    void updateFiringLoop()
+    {
+        const char *sample = NULL;
+        bool active = false;
+        if(tagWeapons() && !halocinematic() && !halodriving() && player1->state == CS_ALIVE && stage != COMPLETE && !ispaused)
+        {
+            const HaloWeaponState &st = carried[currentCarried];
+            const HaloWeaponDef *d = haloweapon(st.def);
+            const HaloTriggerDef *t = d ? d->trigger() : NULL;
+            sample = d ? d->sound(HALO_SOUND_LOOP) : NULL;
+            if(sample && t)
+            {
+                if(t->charge > 0) active = st.chargeStart && lastmillis - st.chargeStart > 150;
+                else active = player1->attacking && st.canfire(*d) && !player1->weaponsel->reloading &&
+                              (d->usesBattery() || player1->weaponsel->mag > 0);
+            }
+        }
+        haloloopsound(sample, active);
     }
 
     void updateWeapons(int elapsed)
@@ -985,9 +1055,12 @@ namespace
             }
             else if(sscanf(line, "checkpoint %f %f %f %f %d %d", &x, &y, &z, &w, &a, &b) == 6)
             {
+                // sscanf reads "nan" and "inf": a checkpoint there would put the player nowhere.
+                if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(w) ||
+                   fabsf(x) > 1e6f || fabsf(y) > 1e6f || fabsf(z) > 1e6f) return false;
                 g.position = vec(x, y, z); g.yaw = w; g.stage = clamp(a, 0, 4); g.marker = max(b, 0);
             }
-            else if(sscanf(line, "vitals %d %f", &a, &x) == 2) { l.health = clamp(a, 1, playerHealth); l.shield = clamp(x, 0.0f, float(playerShield)); }
+            else if(sscanf(line, "vitals %d %f", &a, &x) == 2 && std::isfinite(x)) { l.health = clamp(a, 1, playerHealth); l.shield = clamp(x, 0.0f, float(playerShield)); }
             else if(sscanf(line, "grenades %d %d %d", &a, &b, &c) == 3) { l.frags = clamp(a, 0, 9); l.plasmas = clamp(b, 0, 9); l.grenadeType = c == HALO_GRENADE_PLASMA ? c : HALO_GRENADE_FRAG; }
             else if(sscanf(line, "current %d", &a) == 1) l.current = a ? 1 : 0;
             else if(sscanf(line, "stock %d %d %d %d %d", &a, &b, &c, &d, &e) == 5)
@@ -1003,7 +1076,7 @@ namespace
                 st = HaloWeaponState();
                 st.loaded = max(b, 0);
                 st.reserve = max(c, 0);
-                st.battery = clamp(x, 0.0f, 1.0f);
+                st.battery = std::isfinite(x) ? clamp(x, 0.0f, 1.0f) : 1.0f;
                 const char *path = line + consumed, *eol = strchr(path, '\n');
                 copystring(g.weaponPath[a], path, min(size_t(MAXSTRLEN), size_t((eol ? eol : path + strlen(path)) - path + 1)));
                 ++slot;
@@ -1156,13 +1229,30 @@ namespace
         conoutf("Halo ending reached: %s complete", haloMissions[mission].title);
     }
 
-    // Credits are over (or skipped): leave the finished campaign at the Halo menu.
+    // The title menu (halo_title): on launch, from the pause menu (the campaign stays paused
+    // under it) and after the credits.
+    void showtitle()
+    {
+        loadProgress();
+        if(!controlsLoaded) controlsLoaded = execfile("config/halo.cfg");
+        titleScreen = true;
+        if(haloactive())
+        {
+            player1->attacking = false;
+            player1->stopmoving();
+        }
+        closemenu(NULL);
+        showmenu("Halo");
+    }
+
+    // Credits are over (or skipped): leave the finished campaign at the title menu.
     void finishEnding()
     {
         if(!ending || endingDone) return;
         endingDone = true;
         conoutf("Halo credits finished");
-        showmenu("Halo Campaign");
+        // Back to the title menu, where New Game and Mission select (every mission now) start again.
+        showtitle();
     }
 
     bool installed(int m, int s)
@@ -1668,6 +1758,7 @@ namespace
         u.grenadeType = grenadeType;
         u.grenades = grenadeCount(grenadeType);
         u.overshield = shieldCap > 0 ? clamp(overshield / shieldCap, 0.0f, 2.0f) : 0;
+        u.flashlight = halofxflashlight(&u.flashlightCharge);
         u.hidden = haloscenariohudhidden(&u.blinking);
         return u;
     }
@@ -1683,7 +1774,7 @@ namespace
             if(!bot || bot->state != CS_ALIVE || count >= capacity || (bot->vel.sqrxy() < 0.01f && lastmillis - bot->lastaction > 500)) continue;
             vec delta = vec(bot->o).sub(player1->o);
             delta.rotate_around_z(-yaw);
-            blips[count++] = HaloHudBlip{delta.x / scale, delta.y / scale, enemies[i].team == HALO_TEAM_HUMAN};
+            blips[count++] = HaloHudBlip{delta.x / scale, delta.y / scale, haloteamfriendly(enemies[i].team)};
         }
         return count;
     }
@@ -1692,10 +1783,18 @@ namespace
     void drawVehicleHud(bool tagHud, int right, float yaw)
     {
         HaloVehicleStatus st;
-        if(!halovehiclestatus(st)) return;
+        if(!halovehiclestatus(st))
+        {
+            // Aboard a Pelican (haloscenarioboard): it flies, the player rides.
+            if(haloscenarioboarded()) label("E  Get out", VIRTW/2-200, VIRTH/2+90, 0.6f);
+            return;
+        }
+        // Without the HUD tags the seat's gun still gets a reticle.
+        if(!tagHud && st.weapon >= 0 && !(haloscenariohudhidden(NULL) & HALO_HUD_CROSSHAIR)) halohuddrawreticle(false);
         if(tagHud)
         {
-            // The seat's gun has a retail HUD of its own when the HUD tags carry one.
+            // The seat's gun has a retail HUD of its own when the HUD tags carry one (a plain
+            // reticle when they carry none for it).
             HaloHudWeapon w;
             w.weapon = st.weapon;
             w.battery_weapon = true;
@@ -1711,10 +1810,13 @@ namespace
         for(char *c = title; *c; ++c) *c = toupper(*c);
         label(title, right, VIRTH-212, 0.60f, true);
         const char *seat = st.role == HALO_SEAT_DRIVER ? "DRIVER" : st.role == HALO_SEAT_GUNNER ? "GUNNER" : "PASSENGER";
-        if(st.vehicleClass == HALO_VEHICLE_CAR && st.role == HALO_SEAT_DRIVER)
+        if(st.vehicleClass != HALO_VEHICLE_TURRET && st.vehicleClass != HALO_VEHICLE_PROP && st.role == HALO_SEAT_DRIVER)
         {
-            // Halo world units are 10 feet.
-            defformatstring(speed)("%s  %3d KM/H%s", seat, int(st.speed * 3.048f * 3.6f + .5f), st.airborne ? "  AIR" : "");
+            // Halo world units are 10 feet; a Banshee's pilot also sees the height over the floor.
+            string extra = "";
+            if(st.vehicleClass == HALO_VEHICLE_FLYER) { if(st.altitude >= 0) formatstring(extra)("  ALT %d M", int(st.altitude * 3.048f + .5f)); }
+            else if(st.airborne) copystring(extra, "  AIR");
+            defformatstring(speed)("%s  %3d KM/H%s", seat, int(st.speed * 3.048f * 3.6f + .5f), extra);
             label(speed, right, VIRTH-173, 0.70f, true);
         }
         else label(seat, right, VIRTH-173, 0.70f, true);
@@ -1771,6 +1873,8 @@ unsigned halofilehash(const char *path)
 void halomapstart(const char *name)
 {
     haloscenariostop();
+    halofxreset();
+    haloloopsound(NULL, false);
     halocollisionmap(nullptr);
     haloplayermoved("section start");
     authoredTransition = false;
@@ -2200,6 +2304,50 @@ void haloplayermoved(const char *why, const vec *kept)
                 safeSpots.empty() ? "" : ", the boarding floor kept");
 }
 
+bool haloplayerplace(const vec *feet, float yaw, const char *why)
+{
+    if(!haloactive() || editmode || ending || player1->state != CS_ALIVE || halodriving()) return false;
+    if(!feet)
+    {
+        player1->yaw = yaw;
+        player1->resetinterp();
+        return true;
+    }
+    // Flags sit on the floor or a little above it; the body is tried there and a little higher.
+    vec ground;
+    bool found = false;
+    for(float up : {0.0f, .5f, 1.26f})
+    {
+        const vec at = vec(*feet).add(vec(0, 0, up));
+        if(halocollisionactive())
+        {
+            if(standable(at, ground)) { found = true; break; }
+            continue;
+        }
+        if(OUTBORD(int(at.x), int(at.y))) break;
+        // collide's spawn test drops the body onto the floor of the cube column it stands in; a
+        // floor far below the flag (a flag in the air over the map, such as a50's lift arrival
+        // in the ship) is not one it stands on.
+        const vec old = player1->o;
+        const bool wasOnFloor = player1->onfloor;
+        player1->o = vec(at).add(vec(0, 0, player1->eyeheight));
+        const bool blocked = collide(player1, true);
+        if(!blocked) ground = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        player1->o = old;
+        player1->onfloor = wasOnFloor;
+        if(!blocked && at.z - ground.z <= 4.0f) { found = true; break; }
+    }
+    if(!found) return false;
+    player1->o = vec(ground).add(vec(0, 0, player1->eyeheight));
+    player1->vel = vec(0, 0, 0);
+    player1->timeinair = 0;
+    player1->yaw = yaw;
+    player1->attacking = false;
+    player1->resetinterp();
+    haloplayermoved(why);
+    return true;
+}
+
 bool haloscenariotransition()
 {
     if(!haloactive() || (preview && !retailCartographer()) || authoredTransition || launchPending || halocinematic() ||
@@ -2228,6 +2376,8 @@ void haloupdate(int elapsed)
     if(ispaused || elapsed <= 0)
     {
         haloscenariopausestate(ispaused || menuvisible());
+        // AssaultCube keeps its sounds playing while paused: the loops stop.
+        if(ispaused) { haloloopsound(NULL, false); halovehiclessounds(); }
         return;
     }
     if(startPending)
@@ -2276,17 +2426,31 @@ void haloupdate(int elapsed)
         if(!preview) recordProgress(atCheckpoint);
         // Carried in under an opening scene: the save that keeps the script waits for it to end.
         pendingStartState = !preview && scriptCarried && !atCheckpoint && halocinematic();
+        // A carried-in script is also the in-memory checkpoint until the section's first one, so
+        // a death before it reverts to the script as it came in, in live play as after Continue
+        // (which restores the saved section start the same way), instead of restarting it.
+        if(!preview && scriptCarried && !atCheckpoint && !halocinematic()) haloscenariocheckpoint();
     }
     haloscenariotick(elapsed);
     if(pendingStartState && !halocinematic())
     {
         pendingStartState = false;
-        if(!atCheckpoint && stage != COMPLETE && player1->state == CS_ALIVE) recordProgress(false);
+        if(!atCheckpoint && stage != COMPLETE && player1->state == CS_ALIVE)
+        {
+            haloscenariocheckpoint();
+            recordProgress(false);
+        }
     }
     if(haloscenariocomplete()) finishSection(true);
     if(haloscenariogamewon())
     {
         if(!preview && mission == haloMissionCount - 1 && section == haloMissions[mission].sections - 1) winPending = true;
+        else if(haloscenarioboarded() && stage != COMPLETE)
+        {
+            // The player boarded the extraction Pelican and the script ends the mission (a30).
+            conoutf("Halo: game_won aboard the extraction, %s section %d complete", haloMissions[mission].title, section + 1);
+            finishSection();
+        }
         else conoutf("Halo: game_won ignored on %s, section %d", haloMissions[mission].title, section + 1);
     }
     if(haloscenariogamelost() && !ending && !halocinematic() && player1->state == CS_ALIVE)
@@ -2310,6 +2474,8 @@ void haloupdate(int elapsed)
         return;
     }
     halovehiclesupdate(elapsed);
+    halofxupdate(elapsed);
+    updateFiringLoop();
     if(halocinematic() || player1->state != CS_ALIVE || stage == COMPLETE) return;
     // The run's first section on stock geometry starts on foot by the parked Warthogs; when the
     // script has not created them (a section launched on its own runs no script), one waits there.
@@ -2317,6 +2483,14 @@ void haloupdate(int elapsed)
     {
         escapeOffered = true;
         halovehicleensure(feetOf(player1), player1->yaw, 80.0f);
+    }
+    // A flown section always has a Banshee the player may take (the scenario's, or one beside
+    // them): checked after the opening and every five seconds on foot, so one lost is replaced.
+    static int flightChecked = 0;
+    if(flownSection() && !halodriving() && lastmillis - escapeStarted > 2500 && lastmillis - flightChecked > 5000)
+    {
+        flightChecked = lastmillis;
+        halovehicleensuretype("banshee", feetOf(player1), player1->yaw);
     }
     updateRecovery();
     if(player1->state != CS_ALIVE) return;
@@ -2375,48 +2549,204 @@ void haloupdate(int elapsed)
     }
 }
 
+// halo_damagetrace 1 also logs the material a special body was hit on (materialScale):
+// DAMAGE_MATERIAL target=<name> kind=<ActorKind> material=<retail type> scale=<multiplier>
+// halo_damagetrace 1 logs every hit halodamage sees (tests/test_damage_model.py):
+// DAMAGE_TRACE attacker=<name> target=<name> exact=<0|1> amount=<before shields> side=<n> gun=<n>
+//              health=<whole points taken> shield=<left> carry=<fraction left over>
+VAR(halo_damagetrace, 0, 0, 1);
+
+void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source)
+{
+    pendingHit.target = target;
+    pendingHit.damage = damage;
+    pendingHit.sideEffect = sideEffect;
+    pendingHit.source = target ? source : NULL;
+}
+
+float haloactordamagescale(const playerent *p)
+{
+    const HaloEnemy *enemy = enemyState(p);
+    return enemy ? enemy->damageScale : aiDamageScale;
+}
+
+namespace
+{
+    // Whole health points of an exact amount; the fraction is carried to the next hit.
+    int wholeDamage(float amount, float &carry)
+    {
+        // A little slack so float products that should be whole (13 on Heroic is 1.3 x 10, which
+        // comes out at 12.999999) are not cut a point short with 0.999999 carried.
+        const float total = max(0.0f, amount) + carry;
+        const int whole = int(total + 1e-3f);
+        carry = max(0.0f, total - whole);
+        return whole;
+    }
+
+    // Bodies whose retail collision materials decide what hurts them: the hit material's body
+    // multiplier (the unit's coll tag, actors.txt) times the jpt! damage's modifier for that
+    // material type (weapons.txt and equipment.txt `materials` lines). Every other body takes its
+    // damage as before (the general material model is not applied to them yet).
+    //   Hunter: a direct hit from within 60 degrees of where it faces lands on the shield arm
+    //   (hunter shield: body multiplier 0, and every campaign weapon but the energy sword has
+    //   modifier 0 for it); from behind (beyond 130 degrees) on the exposed skin (hunter skin);
+    //   anything else, blasts included, on the armour plates (hunter armor).
+    //   Sentinel, Monitor and Engineer have one material each (sentinel, monitor, engineer skin);
+    //   the Monitor's body multiplier is 0, so nothing hurts it.
+    // `region` returns the material type used (-1: none applies).
+    float materialScale(const HaloEnemy &enemy, const playerent *target, const playerent *attacker, int gun,
+                        const HaloDamage *source, int &region)
+    {
+        region = -1;
+        switch(enemy.kind)
+        {
+            case HUNTER:
+                region = HALO_MATERIAL_HUNTER_ARMOR;
+                if(attacker && attacker != target && gun != GUN_GRENADE)
+                {
+                    vec delta = vec(attacker->o).sub(target->o);
+                    delta.z = 0;
+                    if(!delta.iszero())
+                    {
+                        const float yaw = target->yaw * RAD;
+                        const float facing = delta.normalize().dot(vec(sinf(yaw), -cosf(yaw), 0));
+                        if(facing > cosf(60 * RAD)) region = HALO_MATERIAL_HUNTER_SHIELD;
+                        else if(facing < cosf(130 * RAD)) region = HALO_MATERIAL_HUNTER_SKIN;
+                    }
+                }
+                break;
+            case SENTINEL: region = HALO_MATERIAL_SENTINEL; break;
+            case MONITOR: region = HALO_MATERIAL_MONITOR; break;
+            case ENGINEER: region = HALO_MATERIAL_ENGINEER_SKIN; break;
+            default: return 1;
+        }
+        const HaloActorDef *def = haloactorvariant(target);
+        float body = def ? def->bodyMultiplier(region) : -1;
+        // Without actors.txt format 2: the retail multipliers of these bodies.
+        if(body < 0) body = region == HALO_MATERIAL_HUNTER_SHIELD || region == HALO_MATERIAL_MONITOR ? 0 : 1;
+        const bool tagged = source && source->hasMaterials;
+        float modifier = tagged ? source->material(region) : 1;
+        // Hits that carry no jpt! modifiers (actors' melee, the stock weapons, a weapon table
+        // written before the `materials` lines): the armour's usual 0.5.
+        if(!tagged && region == HALO_MATERIAL_HUNTER_ARMOR) modifier = .5f;
+        return body * modifier;
+    }
+}
+
+float haloactorcloak(const playerent *p)
+{
+    if(!haloactive() || !p || p == player1 || p->state != CS_ALIVE) return 0;
+    const HaloActorDef *def = haloactorvariant(p);
+    if(!def || !def->camouflaged()) return 0;
+    const HaloEnemy *enemy = enemyState(p);
+    // Super camouflage (the stealth majors) hides completely; plain camouflage nearly.
+    float cloak = def->superCamouflage() ? 1.0f : .9f;
+    // Firing and being hit make it flicker: weaker at once, recovering over a second.
+    const int since = min(lastmillis - p->lastaction, enemy ? lastmillis - enemy->hurtAt : 100000);
+    if(since >= 0 && since < 1000) cloak *= .35f + .65f * since / 1000.0f;
+    return cloak;
+}
+
+float halomodelalpha(const playerent *p)
+{
+    const float cloak = haloactorcloak(p);
+    if(cloak <= 0) return -1;
+    // A faint refracting shimmer that shows more of the body as the cloak flickers weaker,
+    // the same fading the player's own camouflage uses for its screen tint.
+    const float shimmer = .5f + .5f * sinf(lastmillis * .013f + p->clientnum * 1.7f);
+    float alpha = .05f + .08f * shimmer + (1 - cloak) * .6f;
+    // The flicker is a function of time, not rnd(): the renderer must not draw on the game's
+    // random sequence (it runs a different number of times per tick at every frame rate).
+    if(cloak < .85f && ((lastmillis / 40 + p->clientnum) % 3) == 0) alpha += .2f;
+    return clamp(alpha, .04f, .85f);
+}
+
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
 {
     if(damage <= 0 || damage == INT_MAX) return;
+    // A hit from halohit carries its exact amount and side effect; any other is the whole number.
+    const bool exact = pendingHit.target == target;
+    float amount = exact ? pendingHit.damage : float(damage);
+    const bool emp = exact && pendingHit.sideEffect == HALO_SIDE_EFFECT_EMP;
+    const int side = exact ? pendingHit.sideEffect : 0;
+    const HaloDamage *pendingSource = pendingHit.source;
+    pendingHit.target = NULL;
+    pendingHit.source = NULL;
+    const float given = amount;
+    auto trace = [&](float shieldLeft, float carry)
+    {
+        if(halo_damagetrace)
+            conoutf("DAMAGE_TRACE attacker=%s target=%s exact=%d amount=%.3f side=%d gun=%d health=%d shield=%.2f carry=%.3f",
+                    attacker ? (attacker == player1 ? "player" : attacker->name) : "-", target == player1 ? "player" : target->name,
+                    exact, given, side, gun, damage, shieldLeft, carry);
+    };
     // Playfighting actors go through the motions without hurting anyone.
-    if(haloactorflags(attacker) & HALO_AI_PLAYFIGHT) { damage = 0; return; }
-    // object_cannot_take_damage and unit_impervious.
-    if((target == player1 && playerProtected) || (haloactorflags(target) & (HALO_AI_NO_DAMAGE | HALO_AI_IMPERVIOUS))) { damage = 0; return; }
+    if(haloactorflags(attacker) & HALO_AI_PLAYFIGHT) { damage = 0; trace(-1, 0); return; }
+    // object_cannot_take_damage and unit_impervious (traced with shield -1).
+    if((target == player1 && playerProtected) || (haloactorflags(target) & (HALO_AI_NO_DAMAGE | HALO_AI_IMPERVIOUS))) { damage = 0; trace(-1, 0); return; }
     if(target == player1)
     {
         // Enemy fire hurts more on the higher difficulties.
-        if(attacker != player1 && halodifficulty() != 1) damage = max(1, int(damage * halodifficultydamage() + .5f));
+        if(attacker != player1) amount *= halodifficultydamage();
         // In a Warthog the body takes some of the fire.
-        if(halodriving()) damage = halovehicledamage(damage);
+        if(halodriving()) amount = halovehicledamage(amount);
         shieldHit = lastmillis;
         shieldRecharging = false;
-        int factor = attacker != player1 && gun == GUN_SUBGUN ? 2 : 1;
+        const float factor = attacker != player1 && gun == GUN_SUBGUN ? 2 : 1;
         // The overshield's extra layers take the hit first.
         if(overshield > 0)
         {
-            const float layer = min(overshield, float(damage * factor));
+            const float layer = min(overshield, amount * factor);
             overshield -= layer;
-            damage = max(0, int(ceilf(damage - layer / factor - 0.001f)));
-            if(damage <= 0) { haloplaysound("shield-hit", S_NULL); return; }
+            amount = max(0.0f, amount - layer / factor);
+            if(emp) overshield = overshieldTarget = 0;
+            if(amount <= 1e-4f)
+            {
+                if(emp) shield = 0;
+                haloplaysound(emp ? "shield-depleted" : "shield-hit", S_NULL);
+                if(attacker && attacker != player1) halofxdamage(attacker->o, given, true);
+                damage = 0;
+                trace(shield, playerHealthCarry);
+                return;
+            }
         }
         const bool hadShield = shield > 0;
-        float absorbed = min(shield, float(damage * factor));
+        const float absorbed = min(shield, amount * factor);
         shield -= absorbed;
+        amount = max(0.0f, amount - absorbed / factor);
+        if(emp) { shield = 0; overshield = overshieldTarget = 0; }
         if(hadShield) haloplaysound(shield > 0 ? "shield-hit" : "shield-depleted", S_NULL);
-        damage = max(0, int(ceilf(damage - absorbed / factor - 0.001f)));
+        damage = wholeDamage(amount, playerHealthCarry);
+        // The damage-direction arc points at the attacker, for a hit the shield took too.
+        if(attacker && attacker != player1) halofxdamage(attacker->o, given, damage <= 0);
+        trace(shield, playerHealthCarry);
         return;
     }
     HaloEnemy *enemy = enemyState(target);
-    if(!enemy || enemy->shieldMax <= 0) return;
-    enemy->hitTime = lastmillis;
-    float modifier = gun == GUN_ASSAULT ? 0.7f : 1.0f;
-    float absorbed = min(enemy->shield, damage * modifier);
-    if(absorbed > 0)
+    if(!enemy) { trace(0, 0); return; }
+    enemy->hurtAt = lastmillis;
+    int region = -1;
+    const float material = materialScale(*enemy, target, attacker, gun, exact ? pendingSource : NULL, region);
+    if(region >= 0)
     {
-        enemy->shield -= absorbed;
-        damage = max(0, int(ceilf(damage - absorbed / modifier - 0.001f)));
-        particle_splash(PART_PLASMA, 6, 220, target->o);
+        amount *= material;
+        if(halo_damagetrace) conoutf("DAMAGE_MATERIAL target=%s kind=%d material=%d scale=%.3f", target->name, int(enemy->kind), region, material);
     }
+    if(enemy->shieldMax > 0)
+    {
+        enemy->hitTime = lastmillis;
+        const float modifier = gun == GUN_ASSAULT ? 0.7f : 1.0f;
+        const float absorbed = min(enemy->shield, amount * modifier);
+        if(absorbed > 0 || (emp && enemy->shield > 0))
+        {
+            enemy->shield -= absorbed;
+            amount = max(0.0f, amount - absorbed / modifier);
+            if(emp) enemy->shield = 0;
+            particle_splash(PART_PLASMA, emp ? 12 : 6, 220, target->o);
+        }
+    }
+    damage = wholeDamage(amount, enemy->healthCarry);
+    trace(enemy->shield, enemy->healthCarry);
 }
 
 bool halopickup(int index, playerent *p)
@@ -2479,8 +2809,71 @@ const char *haloactormodel(const playerent *p)
     if(p == player1) return "halo/cyborg";
     HaloEnemy *enemy = enemyState(p);
     if(!enemy) return NULL;
+    // Named bodies: Captain Keyes (the captain and captain_ingame variants, which fight as
+    // marines) has his own model; a body whose model was not imported keeps a stand-in.
+    const HaloActorDef *def = haloactorvariant(p);
+    if(def && (def->family == "captain" || def->family == "captain_ingame")) return halomodelor("halo/keyes", profiles[enemy->kind].model);
+    if(enemy->kind == MONITOR) return halomodelor(profiles[MONITOR].model, profiles[SENTINEL].model);
+    if(enemy->kind == ENGINEER) return halomodelor(profiles[ENGINEER].model, profiles[GRUNT].model);
     return profiles[enemy->kind].model;
 }
+
+// `name` when its model loads, else `fallback` (each name is tried once).
+const char *halomodelor(const char *name, const char *fallback)
+{
+    static std::vector<std::pair<std::string, bool>> tried;
+    for(const auto &t : tried) if(t.first == name) return t.second ? name : fallback;
+    const bool ok = loadmodel(name) != NULL;
+    tried.emplace_back(name, ok);
+    return ok ? name : fallback;
+}
+
+// First-person placement: where a viewmodel sits away from the place its retail animation holds
+// it, in the view's frame (right, forward, up; AssaultCube units). The rocket launcher's tube rides
+// the right shoulder with its top above eye height and its rear behind the eye; in AssaultCube's
+// wider view (75 degrees vertical, where Halo's is 70 horizontal) it filled the right of the screen
+// and crowded the reticle, so it sits lower, further right and further forward. A judgement call
+// made without seeing it: `halo_viewmodeloffset <right> <forward> <up>` changes the current
+// weapon's in the game (and with no arguments prints it), for tuning.
+namespace
+{
+    struct ViewOffset { std::string path; vec offset; };
+    std::vector<ViewOffset> viewOffsets = {
+        {"weapons\\rocket launcher\\rocket launcher", vec(0.5f, 1.0f, -1.5f)},
+    };
+
+    ViewOffset *viewOffsetFor(const std::string &path, bool create)
+    {
+        for(ViewOffset &v : viewOffsets) if(v.path == path) return &v;
+        if(!create) return NULL;
+        viewOffsets.push_back({path, vec(0, 0, 0)});
+        return &viewOffsets.back();
+    }
+}
+
+bool halohudmodeloffset(int gun, vec &offset)
+{
+    if(!haloactive() || !tagWeapons()) return false;
+    loopi(2) if(carriedGun[i] == gun)
+    {
+        const HaloWeaponDef *d = haloweapon(carried[i].def);
+        const ViewOffset *v = d ? viewOffsetFor(d->path, false) : NULL;
+        if(!v) return false;
+        offset = v->offset;
+        return true;
+    }
+    return false;
+}
+
+COMMANDF(halo_viewmodeloffset, "sss", (const char *x, const char *y, const char *z)
+{
+    const HaloWeaponDef *d = haloactive() && tagWeapons() ? haloweapon(carried[currentCarried].def) : NULL;
+    if(!d) return;
+    if(*x || *y || *z) viewOffsetFor(d->path, true)->offset = vec(float(atof(x)), float(atof(y)), float(atof(z)));
+    const ViewOffset *v = viewOffsetFor(d->path, false);
+    const vec o = v ? v->offset : vec(0, 0, 0);
+    conoutf("Halo viewmodel offset for %s: %.2f %.2f %.2f (right, forward, up)", d->name.c_str(), o.x, o.y, o.z);
+});
 
 const char *halohudmodel(int gun)
 {
@@ -2559,7 +2952,7 @@ void halodrawhud()
         if(delta.sqrxy() > 58.0f*58.0f) continue;
         delta.rotate_around_z(-yaw);
         // Allies show yellow on the motion tracker, hostiles red.
-        const bool ally = enemies[i].team == HALO_TEAM_HUMAN;
+        const bool ally = haloteamfriendly(enemies[i].team);
         box(trackerX + delta.x*2-7, trackerY + delta.y*2-7, 14, 14, 255, ally ? 220 : 74, ally ? 60 : 81, 250);
     }
     }
@@ -2679,6 +3072,22 @@ void halodrawhud()
         HaloHudBlip blips[64];
         const int count = sensorBlips(blips, 64, yaw);
         halohuddraw(w, hudUnit(), blips, count);
+        // A weapon whose HUD tags show no ammunition (the flamethrower): its fuel as text.
+        bool reticle, ammo;
+        halohudweaponparts(def->index, reticle, ammo);
+        if(!ammo)
+        {
+            if(def->usesBattery())
+            {
+                defformatstring(battery)("%s %d%%", st.overheated ? "OVERHEATED" : "BATTERY", int(st.battery * 100 + .5f));
+                label(battery, right, VIRTH-173, 0.70f, true);
+            }
+            else
+            {
+                defformatstring(rounds)("%02d / %03d", current->mag, current->ammo);
+                label(rounds, right, VIRTH-173, 0.96f, true);
+            }
+        }
     }
     else if(def)
     {
@@ -2721,6 +3130,7 @@ void halodrawhud()
         label(ammo, right, VIRTH-173, 0.96f, true);
     }
     if(const char *vehicle = halovehicleprompt(nearbyWeaponDistance())) label(vehicle, VIRTW/2-200, VIRTH/2+90, 0.6f);
+    else if(const char *board = haloscenarioboardprompt()) label(board, VIRTW/2-200, VIRTH/2+90, 0.6f);
     else if(groundWeapons.inrange(nearbyWeapon))
     {
         const HaloWeaponDef *d = haloweapon(groundWeapons[nearbyWeapon].state.def);
@@ -2777,9 +3187,11 @@ COMMANDF(halo_next, "", ()
 });
 COMMANDF(halo_use, "", ()
 {
-    // In a seat E gets out (or, upside down, is thrown clear).
-    if(halodriving()) { halovehicleuse(0); return; }
+    // In a seat E gets out (or, upside down, is thrown clear); aboard a Pelican, out of it.
+    if(halodriving()) { if(haloscenarioboarded()) haloscenarioboard(); else halovehicleuse(0); return; }
     if(haloscenariouse()) return;
+    // A Pelican the script made enterable (a30's extraction): aboard.
+    if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && !halovehicleprompt(nearbyWeaponDistance()) && haloscenarioboard()) return;
     // A vehicle seat or a weapon on the ground, whichever is nearer.
     if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && halovehicleuse(nearbyWeaponDistance())) return;
     if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && swapWeapon()) return;
@@ -2807,19 +3219,7 @@ static int halounlockedmissions()
 }
 
 // Shows the title menu: on launch, or from the pause menu (the campaign stays paused under it).
-static void halotitle()
-{
-    loadProgress();
-    if(!controlsLoaded) controlsLoaded = execfile("config/halo.cfg");
-    titleScreen = true;
-    if(haloactive())
-    {
-        player1->attacking = false;
-        player1->stopmoving();
-    }
-    closemenu(NULL);
-    showmenu("Halo");
-}
+static void halotitle() { showtitle(); }
 COMMANDN(halo_title, halotitle, "");
 
 // New Game: the difficulty, then The Pillar of Autumn from its start. Unlocked missions stay.
@@ -2831,6 +3231,8 @@ static void halonewgame(int *difficulty)
     sectionLoadout.valid = carryLoadout.valid = restorePending = false;
     if(!installed(0, 0) && installed(1, 0)) queueSection(1, 0, true);
     else queueSection(0, 0);
+    // A warning about the old progress file (a corrupt file restored) is done with once a game starts.
+    if(launchPending) progressNote[0] = '\0';
 }
 COMMANDN(halo_new_game, halonewgame, "i");
 
@@ -2848,6 +3250,8 @@ static void halocontinue()
     carryLoadout.valid = false;
     queueSection(savedGame.mission, savedGame.section);
     if(!launchPending) return;
+    // The last warning is cleared; restoring the saved state sets a new one if it does not fit.
+    progressNote[0] = '\0';
     restorePending = true;
     incomingEscapeTime = savedGame.escapeMillis;
 }
@@ -2905,6 +3309,8 @@ COMMANDN(halo_difficulty_name, halodifficultyname, "");
 static void haloprogressnote() { loadProgress(); result(progressNote); }
 COMMANDN(halo_progress_note, haloprogressnote, "");
 COMMANDF(halo_switch, "d", (bool down) { if(down) haloswitchweapon(); });
+// X: the flashlight (halo_fx.cpp).
+COMMANDF(halo_flashlight, "d", (bool down) { if(down) halofxflashlighttoggle(); });
 
 int haloenemykind(const playerent *p, int *team)
 {
@@ -3004,9 +3410,38 @@ void haloplaysound(const char *sample, int fallback, physent *actor, const vec *
         }
     }
     if(id < 0 || id == S_NULL) return;
-    if(position) audiomgr.playsound(id, position);
-    else if(actor && actor != player1) audiomgr.playsound(id, actor);
-    else audiomgr.playsound(id, SP_HIGH);
+    // A decoded tag sample plays at its retail sound class's gain (sound_class_set_gain).
+    const float gain = haloactive() && sample ? halofxclassgain(halofxsampleclass(sample)) : 1;
+    if(gain <= .01f) return;
+    location *played = NULL;
+    if(position) played = audiomgr._playsound(id, staticreference(*position), SP_NORMAL);
+    else if(actor && actor != player1) played = audiomgr._playsound(id, physentreference(actor), SP_NORMAL);
+    else played = audiomgr._playsound(id, camerareference(), SP_HIGH);
+    if(played && gain < .99f) played->setvolume(gain);
+}
+
+// A decoded tag sample looped from the camera while `active` (the flamethrower's fire, the plasma
+// pistol's charge hum), at its sound class's gain; one at a time: another sample stops the last.
+void haloloopsound(const char *sample, bool active)
+{
+    static int current = -1;
+    int id = -1;
+    if(sample && active)
+    {
+        defformatstring(name)("halo/%s", sample);
+        defformatstring(path)("packages/audio/%s.wav", name);
+        if(fileexists(findfile(path, "rb"), "rb"))
+        {
+            id = audiomgr.findsound(name, 220, gamesounds);
+            if(id < 0) id = audiomgr.addsound(name, 220, -1, true, gamesounds, true, 0);
+        }
+    }
+    if(current >= 0 && current != id) audiomgr.updateloopsound(current, false);
+    current = id;
+    // The class gain through setvolume (the sample's configured volume times it, set every frame so
+    // a fade back to 1 restores it): updateloopsound's own volume sets the raw source gain.
+    if(id >= 0)
+        if(location *l = audiomgr.updateloopsound(id, true)) l->setvolume(halofxclassgain(halofxsampleclass(sample)));
 }
 
 COMMANDF(halo_pause, "", ()
@@ -3055,7 +3490,8 @@ void halodrawtitle()
 
 
 // The player is in a vehicle seat (halo_vehicle.cpp): its controls replace walking and the carried weapons.
-bool halodriving() { return haloactive() && !editmode && halovehicleseated(); }
+// In a vehicle seat, or aboard a Pelican (halo_script_ai.inc): no walking, firing or pickups.
+bool halodriving() { return haloactive() && !editmode && (halovehicleseated() || haloscenarioboarded()); }
 
 void halorendervehicle()
 {
@@ -3157,7 +3593,7 @@ playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeapon
     loopv(enemies)
     {
         botent *bot = enemies[i].bot;
-        if(!bot || bot->state != CS_ALIVE || enemies[i].team == HALO_TEAM_HUMAN) continue;
+        if(!bot || bot->state != CS_ALIVE || haloteamfriendly(enemies[i].team) || haloactorpassive(bot)) continue;
         // Aim at the upper body rather than the eyes.
         vec target = bot->o;
         target.z -= bot->eyeheight * 0.35f;
@@ -3259,9 +3695,21 @@ void halozoomstep()
     if(!d || d->zoomLevels <= 0 || player1->weaponsel->reloading) return;
     s.zoom = (s.zoom + 1) % (d->zoomLevels + 1);
     if(player1->weaponsel->type == GUN_SNIPER) ((sniperrifle *)player1->weaponsel)->setscope(s.zoom > 0);
-    audiomgr.playsound(S_NOAMMO, SP_LOW);
+    // The weapon tag's zoom-in sound for each step in, its zoom-out sound back to no zoom.
+    if(const char *zoom = d->sound(s.zoom > 0 ? HALO_SOUND_ZOOM_IN : HALO_SOUND_ZOOM_OUT)) haloplaysound(zoom, S_NOAMMO);
+    else audiomgr.playsound(S_NOAMMO, SP_LOW);
 }
-COMMANDF(halo_zoom, "d", (bool down) { if(down) halozoomstep(); });
+// In a vehicle seat the zoom key is the secondary trigger (the Banshee's fuel rod, the Scorpion's
+// machine gun).
+COMMANDF(halo_zoom, "d", (bool down)
+{
+    if(halovehicleseated()) halovehiclesecondary(down);
+    else
+    {
+        halovehiclesecondary(false);
+        if(down) halozoomstep();
+    }
+});
 
 #ifdef HALO_QA
 #include "halo_ai.h"
@@ -3272,5 +3720,9 @@ COMMANDF(halo_zoom, "d", (bool down) { if(down) halozoomstep(); });
 #include "retail_qa.inc"
 #include "vehicle_qa.inc"
 #include "combat_qa.inc"
+#include "damage_qa.inc"
 #include "frontend_qa.inc"
+#include "faction_qa.inc"
+#include "presentation_qa.inc"
+#include "soak_qa.inc"
 #endif

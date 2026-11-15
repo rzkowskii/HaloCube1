@@ -6,6 +6,7 @@
 #include "halo_script.h"
 #include "halo_world.h"
 #include "halo_vehicle.h"
+#include "halo_fx.h"
 
 bool hasTE = false, hasMT = false, hasMDA = false, hasDRE = false, hasstencil = false, hasST2 = false, hasSTW = false, hasSTS = false, hasAF;
 
@@ -621,15 +622,20 @@ void transplayer()
 {
     glLoadIdentity();
 
-    glRotatef(camera1->roll, 0, 0, 1);
-    glRotatef(camera1->pitch, -1, 0, 0);
-    glRotatef(camera1->yaw, 0, 1, 0);
+    // Camera shake (halo_fx.cpp): the view only, never the player's own yaw and pitch.
+    float shakeyaw, shakepitch, shakeroll;
+    vec shakeoffset;
+    halofxcamera(shakeyaw, shakepitch, shakeroll, shakeoffset);
+
+    glRotatef(camera1->roll + shakeroll, 0, 0, 1);
+    glRotatef(camera1->pitch + shakepitch, -1, 0, 0);
+    glRotatef(camera1->yaw + shakeyaw, 0, 1, 0);
 
     // move from RH to Z-up LH quake style worldspace
     glRotatef(-90, 1, 0, 0);
     glScalef(1, -1, 1);
 
-    glTranslatef(-camera1->o.x, -camera1->o.y, -camera1->o.z);
+    glTranslatef(-camera1->o.x - shakeoffset.x, -camera1->o.y - shakeoffset.y, -camera1->o.z - shakeoffset.z);
 }
 
 glmatrixf clipmatrix;
@@ -1116,9 +1122,15 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     }
 
     glLoadIdentity();
-    if(scene) glRotatef(camera1->roll, 0, 0, 1);
-    glRotatef(camera1->pitch, -1, 0, 0);
-    glRotatef(camera1->yaw,   0, 1, 0);
+    {
+        // The sky turns with the shaken view (transplayer).
+        float shakeyaw, shakepitch, shakeroll;
+        vec shakeoffset;
+        halofxcamera(shakeyaw, shakepitch, shakeroll, shakeoffset);
+        if(scene || shakeroll) glRotatef((scene ? camera1->roll : 0) + shakeroll, 0, 0, 1);
+        glRotatef(camera1->pitch + shakepitch, -1, 0, 0);
+        glRotatef(camera1->yaw + shakeyaw, 0, 1, 0);
+    }
     glRotatef(90, 1, 0, 0);
     glColor3f(1, 1, 1);
     glDisable(GL_FOG);
@@ -1148,6 +1160,8 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
         resettmu(0);
         haloworlddraw(HALO_SOLID);
         haloworlddrawnozzles();
+        // The flashlight's spot over the solid surfaces (halo_fx.cpp).
+        if(!scene) halofxflashlightworld();
     }
     setuptmu(0, "T * P x 2");
     if(!useHaloWorld) renderstrips();

@@ -8,6 +8,7 @@
 // newline. halo.cpp owns the block (its header, line count and checksum); halo_script.cpp,
 // halo_vehicle.cpp and halo.cpp each write and read their own records.
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -107,10 +108,16 @@ struct HaloStateReader
         if(!f) return 0;
         char *end = nullptr;
         const double value = strtod(f, &end);
-        if(end != f + n) { ok = false; return 0; }
+        // strtod reads "nan" and "inf"; no saved number is either, so a damaged record fails.
+        if(end != f + n || !std::isfinite(value)) { ok = false; return 0; }
         return value;
     }
-    float f() { return float(d()); }
+    float f()
+    {
+        const double v = d();
+        if(v < -3.0e38 || v > 3.0e38) { ok = false; return 0; }
+        return float(v);
+    }
     std::string word()
     {
         size_t n;

@@ -1,12 +1,13 @@
 #include "cube.h"
 #include "halo_weapons.h"
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <sstream>
 
 namespace
 {
-    constexpr int formatVersion = 2;        // tools/halo_weapons.py FORMAT
+    constexpr int formatVersion = 3;        // tools/halo_weapons.py FORMAT
     std::vector<HaloWeaponDef> definitions;
     bool attempted = false, loaded = false;
 
@@ -35,14 +36,25 @@ namespace
         return bool(in >> d.lower >> d.upperMin >> d.upperMax) && d.upperMax >= d.upperMin;
     }
 
+    // A `materials` line: the 33 jpt! modifiers of the damage on the line before it.
+    bool parseMaterials(std::istringstream &in, HaloDamage *d)
+    {
+        if(!d) return false;
+        loopi(HALO_DAMAGE_MATERIALS) if(!(in >> d->materials[i]) || d->materials[i] < 0) return false;
+        d->hasMaterials = true;
+        return true;
+    }
+
     bool parseProjectile(std::istringstream &in, HaloProjectileDef &p)
     {
         std::string first;
         in >> first;
         if(first == "-") return true;
         p.speed = float(atof(first.c_str()));
+        if(!std::isfinite(p.speed)) return false;   // atof takes "nan" and "inf", the stream does not
         if(!(in >> p.finalSpeed >> p.range >> p.gravity >> p.guided) || !parseDamage(in, p.damage)
-           || !(in >> p.category >> p.radius)) return false;
+           || !(in >> p.category >> p.radius >> p.innerRadius >> p.rangeStart >> p.rangeEnd >> p.sideEffect)) return false;
+        p.innerRadius = clamp(p.innerRadius, 0.0f, max(p.radius, 0.0f));
         std::getline(in >> std::ws, p.path);
         p.valid = true;
         return true;
@@ -53,6 +65,7 @@ namespace
         std::istringstream lines(text);
         std::string line;
         HaloWeaponDef *weapon = nullptr;
+        HaloDamage *lastDamage = nullptr;       // what a following `materials` line belongs to
         bool versioned = false;
         int number = 0;
         while(std::getline(lines, line))
@@ -63,6 +76,7 @@ namespace
             std::string key;
             in >> key;
             bool ok = true;
+            HaloDamage *damage = nullptr;
             if(key == "format")
             {
                 int version = 0;
@@ -86,7 +100,8 @@ namespace
             else if(key == "heat") ok = bool(in >> weapon->heatRecover >> weapon->heatOverheat >> weapon->heatLoss);
             else if(key == "zoom") ok = bool(in >> weapon->zoomLevels >> weapon->zoomMin >> weapon->zoomMax);
             else if(key == "aim") ok = bool(in >> weapon->autoaimAngle >> weapon->autoaimRange >> weapon->magnetismAngle >> weapon->magnetismRange);
-            else if(key == "melee") ok = parseDamage(in, weapon->melee);
+            else if(key == "melee") { ok = parseDamage(in, weapon->melee); damage = &weapon->melee; }
+            else if(key == "materials") ok = parseMaterials(in, lastDamage);
             else if(key == "magazine")
             {
                 HaloMagazineDef m;
@@ -104,6 +119,7 @@ namespace
             else if(key == "projectile")
             {
                 ok = !weapon->triggers.empty() && parseProjectile(in, weapon->triggers.back().projectile);
+                if(ok && weapon->triggers.back().projectile.valid) damage = &weapon->triggers.back().projectile.damage;
             }
             else if(key == "sound")
             {
@@ -114,12 +130,21 @@ namespace
                 weapon->sounds.parse(role, tag);
             }
             else if(key == "end") weapon = nullptr;
+            lastDamage = damage;
             if(!ok)
             {
                 conoutf("\f3Halo weapons: invalid line %d in packages/halo/weapons.txt", number);
                 definitions.clear();
                 return false;
             }
+        }
+        // A table cut short inside a record (no `end`) is refused: its last weapon would lack
+        // the triggers and magazines that follow.
+        if(weapon)
+        {
+            conoutf("\f3Halo weapons: packages/halo/weapons.txt ends inside weapon %d; re-run tools/halo_weapons.py", weapon->index);
+            definitions.clear();
+            return false;
         }
         // A table without a format line is refused too, and must not leave definitions behind.
         if(!versioned) definitions.clear();
@@ -130,6 +155,26 @@ namespace
 float HaloDamage::roll() const
 {
     return upperMin + rndscale(upperMax - upperMin);
+}
+
+float HaloDamage::rollFromLower() const
+{
+    const float from = min(lower, upperMax);
+    return from + rndscale(upperMax - from);
+}
+
+float HaloDamage::scaled(float full, float scale) const
+{
+    const float weakest = min(lower, full);
+    return weakest + (full - weakest) * clamp(scale, 0.0f, 1.0f);
+}
+
+float halofalloff(float distance, float start, float end)
+{
+    if(end <= 0) return 1;
+    if(distance <= start) return 1;
+    if(distance >= end) return 0;
+    return 1 - (distance - start) / max(end - start, 1e-4f);
 }
 
 std::string halosoundsample(const std::string &tag)
@@ -145,7 +190,7 @@ bool HaloSounds::parse(const std::string &role, const std::string &tag)
 {
     static const char *const roles[HALO_SOUND_ROLES] = {
         "fire", "charged", "empty", "cycle", "reload", "reload-empty", "melee", "ready", "overheat", "pickup",
-        "throw", "explode", "armed",
+        "throw", "explode", "armed", "zoom-in", "zoom-out", "loop",
     };
     if(tag.empty()) return false;
     loopi(HALO_SOUND_ROLES) if(role == roles[i]) { samples[i] = halosoundsample(tag); return true; }
@@ -240,6 +285,7 @@ bool haloweaponsload()
     loaded = parse(text);
     delete[] text;
     if(loaded) conoutf("Halo weapons: loaded %d definitions", int(definitions.size()));
+    else conoutf("\f3Halo weapons: packages/halo/weapons.txt is unusable; the stock AssaultCube weapons stand in");
     return loaded;
 }
 
@@ -285,6 +331,7 @@ namespace
         std::string line;
         HaloGrenadeDef *grenade = nullptr;
         HaloEquipmentDef *item = nullptr;
+        HaloDamage *lastDamage = nullptr;       // what a following `materials` line belongs to
         bool versioned = false;
         int number = 0;
         while(std::getline(lines, line))
@@ -295,6 +342,7 @@ namespace
             std::string key;
             in >> key;
             bool ok = true;
+            HaloDamage *damage = nullptr;
             if(key == "format")
             {
                 int version = 0;
@@ -330,9 +378,10 @@ namespace
             }
             else if(grenade)
             {
-                if(key == "blast") ok = bool(in >> grenade->innerRadius >> grenade->outerRadius) && parseDamage(in, grenade->blast)
-                                        && bool(in >> grenade->sideEffect >> grenade->category);
-                else if(key == "attached") ok = parseDamage(in, grenade->attached);
+                if(key == "blast") { ok = bool(in >> grenade->innerRadius >> grenade->outerRadius) && parseDamage(in, grenade->blast)
+                                          && bool(in >> grenade->sideEffect >> grenade->category); damage = &grenade->blast; }
+                else if(key == "attached") { ok = parseDamage(in, grenade->attached); damage = &grenade->attached; }
+                else if(key == "materials") ok = parseMaterials(in, lastDamage);
                 else if(key == "path") std::getline(in >> std::ws, grenade->path);
                 else if(key == "equipment") std::getline(in >> std::ws, grenade->equipment);
             }
@@ -344,6 +393,7 @@ namespace
                 else if(key == "ammo") { HaloEquipmentAmmo a; ok = bool(in >> a.weapon >> a.rounds); if(ok) item->ammo.push_back(a); }
             }
             else ok = false;
+            lastDamage = damage;
             if(!ok)
             {
                 conoutf("\f3Halo equipment: invalid line %d in packages/halo/equipment.txt", number);
@@ -352,7 +402,15 @@ namespace
                 return false;
             }
         }
-        if(!versioned) { grenadeDefs.clear(); equipmentDefs.clear(); }
+        if(grenade || item)
+        {
+            conoutf("\f3Halo equipment: packages/halo/equipment.txt ends inside a record; re-run tools/halo_weapons.py");
+            grenadeDefs.clear();
+            equipmentDefs.clear();
+            return false;
+        }
+        // A refused table (no format line, or no grenade types) leaves no equipment behind either.
+        if(!versioned || grenadeDefs.empty()) { grenadeDefs.clear(); equipmentDefs.clear(); }
         return versioned && !grenadeDefs.empty();
     }
 }
@@ -372,6 +430,7 @@ bool haloequipmentload()
     equipmentLoaded = parseEquipment(text);
     delete[] text;
     if(equipmentLoaded) conoutf("Halo equipment: %d grenade types, %d equipment definitions", int(grenadeDefs.size()), int(equipmentDefs.size()));
+    else conoutf("\f3Halo equipment: packages/halo/equipment.txt is unusable; AssaultCube's grenade stands in, no plasma grenades");
     return equipmentLoaded;
 }
 

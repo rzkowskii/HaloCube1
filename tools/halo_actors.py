@@ -14,13 +14,23 @@ from pathlib import Path
 from import_halo_a30 import HaloMap
 from halo_weapons import CAMPAIGN, weapon_index
 
-FORMAT = 1
-# Actor families the engine has bodies for, matching ActorKind in halo.cpp.
+FORMAT = 2                        # 2: team, unitmelee and material lines
+# Actor families the engine has bodies for, matching ActorKind in halo.cpp (monitor and engineer
+# fly and never fight).
 KINDS = {'grunt': 0, 'elite': 1, 'jackal': 2, 'hunter': 3, 'floodcombat elite': 4,
          'floodcombat_human': 5, 'flood_infection': 6, 'floodcarrier': 7, 'sentinel': 8,
          'marine': 9, 'marine_armored': 9, 'crewman': 9, 'marine_suicidal': 9, 'captain': 9,
          'johnson': 9, 'bisenti': 9, 'mendoza': 9, 'fitzgerald': 9, 'jenkins': 9,
-         'marine_wounded': 9, 'captain_ingame': 9}
+         'marine_wounded': 9, 'captain_ingame': 9, 'monitor': 10, 'engineer': 11}
+# Inside the actv tag's unit (bipd): its default team (h: 0 default, 1 player, 2 human,
+# 3 covenant, 4 flood, 5 sentinel, 6-9 unused), the collision model and the melee jpt!.
+UNIT_REFERENCE = 20               # actv: the unit tag reference
+UNIT_TEAM = 384                   # unit: default team
+UNIT_COLLISION = 112              # object: coll reference
+UNIT_MELEE = 648                  # unit: melee damage jpt! reference
+# coll materials: name[32], flags u32 (1 head), material type h, pad, shield leak f,
+# shield damage multiplier f at 44, body damage multiplier f at 60.
+COLL_MATERIALS, MATERIAL_STRIDE = 564, 72
 
 FIELDS = '''# actor <index>
 # path <actv tag>
@@ -35,6 +45,9 @@ FIELDS = '''# actor <index>
 # morale <casualty trigger> <friend killed chance> <leader killed chance>
 # berserk <damage amount> <threshold> <melee range>
 # positions <guard min> <max> <combat min> <max>
+# team <unit default team>          retail numbering: 0 default, 1 player, 2 human, 3 covenant, 4 flood, 5 sentinel
+# unitmelee <lower> <upper min> <upper max>   the unit's own melee jpt! (a Hunter's smash)
+# material <type> <flags> <body multiplier> <shield multiplier>   each collision material (flags 1: head)
 '''
 
 
@@ -53,6 +66,7 @@ def actor_record(halo, tag, weapons):
                          *t.read('2h', a + 464))
     record['vitality'] = t.read('2f', a + 512)
     record['melee'] = t.read('f', a + 352)[0]
+    record.update(unit_record(halo, halo.reference(t, a + UNIT_REFERENCE)))
     if actr and actr.group == 'actr':
         r = actr.address
         record['type'] = t.read('h', r + 20)[0]
@@ -65,6 +79,29 @@ def actor_record(halo, tag, weapons):
     else:
         record.update(type=-1, actr_flags=0, vision=(0,) * 6, defense=(0,) * 3, morale=(0, 0.0, 0.0),
                       berserk=(0.0, 0.0, record['melee']), positions=(0,) * 4)
+    return record
+
+
+def unit_record(halo, unit):
+    """The unit's default team, melee jpt! damage and collision materials."""
+    from halo_weapons import jpt_damage
+    t = halo.tags
+    record = {'team': -1, 'unitmelee': (0.0, 0.0, 0.0), 'materials': []}
+    if not unit or unit.group not in ('bipd', 'vehi'):
+        return record
+    record['team'], = t.read('h', unit.address + UNIT_TEAM)
+    melee = halo.reference(t, unit.address + UNIT_MELEE)
+    if melee and melee.group == 'jpt!':
+        d = jpt_damage(halo, melee)
+        record['unitmelee'] = (d.lower, d.upper_min, d.upper_max)
+    coll = halo.reference(t, unit.address + UNIT_COLLISION)
+    if coll and coll.group == 'coll':
+        for m in t.block(coll.address + COLL_MATERIALS, MATERIAL_STRIDE):
+            flags, = t.read('I', m + 32)
+            kind, = t.read('h', m + 36)
+            shield, = t.read('f', m + 44)
+            body, = t.read('f', m + 60)
+            record['materials'].append((kind, flags, body, shield))
     return record
 
 
@@ -83,6 +120,9 @@ def write(records, path):
                   f'weapon {r["weapon"]}']
         for key in ('vision', 'fire', 'burst', 'grenade', 'vitality', 'defense', 'morale', 'berserk', 'positions'):
             lines.append(key + ' ' + ' '.join(map(number, r[key])))
+        lines.append(f'team {r.get("team", -1)}')
+        lines.append('unitmelee ' + ' '.join(map(number, r.get('unitmelee', (0.0, 0.0, 0.0)))))
+        lines += ['material ' + ' '.join(map(number, m)) for m in r.get('materials', [])]
         lines.append('end')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('\n'.join(lines) + '\n')

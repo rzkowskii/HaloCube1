@@ -2,7 +2,8 @@
 
 Reads the compiled HaloScript from the expanded Xbox maps (same node layout as
 inspect_hs.py) and lists, per mission, each call name that appears inside a
-sleep_until, if, cond or while condition together with the scripts using it.
+sleep_until, if, cond or while condition, or in the value a set stores (both steer
+the scripts' control flow), together with the scripts using it.
 With --all every call is listed, not just those in conditions.
 Output: one JSON object {mission: [{call: [script, ...]}, [every script name]]}.
 """
@@ -17,7 +18,7 @@ sys.path.insert(0, str(root / 'tools'))
 from import_halo_a30 import HaloMap  # noqa: E402
 
 IDS = 'a10 a30 a50 b30 b40 c10 c20 c40 d20 d40'.split()
-CONDITIONAL = ('sleep_until', 'if', 'cond', 'while')
+CONDITIONAL = ('sleep_until', 'if', 'cond', 'while', 'set')
 
 
 def mission_calls(cache, every=False):
@@ -79,8 +80,9 @@ def mission_calls(cache, every=False):
             if every and head_name:
                 found.setdefault(head_name, set()).add(script)
             if head_name in CONDITIONAL and rest:
-                # sleep_until/while/if take the condition first; cond takes clauses.
-                targets = rest if head_name == 'cond' else rest[:1]
+                # sleep_until/while/if take the condition first; cond takes clauses; set takes
+                # the global, then the value.
+                targets = rest if head_name == 'cond' else rest[1:2] if head_name == 'set' else rest[:1]
                 for kid in targets:
                     calls = set()
                     calls_in(kid, calls)

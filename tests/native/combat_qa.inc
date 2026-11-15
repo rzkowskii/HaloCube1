@@ -63,7 +63,7 @@ COMMANDF(qa_grenade_face_actor, "f", (float *distance)
     loopv(enemies)
     {
         botent *bot = enemies[i].bot;
-        if(!bot || bot->state != CS_ALIVE || enemies[i].team == HALO_TEAM_HUMAN) continue;
+        if(!bot || bot->state != CS_ALIVE || haloteamfriendly(enemies[i].team)) continue;
         const float d = player1->o.squareddist(bot->o);
         if(d < best) { best = d; target = bot; }
     }
@@ -140,7 +140,7 @@ COMMANDF(qa_enemy_throw, "", ()
     loopv(enemies)
     {
         botent *bot = enemies[i].bot;
-        if(!bot || bot->state != CS_ALIVE || enemies[i].team == HALO_TEAM_HUMAN) continue;
+        if(!bot || bot->state != CS_ALIVE || haloteamfriendly(enemies[i].team)) continue;
         const float d = player1->o.squareddist(bot->o);
         if(d < best) { best = d; thrower = bot; }
     }
@@ -174,7 +174,7 @@ static void qaSound(const char *owner, const char *role, const char *sample)
 }
 static const char *const qaSoundRoles[HALO_SOUND_ROLES] = {
     "fire", "charged", "empty", "cycle", "reload", "reload-empty", "melee", "ready", "overheat", "pickup",
-    "throw", "explode", "armed",
+    "throw", "explode", "armed", "zoom-in", "zoom-out", "loop",
 };
 COMMANDF(qa_sound_table, "", ()
 {
