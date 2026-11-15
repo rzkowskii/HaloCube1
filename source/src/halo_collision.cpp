@@ -56,6 +56,7 @@ namespace
         std::vector<Vertex> vertices;
         std::vector<Surface> surfaces;
         std::vector<Node> nodes;
+        std::vector<int> devices; // scenario machines whose polygons are part of the mesh, sorted
 
         unsigned build(unsigned first, unsigned count)
         {
@@ -140,6 +141,16 @@ namespace
             }
             if(area <= small) continue;
             data.surfaces.push_back(surface);
+        }
+        if(file.tell() != bytes)
+        {
+            // Optional trailer: the static scenario machines baked into the surfaces.
+            char tag[4];
+            if(file.read(tag, sizeof(tag)) != sizeof(tag) || memcmp(tag, "DEV1", sizeof(tag))) return false;
+            const unsigned devices = file.getlil<uint>();
+            if(devices > 65536 || long(file.tell()) + long(devices) * 4 != bytes) return false;
+            loopi(int(devices)) data.devices.push_back(int(file.getlil<uint>()));
+            std::sort(data.devices.begin(), data.devices.end());
         }
         if(file.tell() != bytes || data.surfaces.empty()) return false;
         data.build(0, unsigned(data.surfaces.size()));
@@ -305,29 +316,35 @@ namespace
     }
 }
 
+// Any section with a valid packages/maps/<section>.hcol uses the original structure
+// collision. A missing file is the normal case (stock AssaultCube geometry); a file that
+// fails validation is reported and also falls back to stock geometry.
 void halocollisionmap(const char *name)
 {
     mesh = {};
     if(!name) return;
     name = behindpath(name);
-    if(strcmp(name, "halo_b30_01") && strcmp(name, "halo_b30_02") && strcmp(name, "halo_b30_03")) return;
-    // The two outdoor sections use the same Xbox BSP and projection.
-    const char *asset = !strcmp(name, "halo_b30_03") ? "halo_b30_01" : name;
-    defformatstring(path)("packages/maps/%s.hcol", asset);
+    defformatstring(path)("packages/maps/%s.hcol", name);
     std::unique_ptr<stream> file(openfile(path, "rb"));
+    if(!file) return;
     CollisionMesh loaded;
-    if(!file || !loadmesh(*file, loaded))
+    if(!loadmesh(*file, loaded))
     {
         conoutf("Halo: retail collision unavailable for %s", name);
         return;
     }
     mesh = std::move(loaded);
-    conoutf("Halo: loaded %u retail collision surfaces for %s", unsigned(mesh.surfaces.size()), name);
+    conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines)", unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()));
 }
 
 bool halocollisionactive()
 {
     return !mesh.nodes.empty() && haloactive() && !editmode;
+}
+
+bool halocollisionbaked(int device)
+{
+    return halocollisionactive() && std::binary_search(mesh.devices.begin(), mesh.devices.end(), device);
 }
 
 bool halocollisiontrace(const vec &from, const vec &to, HaloCollisionHit &hit, unsigned ignoreFlags)

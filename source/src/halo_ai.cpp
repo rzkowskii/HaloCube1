@@ -54,6 +54,9 @@ namespace
         const HaloCommandProgram *program = nullptr;
         size_t cursor = 0;
         int commandUntil = 0, commandStatus = 0;
+        // The loop atom the list last reached: Halo reports such a list as waiting for a
+        // stimulus (ai_command_list_status 2) and ai_command_list_advance steps past the loop.
+        int loopAt = -1;
         float radius = 0;
         waypoint_s *goal = nullptr;
         int thinks = 0, shots = 0, destinationGroup = -1;
@@ -442,7 +445,7 @@ namespace
                 case ATOM_LOOK_PLAYER: body->AimToVec(player1->o); break;
                 case ATOM_CROUCH: e->trycrouch = c.first > 0; break;
                 case ATOM_SET_RADIUS: a.radius = c.first; break;
-                case ATOM_LOOP: a.cursor = 0; continue;
+                case ATOM_LOOP: a.loopAt = int(a.cursor); a.cursor = 0; continue;
                 case ATOM_TELEPORT: if(point) { e->o = vec(*point).add(vec(0, 0, e->eyeheight)); entinmap(e); e->resetinterp(); } break;
                 case ATOM_DIE: dodamage(INT_MAX, e, e, GUN_KNIFE); return true;
                 case ATOM_SCRIPT: if(c.script >= 0) haloscenariowakescript(c.script); break;
@@ -485,6 +488,25 @@ namespace
         return true;
     }
 
+    // An ally the player walks into steps aside, as Halo's marines and crewmen do, so a
+    // corridor they stand in does not stop the player.
+    bool giveWay(Actor &a)
+    {
+        botent *e = a.bot;
+        if(a.team != HALO_TEAM_HUMAN || !alive(player1)) return false;
+        vec gap = vec(e->o).sub(player1->o);
+        gap.z = 0;
+        const float reach = e->radius + player1->radius + 1.5f;
+        const vec heading(player1->vel.x, player1->vel.y, 0);
+        if(gap.squaredlen() > reach * reach || heading.squaredlen() < .04f || gap.dot(heading) <= 0) return false;
+        // Step off the player's line, to whichever side the actor already stands on.
+        vec side(-heading.y, heading.x, 0);
+        side.normalize();
+        if(side.dot(gap) < 0) side.mul(-1);
+        steer(e, vec(e->o).add(vec(side).mul(4.0f)));
+        return true;
+    }
+
     void think(Actor &a, CBot *body)
     {
         ++a.thinks;
@@ -494,6 +516,7 @@ namespace
         if(a.flags & HALO_AI_BRAINDEAD) return;
         perceive(a, body);
         updateMorale(a);
+        if(giveWay(a)) return;
 
         const bool commanded = runCommands(a, body);
         const bool initiative = !a.program || a.commandStatus != 1 || (a.program->flags & COMMAND_ALLOW_INITIATIVE);
@@ -704,17 +727,31 @@ void haloactorcommand(const playerent *bot, const HaloCommandProgram *program)
     a->cursor = 0;
     a->commandUntil = 0;
     a->commandStatus = program ? 1 : 0;
+    a->loopAt = -1;
     a->goal = nullptr;
 }
 
-int haloactorcommandstatus(const playerent *bot) { const Actor *a = find(bot); return a ? a->commandStatus : 0; }
+// 0 no list, 1 running, 2 finished or waiting at a loop for the script to advance it.
+int haloactorcommandstatus(const playerent *bot)
+{
+    const Actor *a = find(bot);
+    if(!a) return 0;
+    return a->commandStatus == 1 && a->loopAt >= 0 ? 2 : a->commandStatus;
+}
 
 void haloactorcommandadvance(const playerent *bot)
 {
     Actor *a = find(bot);
     if(!a || a->commandStatus != 1) return;
-    ++a->cursor;
+    if(a->loopAt >= 0)
+    {
+        // Leave the loop: carry on with the atoms after it.
+        a->cursor = size_t(a->loopAt) + 1;
+        a->loopAt = -1;
+    }
+    else ++a->cursor;
     a->commandUntil = 0;
+    a->goal = nullptr;
 }
 
 int haloactorstatus(const playerent *bot)

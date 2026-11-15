@@ -35,6 +35,7 @@ int haloscenarioobject(const char *name);
 double haloscenarioobjectstate(const char *what, int id);
 double haloscenarioqascript(const char *name, int action);
 bool haloscenariocollide(physent *entity, float &hi, float &lo);
+const char *haloscenarioblockingdevice(physent *entity);
 struct HaloCollisionHit;
 bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit);
 bool haloscenarioescapetimeout();

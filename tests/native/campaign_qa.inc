@@ -116,7 +116,9 @@ COMMANDF(qa_campaign_advance, "", ()
         return;
     }
     if(stage == COMPLETE) return;
-    const vec target = objective();
+    vec target = objective();
+    // Markers are authored at floor height; retail collision places the eyes above the floor.
+    if(halocollisionactive()) target.z += player1->eyeheight;
     player1->o = target;
     entinmap(player1);
     player1->resetinterp();
@@ -230,6 +232,7 @@ COMMANDF(qa_campaign_full, "", ()
         else
         {
             player1->o = target;
+            if(halocollisionactive()) player1->o.z += player1->eyeheight;
             entinmap(player1);
             player1->resetinterp();
             if(stage == EXTRACTION && sectionInteraction()) execute("halo_use");

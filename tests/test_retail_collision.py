@@ -1,0 +1,222 @@
+"""Walk campaign sections on retail BSP collision.
+
+    python3 tests/test_retail_collision.py                  mission a10 (the default)
+    python3 tests/test_retail_collision.py a10 b30          several missions
+    python3 tests/test_retail_collision.py --section a10:3  one section on its own
+
+A mission is walked as one playthrough: the QA client starts its first section and, at each
+transition, carries on into the next section with the mission script's state, the way a
+player arrives there. If a section fails, the walk starts again from the next section in a
+new client. A section started on its own begins the mission script afresh, so doors that
+earlier sections' scripts open can stay shut; such results are marked.
+
+For every section that has an imported packages/maps/<section>.hcol this checks that
+  * 'loaded N retail collision surfaces' is in the log (retail collision is active),
+  * the player spawns standing on retail floor (onfloor, floor within 5 cm below the feet),
+  * every spawn, route marker and item entity has retail floor under it,
+  * walking the importer's route (packages/maps/<section>.route) with ordinary movement
+    input at full speed reaches the exit: the authored transition, or the section's
+    completion,
+  * movement feels the same as on stock AssaultCube geometry: on the first long straight of
+    the route the QA client runs from a standstill on retail collision and again on the
+    map's stock cube geometry. Sustained ground speed (about 16 u/s), the time to cover the
+    first 4 units from a standstill and a standing jump's height must be within 10% of the
+    stock run, and the route
+    follower's speed on every straight it walks must be too.
+A mission's walk stops at the first section without an .hcol (stock geometry, reported and
+skipped, not failed). A missing .route or a route that stalls fails the section; the walk
+logs go to build/qa/.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qa_common import *  # noqa: E402,F403
+sys.path.insert(0, str(root / 'tools'))
+from import_halo_campaign import MISSIONS  # noqa: E402
+
+parser = argparse.ArgumentParser()
+parser.add_argument('missions', nargs='*', help='mission cache names, e.g. a10 b30 c10')
+parser.add_argument('--section', action='append', default=[], metavar='MISSION:N', help='one-based section, e.g. a10:3')
+parser.add_argument('--difficulty', type=int, default=2, choices=range(4),
+                    help='halo_difficulty for the walk; Heroic (2) skips a10\'s scripted tutorial, which Normal gates doors behind')
+parser.add_argument('--timeout', type=int, default=520, help='seconds per section')
+args = parser.parse_args()
+require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
+
+maps = root / 'packages/maps'
+NOMINAL_SPEED = 16.0
+# Sections whose walk is known to stop at a script-gated door (docs/macos-build.md). They are
+# walked and reported every time, but only fail the test once they pass (so the list is pruned).
+KNOWN_BLOCKED = {
+    'halo_a10_05': 'tunnel_door_2 stays shut after mission_tunnel powers it',
+    'halo_a10_06': 'reached only through section 5; on its own cryo_search never opens cryo_door_2',
+    # The route rides lift_d down the c1 tower (flag 4); the walker does not work lift controls yet.
+    'halo_b40_06': 'lift_d ride (route flag 4): the walker does not call and ride lifts',
+    # c10 leaves these sections half way down a lift shaft (bsp 0,1 and bsp 1,3): the route ends
+    # beside the lift's control, and the section ends only once the player rides it down.
+    'halo_c10_01': 'lift_a ride to bsp 0,1: the walker does not call and ride lifts',
+    'halo_c10_04': 'lift_b ride to bsp 1,3: the walker does not call and ride lifts',
+    # c20 leaves its first three sections half way up a platform shaft (bsp 0,1, 1,2, 2,3): the
+    # route ends beside the platform, which rises once the player stands on it.
+    'halo_c20_01': 'platform1 ride to bsp 0,1: the walker does not board lifts',
+    'halo_c20_02': 'platform2 ride to bsp 1,2: the walker does not board lifts',
+    'halo_c20_03': 'platform3 ride to bsp 2,3: the walker does not board lifts',
+    # d40's engine room: enc5_2_door opens only once the four manifolds are opened from their
+    # controls and shot, and the section ends on the elevator, which enc5_3 raises to bsp 4,5.
+    'halo_d40_05': 'manifolds to open and shoot, then the elevator ride to bsp 4,5: the walker does neither',
+}
+
+
+def section_name(mission, number):
+    return f'halo_{mission.cache}_{number:02}'
+
+
+# Runs: (mission, [section numbers walked in one client, in order]).
+runs = []
+for cache in args.missions or ([] if args.section else ['a10']):
+    mission = next((m for m in MISSIONS if m.cache == cache), None)
+    if mission is None:
+        raise SystemExit(f'unknown mission {cache}; choose from {[m.cache for m in MISSIONS]}')
+    runs.append((mission, list(range(1, len(mission.sections) + 1))))
+for item in args.section:
+    cache, number = item.split(':')
+    mission = next(m for m in MISSIONS if m.cache == cache)
+    runs.append((mission, [int(number)]))
+
+failures, skipped, passed, known = [], [], [], []
+
+
+def check(name, log):
+    """Problems with one section's part of a walk log, and a summary for a pass."""
+    problems = []
+    loaded = re.search(rf'loaded (\d+) retail collision surfaces for {name}\b', log)
+    if not loaded:
+        problems.append('retail collision not active (no "loaded N retail collision surfaces")')
+    spawn = re.search(rf'RETAIL_QA spawn map={name} collision=(\d) feet=(\S+) floorgap=(\S+) onfloor=(\d) alive=(\d)', log)
+    if not spawn:
+        problems.append('player never reached live gameplay')
+        return problems, ''
+    _, _, gap, onfloor, alive = spawn.groups()
+    if not (spawn.group(1) == '1' and onfloor == '1' and alive == '1' and 0 <= float(gap) <= .05):
+        problems.append(f'spawn not standing on floor: {spawn.group(0)}')
+    body = log[spawn.start():]
+    end = re.search(rf'RETAIL_QA (PASS|FAIL) (\S+) map={name}\b.*', body)
+    if end:
+        body = body[:end.end()]
+    audit = re.search(r'RETAIL_QA audit entities=(\d+) floorless=(\d+)', body)
+    if audit and int(audit.group(2)):
+        problems.append(f'{audit.group(2)} of {audit.group(1)} spawn/marker/item entities have no retail floor')
+    feel = re.search(r'RETAIL_QA feel retail_speed=(\S+) stock_speed=(\S+) retail_accel=(\S+) stock_accel=(\S+) '
+                     r'retail_apex=(\S+) stock_apex=(\S+) retail_air=\S+ stock_air=\S+ retail_ok=(\d) stock_ok=(\d)', body)
+    note = ''
+    if not feel:
+        if end and end.group(1) == 'PASS':
+            problems.append('movement feel not measured (no clear straight of 22+ steps on the route)')
+    else:
+        speed, stock_speed, accel, stock_accel, apex, stock_apex = map(float, feel.groups()[:6])
+        retail_ok, stock_ok = feel.group(7) == '1', feel.group(8) == '1'
+        # AssaultCube's ground speed is maxspeed 16 u/s. Where the stock cube layout has no
+        # room for the straight (it is coarser than the retail floors), compare with that.
+        reference = stock_speed if stock_ok else NOMINAL_SPEED
+        note = f'speed {speed:.2f} vs {"stock" if stock_ok else "nominal"} {reference:.2f} u/s'
+        if not retail_ok:
+            problems.append('movement-feel straight stalled on retail collision')
+        elif speed < .9 * reference:
+            problems.append(f'sluggish: ground speed {speed:.2f} u/s, stock {reference:.2f}')
+        if retail_ok and stock_ok:
+            if accel < 0 or accel > 1.1 * stock_accel:
+                problems.append(f'sluggish: first 4 units from a standstill in {accel:.0f} ms, stock {stock_accel:.0f} ms')
+            if stock_apex > 0 and apex < .9 * stock_apex:
+                problems.append(f'jump apex {apex:.2f}, stock {stock_apex:.2f}')
+        # Straights where a door or another body was just ahead are reported but not judged.
+        walked = [float(v) for v in re.findall(r'RETAIL_QA walk-speed waypoints=\S+ speed=(\S+) held=0', body)]
+        slow = [v for v in walked if v < .9 * reference]
+        if slow:
+            problems.append(f'sluggish: {len(slow)} of {len(walked)} walked straights below 90% ({min(slow):.2f} u/s)')
+        note += f'; walked straights {min(walked):.2f}..{max(walked):.2f}' if walked else ''
+    if not end or end.group(1) != 'PASS':
+        problems.append('exit not reached by walking: ' + (end.group(0) if end else 'no result'))
+    crouched = re.search(r'RETAIL_QA crouched (\d+) times', body)
+    summary = f'{end.group(2) if end else "-"}; {loaded.group(1) if loaded else "?"} surfaces; ' \
+              f'{audit.group(0)[10:] if audit else ""}; {note}' + (f'; crouched {crouched.group(1)}x' if crouched else '')
+    return problems, summary
+
+
+def walk_run(mission, walk):
+    """Walks sections `walk` of a mission in one client. Returns the sections not reached."""
+    mission_index = MISSIONS.index(mission) + 1
+    # qa_retail_start takes the engine's one-based section. a30's engine section 1 is the
+    # standalone halo_a30 map, so its imported parts (halo_a30_01, _02) are sections 2 and 3.
+    engine_section = walk[0] + (1 if mission.cache == 'a30' else 0)
+    first = section_name(mission, walk[0])
+    profile = scratch(f'retail-{first}-')
+    logfile = SCRATCH / f'retail-collision-{first}{"-" + str(walk[-1]) if len(walk) > 1 else ""}.log'
+    routes = [str(maps / f'{section_name(mission, n)}.route') for n in walk]
+    with logfile.open('w') as output:
+        try:
+            result = subprocess.run(
+                [QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600',
+                 f'-ehalo_scripttrace 1; maxfps 120; halo_difficulty {args.difficulty}; sleep 600 [qa_retail_start {mission_index} {engine_section}] 1'],
+                cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=args.timeout * len(walk),
+                env={**os.environ, 'HALOQA_RETAIL_ROUTE': routes[0], 'HALOQA_RETAIL_CHAIN': '\n'.join(routes[1:])})
+            code = result.returncode
+        except subprocess.TimeoutExpired:
+            code = 'timeout'
+    log = logfile.read_text(errors='replace')
+    for position, number in enumerate(walk):
+        name = section_name(mission, number)
+        problems, summary = check(name, log)
+        if code != 0 and number == walk[-1]:
+            problems.append(f'exit {code}')
+        fresh = '' if position or walk[0] == 1 else ' (started on its own: the mission script began afresh)'
+        exit_only = all(problem.startswith('exit not reached') for problem in problems)
+        if problems and name in KNOWN_BLOCKED and exit_only:
+            known.append(name)
+            print(f'{name}: KNOWN {KNOWN_BLOCKED[name]}: {problems[0]}{fresh}', flush=True)
+            return walk[position + 1:]
+        if problems:
+            failures.append((name, '; '.join(problems) + fresh))
+            print(f'{name}: FAIL {"; ".join(problems)}{fresh}', flush=True)
+            for line in log.splitlines():
+                if line.startswith('RETAIL_QA') and (f'map={name}' in line or not re.search(r'map=\S+', line)) and \
+                   any(w in line for w in ('PASS', 'FAIL', 'stuck', 'floorless', 'audit', 'feel', 'blocked', 'waiting', 'crouching', 'squeezing')):
+                    print('   ', line)
+            print(f'    log {logfile}', flush=True)
+            return walk[position + 1:]
+        passed.append(name)
+        print(f'{name}: PASS {summary}{fresh}', flush=True)
+        if name in KNOWN_BLOCKED:
+            failures.append((name, 'now passes: remove it from KNOWN_BLOCKED and docs/macos-build.md'))
+    return []
+
+
+for mission, numbers in runs:
+    walk = []
+    for number in numbers:
+        name = section_name(mission, number)
+        if not (maps / f'{name}.hcol').is_file():
+            skipped.extend(section_name(mission, n) for n in numbers[numbers.index(number):])
+            print(f'{name}: no .hcol, stock AssaultCube geometry (skipped with the rest of the run)', flush=True)
+            break
+        if not (maps / f'{name}.route').is_file():
+            failures.append((name, 'no .route; re-run tools/import_halo_campaign.py'))
+            print(f'{name}: FAIL no .route', flush=True)
+            break
+        walk.append(number)
+    # After a failed section the walk carries on from the next section in a new client, so one
+    # blocked section does not hide the rest.
+    while walk:
+        walk = walk_run(mission, walk)
+
+print(f'\n{len(passed)} passed, {len(failures)} failed, {len(known)} known blocked, {len(skipped)} on stock geometry')
+if known:
+    print('known blocked:', ', '.join(f'{n} ({KNOWN_BLOCKED[n]})' for n in known))
+if skipped:
+    print('stock geometry:', ', '.join(skipped))
+if failures:
+    raise SystemExit('retail collision failed: ' + '; '.join(f'{n} ({why})' for n, why in failures))
+print('Retail collision route passed.')

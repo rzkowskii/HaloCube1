@@ -29,19 +29,65 @@ def collision_frames(halo, tag, model, poses):
     for index, node in enumerate(tags.block(reference.address + 652, 64)):
         if index >= len(model.nodes):
             break
-        points = []
+        points, decks, undersides = [], {}, {}
         for bsp in tags.block(node + 52, 96):
-            points.extend(tags.read('3f', vertex) for vertex in tags.block(bsp + 84, 16))
+            vertices = [tags.read('3f', vertex) for vertex in tags.block(bsp + 84, 16)]
+            points.extend(vertices)
+            planes = [tags.read('3f', q) for q in tags.block(bsp + 12, 16)]
+            edges = [tags.read('6i', q) for q in tags.block(bsp + 72, 24)]
+            for number, surface in enumerate(tags.block(bsp + 60, 12)):
+                designator, edge = tags.read('Ii', surface)
+                plane = designator & 0x7fffffff
+                if plane >= len(planes):
+                    continue
+                facing = (-1 if designator & 0x80000000 else 1) * planes[plane][2]
+                if abs(facing) < .9:
+                    continue
+                try:
+                    loop = _surface_loop(number, edge, edges, vertices)
+                except ValueError:
+                    continue
+                area = abs(sum(a[0]*b[1] - b[0]*a[1] for a, b in zip(loop, loop[1:] + loop[:1]))) / 2
+                height = round(sum(v[2] for v in loop) / len(loop), 3)
+                faces = decks if facing > 0 else undersides
+                faces[height] = faces.get(height, 0) + area
         if points:
-            nodes.append((index, model.nodes[index][0], points))
+            # The floor a body rides on: the upward face with the most area, and the underside of
+            # its slab (a downward face as large, at most 0.55 below it), if there is one.
+            deck = max(decks, key=decks.get) if decks else None
+            slab = max((height for height, area in undersides.items()
+                        if deck is not None and 0 < deck - height <= .55 and area >= .8 * decks[deck]), default=None)
+            nodes.append((index, model.nodes[index][0], points, deck, slab))
     result = []
-    for index, name, points in nodes:
+    for index, name, points, deck, slab in nodes:
         frames = []
         for pose in poses:
             axes = list(zip(*(pose[name].point(point) for point in points)))
             frames.append(tuple(map(min, axes)) + tuple(map(max, axes)))
+        # A lift platform (a thin slab that travels a storey or more) collides as one box, so
+        # its top is where a body stands. c10's lifts have a rim 0.2 units above the deck, which
+        # put the box top 0.46 units above the landings, too high to step or jump onto: use the
+        # deck. Doors and other machines keep their full extent, and so do lifts whose deck is
+        # within 0.1 units of their top (b40's, 0.03 below it).
+        top = max(point[2] for point in points)
+        travels = frames and abs(frames[-1][2] - frames[0][2]) > 4
+        if deck is not None and top - deck > .1 and travels and frames[0][5] - frames[0][2] < .55:
+            frames = [frame[:5] + (frame[5] - (top - deck),) for frame in frames]
+        elif slab is not None and travels and top - deck > 1:
+            # An elevator car (d40's elevator, a 0.2-unit floor slab in a frame 5.1 units tall, which
+            # rises 101 units up the shaft) would collide as a solid block filling the car. Keep its
+            # floor slab: the body rides on the deck, and the shaft walls hold it in. No other
+            # retail machine has a slab under its deck and a frame more than a unit above it.
+            bottom = min(point[2] for point in points)
+            frames = [frame[:2] + (frame[2] + (slab - bottom),) + frame[3:5] + (frame[5] - (top - deck),)
+                      for frame in frames]
         result.append((index, frames))
     return result
+
+
+def _surface_loop(surface, first_edge, edges, vertices):
+    from halo_collision import surface_vertices
+    return surface_vertices(surface, first_edge, edges, vertices)
 
 
 def structure_leaves(region, address, point):

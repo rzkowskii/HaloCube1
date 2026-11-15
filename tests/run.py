@@ -25,6 +25,7 @@ QUICK = [
     'test_devices.py',                # door collision, BSP switch, lift carries the player
     'test_library_platform.py',       # Library elevated platform
     'test_b30_retail_collision.py',   # Silent Cartographer on retail BSP collision
+    'test_retail_collision.py',       # a10 (its default) on retail collision: active, spawn on floor, route walks to the exit
     'test_campaign_replay.py',        # all 55 sections complete in one run
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons

@@ -6,6 +6,7 @@
 #include "halo_ai.h"
 #include "halo_weapons.h"
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <memory>
 #include <random>
@@ -553,6 +554,19 @@ namespace
         const char *cache = "";
         HudTimer hudTimer;
         std::unordered_map<std::string, TutorialPoll> tutorialPolls;
+        // Per program.switches entry, this section: 1 armed, 0 waiting for the player to leave
+        // the volume they started in, 2 the entry doorway (never fires). Empty until the first
+        // live tick of the section.
+        std::vector<signed char> switchArm;
+        // A BSP switch half way along a lift shaft (c20's platforms, c10's lifts) ends the
+        // section there, and the next one puts the player at its start on the landing: the rest
+        // of the ride never happens. The volumes on that stretch of the shaft (c20's
+        // section7_trigger, above bsp 2,3, which section6 waits for) count as entered by the
+        // player for the first second of the next section (noteRide).
+        vec switchPoint;
+        bool rideCarried = false, ridePending = false;
+        std::vector<int> ridden;
+        int riddenUntil = -1;
 
         void start(int m, int s);
         void stop();
@@ -598,14 +612,17 @@ namespace
         void updateCamera();
         Pose currentActor(int actor, int depth = 0) const;
         bool testVolume(int index, int object = playerObject) const;
+        bool playerPoint(vec &point) const;
+        void noteRide();
         bool switchBsp(int bsp, const char *trigger);
+        void armSwitches();
         void updateDevices(bool gameplay);
         void updateRecordings();
         bool setGroup(int index, float value, bool immediate = false);
         float groupValue(int index, float fallback = 0) const;
         bool deviceActive(size_t index) const;
         void renderDevices() const;
-        bool collideDevices(physent *entity, float &hi, float &lo) const;
+        bool collideDevices(physent *entity, float &hi, float &lo, int *blocking = nullptr) const;
         bool traceDevices(const vec &from, const vec &to, HaloCollisionHit &hit) const;
         bool useDevice();
         void setWorld(int bsp);
@@ -1125,6 +1142,56 @@ namespace
         conoutf("Halo scene: %s BSP %d", cache, bsp);
     }
 
+    // The player's body centre in retail coordinates, as the volume tests see it.
+    bool Scenario::playerPoint(vec &point) const
+    {
+        if(!projection || player1->state != CS_ALIVE) return false;
+        const Projection &p = *projection;
+        point = vec(p.origin.x + (player1->o.x - p.margin) / p.xy,
+                    p.origin.y - (player1->o.y - p.margin) / p.xy,
+                    p.origin.z + (player1->o.z - .45f * player1->eyeheight) / p.z);
+        return true;
+    }
+
+    static bool insideVolume(const Volume &volume, vec point)
+    {
+        if(volume.kind == 0)
+        {
+            return point.x > volume.origin.x && point.x < volume.extent.x &&
+                   point.y > volume.origin.y && point.y < volume.extent.y &&
+                   point.z > volume.origin.z && point.z < volume.extent.z;
+        }
+        vec local = point.sub(volume.origin);
+        vec side;
+        side.cross(volume.up, volume.forward);
+        float x = local.dot(volume.forward), y = local.dot(side), z = local.dot(volume.up);
+        return x > 0 && x < volume.extent.x && y > 0 && y < volume.extent.y && z > 0 && z < volume.extent.z;
+    }
+
+    // First live tick of a section entered through a switch volume: the player stands at the
+    // section's start. When that is more than a unit above or below where the switch fired, the
+    // switch was part way along a lift ride; the volumes on the vertical line from the switch
+    // point to the start's height are the ones the rest of the ride would have passed.
+    void Scenario::noteRide()
+    {
+        ridden.clear();
+        vec start;
+        if(!playerPoint(start) || fabs(start.z - switchPoint.z) <= 1) return;
+        const float low = min(start.z, switchPoint.z), high = max(start.z, switchPoint.z);
+        for(size_t i = 0; i < program.volumes.size(); ++i)
+        {
+            for(float z = low; z <= high; z += .1f)
+            {
+                if(!insideVolume(program.volumes[i], vec(switchPoint.x, switchPoint.y, z))) continue;
+                ridden.push_back(int(i));
+                conoutf("Halo trigger: %s passed on the ride from %.1f to %.1f", program.volumes[i].name.c_str(),
+                        switchPoint.z, start.z);
+                break;
+            }
+        }
+        riddenUntil = tick + int(ticksPerSecond);
+    }
+
     bool Scenario::testVolume(int index, int object) const
     {
         const Volume *volume = at(program.volumes, index);
@@ -1132,11 +1199,8 @@ namespace
         vec point;
         if(object == playerObject)
         {
-            if(player1->state != CS_ALIVE) return false;
-            const Projection &p = *projection;
-            point = vec(p.origin.x + (player1->o.x - p.margin) / p.xy,
-                        p.origin.y - (player1->o.y - p.margin) / p.xy,
-                        p.origin.z + (player1->o.z - .45f * player1->eyeheight) / p.z);
+            if(!playerPoint(point)) return false;
+            if(tick <= riddenUntil && std::find(ridden.begin(), ridden.end(), index) != ridden.end()) return true;
         }
         else
         {
@@ -1146,17 +1210,7 @@ namespace
             point = pose.position;
             point.add(poseOffset(vec(program.objects[object].center).mul(actor->scale), pose));
         }
-        if(volume->kind == 0)
-        {
-            return point.x > volume->origin.x && point.x < volume->extent.x &&
-                   point.y > volume->origin.y && point.y < volume->extent.y &&
-                   point.z > volume->origin.z && point.z < volume->extent.z;
-        }
-        vec local = point.sub(volume->origin);
-        vec side;
-        side.cross(volume->up, volume->forward);
-        float x = local.dot(volume->forward), y = local.dot(side), z = local.dot(volume->up);
-        return x > 0 && x < volume->extent.x && y > 0 && y < volume->extent.y && z > 0 && z < volume->extent.z;
+        return insideVolume(*volume, point);
     }
 
     bool Scenario::switchBsp(int bsp, const char *trigger)
@@ -1164,9 +1218,46 @@ namespace
         const Projection *next = at(program.projections, section + 1);
         if(!next || !projection || bsp != next->bsp || bsp == projection->bsp) return false;
         if(cartographerInterior() && !cartographerMapped()) return false;
+        vec point;
+        const bool alive = playerPoint(point);
         if(!haloscenariotransition()) return false;
         conoutf("Halo trigger: %s BSP %d to %d", trigger, projection->bsp, bsp);
+        if(alive)
+        {
+            switchPoint = point;
+            rideCarried = true;
+        }
         return true;
+    }
+
+    // A section can start inside a switch volume to the BSP it goes on to: b40's c1 tower
+    // (BSP 11) is entered through its top "bsp 11,2" doorway and left through the bottom one.
+    // A volume the player starts in fires only once they have left it, and one with another
+    // volume to the same BSP (the way out) never fires in this section.
+    void Scenario::armSwitches()
+    {
+        const size_t count = program.switches.size();
+        if(switchArm.size() != count)
+        {
+            switchArm.assign(count, 1);
+            for(size_t i = 0; i < count; ++i)
+            {
+                const BspSwitch &entry = program.switches[i];
+                if(entry.from != world || !testVolume(entry.volume)) continue;
+                bool elsewhere = false;
+                for(size_t j = 0; j < count && !elsewhere; ++j)
+                {
+                    const BspSwitch &other = program.switches[j];
+                    elsewhere = j != i && other.from == entry.from && other.to == entry.to && !testVolume(other.volume);
+                }
+                switchArm[i] = elsewhere ? 2 : 0;
+                conoutf("Halo trigger: %s %s in this section", program.volumes[entry.volume].name.c_str(),
+                        elsewhere ? "is the entry, ignored" : "holds the start, armed once left");
+            }
+            return;
+        }
+        for(size_t i = 0; i < count; ++i)
+            if(!switchArm[i] && !testVolume(program.switches[i].volume)) switchArm[i] = 1;
     }
 
     float Scenario::groupValue(int index, float fallback) const
@@ -1316,7 +1407,12 @@ namespace
                 else s.desiredPosition = 0;
             }
             DeviceState previous = s;
-            seekDevice(s.power, s.powerVelocity, groupValue(d.powerGroup, s.desiredPower), d.powerAccel, d.powerSpeed);
+            // A machine with no power transition time (a10's jeff-tube tunnel and cryo doors)
+            // powers up at once; seekDevice would otherwise treat the zero rate as never moving
+            // and the door stays locked after the script powers it.
+            const float wantPower = groupValue(d.powerGroup, s.desiredPower);
+            if(d.powerSpeed <= 0) { s.power = wantPower; s.powerVelocity = 0; }
+            else seekDevice(s.power, s.powerVelocity, wantPower, d.powerAccel, d.powerSpeed);
             float speed = d.offSpeed * (1 - s.power) + d.onSpeed * s.power;
             float accel = d.offAccel * (1 - s.power) + d.onAccel * s.power;
             if(!d.control && d.kind == 2)
@@ -1349,7 +1445,7 @@ namespace
         }
     }
 
-    bool Scenario::collideDevices(physent *entity, float &hi, float &lo) const
+    bool Scenario::collideDevices(physent *entity, float &hi, float &lo, int *blocking) const
     {
         if(!loaded || cue || editmode || entity->type == ENT_CAMERA) return false;
         const Projection &p = *projection;
@@ -1358,7 +1454,7 @@ namespace
         float radius = entity->radius / p.xy;
         for(size_t i = 0; i < devices.size(); ++i)
         {
-            if(!deviceActive(i)) continue;
+            if(!deviceActive(i) || halocollisionbaked(int(i))) continue;
             const Device &d = program.devices[i];
             if(d.control || d.panels.empty() || d.kind == 2) continue;
             vec local = deviceLocal(p, d, entity->o);
@@ -1371,9 +1467,9 @@ namespace
                 float top = (box.high.z + d.pose.position.z - p.origin.z) * p.z;
                 if(feet >= top - .23f * p.z) lo = max(lo, top);
                 else if(feet + height <= bottom + .10f * p.z) hi = min(hi, bottom);
-                else if(d.elevator != panel.node && top - bottom > .05f * p.z) return true;
+                else if(d.elevator != panel.node && top - bottom > .05f * p.z) { if(blocking) *blocking = int(i); return true; }
                 else lo = max(lo, top);
-                if(hi - lo < height) return true;
+                if(hi - lo < height) { if(blocking) *blocking = int(i); return true; }
             }
         }
         return false;
@@ -1386,7 +1482,8 @@ namespace
         bool found = false;
         for(size_t i = 0; i < devices.size(); ++i)
         {
-            if(!deviceActive(i)) continue;
+            // Baked machines are part of the structure trace.
+            if(!deviceActive(i) || halocollisionbaked(int(i))) continue;
             const Device &d = program.devices[i];
             if(d.control || d.panels.empty() || d.kind == 2) continue;
             const vec local = deviceLocal(p, d, from);
@@ -1780,7 +1877,7 @@ namespace
         }
         if(is("ai_command_list_status"))
         {
-            // 0 no list, 1 still running, 2 finished, across the given units.
+            // 0 no list, 1 still running, 2 finished or waiting at a loop atom, across the given units.
             const int value = index(0);
             int status = 0;
             if(value <= actorList)
@@ -1801,7 +1898,11 @@ namespace
         if(is("unit_get_health"))
         {
             playerent *p = actorFromValue(index(0));
-            return result(p && p->state == CS_ALIVE ? haloactorhealthfraction(p) : -1.0f);
+            if(p) return result(p->state == CS_ALIVE ? haloactorhealthfraction(p) : -1.0f);
+            // A scripted unit without an AI body (a10's Keyes on the bridge) cannot be hurt
+            // here: unhurt while it exists. Reporting -1 made a10 think the player shot Keyes.
+            const int value = index(0);
+            return result(value >= 0 && at(actors, value) && actors[value].visible ? 1.0f : -1.0f);
         }
         if(is("objects_can_see_object") || is("objects_can_see_flag"))
         {
@@ -2576,6 +2677,10 @@ namespace
     void Scenario::start(int m, int s)
     {
         const bool continuing = mission == m && s == section + 1 && runningGameplay && !threads.empty();
+        ridePending = continuing && rideCarried;
+        rideCarried = false;
+        ridden.clear();
+        riddenUntil = -1;
         stop();
         cache = haloMissions[m].cache;
         if(mission != m || program.scripts.empty())
@@ -2591,6 +2696,7 @@ namespace
         mission = m;
         section = s;
         projection = at(program.projections, s);
+        switchArm.clear();
         if(!projection) return;
         prepareAI();
         if(continuing)
@@ -2795,6 +2901,11 @@ namespace
                 continue;
             }
             if(player1->state != CS_ALIVE || intermission) continue;
+            if(ridePending)
+            {
+                ridePending = false;
+                noteRide();
+            }
             for(size_t i = 0; i < threads.size() && !cue; ++i)
             {
                 Thread &thread = threads[i];
@@ -2814,9 +2925,13 @@ namespace
             }
             if(!cue)
             {
-                for(const BspSwitch &entry : program.switches)
-                    if(entry.from == world && testVolume(entry.volume) &&
+                armSwitches();
+                for(size_t i = 0; i < program.switches.size(); ++i)
+                {
+                    const BspSwitch &entry = program.switches[i];
+                    if(switchArm[i] == 1 && entry.from == world && testVolume(entry.volume) &&
                        switchBsp(entry.to, program.volumes[entry.volume].name.c_str())) break;
+                }
             }
             if(pendingCheckpoint && !cue && !intermission && (!cartographerInterior() || player1->onfloor))
             {
@@ -2916,7 +3031,7 @@ namespace
 void haloscenariostart(int mission, int section, bool preview, bool continuing)
 {
     if(!continuing) scenario.runningGameplay = false;
-    if(!preview || halocollisionactive()) scenario.start(mission, section);
+    if(!preview || (mission == 3 && halocollisionactive())) scenario.start(mission, section);
 }
 
 void haloscenariostop() { scenario.stop(); }
@@ -3190,6 +3305,15 @@ bool halocartographertarget(vec &point, bool &mapped)
     return true;
 }
 bool haloscenariocollide(physent *entity, float &hi, float &lo) { return scenario.collideDevices(entity, hi, lo); }
+// The script name of the device a body at this spot would collide with, or null (QA diagnostics).
+const char *haloscenarioblockingdevice(physent *entity)
+{
+    float hi = 1e9f, lo = -1e9f;
+    int index = -1;
+    if(!scenario.collideDevices(entity, hi, lo, &index) || index < 0) return nullptr;
+    const auto *object = at(scenario.program.objects, scenario.program.devices[index].object);
+    return object && !object->name.empty() ? object->name.c_str() : "unnamed";
+}
 float haloscenarioscale()
 {
     // The standalone a30 map has no projection; tools/import_halo_a30.py uses HORIZONTAL_SCALE 2.75.
@@ -3201,10 +3325,14 @@ bool haloscenarioexitpoint(vec &point)
     if(!scenario.loaded || !scenario.projection) return false;
     const Projection *next = at(scenario.program.projections, scenario.section + 1);
     if(!next) return false;
-    for(const BspSwitch &entry : scenario.program.switches)
+    const std::vector<BspSwitch> &switches = scenario.program.switches;
+    for(size_t i = 0; i < switches.size(); ++i)
     {
+        const BspSwitch &entry = switches[i];
         const Volume *volume = at(scenario.program.volumes, entry.volume);
         if(entry.from != scenario.world || entry.to != next->bsp || !volume) continue;
+        // Not the doorway the section was entered by (b40's c1 tower).
+        if(scenario.switchArm.size() == switches.size() && scenario.switchArm[i] == 2) continue;
         point = toWorld(*scenario.projection, volumeCenter(*volume));
         return true;
     }
@@ -3224,6 +3352,44 @@ COMMANDF(halo_script_status, "", ()
     conoutf("HaloScript: %s section %d tick %d, %zu unbound commands",
             scenario.cache, scenario.section + 1, scenario.tick, scenario.unsupported.size());
     for(const std::string &command : scenario.unsupported) conoutf("HaloScript: unbound %s", command.c_str());
+    if(!halo_scripttrace) return;
+    // Where each live script is waiting: its name and the call chain of its stack.
+    for(size_t i = 0; i < scenario.threads.size(); ++i)
+    {
+        const auto &thread = scenario.threads[i];
+        if(thread.done || thread.disabled || thread.stack.empty()) continue;
+        std::string chain;
+        // A short rendering of an expression: (head arg arg ...), two levels deep.
+        std::function<void(uint32_t, int)> show = [&](uint32_t datum, int depth)
+        {
+            const auto *node = scenario.program.node(datum);
+            if(!node) return;
+            if(node->flags & 1) { chain += scenario.program.text(node->text); return; }
+            const auto *head = scenario.program.node(node->data);
+            if(!head) return;
+            chain += "(";
+            chain += scenario.program.text(head->text);
+            if(depth < 2) for(uint32_t it = head->next; const auto *arg = scenario.program.node(it); it = arg->next)
+            {
+                chain += " ";
+                show(it, depth + 1);
+            }
+            else chain += " ...";
+            chain += ")";
+        };
+        for(const auto &frame : thread.stack)
+        {
+            if(!chain.empty()) chain += " > ";
+            if(&frame == &thread.stack.back()) show(frame.expression, 0);
+            else
+            {
+                const auto *node = scenario.program.node(frame.expression);
+                const auto *head = node && !(node->flags & 1) ? scenario.program.node(node->data) : nullptr;
+                if(head) chain += scenario.program.text(head->text);
+            }
+        }
+        conoutf("HaloScript: thread %s waits in %s", scriptName(scenario.program, int(i)), chain.c_str());
+    }
 });
 
 void haloscenariopausestate(bool paused)

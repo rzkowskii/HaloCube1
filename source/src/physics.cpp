@@ -310,8 +310,11 @@ static bool retailstepup(const physent *d, vec &feet, const vec &delta)
     return true;
 }
 
+// retaildebug 1 logs the player's retail contacts and blocked moves (tests/native/retail_qa.inc).
+VAR(retaildebug, 0, 0, 1);
 static bool retailmove(physent *d, vec delta, float gravity)
 {
+    const bool debug = retaildebug && d == player1;
     const vec original = d->o;
     vec feet = retailfeet(d);
     const bool actor = d->type == ENT_PLAYER || d->type == ENT_BOT;
@@ -333,6 +336,7 @@ static bool retailmove(physent *d, vec delta, float gravity)
             break;
         }
         collided = true;
+        if(debug) conoutf("RDBG it=%d delta=%.4f,%.4f,%.4f hit=%d frac=%.4f n=%.3f,%.3f,%.3f", i, delta.x, delta.y, delta.z, hit.surface, hit.fraction, hit.normal.x, hit.normal.y, hit.normal.z);
         if(i == 0 && actor && grounded && !rising && hit.normal.z < retailSlope &&
            delta.sqrxy() > 1e-8f && retailstepup(d, feet, delta))
         {
@@ -370,22 +374,73 @@ static bool retailmove(physent *d, vec delta, float gravity)
         }
     }
 
-    d->o = vec(feet).add(vec(0, 0, d->eyeheight));
-    float hi = 1e9f, lo = -1e9f, headspace = 10.0f;
-    hitplayer = nullptr;
-    if(collidedynamic(d, hi, lo, headspace) || feet.z + retailheight(d) > hi + retailSkin)
+    float hi = 1e9f, lo = -1e9f;
+    auto dynamicblocked = [&](const vec &at)
     {
-        d->o = original;
-        d->onfloor = grounded;
-        return true;
+        d->o = vec(at).add(vec(0, 0, d->eyeheight));
+        hi = 1e9f;
+        lo = -1e9f;
+        float headspace = 10.0f;
+        hitplayer = nullptr;
+        return collidedynamic(d, hi, lo, headspace) || at.z + retailheight(d) > hi + retailSkin;
+    };
+    if(dynamicblocked(feet))
+    {
+        // Device panels, mapmodels and other bodies are boxes. Slide along them as stock
+        // collision does, keeping whichever axis of the move is free, instead of stopping dead.
+        bool slid = false;
+        if(actor)
+        {
+            const vec from(original.x, original.y, original.z - d->eyeheight);
+            vec along[3];
+            int options = 0;
+            if(hitplayer)
+            {
+                // Another body is round: slide around it, as stock collision pushes past.
+                vec away(hitplayer->o.x - from.x, hitplayer->o.y - from.y, 0), move(feet.x - from.x, feet.y - from.y, 0);
+                if(!away.iszero())
+                {
+                    away.normalize();
+                    const float into = move.dot(away);
+                    if(into > 0) move.sub(vec(away).mul(into));
+                    along[options++] = vec(from.x + move.x, from.y + move.y, feet.z);
+                }
+            }
+            const bool ymajor = fabsf(feet.y - from.y) > fabsf(feet.x - from.x);
+            along[options++] = ymajor ? vec(from.x, feet.y, feet.z) : vec(feet.x, from.y, feet.z);
+            along[options++] = ymajor ? vec(feet.x, from.y, feet.z) : vec(from.x, feet.y, feet.z);
+            loopk(options)
+            {
+                const vec &option = along[k];
+                if(option.squareddist(from) < 1e-10f || retailoverlap(d, option) || dynamicblocked(option)) continue;
+                feet = option;
+                slid = true;
+                break;
+            }
+        }
+        if(!slid)
+        {
+            if(debug) { const char *dev = haloscenarioblockingdevice(d); conoutf("RDBG dynamic revert hi=%.3f lo=%.3f feet=%.3f hitplayer=%d device=%s at %.2f,%.2f", hi, lo, feet.z, hitplayer != nullptr, dev ? dev : "-", d->o.x, d->o.y); }
+            d->o = original;
+            d->onfloor = grounded;
+            return true;
+        }
+        collided = true;
     }
-    if(feet.z < lo && original.z - d->eyeheight >= lo - retailSkin)
+    // A device or mapmodel top below the step height (a door sill, a floor hatch) is climbed
+    // onto, as stock collision does with its rise. Without it a few centimetres of lip stop
+    // the player dead.
+    const float climb = lo - feet.z;
+    const vec raised(feet.x, feet.y, lo + retailSkin);
+    if(feet.z < lo && (original.z - d->eyeheight >= lo - retailSkin ||
+       (actor && climb <= retailStep && raised.z + retailheight(d) <= hi + retailSkin && !retailoverlap(d, raised))))
     {
         d->o.z = lo + d->eyeheight + retailSkin;
         floor = true;
     }
     else if(feet.z < lo - retailSkin)
     {
+        if(debug) conoutf("RDBG below lo revert lo=%.3f feet=%.3f", lo, feet.z);
         d->o = original;
         d->onfloor = grounded;
         return true;

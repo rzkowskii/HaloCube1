@@ -23,6 +23,7 @@ The quick tier takes 10 to 15 minutes. It needs the imported campaign assets
 | `test_devices.py` | Autumn door collision, first BSP switch, Control Room lift |
 | `test_library_platform.py` | The Library's elevated platform carries the player |
 | `test_b30_retail_collision.py` | Silent Cartographer route on retail BSP collision |
+| `test_retail_collision.py` | Generic retail-collision walk (default `a10`), one playthrough per mission: for each section with a `packages/maps/<section>.hcol` the log says `loaded N retail collision surfaces`, the player spawns standing on retail floor, every spawn, marker and item has floor under it, the importer's `.route` is walked at full speed to the exit, and movement feels like stock geometry (speed, acceleration, jump within 10%). See below |
 | `test_campaign_replay.py` | All 55 sections complete in one run |
 | `test_weapon_tags.py` | Retail weapon table matches known tag values and the engine's parsed copy |
 | `test_weapon_fire.py` | Rate of fire, zoom, overheat, needler ramp, charged shot, swap, revert, enemy weapons and drops |
@@ -36,6 +37,46 @@ The quick tier takes 10 to 15 minutes. It needs the imported campaign assets
 | `test_autumn_opening.py` | Slow: four-minute Autumn opening at normal speed |
 | `test_package_input.py` | Slow: real keystrokes into the packaged app |
 | `test_maw_drive.py` | Slow: Warthog escape driven by keystrokes |
+
+## Retail collision walk
+
+`python3 tests/test_retail_collision.py [mission ...] [--section a10:3]` walks each mission as one
+playthrough in the QA client (`qa_retail_start` in `tests/native/retail_qa.inc`): it starts the
+first section and, at each transition, carries on into the next with the mission script's state,
+as a player arrives there. `--section` walks one section on its own; the mission script then
+starts afresh, so doors that earlier sections' scripts open stay shut (see
+`docs/macos-build.md`). The walk sets `halo_difficulty 2` because Normal runs the Autumn's scripted
+cryo tutorial, which keeps its doors shut until the player has performed it. The player cannot be
+hurt; contact-stage enemies, and Covenant that hold the walk up, are removed (as the player would
+fight them), so only collision and the exit are measured.
+
+The route follower holds forward at full speed. It crouches where the importer's route marks a
+crawl space, jumps where it marks a ledge, obstacle or gap, and squeezes through the gap of a part
+open door. At a closed scripted door it clears the Covenant in the room, steps back, looks around
+(tutorial scripts wait for the player to look at the crewman or the door) and tries again, for up
+to `HALOQA_RETAIL_WAIT` ms per door (default 150000). Failures print the waypoint, the surface or
+device in the way and the log path under `build/qa/`.
+
+Movement feel: on the first clear, flat straight of 22 or more route steps, the walk stops and runs
+the straight twice from a standstill with a fixed heading, once on retail collision and once on the
+same map's stock cube geometry, then jumps from a standstill. `RETAIL_QA feel` reports sustained
+ground speed (about 16 u/s), the time to cover the first 4 units from a standstill, and the jump's apex and airtime. The test
+fails a section whose retail speed is more than 10% below stock (or below 16 u/s when the stock
+layout has no room for the straight), whose acceleration or jump falls short of stock by more than
+10%, or where the route follower's speed on any straight it walks is more than 10% below stock.
+
+Sections in `KNOWN_BLOCKED` (a10 sections 5 and 6, which wait at script-gated doors; b40 section
+6, c10 sections 1 and 4 and c20 sections 1 to 3, which end on a lift ride the walker cannot make;
+d40 section 5, whose manifolds must be shot; see `docs/macos-build.md`) are walked and
+printed as `KNOWN` with the reason instead of failing; the test fails once one of them passes, so
+the list stays current.
+
+The importer writes the route next to each `.hcol` (`tools/import_halo_campaign.py --collision
+validated|all|none`; the default `validated` writes both for the missions in
+`VALIDATED_COLLISION`). Route rows are `x y z [flags]`, with flag 1 for a crouched step, 2 for a
+jump, 4 for the first step after a lift ride and 8 for a walk off a ledge onto the floor below
+(`LEDGE_DROPS`; the walker walks it like any other step, and d20 section 1's last row, over the shaft
+its exit volume hangs in, `EXIT_FALLS`, has the flag too).
 
 ## QA client
 

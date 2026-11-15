@@ -14,7 +14,15 @@ with (SCRATCH/'campaign-progression.log').open('w') as log:
                     '-ehalo_campaign; qa_after_gameplay ['+'; '.join(actions)+']'],cwd=RUNTIME,stdout=log,stderr=subprocess.STDOUT,timeout=90)
     assert p.returncode==0
 rows=(SCRATCH/'campaign-progression.log').read_text().splitlines()
-assert any('map=halo_a10_01 stage=5' in row for row in rows),rows[-30:]
+# On retail collision a10_01's completion can walk straight into its authored bsp0,1
+# transition before qa_campaign_state runs: a completion logged on a10_01 counts too.
+def completed_first():
+    if any('map=halo_a10_01 stage=5' in row for row in rows): return True
+    loaded=[i for i,row in enumerate(rows) if row.startswith('read map packages/maps/halo_a10_0')]
+    first=next((i for i in loaded if 'halo_a10_01' in rows[i]),None)
+    second=next((i for i in loaded if 'halo_a10_02' in rows[i]),None)
+    return first is not None and second is not None and any(row=='Halo: mission complete' for row in rows[first:second])
+assert completed_first(),rows[-30:]
 assert any('map=halo_a10_02 stage=' in row for row in rows),rows[-30:]
 assert (profile/'config/halo-progress.txt').read_text().strip()=='1 0 1'
 print('Scripted sector completion advanced to the next map and saved progression.')

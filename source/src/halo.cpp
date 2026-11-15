@@ -449,7 +449,7 @@ namespace
             setStage(checkpointStage);
             nextRouteMarker = checkpointMarker;
         }
-        else setStage(halocollisionactive() ? EXTRACTION : INSERTION);
+        else setStage(retailCartographer() ? EXTRACTION : INSERTION);
     }
 
     vec feetOf(const playerent *p) { return vec(p->o).sub(vec(0, 0, p->eyeheight)); }
@@ -859,6 +859,25 @@ void halomapstart(const char *name)
     checkpointItems.setsize(0);
 }
 
+// Retail floor for a body at an authored point. Retail starts were placed for Halo's own
+// bodies, so an AssaultCube body can overlap a console or a cryo tube there: try the point,
+// then a ring of nearby spots, and move the point onto the first floor found.
+static bool retailfloorspot(vec &point, float radius, float height)
+{
+    static const float ring[][2] = {{0, 0}, {.6f, 0}, {-.6f, 0}, {0, .6f}, {0, -.6f}, {.45f, .45f}, {-.45f, .45f}, {.45f, -.45f},
+        {-.45f, -.45f}, {1.2f, 0}, {-1.2f, 0}, {0, 1.2f}, {0, -1.2f}, {.85f, .85f}, {-.85f, .85f}, {.85f, -.85f}, {-.85f, -.85f}};
+    for(const auto &offset : ring)
+    {
+        const vec at(point.x + offset[0], point.y + offset[1], point.z);
+        HaloCollisionHit hit;
+        if(!halocollisionsweep(vec(at).add(vec(0, 0, 1.26f)), vec(0, 0, -4.26f), radius, height, hit) ||
+           hit.normal.z < .65f || hit.fraction <= 0) continue;
+        point = vec(at.x, at.y, at.z + 1.26f - 4.26f * hit.fraction + .015f);
+        return true;
+    }
+    return false;
+}
+
 playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int actorIndex, int team)
 {
     if(const HaloActorDef *actor = haloactordef(actorIndex)) if(kind < 0) kind = actor->kind;
@@ -866,10 +885,9 @@ playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int act
     if(halocollisionactive())
     {
         const ActorProfile &profile = profiles[kind];
-        HaloCollisionHit hit;
-        if(!halocollisionsweep(vec(point).add(vec(0, 0, 1.26f)), vec(0, 0, -4.26f), profile.radius,
-                               profile.eyeheight + .7f, hit) || hit.normal.z < .65f) return nullptr;
-        return spawnEnemy(ActorKind(kind), vec(point).add(vec(0, 0, profile.eyeheight)), yaw, -1, actorIndex, team);
+        vec feet = point;
+        if(!retailfloorspot(feet, profile.radius, profile.eyeheight + .7f)) return nullptr;
+        return spawnEnemy(ActorKind(kind), vec(feet).add(vec(0, 0, profile.eyeheight)), yaw, -1, actorIndex, team);
     }
     const int x = int(point.x), y = int(point.y);
     if(OUTBORD(x, y) || SOLID(S(x, y)) || fabsf(S(x, y)->floor - point.z) > 5.0f) return nullptr;
@@ -930,10 +948,9 @@ bool haloenemymove(playerent *p, const vec &point)
     const ActorProfile &profile = profiles[enemy->kind];
     if(halocollisionactive())
     {
-        HaloCollisionHit hit;
-        if(!halocollisionsweep(vec(point).add(vec(0, 0, 1.26f)), vec(0, 0, -4.26f), profile.radius,
-                               profile.eyeheight + .7f, hit) || hit.normal.z < .65f) return false;
-        p->o = vec(point).add(vec(0, 0, profile.eyeheight));
+        vec feet = point;
+        if(!retailfloorspot(feet, profile.radius, profile.eyeheight + .7f)) return false;
+        p->o = vec(feet).add(vec(0, 0, profile.eyeheight));
     }
     else p->o = point;
     p->vel = vec(0, 0, 0);
@@ -961,7 +978,7 @@ bool halorespawn()
 
 bool haloscenariotransition()
 {
-    if(!haloactive() || (preview && !halocollisionactive()) || authoredTransition || launchPending || halocinematic() ||
+    if(!haloactive() || (preview && !retailCartographer()) || authoredTransition || launchPending || halocinematic() ||
        stage == COMPLETE || section + 1 >= haloMissions[mission].sections) return false;
     if(!installed(mission, section + 1)) return false;
     authoredTransition = true;
@@ -1719,4 +1736,5 @@ COMMANDF(halo_zoom, "d", (bool down) { if(down) halozoomstep(); });
 // campaign state, so they compile into the same translation unit.
 #include "campaign_qa.inc"
 #include "b30_qa.inc"
+#include "retail_qa.inc"
 #endif

@@ -15,7 +15,7 @@ PYTHONPATH="$root/tools" python3 - "$packages" "$partial" <<'PYTHON'
 from pathlib import Path
 import sys
 
-from import_halo_campaign import MISSIONS
+from import_halo_campaign import MISSIONS, STOCK_SECTIONS, VALIDATED_COLLISION
 
 packages = Path(sys.argv[1])
 partial = sys.argv[2] == '1'
@@ -28,14 +28,14 @@ if not partial:
     for table in ('weapons.txt', 'actors.txt'):
         if not (packages / 'halo' / table).is_file():
             missing.append(f'halo/{table}')
-    for section in (1, 2):
-        if not (packages / f'maps/halo_b30_{section:02}.hcol').is_file():
-            missing.append(f'maps/halo_b30_{section:02}.hcol')
     for mission in MISSIONS:
         if not (packages / f'halo/{mission.cache}.hscb').is_file():
             missing.append(f'halo/{mission.cache}.hscb')
         for section in range(1, len(mission.sections) + 1):
-            for suffix in ('cgz', 'cfg', 'mesh'):
+            # Validated missions play on retail collision (except STOCK_SECTIONS); a missing .hcol
+            # would silently fall back to stock geometry.
+            retail = mission.cache in VALIDATED_COLLISION and (mission.cache, section - 1) not in STOCK_SECTIONS
+            for suffix in ('cgz', 'cfg', 'mesh') + (('hcol',) if retail else ()):
                 name = f'maps/halo_{mission.cache}_{section:02}.{suffix}'
                 if not (packages / name).is_file():
                     missing.append(name)

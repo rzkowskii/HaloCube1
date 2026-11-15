@@ -13,6 +13,8 @@ struct HaloCollisionHit
 
 void halocollisionmap(const char *name);
 bool halocollisionactive();
+// A scenario machine whose real polygons are in the loaded .hcol (its box collision is skipped).
+bool halocollisionbaked(int device);
 bool halocollisiontrace(const vec &from, const vec &to, HaloCollisionHit &hit, unsigned ignoreFlags = 0);
 bool halocollisionopen(const vec &point);
 
