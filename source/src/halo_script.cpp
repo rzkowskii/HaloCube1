@@ -5,6 +5,9 @@
 #include "halo_script.h"
 #include "halo_ai.h"
 #include "halo_weapons.h"
+#include "halo_vehicle.h"
+#include "halo_hud.h"
+#include "halo_state.h"
 #include <algorithm>
 #include <functional>
 #include <cmath>
@@ -397,6 +400,9 @@ namespace
     // The one HUD countdown, and the tutorial prompts that wait for the player to act.
     struct HudTimer { bool shown = false, running = false; int remaining = 0, end = 0; };
     struct TutorialPoll { int first = 0; float yaw = 0, pitch = 0; };
+    // A nav point the script shows the player: on a cutscene flag or on an object, raised by
+    // `offset` Halo world units, with the retail waypoint arrow type ("default_red").
+    struct NavPoint { int flag = -1, object = -1; std::string type; float offset = 0; };
 
     struct Thread
     {
@@ -550,8 +556,12 @@ namespace
         int savedChapter = -1, savedChapterStart = 0;
         std::string savedObjective, savedHelp;
         bool savedShowHelp = false;
+        // Nav points and the HUD parts the script hides or blinks (halo_hud.cpp draws them).
+        std::vector<NavPoint> navPoints, savedNavPoints;
+        int hudHidden = 0, hudBlinking = 0, savedHudHidden = 0, savedHudBlinking = 0;
         std::unordered_map<int, Value> savedExternal;
         const char *cache = "";
+        unsigned programHash = 0;     // FNV-1a of the loaded .hscb file (saved games, halo.cpp)
         HudTimer hudTimer;
         std::unordered_map<std::string, TutorialPoll> tutorialPolls;
         // Per program.switches entry, this section: 1 armed, 0 waiting for the player to leave
@@ -595,6 +605,7 @@ namespace
         Actor *scripted(int id);
         template<class F> void eachUnit(int value, F f);
         bool aiCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
+        bool vehicleCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
         void configureActor(playerent *bot, int encounter, int squad, const SquadStart &start);
         void updatePlatoons();
         int actorListFor(int reference);
@@ -617,6 +628,8 @@ namespace
         bool switchBsp(int bsp, const char *trigger);
         void armSwitches();
         void updateDevices(bool gameplay);
+        bool carryBodies(const Device &d, const DeviceBox &old, const vec &delta);
+        float liftBoard(physent *entity, float lo) const;
         void updateRecordings();
         bool setGroup(int index, float value, bool immediate = false);
         float groupValue(int index, float fallback = 0) const;
@@ -637,7 +650,7 @@ namespace
         void startMusic(int id, float gain);
         void stopMusic(int id);
         void setAlternate(int id, bool enabled);
-        void setActor(int id, bool visible, bool reset);
+        void setActor(int id, bool visible, bool reset, bool bulk = false);
         void draw();
         void render();
     };
@@ -1430,19 +1443,65 @@ namespace
             for(const DevicePanel &panel : d.panels)
             {
                 if(panel.node != d.elevator || panel.frames.empty()) continue;
-                DeviceBox old = panelBox(d, panel, previous);
-                if(!abovePanel(local, old, 0) || fabsf(local.z - old.high.z) > .22f) continue;
-                DeviceBox current = panelBox(d, panel, s);
+                const DeviceBox old = panelBox(d, panel, previous), current = panelBox(d, panel, s);
                 vec delta = vec(current.high).sub(old.high);
                 delta.rotate_around_z(d.pose.yaw);
                 delta = vec(delta.x * projection->xy, -delta.y * projection->xy, delta.z * projection->z);
-                player1->o.add(delta);
-                player1->newpos.add(delta);
-                if(halo_scripttrace && previous.positionVelocity == 0)
+                if(carryBodies(d, old, delta) && halo_scripttrace && previous.positionVelocity == 0)
                     conoutf("Halo lift: carrying player on device %zu", i);
                 break;
             }
         }
+    }
+
+    // Everyone standing on a lift deck moves with it: the player, allies and enemies alike, on
+    // retail collision as on stock geometry. On a rising deck a body counts once any part of it
+    // is over the deck (as collideDevices stands it there), so the deck never lifts into someone
+    // standing on its edge, which would wedge them in its box. A descending deck takes only the
+    // bodies whose centre is over it: one standing on the landing beside a flush deck would
+    // otherwise be dragged down through the landing's floor. Returns whether the player was carried.
+    bool Scenario::carryBodies(const Device &d, const DeviceBox &old, const vec &delta)
+    {
+        auto carry = [&](playerent *body)
+        {
+            if(!body || body->state != CS_ALIVE || (body->type != ENT_PLAYER && body->type != ENT_BOT)) return false;
+            const vec local = deviceLocal(*projection, d, vec(body->o).sub(vec(0, 0, body->eyeheight)));
+            const float edge = delta.z > 0 ? body->radius / projection->xy : 0;
+            if(!abovePanel(local, old, edge) || fabsf(local.z - old.high.z) > .22f) return false;
+            body->o.add(delta);
+            body->newpos.add(delta);
+            return true;
+        };
+        const bool player = carry(player1);
+        loopv(players) if(players[i] && players[i] != player1) carry(players[i]);
+        return player;
+    }
+
+    // Boarding a lift: a lift deck at rest may stand a little proud of its landing (the Library's
+    // platforms are 0.38 units up at the bottom of their shafts, 2.6 units at floor 1's scale, more
+    // than a step). A grounded body may step onto the deck top `lo` from up to 0.45 retail units
+    // below it. Returns that allowance in world units, or 0 when `lo` is not a lift deck under it.
+    float Scenario::liftBoard(physent *entity, float lo) const
+    {
+        if(!loaded || cue || editmode || !projection) return 0;
+        const Projection &p = *projection;
+        const float radius = entity->radius / p.xy;
+        for(size_t i = 0; i < devices.size(); ++i)
+        {
+            if(!deviceActive(i) || halocollisionbaked(int(i))) continue;
+            const Device &d = program.devices[i];
+            if(d.control || d.elevator < 0 || d.kind == 2) continue;
+            const vec local = deviceLocal(p, d, entity->o);
+            for(const DevicePanel &panel : d.panels)
+            {
+                if(panel.node != d.elevator || panel.frames.empty()) continue;
+                const DeviceBox box = panelBox(d, panel, devices[i]);
+                if(!abovePanel(local, box, radius)) continue;
+                const float top = (box.high.z + d.pose.position.z - p.origin.z) * p.z;
+                if(fabsf(top - lo) < .01f) return .45f * p.z;
+            }
+        }
+        return 0;
     }
 
     bool Scenario::collideDevices(physent *entity, float &hi, float &lo, int *blocking) const
@@ -1713,7 +1772,7 @@ namespace
         }), talking.end());
     }
 
-    void Scenario::setActor(int id, bool visible, bool reset)
+    void Scenario::setActor(int id, bool visible, bool reset, bool bulk)
     {
         if(!at(actors, id)) return;
         if(reset)
@@ -1724,6 +1783,10 @@ namespace
         actors[id].visible = visible;
         int device = objectDevices[id];
         if(device >= 0) devices[device].visible = visible;
+        // A vehicle the engine drives for this object (halo_vehicle.cpp) is created and destroyed with it.
+        halovehicleobject(id, visible, reset, bulk);
+        // So is scenario equipment with this name (halo.cpp).
+        haloequipmentobject(id, visible, reset);
     }
 
     Value Scenario::command(Thread &thread, const Node &node, const char *name, const std::vector<Value> &args, bool scene)
@@ -1922,9 +1985,15 @@ namespace
             vec end = target;
             return result(!intersectgeometry(player1->o, end));
         }
-        // Vehicles are not driven by actors yet. These stand-ins let the waits that
-        // depend on boarding move on instead of hanging.
-        if(is("vehicle_test_seat_list")) return result(true);
+        // The engine's vehicles (halo_vehicle.cpp) answer for the objects they stand for here;
+        // vehicleCommand (halo_script_ai.inc) falls through for every other object.
+        {
+            Value vehicle;
+            if(vehicleCommand(name, args, scene, vehicle)) return vehicle;
+        }
+        // Vehicles the engine does not drive (Pelicans, Banshees, Ghosts): these stand-ins let
+        // the waits that depend on boarding them move on instead of hanging.
+        if(is("vehicle_test_seat_list") || is("vehicle_test_seat")) return result(true);
         if(is("ai_going_to_vehicle")) return result(0);
         if(is("ai_go_to_vehicle") || is("ai_allegiance") || is("ai_vehicle_encounter") || is("ai_vehicle_enterable_distance"))
             return {};
@@ -2054,14 +2123,14 @@ namespace
         if(is("object_destroy")) { setActor(object(0), false, true); return {}; }
         if(is("object_destroy_all"))
         {
-            for(size_t i = 0; i < actors.size(); ++i) setActor(int(i), false, true);
+            for(size_t i = 0; i < actors.size(); ++i) setActor(int(i), false, true, true);
             return {};
         }
         if(is("object_create_containing") || is("object_create_anew_containing") || is("object_destroy_containing"))
         {
             if(*text(0)) for(size_t i = 0; i < actors.size(); ++i)
                 if(program.objects[i].name.find(text(0)) != std::string::npos)
-                    setActor(int(i), !is("object_destroy_containing"), true);
+                    setActor(int(i), !is("object_destroy_containing"), true, true);
             return {};
         }
         if(is("object_teleport") || is("object_set_facing"))
@@ -2079,6 +2148,8 @@ namespace
                 actors[id].pose.yaw = flag->pose.yaw;
                 actors[id].pose.pitch = flag->pose.pitch;
                 actors[id].pose.roll = 0;
+                if(is("object_teleport") && !scene && projection)
+                    halovehicleteleport(id, toWorld(*projection, flag->pose.position), 90 - flag->pose.yaw / RAD);
             }
             return {};
         }
@@ -2247,6 +2318,56 @@ namespace
             }
             return {};
         }
+        // Nav points: (activate_team_nav_point_flag <type> <team> <flag> <offset>), the _object form
+        // with an object, the per-unit forms (activate_nav_point_*) with a unit instead of a team;
+        // the deactivate forms take the team or unit and the flag or object. One player: the team
+        // and unit arguments are not checked.
+        if(!strncmp(name, "activate_", 9) || !strncmp(name, "deactivate_", 11))
+        {
+            const bool on = name[0] == 'a';
+            const char *rest = name + (on ? 9 : 11);
+            if(!strncmp(rest, "team_", 5)) rest += 5;
+            const bool flag = !strcmp(rest, "nav_point_flag"), item = !strcmp(rest, "nav_point_object");
+            if(flag || item)
+            {
+                const size_t target = on ? 2 : 1;
+                int id = -1;
+                if(flag)
+                {
+                    // Flag literals carry both their name and their index; the name decides.
+                    id = named(program.flags, text(target));
+                    if(id < 0 && !*text(target)) id = index(target);
+                    if(!at(program.flags, id)) return {};
+                }
+                else id = object(target);
+                auto same = [&](const NavPoint &n) { return flag ? n.flag == id : n.object == id; };
+                navPoints.erase(std::remove_if(navPoints.begin(), navPoints.end(), same), navPoints.end());
+                if(on)
+                {
+                    NavPoint n;
+                    (flag ? n.flag : n.object) = id;
+                    n.type = text(0);
+                    n.offset = float(value(3));
+                    navPoints.push_back(n);
+                }
+                return {};
+            }
+        }
+        if(!strncmp(name, "hud_show_", 9) || !strncmp(name, "hud_blink_", 10))
+        {
+            const bool blink = name[4] == 'b';
+            const char *part = name + (blink ? 10 : 9);
+            const int bit = !strcmp(part, "health") ? HALO_HUD_HEALTH : !strcmp(part, "shield") ? HALO_HUD_SHIELD :
+                            !strcmp(part, "motion_sensor") ? HALO_HUD_MOTION : !strcmp(part, "crosshair") ? HALO_HUD_CROSSHAIR : 0;
+            if(bit)
+            {
+                int &bits = blink ? hudBlinking : hudHidden;
+                // hud_show_* true shows the part; hud_blink_* true starts it flashing.
+                if(truth(0) != blink) bits &= ~bit;
+                else bits |= bit;
+                return {};
+            }
+        }
         if(is("print") || is("cls") || is("object_pvs_set_camera") || is("object_pvs_clear") ||
            is("object_beautify") || is("objects_predict") || is("object_type_predict")) return {};
 
@@ -2345,7 +2466,7 @@ namespace
         if(is("player0_joystick_set_is_normal")) return answer(1);
         if(is("player0_look_pitch_is_inverted")) return answer(0);
         if(is("player0_look_invert_pitch")) return handled();
-        if(is("unit_get_total_grenade_count")) return answer(player1->mag[GUN_GRENADE]);
+        if(is("unit_get_total_grenade_count")) return answer(haloplayergrenades(-1));
         if(is("unit_get_shield")) return answer(haloplayershieldfraction());
         if(is("unit_solo_player_integrated_night_vision_is_active")) return answer(0);
         if(is("unit_has_weapon_readied"))
@@ -2359,8 +2480,7 @@ namespace
             "player_enable_input", "player_camera_control", "players_unzoom_all", "garbage_collect_now", "inspect", "render_lights",
             "player_effect_impact", "player_effect_rumble", "player_effect_set_max_rotation", "player_effect_set_max_rumble",
             "player_effect_set_max_translation", "player_effect_start", "player_effect_stop", "sound_class_set_gain",
-            "hud_blink_health", "hud_blink_motion_sensor", "hud_blink_shield", "hud_show_crosshair", "hud_show_health",
-            "hud_show_motion_sensor", "hud_show_shield", "enable_hud_help_flash", "preload_textures", "object_pvs_activate", "object_pvs_set_object",
+            "display_scenario_help", "enable_hud_help_flash", "preload_textures", "object_pvs_activate", "object_pvs_set_object",
             "cinematic_screen_effect_start", "cinematic_screen_effect_stop", "cinematic_screen_effect_set_convolution",
             "cinematic_screen_effect_set_filter", "cinematic_screen_effect_set_filter_desaturation_tint",
             "cinematic_screen_effect_set_video"};
@@ -2686,12 +2806,15 @@ namespace
         if(mission != m || program.scripts.empty())
         {
             program = {};
+            programHash = 0;
             if(!program.load(cache))
             {
                 program = {};
                 conoutf("Halo: no retail scenario program for %s", cache);
                 return;
             }
+            defformatstring(file)("packages/halo/%s.hscb", cache);
+            programHash = halofilehash(file);
         }
         mission = m;
         section = s;
@@ -2758,6 +2881,9 @@ namespace
         objective.clear();
         help.clear();
         showHelp = false;
+        navPoints.clear();
+        savedNavPoints.clear();
+        hudHidden = hudBlinking = savedHudHidden = savedHudBlinking = 0;
         loaded = true;
         for(size_t i = 0; i < program.globals.size(); ++i)
         {
@@ -2867,6 +2993,9 @@ namespace
             }
             startGameplay();
         }
+        // A scene can leave the player somewhere else (the Cartographer's handoff above): the
+        // fall and wedge recovery forgets the floors from before it.
+        haloplayermoved("after a cutscene");
     }
 
     void Scenario::update(int elapsed)
@@ -3133,6 +3262,25 @@ double haloscenarioqascript(const char *name, int action)
     return action == 1 ? scenario.threads[index].started : scenario.threads[index].done;
 }
 
+// QA probes (tests/test_frontend_progress.py): a global by name (read, or set with `set`), and
+// the script's clock and how many threads have started and objects are visible.
+double haloscenarioqaglobal(const char *name, bool set, double value)
+{
+    if(!scenario.loaded) return -1;
+    const int index = named(scenario.program.globals, name);
+    if(index < 0 || size_t(index) >= scenario.globals.size()) return -1;
+    if(set) scenario.globals[index].number = value;
+    return scenario.globals[index].number;
+}
+
+void haloscenarioqastate(int &tick, int &started, int &visible)
+{
+    tick = scenario.loaded ? scenario.tick : -1;
+    started = visible = 0;
+    for(const Thread &t : scenario.threads) started += t.started;
+    for(const Actor &a : scenario.actors) visible += a.visible;
+}
+
 void haloscenariowakescript(int script)
 {
     if(scenario.loaded) scenario.wake(script, false);
@@ -3171,6 +3319,9 @@ void haloscenariocheckpoint()
     scenario.savedObjective = scenario.objective;
     scenario.savedHelp = scenario.help;
     scenario.savedShowHelp = scenario.showHelp;
+    scenario.savedNavPoints = scenario.navPoints;
+    scenario.savedHudHidden = scenario.hudHidden;
+    scenario.savedHudBlinking = scenario.hudBlinking;
     scenario.savedChapter = scenario.chapter;
     scenario.savedChapterStart = scenario.chapterStart;
     scenario.savedTick = scenario.tick;
@@ -3191,6 +3342,9 @@ void haloscenariorevert()
         scenario.objective = scenario.savedObjective;
         scenario.help = scenario.savedHelp;
         scenario.showHelp = scenario.savedShowHelp;
+        scenario.navPoints = scenario.savedNavPoints;
+        scenario.hudHidden = scenario.savedHudHidden;
+        scenario.hudBlinking = scenario.savedHudBlinking;
         scenario.chapter = scenario.savedChapter;
         scenario.chapterStart = scenario.savedChapterStart;
         scenario.restoreSquads();
@@ -3204,6 +3358,479 @@ void haloscenariorevert()
         scenario.start(m, s);
         if(scenario.cue) scenario.endCue(true);
     }
+}
+
+// ---- Saved games: the mission script's state in config/halo-progress.txt (halo.cpp, version 3)
+//
+// The records hold what haloscenariocheckpoint() keeps for a revert (globals, threads with their
+// whole call stacks, scripted objects, the living squad members, device groups and devices,
+// external globals, objective and help text, nav points, the HUD parts hidden or blinking, the
+// chapter and the tick), plus what the scripts set on the AI for the rest of the section and a
+// revert leaves as it is (actor lists, activation links, migration targets, platoon rules that
+// fired, ai_grenades, the HUD timer). Script, global, object, device, encounter and squad records
+// carry their names, checked against the loaded .hscb; a thread's frames are node datums, which
+// only mean anything with the same .hscb, so halo.cpp also compares the file's hash and falls back
+// to restarting the script when it differs. Pointers (text, recordings, animations, squad starts)
+// are written as offsets and indices.
+namespace
+{
+    struct StateView
+    {
+        const std::vector<Value> *globals;
+        const std::vector<Thread> *threads;
+        const std::vector<Actor> *actors;
+        std::vector<SquadBot> squads;
+        const std::vector<DeviceGroup> *groups;
+        const std::vector<DeviceState> *devices;
+        const std::unordered_map<int, Value> *external;
+        const std::string *objective, *help;
+        bool showHelp;
+        const std::vector<NavPoint> *navs;
+        int hudHidden, hudBlinking, chapter, chapterStart, tick;
+    };
+
+    void writeValue(std::string &out, const Value &v)
+    {
+        const std::string &strings = scenario.program.strings;
+        long long offset = -1;
+        if(v.text >= strings.c_str() && v.text < strings.c_str() + strings.size()) offset = v.text - strings.c_str();
+        halostatef(out, " %.17g %d %lld", v.number, v.type, offset);
+    }
+
+    Value readValue(HaloStateReader &r)
+    {
+        Value v;
+        v.number = r.d();
+        v.type = r.i();
+        const long long offset = r.integer();
+        if(offset < -1 || offset >= (long long)scenario.program.strings.size()) r.ok = false;
+        v.text = offset >= 0 && r.ok ? scenario.program.text(uint32_t(offset)) : "";
+        return v;
+    }
+
+    void writeActor(std::string &out, const Actor &a)
+    {
+        const Program &p = scenario.program;
+        const long long recording = a.recording && !p.recordings.empty() ? a.recording - p.recordings.data() : -1;
+        const long long animation = a.animation && !p.animations.empty() ? a.animation - p.animations.data() : -1;
+        halostatef(out, " %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %d %d %d %.9g %.9g %.9g %.9g %.9g %d %d %d %d %d %d %d %d",
+                   a.pose.position.x, a.pose.position.y, a.pose.position.z, a.pose.yaw, a.pose.pitch, a.pose.roll, a.pose.fov,
+                   a.visible, a.animationLoop, a.recordingDeletes, a.recordingHover, a.grounded, a.scale, a.speed,
+                   a.velocity.x, a.velocity.y, a.velocity.z, a.animationStart, a.animationEnd, a.recordingStart, a.recordingEnd,
+                   a.parent, a.gait, a.gaitStart, a.baseSeat);
+        halostatef(out, " %d %d %d %d %d %d %d %d %d %zu %lld %lld", a.open, a.hovering, a.collideable, a.enterable, a.suspended,
+                   a.cannotTakeDamage, a.meleeInhibited, a.rangedInhibited, a.squadReference, a.input, recording, animation);
+        halostateword(out, a.permutation);
+        halostateword(out, a.parentMarker);
+        halostateword(out, a.childMarker);
+    }
+
+    bool readActor(HaloStateReader &r, Actor &a)
+    {
+        const Program &p = scenario.program;
+        a.pose.position.x = r.f(); a.pose.position.y = r.f(); a.pose.position.z = r.f();
+        a.pose.yaw = r.f(); a.pose.pitch = r.f(); a.pose.roll = r.f(); a.pose.fov = r.f();
+        a.visible = r.b(); a.animationLoop = r.b(); a.recordingDeletes = r.b(); a.recordingHover = r.b(); a.grounded = r.b();
+        a.scale = r.f(); a.speed = r.f();
+        a.velocity.x = r.f(); a.velocity.y = r.f(); a.velocity.z = r.f();
+        a.animationStart = r.i(); a.animationEnd = r.i(); a.recordingStart = r.i(); a.recordingEnd = r.i();
+        a.parent = r.i(); a.gait = r.i(); a.gaitStart = r.i(); a.baseSeat = r.i();
+        a.open = r.b(); a.hovering = r.b(); a.collideable = r.b(); a.enterable = r.b(); a.suspended = r.b();
+        a.cannotTakeDamage = r.b(); a.meleeInhibited = r.b(); a.rangedInhibited = r.b();
+        a.squadReference = r.i();
+        const long long input = r.integer(), recording = r.integer(), animation = r.integer();
+        a.permutation = r.word();
+        a.parentMarker = r.word();
+        a.childMarker = r.word();
+        // gait indexes Object::locomotion[3] unchecked when the actor is drawn.
+        if(!r.ok || input < 0 || recording < -1 || recording >= (long long)p.recordings.size() ||
+           animation < -1 || animation >= (long long)p.animations.size() || a.gait < -1 || a.gait > 2) return false;
+        a.recording = recording >= 0 ? &p.recordings[size_t(recording)] : nullptr;
+        a.animation = animation >= 0 ? &p.animations[size_t(animation)] : nullptr;
+        a.input = size_t(input);
+        // A recording's input index past its end would read out of range.
+        if(a.recording && a.input > a.recording->inputs.size()) return false;
+        return true;
+    }
+
+    template<class T> void writeInts(std::string &out, const char *key, const T &values)
+    {
+        halostatef(out, "s %s %zu", key, values.size());
+        for(int v : values) halostatef(out, " %d", v);
+        out += '\n';
+    }
+
+    template<class F> bool readInts(HaloStateReader &r, F add)
+    {
+        const int count = r.i();
+        if(!r.ok || count < 0 || count > 100000) return false;
+        for(int k = 0; k < count && r.ok; ++k) add(r.i());
+        return r.ok;
+    }
+
+    std::string objectName(int object)
+    {
+        const Object *o = at(scenario.program.objects, object);
+        return o ? o->name : std::string();
+    }
+
+    void writeState(std::string &out, const StateView &v)
+    {
+        const Program &p = scenario.program;
+        halostatef(out, "s program");
+        halostateword(out, scenario.cache);
+        halostatef(out, " %08x %zu %zu %zu %zu %zu %zu %zu\n", scenario.programHash, p.nodes.size(), p.scripts.size(), p.globals.size(),
+                   p.objects.size(), p.devices.size(), p.deviceGroups.size(), p.encounters.size());
+        halostatef(out, "s clock %d %d %d %d %d %d\n", v.tick, v.chapter, v.chapterStart, v.hudHidden, v.hudBlinking, haloaigrenades() ? 1 : 0);
+        halostatef(out, "s text");
+        halostateword(out, *v.objective);
+        halostateword(out, *v.help);
+        halostatef(out, " %d\n", v.showHelp);
+        for(size_t i = 0; i < v.globals->size(); ++i)
+        {
+            halostatef(out, "s global %zu", i);
+            halostateword(out, p.globals[i].name);
+            writeValue(out, (*v.globals)[i]);
+            out += '\n';
+        }
+        // Map order is not stable: sort the external globals by id.
+        std::vector<int> ids;
+        for(const auto &e : *v.external) ids.push_back(e.first);
+        std::sort(ids.begin(), ids.end());
+        for(int id : ids)
+        {
+            halostatef(out, "s external %d", id);
+            writeValue(out, v.external->at(id));
+            out += '\n';
+        }
+        for(size_t i = 0; i < v.threads->size(); ++i)
+        {
+            const Thread &t = (*v.threads)[i];
+            if(t.stack.empty() && !t.wake && !t.started && !t.done && !t.disabled && t.result.type == 4 && !t.result.number) continue;
+            halostatef(out, "s thread %zu", i);
+            halostateword(out, p.scripts[i].name);
+            halostatef(out, " %d %d %d %d", t.wake, t.started, t.done, t.disabled);
+            writeValue(out, t.result);
+            halostatef(out, " %zu\n", t.stack.size());
+            for(const Frame &f : t.stack)
+            {
+                halostatef(out, "s frame %08x %08x %d %d %d", f.expression, f.next, f.phase, f.deadline, f.interval);
+                writeValue(out, f.result);
+                halostatef(out, " %zu", f.arguments.size());
+                for(const Value &a : f.arguments) writeValue(out, a);
+                halostatef(out, " %zu", f.shuffled.size());
+                for(uint32_t s : f.shuffled) halostatef(out, " %08x", s);
+                out += '\n';
+            }
+        }
+        std::string blank;
+        writeActor(blank, Actor());
+        for(size_t i = 0; i < v.actors->size(); ++i)
+        {
+            std::string fields;
+            writeActor(fields, (*v.actors)[i]);
+            if(fields == blank) continue;
+            halostatef(out, "s object %zu", i);
+            halostateword(out, p.objects[i].name);
+            out += fields;
+            out += '\n';
+        }
+        for(const SquadBot &bot : v.squads)
+        {
+            const Encounter *e = at(p.encounters, bot.encounter);
+            const Squad *s = e ? at(e->squads, bot.squad) : nullptr;
+            if(!s || s->starts.empty() || bot.start < s->starts.data() || bot.start >= s->starts.data() + s->starts.size()) continue;
+            halostatef(out, "s squad %d", bot.encounter);
+            halostateword(out, e->name);
+            halostatef(out, " %d", bot.squad);
+            halostateword(out, s->name);
+            halostatef(out, " %d %d %d\n", int(bot.start - s->starts.data()), bot.suspended, bot.scriptFlags);
+        }
+        for(size_t i = 0; i < v.groups->size(); ++i)
+        {
+            const DeviceGroup &g = (*v.groups)[i];
+            halostatef(out, "s group %zu %.9g %d %d\n", i, g.value, g.once, g.changed);
+        }
+        for(size_t i = 0; i < v.devices->size(); ++i)
+        {
+            const DeviceState &d = (*v.devices)[i];
+            halostatef(out, "s device %zu", i);
+            halostateword(out, objectName(p.devices[i].object));
+            halostatef(out, " %.9g %.9g %.9g %.9g %.9g %.9g %d %d %d %d %d\n", d.power, d.position, d.powerVelocity, d.positionVelocity,
+                       d.desiredPower, d.desiredPosition, d.hold, d.visible, d.automatic, d.oneSided, d.changed);
+        }
+        for(const NavPoint &n : *v.navs)
+        {
+            halostatef(out, "s nav %d %d", n.flag, n.object);
+            halostateword(out, n.type);
+            halostatef(out, " %.9g\n", n.offset);
+        }
+        // What the scripts set on the AI and the HUD timer: live state, the same as the
+        // checkpoint's when written as one is taken.
+        writeInts(out, "lists", scenario.actorLists);
+        halostatef(out, "s links %zu", scenario.links.size());
+        for(const auto &link : scenario.links) halostatef(out, " %d %d", link.first, link.second);
+        out += '\n';
+        writeInts(out, "migrations", scenario.migrationTargets);
+        writeInts(out, "maneuvered", scenario.maneuvered);
+        writeInts(out, "flipped", scenario.flipped);
+        const HudTimer &timer = scenario.hudTimer;
+        halostatef(out, "s timer %d %d %d %d\n", timer.shown, timer.running, timer.remaining, timer.end);
+    }
+
+    // Everything a state block restores, read in full before any of it is applied.
+    struct ParsedState
+    {
+        std::vector<Value> globals;
+        std::unordered_map<int, Value> external;
+        std::vector<Thread> threads;
+        std::vector<Actor> actors;
+        std::vector<SquadBot> squads;
+        std::vector<DeviceGroup> groups;
+        std::vector<DeviceState> devices;
+        std::vector<NavPoint> navs;
+        std::string objective, help;
+        bool showHelp = false, grenades = true;
+        int tick = 0, chapter = -1, chapterStart = 0, hudHidden = 0, hudBlinking = 0;
+        std::vector<int> actorLists;
+        std::vector<std::pair<int, int>> links;
+        std::set<int> migrations, maneuvered, flipped;
+        HudTimer timer;
+    };
+
+    bool parseState(const std::vector<std::string> &records, ParsedState &s, std::string &why)
+    {
+        const Program &p = scenario.program;
+        s.globals.assign(p.globals.size(), {});
+        s.threads.assign(p.scripts.size(), {});
+        s.actors.assign(p.objects.size(), {});
+        s.groups.clear();
+        s.devices.clear();
+        bool program = false, clock = false, text = false, timer = false;
+        std::vector<bool> globalSeen(p.globals.size(), false);
+        Thread *thread = nullptr;
+        size_t frames = 0;
+        auto fail = [&](const char *reason, size_t line) { why = std::string(reason) + " (script record " + std::to_string(line + 1) + ")"; return false; };
+        for(size_t line = 0; line < records.size(); ++line)
+        {
+            HaloStateReader r(records[line].c_str());
+            if(frames && !r.key("frame")) return fail("a thread is missing frames", line);
+            if(frames)
+            {
+                Frame f(r.x());
+                f.next = r.x();
+                f.phase = r.i(); f.deadline = r.i(); f.interval = r.i();
+                f.result = readValue(r);
+                const int args = r.i();
+                if(!r.ok || args < 0 || args > 4096) return fail("bad frame", line);
+                for(int k = 0; k < args && r.ok; ++k) f.arguments.push_back(readValue(r));
+                const int shuffled = r.i();
+                if(!r.ok || shuffled < 0 || shuffled > 256) return fail("bad frame", line);
+                for(int k = 0; k < shuffled && r.ok; ++k) f.shuffled.push_back(r.x());
+                // step() dereferences a frame's expression without a check.
+                if(!r.ok || r.more() || !p.node(f.expression)) return fail("bad frame", line);
+                thread->stack.push_back(std::move(f));
+                --frames;
+                continue;
+            }
+            if(r.key("program"))
+            {
+                const std::string cache = r.word();
+                r.x();
+                const long long counts[7] = {r.integer(), r.integer(), r.integer(), r.integer(), r.integer(), r.integer(), r.integer()};
+                const size_t sizes[7] = {p.nodes.size(), p.scripts.size(), p.globals.size(), p.objects.size(), p.devices.size(),
+                                         p.deviceGroups.size(), p.encounters.size()};
+                if(!r.ok || cache != scenario.cache) return fail("saved for another mission's script", line);
+                for(int k = 0; k < 7; ++k) if(counts[k] != (long long)sizes[k]) return fail("the mission script's tables changed", line);
+                program = true;
+            }
+            else if(!program) return fail("no program record", line);
+            else if(r.key("clock"))
+            {
+                s.tick = r.i(); s.chapter = r.i(); s.chapterStart = r.i(); s.hudHidden = r.i(); s.hudBlinking = r.i(); s.grenades = r.b();
+                if(!r.ok || s.tick < 0) return fail("bad clock", line);
+                clock = true;
+            }
+            else if(r.key("text"))
+            {
+                s.objective = r.word(); s.help = r.word(); s.showHelp = r.b();
+                if(!r.ok) return fail("bad text", line);
+                text = true;
+            }
+            else if(r.key("global"))
+            {
+                const int index = r.i();
+                const std::string name = r.word();
+                const Value v = readValue(r);
+                if(!r.ok || !at(p.globals, index) || p.globals[index].name != name) return fail("unknown global", line);
+                s.globals[index] = v;
+                globalSeen[index] = true;
+            }
+            else if(r.key("external"))
+            {
+                const int id = r.i();
+                const Value v = readValue(r);
+                if(!r.ok) return fail("bad external global", line);
+                s.external[id] = v;
+            }
+            else if(r.key("thread"))
+            {
+                const int index = r.i();
+                const std::string name = r.word();
+                if(!r.ok || !at(p.scripts, index) || p.scripts[index].name != name) return fail("unknown script", line);
+                Thread &t = s.threads[index];
+                t.wake = r.i(); t.started = r.b(); t.done = r.b(); t.disabled = r.b();
+                t.result = readValue(r);
+                const int count = r.i();
+                if(!r.ok || count < 0 || count > 96) return fail("bad thread", line);
+                thread = &t;
+                frames = size_t(count);
+            }
+            else if(r.key("object"))
+            {
+                const int index = r.i();
+                const std::string name = r.word();
+                if(!r.ok || !at(p.objects, index) || p.objects[index].name != name) return fail("unknown object", line);
+                if(!readActor(r, s.actors[index])) return fail("bad object", line);
+            }
+            else if(r.key("squad"))
+            {
+                SquadBot bot{};
+                bot.encounter = r.i();
+                const std::string encounter = r.word();
+                bot.squad = r.i();
+                const std::string squad = r.word();
+                const int start = r.i();
+                bot.suspended = r.b();
+                bot.scriptFlags = r.i();
+                const Encounter *e = at(p.encounters, bot.encounter);
+                const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
+                if(!r.ok || !sq || e->name != encounter || sq->name != squad || !at(sq->starts, start)) return fail("unknown squad", line);
+                bot.start = &sq->starts[start];
+                bot.bot = nullptr;
+                s.squads.push_back(bot);
+            }
+            else if(r.key("group"))
+            {
+                const int index = r.i();
+                DeviceGroup g{};
+                g.value = r.f(); g.once = r.b(); g.changed = r.b();
+                if(!r.ok || index != int(s.groups.size()) || size_t(index) >= p.deviceGroups.size()) return fail("bad device group", line);
+                s.groups.push_back(g);
+            }
+            else if(r.key("device"))
+            {
+                const int index = r.i();
+                const std::string name = r.word();
+                DeviceState d;
+                d.power = r.f(); d.position = r.f(); d.powerVelocity = r.f(); d.positionVelocity = r.f();
+                d.desiredPower = r.f(); d.desiredPosition = r.f(); d.hold = r.i();
+                d.visible = r.b(); d.automatic = r.b(); d.oneSided = r.b(); d.changed = r.b();
+                if(!r.ok || index != int(s.devices.size()) || size_t(index) >= p.devices.size() || objectName(p.devices[index].object) != name)
+                    return fail("unknown device", line);
+                s.devices.push_back(d);
+            }
+            else if(r.key("nav"))
+            {
+                NavPoint n;
+                n.flag = r.i(); n.object = r.i(); n.type = r.word(); n.offset = r.f();
+                if(!r.ok || (n.flag >= 0 && !at(p.flags, n.flag))) return fail("bad nav point", line);
+                s.navs.push_back(n);
+            }
+            else if(r.key("lists")) { if(!readInts(r, [&](int v) { s.actorLists.push_back(v); })) return fail("bad actor lists", line); }
+            else if(r.key("links"))
+            {
+                const int count = r.i();
+                if(!r.ok || count < 0 || count > 100000) return fail("bad links", line);
+                for(int k = 0; k < count && r.ok; ++k) { const int a = r.i(); s.links.emplace_back(a, r.i()); }
+                if(!r.ok) return fail("bad links", line);
+            }
+            else if(r.key("migrations")) { if(!readInts(r, [&](int v) { s.migrations.insert(v); })) return fail("bad migrations", line); }
+            else if(r.key("maneuvered")) { if(!readInts(r, [&](int v) { s.maneuvered.insert(v); })) return fail("bad platoon state", line); }
+            else if(r.key("flipped")) { if(!readInts(r, [&](int v) { s.flipped.insert(v); })) return fail("bad platoon state", line); }
+            else if(r.key("timer"))
+            {
+                s.timer.shown = r.b(); s.timer.running = r.b(); s.timer.remaining = r.i(); s.timer.end = r.i();
+                if(!r.ok) return fail("bad HUD timer", line);
+                timer = true;
+            }
+            else return fail("unknown record", line);
+            if(!r.ok || r.more()) return fail("malformed record", line);
+        }
+        if(frames) { why = "a thread is missing frames"; return false; }
+        if(!program || !clock || !text || !timer) { why = "the script state is incomplete"; return false; }
+        if(s.groups.size() != p.deviceGroups.size() || s.devices.size() != p.devices.size()) { why = "device records are missing"; return false; }
+        if(std::find(globalSeen.begin(), globalSeen.end(), false) != globalSeen.end()) { why = "global records are missing"; return false; }
+        return true;
+    }
+}
+
+bool haloscenariostatesave(std::string &out, bool live)
+{
+    Scenario &s = scenario;
+    if(!s.loaded || !s.projection || (live ? s.cue != nullptr : s.savedThreads.empty())) return false;
+    StateView v;
+    if(live)
+    {
+        v = StateView{&s.globals, &s.threads, &s.actors, {}, &s.groups, &s.devices, &s.external, &s.objective, &s.help, s.showHelp,
+                      &s.navPoints, s.hudHidden, s.hudBlinking, s.chapter, s.chapterStart, s.tick};
+        for(const SquadBot &bot : s.squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) v.squads.push_back(bot);
+    }
+    else v = StateView{&s.savedGlobals, &s.savedThreads, &s.savedActors, s.savedSquadBots, &s.savedGroups, &s.savedDevices,
+                       &s.savedExternal, &s.savedObjective, &s.savedHelp, s.savedShowHelp, &s.savedNavPoints, s.savedHudHidden,
+                       s.savedHudBlinking, s.savedChapter, s.savedChapterStart, s.savedTick};
+    writeState(out, v);
+    return true;
+}
+
+bool haloscenariostaterestore(const std::vector<std::string> &records, bool commit, std::string &why)
+{
+    Scenario &s = scenario;
+    if(!s.loaded || !s.projection) { why = "no mission script is loaded"; return false; }
+    ParsedState parsed;
+    if(!parseState(records, parsed, why)) return false;
+    if(!commit) return true;
+    // Into the checkpoint's slots: the revert that follows (halo.cpp) restores them as it does
+    // after a death, and they stay the checkpoint a later death reverts to.
+    s.savedGlobals = std::move(parsed.globals);
+    s.savedThreads = std::move(parsed.threads);
+    s.savedActors = std::move(parsed.actors);
+    s.savedSquadBots = std::move(parsed.squads);
+    s.savedGroups = std::move(parsed.groups);
+    s.savedDevices = std::move(parsed.devices);
+    s.savedExternal = std::move(parsed.external);
+    s.savedObjective = parsed.objective;
+    s.savedHelp = parsed.help;
+    s.savedShowHelp = parsed.showHelp;
+    s.savedNavPoints = std::move(parsed.navs);
+    s.savedHudHidden = parsed.hudHidden;
+    s.savedHudBlinking = parsed.hudBlinking;
+    s.savedChapter = parsed.chapter;
+    s.savedChapterStart = parsed.chapterStart;
+    s.savedTick = parsed.tick;
+    s.actorLists = std::move(parsed.actorLists);
+    s.links = std::move(parsed.links);
+    s.migrationTargets = std::move(parsed.migrations);
+    s.maneuvered = std::move(parsed.maneuvered);
+    s.flipped = std::move(parsed.flipped);
+    s.hudTimer = parsed.timer;
+    haloaisetgrenades(parsed.grenades);
+    return true;
+}
+
+unsigned haloscenarioprogramhash() { return scenario.loaded ? scenario.programHash : 0; }
+
+unsigned haloscenariofilehash(int mission)
+{
+    if(mission < 0 || mission >= haloMissionCount) return 0;
+    defformatstring(path)("packages/halo/%s.hscb", haloMissions[mission].cache);
+    return halofilehash(path);
+}
+
+const char *haloscenarioobjectname(int object)
+{
+    const Object *o = at(scenario.program.objects, object);
+    return o ? o->name.c_str() : "";
 }
 
 bool haloscenarioexit() { return scenario.beginCue(SceneTrigger::Exit); }
@@ -3274,6 +3901,36 @@ const char *halocinematicworld() { return halocinematic() ? scenario.worldName.c
 float halocinematicfov() { return halocinematic() ? clamp(scenario.currentCamera().fov, 25.0f, 140.0f) : 0; }
 float halocinematicnear() { return halocinematic() ? scenario.nearClip * 4 : .15f; }
 void haloscenariodraw() { scenario.draw(); }
+int haloscenarionavpoints(HaloHudNav *out, int capacity)
+{
+    if(!scenario.loaded || scenario.cue || !scenario.projection) return 0;
+    int count = 0;
+    for(const NavPoint &n : scenario.navPoints)
+    {
+        if(count >= capacity) break;
+        vec point;
+        if(n.flag >= 0)
+        {
+            const Flag *flag = at(scenario.program.flags, n.flag);
+            if(!flag) continue;
+            point = toWorld(*scenario.projection, vec(flag->pose.position).add(vec(0, 0, n.offset)));
+        }
+        else
+        {
+            if(!scenario.objectPosition(n.object, point)) continue;
+            point.z += n.offset * scenario.projection->z;
+        }
+        out[count++] = HaloHudNav{point.x, point.y, point.z, n.type.c_str()};
+    }
+    return count;
+}
+
+int haloscenariohudhidden(int *blinking)
+{
+    if(blinking) *blinking = scenario.loaded ? scenario.hudBlinking : 0;
+    return scenario.loaded ? scenario.hudHidden : 0;
+}
+
 const char *haloscenarioobjective()
 {
     return scenario.loaded && !scenario.objective.empty() ? scenario.objective.c_str() : nullptr;
@@ -3305,6 +3962,7 @@ bool halocartographertarget(vec &point, bool &mapped)
     return true;
 }
 bool haloscenariocollide(physent *entity, float &hi, float &lo) { return scenario.collideDevices(entity, hi, lo); }
+float haloscenarioliftboard(physent *entity, float lo) { return scenario.liftBoard(entity, lo); }
 // The script name of the device a body at this spot would collide with, or null (QA diagnostics).
 const char *haloscenarioblockingdevice(physent *entity)
 {
@@ -3401,4 +4059,21 @@ void haloscenariopausestate(bool paused)
         if(paused) alSourcePause(channel.second->channel.id);
         else if(channel.second->channel.state() == AL_PAUSED) channel.second->channel.play();
     }
+}
+
+bool haloscenarioobjectvisible(int object)
+{
+    const Actor *actor = scenario.loaded ? at(scenario.actors, object) : nullptr;
+    return actor && actor->visible;
+}
+
+bool haloscenarioobjectcarried(int object, vec &feet, float &yaw)
+{
+    if(!scenario.loaded || scenario.cue || !scenario.projection) return false;
+    const Actor *actor = at(scenario.actors, object);
+    if(!actor || !actor->visible || (actor->parent < 0 && !actor->recording)) return false;
+    const Pose pose = scenario.currentActor(object);
+    feet = toWorld(*scenario.projection, pose.position);
+    yaw = 90 - pose.yaw / RAD;
+    return true;
 }

@@ -16,6 +16,8 @@ python3 tools/import_halo_library.py "$maps"
 python3 tools/halo_weapons.py "$maps"
 # Actor behaviour tables; the scripts importer stores their indices per squad start.
 python3 tools/halo_actors.py "$maps"
+# Vehicle definitions and models; the campaign sections record vehicle placements by their index.
+python3 tools/halo_vehicles.py "$maps"
 python3 tools/import_halo_campaign.py "$maps"
 python3 tools/import_halo_models.py "$maps/a30.map" "$root"
 python3 tools/import_halo_campaign_actors.py "$maps" "$root"

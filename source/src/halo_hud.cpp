@@ -45,6 +45,10 @@ namespace
     int motionX = 41, motionY = 41, sweepSheet = -1, blipSheet = -1;
     float motionRange = 20, motionScale = 32;
     int counterSheet = -1, counterAdvance = 9;
+    // Nav point arrows from the HUD globals: the bitmap and one entry per arrow type.
+    struct Arrow { std::string name; unsigned colour = 0; float opacity = 1, translucency = 0; int onScreen = 1, offScreen = 0, occluded = 6; };
+    int waypointSheet = -1;
+    std::vector<Arrow> arrows;
     bool attempted = false, loaded = false;
 
     float unitScale() { return VIRTH / 480.0f; }
@@ -83,6 +87,15 @@ namespace
             if(key == "health") { healthMid = hex(in); in >> healthHigh >> healthLow; continue; }
             if(key == "motion") { in >> motionX >> motionY >> motionRange >> motionScale >> sweepSheet >> blipSheet; continue; }
             if(key == "counter") { int width; in >> counterSheet >> width >> counterAdvance; continue; }
+            if(key == "waypoint") { in >> waypointSheet; continue; }
+            if(key == "arrow")
+            {
+                Arrow a;
+                in >> a.name;
+                a.colour = hex(in);
+                if(in >> a.opacity >> a.translucency >> a.onScreen >> a.offScreen >> a.occluded) arrows.push_back(a);
+                continue;
+            }
             if(!group) continue;
             Element e;
             e.kind = key[0];
@@ -207,11 +220,13 @@ namespace
         vec2 at = origin(anchor, e.at, size.x, size.y);
         if(anchor == CENTER)
         {
-            // Reticles hang from their registration point at the screen centre.
+            // Reticles hang from their registration point at the screen centre. The point is
+            // measured from the sprite's own top-left corner (in page fractions): sprites on
+            // combined sheets have it at half their size whatever their place on the page.
             const Page &page = sheets[e.sheet].pages[clamp(s->page, 0, int(sheets[e.sheet].pages.size()) - 1)];
             const float k = unitScale();
-            at.x -= (s->rx - s->left) * page.width * e.at.sx * k;
-            at.y -= (s->ry - s->top) * page.height * e.at.sy * k;
+            at.x -= s->rx * page.width * e.at.sx * k;
+            at.y -= s->ry * page.height * e.at.sy * k;
         }
         setColour(colour, alpha);
         quad(t, *s, at.x, at.y, size.x, size.y);
@@ -219,14 +234,14 @@ namespace
     }
 
     // Meters reveal their sheet's pixels in fill order, which the alpha channel encodes.
-    void drawMeter(int anchor, const Element &e, float fraction)
+    void drawMeter(int anchor, const Element &e, float fraction, float alpha = 1)
     {
         fraction = clamp(fraction, 0.0f, 1.0f);
         if(fraction <= 0.001f) return;
         unsigned colour = e.flags & 2 ? blend(e.low, e.high, fraction) : e.high;
         glEnable(GL_ALPHA_TEST);
         glAlphaFunc(GL_GEQUAL, max(1.0f - fraction, 1.0f / 255));
-        drawSprite(anchor, e, colour, 1 - e.translucency * 0.5f);
+        drawSprite(anchor, e, colour, (1 - e.translucency * 0.5f) * alpha);
         glDisable(GL_ALPHA_TEST);
     }
 
@@ -284,7 +299,7 @@ namespace
         }
     }
 
-    void drawWeapon(const HaloHudWeapon &w)
+    void drawWeapon(const HaloHudWeapon &w, int hidden)
     {
         const Group *g = weaponGroup(w.weapon);
         if(!g) return;
@@ -325,7 +340,7 @@ namespace
                 }
                 case 'c':
                 {
-                    if(!crosshairActive(e, w, *g)) break;
+                    if((hidden & HALO_HUD_CROSSHAIR) || !crosshairActive(e, w, *g)) break;
                     // Warnings flash; the aim reticle turns red on an aim-assist target.
                     unsigned colour = e.state == AIM && w.locked ? 0x00ff2020 : e.colour ? e.colour : e.flash;
                     float alpha = 1;
@@ -337,32 +352,57 @@ namespace
         }
     }
 
+    // The HUD part an element belongs to, for hud_show_* and hud_blink_* (0: none).
+    int unitPart(int state)
+    {
+        switch(state)
+        {
+            case SHIELD_BACK: case SHIELD_METER: return HALO_HUD_SHIELD;
+            case HEALTH_BACK: case HEALTH_METER: return HALO_HUD_HEALTH;
+            case MOTION_BACK: case MOTION_FRONT: return HALO_HUD_MOTION;
+            default: return 0;
+        }
+    }
+
     void drawUnit(const HaloHudUnit &u, const HaloHudBlip *blips, int blipCount)
     {
         const float shieldFlash = u.shield < 0.25f ? flashPhase(0.5f) : 0;
         for(const Element &e : unit.elements)
         {
             const int anchor = e.state == MOTION_BACK || e.state == MOTION_FRONT ? BOTTOM_LEFT : unit.anchor;
+            const int part = unitPart(e.state);
+            if(part & u.hidden) continue;
+            // A part the script blinks (the a10 tutorial's shield, health and motion sensor) pulses.
+            const float blink = part & u.blinking ? 0.15f + 0.85f * flashPhase(0.5f) : 1;
             switch(e.state)
             {
                 case SHIELD_BACK: case HEALTH_BACK:
-                    drawSprite(anchor, e, shieldFlash > 0 && e.state == SHIELD_BACK ? blend(e.colour, e.flash, shieldFlash) : e.colour);
+                    drawSprite(anchor, e, shieldFlash > 0 && e.state == SHIELD_BACK ? blend(e.colour, e.flash, shieldFlash) : e.colour, blink);
                     break;
                 case SHIELD_METER:
-                    drawMeter(anchor, e, u.shield);
+                {
+                    drawMeter(anchor, e, u.shield, blink);
+                    // The overshield's layers fill the meter again, green and then red.
+                    Element layer = e;
+                    layer.flags &= ~2;
+                    layer.high = 0xff40ff60;
+                    if(u.overshield > 0) drawMeter(anchor, layer, min(u.overshield, 1.0f));
+                    layer.high = 0xffff4040;
+                    if(u.overshield > 1) drawMeter(anchor, layer, u.overshield - 1);
                     break;
+                }
                 case HEALTH_METER:
                 {
                     // Health shades from the low colour through the mid colour to full.
                     Element shaded = e;
                     shaded.flags &= ~2;
                     shaded.high = u.health >= healthHigh ? e.high : u.health >= healthLow ? healthMid : e.low;
-                    drawMeter(anchor, shaded, u.health);
+                    drawMeter(anchor, shaded, u.health, blink);
                     break;
                 }
                 case MOTION_BACK:
                 {
-                    drawSprite(anchor, e, e.colour ? e.colour : 0xff2896ff, 0.85f);
+                    drawSprite(anchor, e, e.colour ? e.colour : 0xff2896ff, 0.85f * blink);
                     // Contacts inside the sensor's range, as blips around the centre.
                     const Sprite *dot = sprite(blipSheet, 0);
                     Texture *t = dot ? pageTexture(blipSheet, dot->page) : nullptr;
@@ -381,7 +421,7 @@ namespace
                     }
                     break;
                 }
-                case MOTION_FRONT: drawSprite(anchor, e, e.colour); break;
+                case MOTION_FRONT: drawSprite(anchor, e, e.colour, blink); break;
                 case FLASHLIGHT_BACK: if(u.flashlight) drawSprite(anchor, e, e.colour); break;
                 case FLASHLIGHT_METER: if(u.flashlight) drawMeter(anchor, e, u.flashlightCharge); break;
                 default: break;
@@ -423,6 +463,101 @@ void halohuddraw(const HaloHudWeapon &weapon, const HaloHudUnit &u, const HaloHu
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     drawUnit(u, blips, blipCount);
-    drawWeapon(weapon);
+    drawWeapon(weapon, u.hidden);
+    glColor4f(1, 1, 1, 1);
+}
+
+namespace
+{
+    const Arrow *arrowType(const char *name)
+    {
+        for(const Arrow &a : arrows) if(name && a.name == name) return &a;
+        // Unknown types draw as the first one ("default").
+        return arrows.empty() ? nullptr : &arrows[0];
+    }
+
+    // A waypoint sprite with its registration point at (x, y), turned by `angle` degrees.
+    bool drawArrow(int sequence, unsigned colour, float alpha, float x, float y, float angle)
+    {
+        const Sprite *s = sprite(waypointSheet, sequence);
+        Texture *t = s ? pageTexture(waypointSheet, s->page) : nullptr;
+        if(!t) return false;
+        const vec2 size = spriteSize(waypointSheet, *s, Placement());
+        const Page &page = sheets[waypointSheet].pages[clamp(s->page, 0, int(sheets[waypointSheet].pages.size()) - 1)];
+        const float k = unitScale();
+        glPushMatrix();
+        glTranslatef(x, y, 0);
+        if(angle) glRotatef(angle, 0, 0, 1);
+        setColour(colour, alpha);
+        quad(t, *s, -s->rx * page.width * k, -s->ry * page.height * k, size.x, size.y);
+        glPopMatrix();
+        return true;
+    }
+
+    void drawDiamond(float x, float y, unsigned colour, float alpha)
+    {
+        glDisable(GL_TEXTURE_2D);
+        setColour(colour, alpha);
+        const float r = 14 * unitScale() / 3.75f;
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x, y - r); glVertex2f(x + r, y); glVertex2f(x, y + r); glVertex2f(x - r, y);
+        glEnd();
+        glEnable(GL_TEXTURE_2D);
+    }
+}
+
+void halohuddrawnav(const HaloHudNav *navs, int count)
+{
+    if(count <= 0) return;
+    const bool sprites = halohudload() && waypointSheet >= 0 && !arrows.empty();
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    const float margin = VIRTH * .06f;
+    loopi(count)
+    {
+        const HaloHudNav &n = navs[i];
+        const Arrow *arrow = sprites ? arrowType(n.type) : nullptr;
+        // Without the HUD globals: blue for the default arrows, red for the *_red ones.
+        const unsigned colour = arrow ? arrow->colour : n.type && strstr(n.type, "red") ? 0xffff552b : 0xff2896ff;
+        const float alpha = arrow ? clamp(1 - arrow->translucency, 0.2f, 1.0f) : 0.95f;
+        vec4 clip;
+        mvpmatrix.transform(vec(n.x, n.y, n.z), clip);
+        float x = 0, y = 0;
+        bool onScreen = false;
+        if(clip.w > 0.01f)
+        {
+            x = VIRTW * (0.5f + 0.5f * clip.x / clip.w);
+            y = VIRTH * (0.5f - 0.5f * clip.y / clip.w);
+            onScreen = x >= margin && x <= VIRTW - margin && y >= margin && y <= VIRTH - margin;
+        }
+        if(onScreen)
+        {
+            if(!arrow || !drawArrow(arrow->onScreen, colour, alpha, x, y, 0)) drawDiamond(x, y, colour, alpha);
+            continue;
+        }
+        // Off screen (or behind the view): an arrow on the screen's edge pointing towards the point.
+        float dx = clip.x * VIRTW, dy = -clip.y * VIRTH;
+        if(clip.w < 0) { dx = -dx; dy = -dy; }
+        if(fabsf(dx) < 1e-4f && fabsf(dy) < 1e-4f) dy = 1;   // straight behind: point down
+        const float hw = VIRTW * .5f - margin, hh = VIRTH * .5f - margin;
+        const float scale = min(hw / max(fabsf(dx), 1e-4f), hh / max(fabsf(dy), 1e-4f));
+        x = VIRTW * .5f + dx * scale;
+        y = VIRTH * .5f + dy * scale;
+        // The retail off-screen sprite points down the screen.
+        const float angle = atan2f(dy, dx) / RAD - 90;
+        if(!arrow || !drawArrow(arrow->offScreen, colour, alpha, x, y, angle))
+        {
+            glDisable(GL_TEXTURE_2D);
+            setColour(colour, alpha);
+            const float r = 16 * unitScale() / 3.75f, a = atan2f(dy, dx);
+            glBegin(GL_TRIANGLES);
+            glVertex2f(x + cosf(a) * r, y + sinf(a) * r);
+            glVertex2f(x + cosf(a + 2.4f) * r, y + sinf(a + 2.4f) * r);
+            glVertex2f(x + cosf(a - 2.4f) * r, y + sinf(a - 2.4f) * r);
+            glEnd();
+            glEnable(GL_TEXTURE_2D);
+        }
+    }
     glColor4f(1, 1, 1, 1);
 }

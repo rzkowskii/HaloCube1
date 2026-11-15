@@ -347,6 +347,14 @@ bool halocollisionbaked(int device)
     return halocollisionactive() && std::binary_search(mesh.devices.begin(), mesh.devices.end(), device);
 }
 
+bool halocollisionbounds(vec &low, vec &high)
+{
+    if(!halocollisionactive()) return false;
+    low = mesh.nodes[0].bounds.low;
+    high = mesh.nodes[0].bounds.high;
+    return true;
+}
+
 bool halocollisiontrace(const vec &from, const vec &to, HaloCollisionHit &hit, unsigned ignoreFlags)
 {
     hit = {};

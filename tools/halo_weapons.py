@@ -10,21 +10,66 @@ stay in radians and times in seconds. source/src/halo_weapons.cpp reads it.
 import argparse
 import json
 import mmap
+from collections import namedtuple
 from pathlib import Path
 
 from import_halo_a30 import HaloMap
 
 CAMPAIGN = ('a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', 'd20', 'd40')
 TICKS = 30
-FORMAT = 1
+FORMAT = 2                        # 2: damage is <lower> <upper min> <upper max> (format 1 had two values)
 
 # Byte offsets inside the tags. Objects start with a 380-byte object section;
 # items add 396 more, so weapon fields begin at 776.
 OBJECT, ITEM = 380, 396
 WEAPON = OBJECT + ITEM
 MAGAZINE_STRIDE, TRIGGER_STRIDE = 112, 276
-DAMAGE = 452                      # damage section inside a jpt! tag
+
+# damage_effect (jpt!) layout in the Xbox Halo CE 1.0 caches, from the tag body. Read from the
+# bytes of every campaign jpt! tag: weapons\frag grenade\explosion gives radius 1.5-2.5, category
+# 3 (grenade), flags 0x20 (detonates explosives), AOE core radius 0.4, lower bound 80, upper bound
+# 120-120; weapons\sniper rifle\sniper bullet a 0.5 vehicle passthrough penalty after its 101-101;
+# the pistol and sniper bullets flag 0x2 (can cause headshots), the pulse generator 0x40 (only
+# hurts shields), flames 0x80 (flaming death), the infection form 0x1000 (pop).
+JPT_RADIUS = 0                    # 2f: full effect inside the first, none past the second
+JPT_CUTOFF_SCALE = 8              # f
+JPT_FLAGS = 12                    # u32
+DAMAGE = 452                      # the damage section; its fields, from it:
+JPT_SIDE_EFFECT = 0               # h: 0 none, 1 harmless, 2 lethal to the unsuspecting, 3 EMP
+JPT_CATEGORY = 2                  # h: 0 none, 1 falling, 2 bullet, 3 grenade, 4 high explosive,
+#                                   5 sniper, 6 melee, 7 flame, 8 mounted weapon, 9 vehicle,
+#                                   10 plasma, 11 needle, 12 shotgun
+JPT_DAMAGE_FLAGS = 4              # u32: 0x1 does not hurt owner, 0x2 headshots, 0x4 pings resistant
+#                                   units, 0x20 detonates explosives, 0x40 only hurts shields, ...
+JPT_CORE_RADIUS = 8               # f: AOE core radius
+JPT_LOWER = 12                    # f: damage lower bound, what a hit scaled down to nothing deals
+JPT_UPPER = 16                    # 2f: damage upper bound (min, max), a full-strength hit's range
+JPT_PASSTHROUGH = 24              # f: vehicle passthrough penalty
+JPT_CAMOUFLAGE = 28               # f: active camouflage damage
+JPT_STUN = 32                     # 3f: stun, maximum stun, stun time
+JPT_ACCELERATION = 48             # f: instantaneous acceleration
+# (40 bytes on, the material damage modifiers.)
+Damage = namedtuple('Damage', 'inner outer side_effect category flags core lower upper_min upper_max passthrough')
 ACTOR_WEAPON = 100                # carried weapon reference inside an actv tag
+# Sound references. A weapon's own: ready effect, overheated effect, pickup sound and its
+# first-person animation graph (whose animations carry the reload, melee and ready sounds).
+WEAPON_READY, WEAPON_OVERHEATED, WEAPON_PICKUP, WEAPON_FP_ANIMATIONS = 52, 108, 392, 356
+MAGAZINE_EQUIPMENT, MAGAZINE_EQUIPMENT_STRIDE = 100, 28     # the ammo pickups a magazine takes
+FIRING_EFFECTS, FIRING_EFFECT_STRIDE = 264, 132            # inside a trigger
+FIRING_EFFECT, FIRING_MISFIRE, FIRING_EMPTY = 36, 52, 68
+ANTR_SOUNDS, ANTR_ANIMATIONS, ANIMATION_STRIDE, ANIMATION_SOUND = 84, 116, 180, 60
+EFFECT_EVENTS, EVENT_STRIDE, EVENT_PARTS, PART_STRIDE, PART_TYPE = 52, 68, 44, 104, 24
+# Grenades: the globals' grenade block, the projectile's fuse and material responses, the eqip powerup.
+GLOBALS_GRENADES, GRENADE_STRIDE = 0x128, 68
+PROJECTILE_FLAGS, PROJECTILE_TIMER_STARTS, PROJECTILE_ARMING, PROJECTILE_EFFECT = 0, 4, 40, 48
+PROJECTILE_TIMER, PROJECTILE_ATTACHED = 64, 152
+MATERIAL_RESPONSES, MATERIAL_STRIDE, POTENTIAL_RESPONSE, RESPONSE_ATTACH = 196, 160, 36, 4
+OBJECT_ATTACHMENTS, ATTACHMENT_STRIDE = 320, 72
+LOOPING_TRACKS, TRACK_STRIDE, TRACK_LOOP = 60, 160, 64
+EQUIPMENT = WEAPON                # eqip fields follow the item section as the weapon's do
+EQUIPMENT_FORMAT = 2              # 2: blast and attached damage carry the upper bound's min and max
+# Interface sounds the engine plays for the player's shield and health.
+UI_SOUNDS = {'shield-low': r'sound\sfx\ui\shield_low', 'health-low': r'sound\sfx\ui\health_low_heart'}
 
 # Weapons the player can hold, with their AssaultCube firing behaviour. The
 # remaining weapon tags are vehicle, turret or actor-only guns.
@@ -50,24 +95,60 @@ WEAPON_FIELDS = '''# path <tag>                 retail weapon tag
 # heat <recover> <overheat> <loss/s>
 # zoom <levels> <min> <max>   magnification
 # aim <autoaim angle> <autoaim range> <magnetism angle> <magnetism range>
-# melee <lower> <upper>
+# melee <lower> <upper min> <upper max>
+#   jpt! damage: a full-strength hit deals a random amount in [upper min, upper max]; the lower
+#   bound is what Halo scales a hit down to (range or area falloff, fall speed)
 # magazine <loaded> <initial total> <max total> <reload s> <rounds reloaded> <recharged/s>
 # trigger <rate initial> <rate final> <rate accel s> <rate decel s> <rounds/shot> <projectiles/shot>
 #         <distribution angle> <error initial> <error final> <error accel s> <error decel s>
 #         <error angle min> <error angle max> <charge s> <heat/round> <age/round> <magazine>
-# projectile <speed initial> <speed final> <range> <gravity> <guided rad/s> <damage lower> <damage upper>
-#            <category> <area radius> <path>
+# projectile <speed initial> <speed final> <range> <gravity> <guided rad/s> <damage lower>
+#            <damage upper min> <damage upper max> <category> <area radius> <path>
+# sound <role> <snd! tag>      fire, charged, empty, cycle, reload, reload-empty, melee, ready, overheat, pickup
+# ammo <rounds> <eqip tag>     an ammo pickup this weapon's magazine takes, and the rounds it gives
+'''
+
+EQUIPMENT_FIELDS = '''# grenade <type> <maximum carried> <sticks to units 0|1> <timer starts> <arming s> <fuse s> <flags>
+#   timer starts: 0 immediately, 1 after the first bounce, 2 at rest (or stuck), 3 after any bounce
+# blast <inner radius> <outer radius> <damage lower> <damage upper min> <damage upper max>
+#       <side effect> <category>
+#   full damage inside the inner radius, falling to none at the outer; side effect 3 is EMP;
+#   damage as in weapons.txt: a full-strength hit rolls [upper min, upper max]
+# attached <damage lower> <damage upper min> <damage upper max>   to the unit a sticky grenade is stuck to
+# path <proj tag> / equipment <eqip tag> / sound <role> <snd! tag>   (throw, explode, armed)
+# equipment <index>
+#   path <eqip tag>
+#   kind <powerup> <grenade type> <powerup time s>
+#     powerup: 0 none (ammo), 1 double speed, 2 over shield, 3 active camouflage,
+#              4 full-spectrum vision, 5 health, 6 grenade
+#   worldmodel <model>|-        under packages/models
+#   ammo <weapons.txt index> <rounds>   for each weapon whose magazine takes it
+#   sound pickup <snd! tag>
+# sound <role> <snd! tag>       interface sounds: shield-low, health-low
 '''
 
 
-def damage_values(halo, tag):
-    """Lower and upper damage, category and area radius of a jpt! tag."""
+def jpt_damage(halo, tag):
+    """The damage of a jpt! tag, read with the JPT_* layout (weapons, melee and grenades alike)."""
     t, a = halo.tags, tag.address
-    category, = t.read('h', a + DAMAGE + 2)
-    lower, = t.read('f', a + DAMAGE + 16)
-    upper, = t.read('f', a + DAMAGE + 24)
-    radius, = t.read('f', a + 4)
-    return lower, max(lower, upper), category, radius
+    inner, outer = t.read('2f', a + JPT_RADIUS)
+    d = a + DAMAGE
+    side_effect, = t.read('h', d + JPT_SIDE_EFFECT)
+    category, = t.read('h', d + JPT_CATEGORY)
+    flags, = t.read('I', d + JPT_DAMAGE_FLAGS)
+    core, = t.read('f', d + JPT_CORE_RADIUS)
+    lower, = t.read('f', d + JPT_LOWER)
+    upper_min, upper_max = t.read('2f', d + JPT_UPPER)
+    passthrough, = t.read('f', d + JPT_PASSTHROUGH)
+    upper_max = max(upper_min, upper_max)
+    return Damage(inner, outer, side_effect, category, flags, core, min(lower, upper_max), upper_min, upper_max,
+                  passthrough)
+
+
+def damage_values(halo, tag):
+    """Lower bound, upper bound min and max, category and area radius of a jpt! tag."""
+    d = jpt_damage(halo, tag)
+    return d.lower, d.upper_min, d.upper_max, d.category, d.outer
 
 
 def referenced(halo, tag, group, limit=2048):
@@ -88,6 +169,94 @@ def referenced(halo, tag, group, limit=2048):
     return None
 
 
+def effect_sound(halo, tag):
+    """The sound a reference plays: a snd! itself, the first snd! part of an effe's events, or
+    the loop of a looping sound (lsnd)."""
+    if tag is None:
+        return None
+    t = halo.tags
+    try:
+        if tag.group == 'snd!':
+            return tag.name
+        if tag.group == 'lsnd':
+            for track in t.block(tag.address + LOOPING_TRACKS, TRACK_STRIDE):
+                loop = halo.reference(t, track + TRACK_LOOP)
+                if loop and loop.group == 'snd!':
+                    return loop.name
+            return None
+        if tag.group == 'effe':
+            for event in t.block(tag.address + EFFECT_EVENTS, EVENT_STRIDE):
+                for part in t.block(event + EVENT_PARTS, PART_STRIDE):
+                    found = halo.reference(t, part + PART_TYPE)
+                    if found and found.group == 'snd!':
+                        return found.name
+    except ValueError:
+        return None
+    return None
+
+
+def animation_sounds(halo, antr):
+    """First-person animation name (without 'first-person ') to the sound it plays."""
+    if antr is None or antr.group != 'antr':
+        return {}
+    t = halo.tags
+    sounds = [halo.reference(t, entry) for entry in t.block(antr.address + ANTR_SOUNDS, 20)]
+    found = {}
+    for animation in t.block(antr.address + ANTR_ANIMATIONS, ANIMATION_STRIDE):
+        index, = t.read('h', animation + ANIMATION_SOUND)
+        if 0 <= index < len(sounds) and sounds[index] and sounds[index].group == 'snd!':
+            found.setdefault(t.name(animation, 32).removeprefix('first-person '), sounds[index].name)
+    return found
+
+
+def weapon_sounds(halo, tag):
+    """Sound roles of a weapon from its tags: the first trigger's firing, empty and misfire
+    effects, the second trigger's shot, the first-person animations' sounds and the pickup sound."""
+    t, a = halo.tags, tag.address + WEAPON
+    sounds = {}
+    triggers = list(t.block(a + 500, TRIGGER_STRIDE))
+    for index, trigger in enumerate(triggers[:2]):
+        effects = list(t.block(trigger + FIRING_EFFECTS, FIRING_EFFECT_STRIDE))
+        if not effects:
+            continue
+        fire = effect_sound(halo, halo.reference(t, effects[0] + FIRING_EFFECT))
+        if index == 0:
+            sounds['fire'] = fire
+            sounds['empty'] = effect_sound(halo, halo.reference(t, effects[0] + FIRING_EMPTY))
+            if t.read('f', a + 72)[0] > 0:      # only weapons that overheat misfire from heat
+                sounds['overheat'] = effect_sound(halo, halo.reference(t, effects[0] + FIRING_MISFIRE))
+        elif fire != sounds.get('fire'):
+            sounds['charged'] = fire
+    animations = animation_sounds(halo, halo.reference(t, a + WEAPON_FP_ANIMATIONS))
+    full = animations.get('reload-full') or animations.get('enter') or animations.get('reload-empty')
+    sounds.update({
+        'cycle': animations.get('fire-1'),
+        'reload': full,
+        'reload-empty': animations.get('reload-empty') or full,
+        'melee': animations.get('melee'),
+        'ready': animations.get('ready') or effect_sound(halo, halo.reference(t, a + WEAPON_READY)),
+        'pickup': effect_sound(halo, halo.reference(t, a + WEAPON_PICKUP)),
+    })
+    overheat = animations.get('overheating') or animations.get('o-h-s-enter') or \
+        effect_sound(halo, halo.reference(t, a + WEAPON_OVERHEATED))
+    if overheat:
+        sounds['overheat'] = overheat
+    return {role: name for role, name in sounds.items() if name}
+
+
+def weapon_ammo(halo, tag):
+    """The ammo pickups (eqip tags) the weapon's first magazine takes, with their rounds."""
+    t, a = halo.tags, tag.address + WEAPON
+    found = []
+    for magazine in list(t.block(a + 488, MAGAZINE_STRIDE))[:1]:
+        for entry in t.block(magazine + MAGAZINE_EQUIPMENT, MAGAZINE_EQUIPMENT_STRIDE):
+            rounds, = t.read('h', entry)
+            equipment = halo.reference(t, entry + 12)
+            if equipment and equipment.group == 'eqip':
+                found.append((rounds, equipment.name))
+    return found
+
+
 def projectile_record(halo, proj):
     t, a = halo.tags, proj.address + OBJECT
     initial, final, guided = t.read('3f', a + 104)
@@ -98,22 +267,22 @@ def projectile_record(halo, proj):
         if tag and tag.group == 'jpt!':
             values = damage_values(halo, tag)
             # Needles carry an empty impact tag and deal their damage on detonation.
-            if damage is None or values[1] > damage[1]:
+            if damage is None or values[2] > damage[2]:
                 damage = values
     if damage is None:
         effect = halo.reference(t, a + 48)
         tag = referenced(halo, effect, 'jpt!') if effect and effect.group == 'effe' else None
-        damage = damage_values(halo, tag) if tag else (0.0, 0.0, -1, 0.0)
-    lower, upper, category, radius = damage
+        damage = damage_values(halo, tag) if tag else (0.0, 0.0, 0.0, -1, 0.0)
+    lower, upper_min, upper_max, category, radius = damage
     return (initial * TICKS, final * TICKS, maximum, gravity, guided * TICKS,
-            lower, upper, category, radius, proj.name)
+            lower, upper_min, upper_max, category, radius, proj.name)
 
 
 def weapon_record(halo, tag, viewmodels, models):
     t, a = halo.tags, tag.address + WEAPON
     model = halo.reference(t, tag.address + 40)     # the object's third-person model
     melee = halo.reference(t, a + 140)
-    melee = damage_values(halo, melee)[:2] if melee and melee.group == 'jpt!' else (0.0, 0.0)
+    melee = damage_values(halo, melee)[:3] if melee and melee.group == 'jpt!' else (0.0, 0.0, 0.0)
     record = {
         'path': tag.name,
         'label': t.name(a + 4, 32) or '-',
@@ -126,6 +295,8 @@ def weapon_record(halo, tag, viewmodels, models):
         'aim': t.read('4f', a + 220),
         'melee': melee,
         'magazines': [], 'triggers': [],
+        'sounds': weapon_sounds(halo, tag),
+        'ammo': weapon_ammo(halo, tag),
     }
     for magazine in t.block(a + 488, MAGAZINE_STRIDE):
         recharge, initial, maximum, loaded = t.read('4h', magazine + 4)
@@ -171,8 +342,108 @@ def write(records, path):
             lines.append('trigger ' + ' '.join(map(number, trigger['values'])))
             p = trigger['projectile']
             lines.append('projectile ' + (' '.join(map(number, p[:-1])) + ' ' + p[-1] if p else '-'))
+        lines += [f'sound {role} {name}' for role, name in sorted(record['sounds'].items())]
+        lines += [f'ammo {rounds} {name}' for rounds, name in record['ammo']]
         lines.append('end')
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(lines) + '\n')
+
+
+def jpt_values(halo, tag):
+    """Area damage of a jpt! tag: radius bounds (full damage inside the first, none past the
+    second), damage lower bound, upper bound min and max, side effect and category."""
+    d = jpt_damage(halo, tag)
+    return d.inner, d.outer, d.lower, d.upper_min, d.upper_max, d.side_effect, d.category
+
+
+def effect_damage(halo, effect):
+    """The jpt! part of an effe with the largest radius (a detonation's blast, not its shock wave)."""
+    t, best = halo.tags, None
+    if effect is None or effect.group != 'effe':
+        return None
+    for event in t.block(effect.address + EFFECT_EVENTS, EVENT_STRIDE):
+        for part in t.block(event + EVENT_PARTS, PART_STRIDE):
+            found = halo.reference(t, part + PART_TYPE)
+            if found and found.group == 'jpt!':
+                values = jpt_values(halo, found)
+                if best is None or (values[4], values[1]) > (best[4], best[1]):
+                    best = values
+    return best
+
+
+def grenade_records(halo):
+    """The globals' grenade types (0 fragmentation, 1 plasma): carried maximum, the thrown
+    projectile's fuse, stickiness and blast, and their sounds."""
+    t = halo.tags
+    globals_tag = next(tag for tag in halo.directory if tag.group == 'matg')
+    records = []
+    for index, grenade in enumerate(t.block(globals_tag.address + GLOBALS_GRENADES, GRENADE_STRIDE)):
+        maximum, = t.read('h', grenade)
+        throw, equipment, proj = (halo.reference(t, grenade + offset) for offset in (4, 36, 52))
+        if not proj or proj.group != 'proj':
+            continue
+        a = proj.address + OBJECT
+        flags, = t.read('I', a + PROJECTILE_FLAGS)
+        starts, = t.read('h', a + PROJECTILE_TIMER_STARTS)
+        arming, = t.read('f', a + PROJECTILE_ARMING)
+        _, fuse = t.read('2f', a + PROJECTILE_TIMER)
+        sticks = any(t.read('h', response + POTENTIAL_RESPONSE)[0] == RESPONSE_ATTACH
+                     for response in t.block(a + MATERIAL_RESPONSES, MATERIAL_STRIDE))
+        detonation = halo.reference(t, a + PROJECTILE_EFFECT)
+        attached = halo.reference(t, a + PROJECTILE_ATTACHED)
+        armed = None
+        for attachment in t.block(proj.address + OBJECT_ATTACHMENTS, ATTACHMENT_STRIDE):
+            armed = armed or effect_sound(halo, halo.reference(t, attachment))
+        sounds = {'throw': effect_sound(halo, throw), 'explode': effect_sound(halo, detonation), 'armed': armed}
+        records.append({
+            'type': index, 'maximum': maximum, 'sticks': int(sticks), 'starts': starts, 'arming': arming,
+            'fuse': fuse, 'flags': flags, 'path': proj.name,
+            'equipment': equipment.name if equipment and equipment.group == 'eqip' else None,
+            'blast': effect_damage(halo, detonation) or (0.0, 0.0, 0.0, 0.0, 0.0, 0, 0),
+            'attached': jpt_values(halo, attached)[2:5] if attached and attached.group == 'jpt!' else (0.0, 0.0, 0.0),
+            'sounds': {role: name for role, name in sounds.items() if name},
+        })
+    return records
+
+
+def equipment_record(halo, tag, models):
+    t, a = halo.tags, tag.address + EQUIPMENT
+    powerup, grenade = t.read('2h', a)
+    time, = t.read('f', a + 4)
+    model = halo.reference(t, tag.address + 40)
+    pickup = effect_sound(halo, halo.reference(t, a + 8))
+    return {'path': tag.name, 'kind': (powerup, grenade, time),
+            'worldmodel': models.get(model.name, '-') if model else '-',
+            'sounds': {'pickup': pickup} if pickup else {}}
+
+
+def write_equipment(grenades, equipment, weapons, ui_sounds, path):
+    """packages/halo/equipment.txt: grenade types, every campaign eqip tag (with the weapons
+    whose ammo it is) and the interface sounds, for source/src/halo_weapons.cpp."""
+    ammo = {}
+    for index, weapon in enumerate(weapons):
+        if weapon['class'] in PLAYER.values():
+            for rounds, name in weapon['ammo']:
+                ammo.setdefault(name, []).append((index, rounds))
+    lines = [f'format {EQUIPMENT_FORMAT}', f'# {len(grenades)} grenade types and {len(equipment)} equipment tags '
+             'from the Xbox campaign caches', EQUIPMENT_FIELDS.rstrip()]
+    for g in grenades:
+        lines += [f'grenade {g["type"]} {g["maximum"]} {g["sticks"]} {g["starts"]} {number(g["arming"])} '
+                  f'{number(g["fuse"])} {g["flags"]}',
+                  'blast ' + ' '.join(map(number, g['blast'])),
+                  'attached ' + ' '.join(map(number, g['attached'])),
+                  f'path {g["path"]}']
+        if g['equipment']:
+            lines.append(f'equipment {g["equipment"]}')
+        lines += [f'sound {role} {name}' for role, name in sorted(g['sounds'].items())]
+        lines.append('end')
+    for index, record in enumerate(equipment):
+        lines += [f'equipment {index}', f'path {record["path"]}',
+                  'kind ' + ' '.join(map(number, record['kind'])), f'worldmodel {record["worldmodel"]}']
+        lines += [f'ammo {weapon} {rounds}' for weapon, rounds in ammo.get(record['path'], [])]
+        lines += [f'sound {role} {name}' for role, name in sorted(record['sounds'].items())]
+        lines.append('end')
+    lines += [f'sound {role} {name}' for role, name in sorted(ui_sounds.items())]
     path.write_text('\n'.join(lines) + '\n')
 
 
@@ -186,6 +457,23 @@ def weapon_index(root):
         key, _, rest = line.partition(' ')
         if key == 'weapon':
             current = int(rest)
+        elif key == 'path' and current is not None:
+            index[rest] = current
+    return index
+
+
+def equipment_index(root):
+    """eqip tag path to its packages/halo/equipment.txt index, read back from the table."""
+    index, current = {}, None
+    path = Path(root) / 'packages/halo/equipment.txt'
+    if not path.exists():
+        return index
+    for line in path.read_text().splitlines():
+        key, _, rest = line.partition(' ')
+        if key == 'equipment' and rest.isdigit():
+            current = int(rest)
+        elif key == 'end':
+            current = None
         elif key == 'path' and current is not None:
             index[rest] = current
     return index
@@ -213,19 +501,30 @@ def main():
     args = parser.parse_args()
     viewmodels = library_models(args.output, 'viewmodels')
     models = library_models(args.output, 'models')
-    records = {}
+    records, equipment, grenades, ui_sounds = {}, {}, [], {}
     for cache in CAMPAIGN:
         with (args.maps / f'{cache}.map').open('rb') as file, \
                 mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
+            if not grenades:
+                grenades = grenade_records(halo)
+            names = {tag.name for tag in halo.directory if tag.group == 'snd!'}
+            for role, name in UI_SOUNDS.items():
+                if name in names:
+                    ui_sounds.setdefault(role, name)
             for tag in halo.directory:
                 if tag.group == 'weap' and tag.name not in records:
                     records[tag.name] = weapon_record(halo, tag, viewmodels, models)
+                elif tag.group == 'eqip' and tag.name not in equipment:
+                    equipment[tag.name] = equipment_record(halo, tag, models)
     ordered = [records[name] for name in sorted(records)]
     target = args.output / 'packages/halo/weapons.txt'
     write(ordered, target)
     playable = sum(r['class'] in PLAYER.values() for r in ordered)
     print(f'{len(ordered)} weapons ({playable} player weapons) -> {target}')
+    target = args.output / 'packages/halo/equipment.txt'
+    write_equipment(grenades, [equipment[name] for name in sorted(equipment)], ordered, ui_sounds, target)
+    print(f'{len(grenades)} grenade types, {len(equipment)} equipment tags -> {target}')
 
 
 if __name__ == '__main__':

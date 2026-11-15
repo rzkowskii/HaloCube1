@@ -142,10 +142,14 @@ namespace
         const float yaw = a.bot->yaw * RAD;
         const vec facing(sinf(yaw), -cosf(yaw), 0);
         const float angle = acosf(clamp(vec(delta.x, delta.y, 0).normalize().dot(facing), -1.0f, 1.0f));
-        const bool inCone = distance <= d.visionDistance * s && angle <= d.visionMax * 0.5f + 0.3f;
-        const bool inPeriphery = distance <= d.peripheralDistance * s && angle <= d.peripheralAngle * 0.5f;
+        // Active camouflage hides the player beyond a short range, a little further while they
+        // fire; actors already fighting them lose track (perceive drops to alert after 4 s).
+        const float camo = t == player1 ? haloplayercamo() : 0;
+        const float reach = s * (1 - camo * (lastmillis - player1->lastaction < 1000 ? .6f : .88f));
+        const bool inCone = distance <= d.visionDistance * reach && angle <= d.visionMax * 0.5f + 0.3f;
+        const bool inPeriphery = distance <= d.peripheralDistance * reach && angle <= d.peripheralAngle * 0.5f;
         // Actors already fighting keep tracking a target they know about.
-        const bool tracking = a.awareness == COMBAT && a.target == t && distance <= d.visionDistance * s * 1.5f;
+        const bool tracking = a.awareness == COMBAT && a.target == t && distance <= d.visionDistance * reach * 1.5f;
         if(!inCone && !inPeriphery && !tracking) return false;
         return body->IsVisible(centreOf(t));
     }
@@ -353,9 +357,11 @@ namespace
         const float speed = trigger && trigger->projectile.valid ? max(1.0f, trigger->projectile.speed * s) : 1000.0f;
         vec aim = centreOf(t);
         aim.add(vec(t->vel).mul(d.lead * distance / speed));
-        if(d.error > 0)
+        // A camouflaged player is hard to hit: the shots spread wider.
+        const float camoError = t == player1 ? haloplayercamo() * 0.12f : 0;
+        if(d.error > 0 || camoError > 0)
         {
-            const float spread = tanf(d.error) * distance;
+            const float spread = tanf(d.error + camoError) * distance;
             aim.add(vec(frand(-spread, spread), frand(-spread, spread), frand(-spread, spread) * 0.5f));
         }
         body->AimToVec(aim);
@@ -386,11 +392,16 @@ namespace
         const float flight = clamp(direction.magnitude() / 60.0f, 0.4f, 1.6f);
         direction.normalize().mul(1.6f);
         direction.z += 0.25f * flight;
-        grenadeent *g = new grenadeent(e);
-        bounceents.add(g);
-        g->activate(e->o, a.target->o);
-        g->moveoutsidebbox(direction, e);
-        g->_throw(g->o, direction);
+        // The retail grenade of the variant's type (the Covenant throw plasma); AssaultCube's
+        // frag grenade without packages/halo/equipment.txt.
+        if(!halothrowgrenade(e, haloactorgrenadetype(e), direction))
+        {
+            grenadeent *g = new grenadeent(e);
+            bounceents.add(g);
+            g->activate(e->o, a.target->o);
+            g->moveoutsidebbox(direction, e);
+            g->_throw(g->o, direction);
+        }
         --e->mag[GUN_GRENADE];
     }
 
@@ -774,6 +785,15 @@ float haloactorhealthfraction(const playerent *bot)
 }
 
 int haloactorflags(const playerent *bot) { const Actor *a = find(bot); return a ? a->flags : 0; }
+
+int haloactorgrenadetype(const playerent *bot)
+{
+    const Actor *a = find(bot);
+    if(!a) return -1;
+    // The variant's grenade type; the Covenant's plasma or the humans' frag when it names none known.
+    if(halogrenadedef(a->def->grenadeType)) return a->def->grenadeType;
+    return a->team == HALO_TEAM_HUMAN ? HALO_GRENADE_FRAG : HALO_GRENADE_PLASMA;
+}
 void haloaisetgrenades(bool on) { grenadesAllowed = on; }
 bool haloaigrenades() { return grenadesAllowed; }
 

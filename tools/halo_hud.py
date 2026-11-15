@@ -10,6 +10,7 @@ rectangles and registration points are normalised to their page.
 source/src/halo_hud.cpp reads it.
 """
 import argparse
+import filecmp
 import json
 import mmap
 import shutil
@@ -39,6 +40,8 @@ FIELDS = '''# bitmap <id> <tag>, then page <width> <height> <file> and sequence 
 # motion <centre x> <centre y> <range> <scale> <sweep bitmap> <blip bitmap>
 # health <mid colour> <max cutoff> <min cutoff>
 # counter <bitmap> <character width> <screen width> <x offset> <y offset> <decimal width> <colon width>
+# waypoint <bitmap> (the nav point arrows), then per arrow type
+#   arrow <name> <colour> <opacity> <translucency> <on-screen sequence> <off-screen sequence> <occluded sequence>
 '''
 
 
@@ -67,7 +70,8 @@ class Exporter:
             source = self.root / 'build/retail-assets' / image['paths'][0]
             target = self.textures / f'{index}' / f'{page}.png'
             target.parent.mkdir(parents=True, exist_ok=True)
-            if source.exists() and (not target.exists() or target.stat().st_mtime < source.stat().st_mtime):
+            # Compare contents, not times: ids shift when a new sheet is registered earlier.
+            if source.exists() and (not target.exists() or not filecmp.cmp(source, target, shallow=False)):
                 shutil.copyfile(source, target)
             lines.append(f'page {image["size"][0]} {image["size"][1]} halo_hud/{index}/{page}.png')
         t = halo.tags
@@ -256,6 +260,28 @@ def grenade_lines(exp, halo):
     return lines
 
 
+def waypoint_lines(exp, halo):
+    """The HUD globals' nav point arrows (activate_nav_point_* in the mission scripts)."""
+    t = halo.tags
+    globals_tag = find(halo, 'matg')
+    interface = t.block(globals_tag.address + 0x140, 304)[0]
+    hudg = halo.reference(t, interface + 0x60)
+    if not hudg or hudg.group != 'hudg':
+        return []
+    bitmap = exp.bitmap(halo, halo.reference(t, hudg.address + 0x150))
+    if bitmap < 0:
+        return []
+    lines = [f'waypoint {bitmap}']
+    for arrow in t.block(hudg.address + 0x160, 104):
+        name = t.name(arrow, 32)
+        colour, = t.read('I', arrow + 40)
+        opacity, translucency = t.read('2f', arrow + 44)
+        on_screen, off_screen, occluded = t.read('3h', arrow + 52)
+        if name and ' ' not in name:
+            lines.append(f'arrow {name} {colour:08x} {n(opacity)} {n(translucency)} {on_screen} {off_screen} {occluded}')
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('maps', type=Path, help='Directory with the expanded Xbox campaign caches')
@@ -265,13 +291,14 @@ def main():
     if not weapons:
         raise SystemExit('run tools/halo_weapons.py first to write packages/halo/weapons.txt')
     exp = Exporter(args.output)
-    weapon_blocks, done, unit, grenades = [], set(), [], []
+    weapon_blocks, done, unit, grenades, waypoints = [], set(), [], [], []
     for cache in CAMPAIGN:
         with (args.maps / f'{cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
             if not unit:
                 unit = unit_lines(exp, halo)
                 grenades = grenade_lines(exp, halo)
+                waypoints = waypoint_lines(exp, halo)
             for tag in halo.directory:
                 if tag.group != 'weap' or tag.name in done or tag.name not in weapons:
                     continue
@@ -280,7 +307,7 @@ def main():
                 anchor, cutoffs, scope, lines = weapon_lines(exp, halo, wphi)
                 weapon_blocks += [f'weapon {weapons[tag.name]} {anchor} ' + ' '.join(map(str, cutoffs)) + f' {scope}',
                                   *lines, 'end']
-    out = [f'format {FORMAT}', FIELDS.rstrip(), *exp.bitmap_lines, *unit, *grenades, *weapon_blocks]
+    out = [f'format {FORMAT}', FIELDS.rstrip(), *exp.bitmap_lines, *unit, *grenades, *waypoints, *weapon_blocks]
     target = args.output / 'packages/halo/hud.txt'
     target.write_text('\n'.join(out) + '\n')
     print(f'{len(done)} weapon HUDs, {len(exp.bitmaps)} sprite sheets -> {target}')

@@ -350,3 +350,129 @@
         }
         return false;
     }
+
+    // --- Vehicles the engine drives (halo_vehicle.cpp) ---------------------------------
+    // The Warthogs and turrets placed in this section answer the boarding and seat commands for
+    // their scenario objects. Everything else (Pelicans, dropships, Banshees, Ghosts, and the
+    // scripted cargo carried by them) falls through to the stand-ins and the attach code.
+    bool Scenario::vehicleCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out)
+    {
+        if(strncmp(name, "vehicle_", 8) && strncmp(name, "unit_", 5) && strncmp(name, "ai_", 3)) return false;
+        auto is = [name](const char *candidate) { return !strcmp(name, candidate); };
+        auto value = [&](size_t i, double fallback = 0) { return i < args.size() ? args[i].number : fallback; };
+        auto index = [&](size_t i) { return i < args.size() ? args[i].integer() : -1; };
+        auto text = [&](size_t i) { return i < args.size() ? args[i].text : ""; };
+        auto truth = [&](size_t i) { return i < args.size() && args[i].truth(); };
+        auto answer = [&](double v) { out = number(v, 8); return true; };
+        auto handled = [&]() { out = {}; return true; };
+        auto object = [&](size_t i)
+        {
+            const int id = named(program.objects, text(i));
+            return id >= 0 ? id : index(i);
+        };
+        // The player and the actors in a unit value.
+        auto units = [&](int v)
+        {
+            std::vector<playerent *> list;
+            eachUnit(v, [&](playerent *unit) { if(unit) list.push_back(unit); });
+            return list;
+        };
+        if(is("vehicle_test_seat_list") || is("vehicle_test_seat"))
+        {
+            const int id = object(0);
+            const Object *o = at(program.objects, id);
+            // The Maw's escape Warthog stands in for the scenario Warthogs (halovehicleescapeseat):
+            // trench_jeep_test asks for trench_jeep1..4 and asspain_1..3.
+            const bool warthog = o && o->kind == 1;
+            const std::vector<playerent *> list = units(index(2));
+            bool inside = false;
+            if(warthog) for(playerent *unit : list) inside |= halovehicleescapeseat(id, text(1), unit);
+            if(!halovehiclebound(id))
+            {
+                // A Warthog or a turret that is not in this section: nobody (but the escape
+                // Warthog's driver) is in it.
+                if(o && (o->kind == 1 || o->kind == 6)) return answer(inside);
+                return false;
+            }
+            for(playerent *unit : list) inside |= halovehicleseattest(id, text(1), unit);
+            return answer(inside);
+        }
+        if(is("unit_enter_vehicle") || is("vehicle_load_magic"))
+        {
+            // (unit_enter_vehicle unit vehicle seat), (vehicle_load_magic vehicle seat units)
+            const bool enter = is("unit_enter_vehicle");
+            const int id = object(enter ? 1 : 0);
+            if(!halovehiclebound(id)) return false;
+            bool loaded = false;
+            for(playerent *unit : units(index(enter ? 0 : 2))) loaded |= halovehicleload(id, text(enter ? 2 : 1), unit);
+            return loaded ? answer(1) : false;
+        }
+        if(is("unit_exit_vehicle"))
+        {
+            bool released = false;
+            for(playerent *unit : units(index(0))) released |= halovehicleunseat(unit);
+            return released ? answer(1) : false;
+        }
+        if(is("vehicle_unload"))
+        {
+            const int id = object(0);
+            return halovehiclebound(id) ? answer(halovehicleunload(id, text(1))) : false;
+        }
+        if(is("vehicle_riders"))
+        {
+            // Only the player can be named in a list of riders here (actors ride by squad).
+            const int id = object(0);
+            return halovehiclebound(id) ? answer(halovehicleseattest(id, "", player1) ? playerList : 0) : false;
+        }
+        if(is("vehicle_driver") || is("vehicle_gunner"))
+        {
+            const int id = object(0);
+            if(!halovehiclebound(id)) return false;
+            return answer(halovehicleseattest(id, is("vehicle_driver") ? "driver" : "gunner", player1) ? playerObject : noObject);
+        }
+        if(is("unit_in_vehicle"))
+        {
+            const std::vector<playerent *> list = units(index(0));
+            if(list.empty()) return false;
+            bool inside = false;
+            for(playerent *unit : list) inside |= halovehicleinside(unit);
+            return answer(inside);
+        }
+        if(is("unit_set_enterable_by_player"))
+        {
+            // Recorded on the object as well (aiCommand).
+            if(halovehiclebound(object(0))) halovehicleenterable(object(0), truth(1));
+            return false;
+        }
+        if(is("ai_vehicle_enterable_distance") || is("ai_vehicle_enterable_actor_type") || is("ai_vehicle_enterable_disable"))
+        {
+            const int id = object(0);
+            if(!halovehiclebound(id)) return false;
+            if(is("ai_vehicle_enterable_distance")) halovehicleaiboard(id, float(value(1)), -2, false);
+            else if(is("ai_vehicle_enterable_disable")) halovehicleaiboard(id, -1, -2, true);
+            else
+            {
+                static const char *const kinds[] = {"grunt", "elite", "jackal", "hunter"};
+                int kind = -1;
+                loopi(4) if(strstr(text(1), kinds[i])) kind = i;
+                halovehicleaiboard(id, -1, kind, false);
+            }
+            return handled();
+        }
+        if(is("ai_go_to_vehicle"))
+        {
+            // (ai_go_to_vehicle squad vehicle seat)
+            const int id = object(1);
+            if(scene || !halovehiclebound(id)) return false;
+            std::vector<playerent *> list;
+            eachActor(index(0), [&](SquadBot &bot, int) { list.push_back(bot.bot); });
+            halovehicleaigoto(id, text(2), list.data(), int(list.size()));
+            return handled();
+        }
+        if(is("ai_exit_vehicle"))
+        {
+            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { halovehicleunseat(bot.bot); });
+            return false;
+        }
+        return false;
+    }

@@ -301,6 +301,23 @@ def opened_devices(program):
     return opened
 
 
+def moved_devices(program):
+    """Names of the devices some script moves to any position (c10's mission_swamp_a brings
+    lift_a up to the landing with (device_set_position lift_a 0.0))."""
+    moved = set()
+    setters = {'device_set_position', 'device_set_position_immediate'}
+    for salt, _, _, flags, _, _, data in program.nodes:
+        if not salt or flags & 1:
+            continue
+        try:
+            head = program.node(data)
+            if program.text(head[5]) in setters:
+                moved.add(program.text(program.node(head[4])[5]))
+        except ValueError:
+            continue
+    return moved
+
+
 def opened_groups(program):
     """Names of the device groups some script sets to a non-zero position.
 
@@ -540,6 +557,176 @@ class DoorBlocks:
     def closable_at(self, x, y, z4):
         """An open door whose closed panels would stand here."""
         return self._hits(self.closable, x, y, z4 / 4)
+
+
+def _device_table(halo, output):
+    """(name, row) for every scenario machine and control, in the engine's device order, the
+    scripts and the device group names and initial values."""
+    from halo_devices import device_rows
+    from import_halo_scripts import model_pack_scale, named_objects, Program
+    program = Program(halo)
+    names = {index: name for index, (name, _, _) in enumerate(named_objects(program))}
+    group_rows = halo.tags.block(halo.scenario + 648, 52)
+    groups = [halo.tags.read('f', p + 32)[0] for p in group_rows]
+    group_names = [halo.tags.name(p, 32) for p in group_rows]
+    rows = [(names.get(row[0], ''), row) for row in device_rows(halo, output, False, model_pack_scale)]
+    return rows, program, groups, group_names
+
+
+def _frame_position(frame, frames, flags):
+    """The device position (0 to 1) whose animation frame is `frame`, as the engine's
+    deviceFrame maps it (flag 8 reverses the position)."""
+    value = frame / max(frames - 1, 1)
+    return 1 - value if flags & 8 else value
+
+
+class LightBridges:
+    """c10's light bridges: flat machine panels that slide out over a pit when their position is
+    set (bridge_a to bridge_e, extended from their control panels, or by a script: flicker_bridge
+    moves bridge_c). The engine collides with each panel's box in its current pose, so an
+    extended bridge is floor; a retracted one leaves the pit open.
+
+    The route planner walks a bridge's extended deck as floor (`add_floors`; `cells` maps each
+    deck cell, x, y and quarter-unit z, to its bridge), and
+    `entry(here, node)` prices stepping onto it from `here`: 0 for a bridge that starts extended,
+    SCRIPTED_COST (a wait) for one a script extends or whose control is within reach of `here`,
+    and None (no way on) for one whose controls are all elsewhere, such as on the far side.
+    """
+
+    def __init__(self, halo, projection, output, wait_cost, bsp):
+        rows, program, groups, group_names = _device_table(halo, output)
+        opened_by_script, opened_by_group = opened_devices(program), opened_groups(program)
+        self.projection, self.wait_cost = projection, wait_cost
+        self.bridges, self.cells = [], {}
+        controls = {}
+        for name, row in rows:
+            # A control, by its position group; the engine's use skips controls with flag 16.
+            if row[9] and not row[4] & 16:
+                controls.setdefault(row[2], []).append((name, row[-2][:3]))
+        for device, (name, row) in enumerate(rows):
+            power, position, flags, control, kind = row[1], row[2], row[4], row[9], row[10]
+            pose, panels = row[-2], row[-1]
+            if control or kind == 2 or not panels or not row[8] >> bsp & 1:
+                continue
+            # A bridge: every panel a flat slab under half a unit thick that keeps its height,
+            # and some panel slides more than a unit across.
+            if not all(frames[0][5] - frames[0][2] < .5 and abs(frames[-1][2] - frames[0][2]) < .05 for _, frames in panels):
+                continue
+            if max(max(abs(frames[-1][i] - frames[0][i]) for i in (0, 1, 3, 4)) for _, frames in panels) <= 1:
+                continue
+            # Extended: the end pose whose panels join into the fewest separate strips.
+            def strips(index):
+                boxes = [frames[index] for _, frames in panels]
+                parent = list(range(len(boxes)))
+                def find(i):
+                    while parent[i] != i:
+                        i = parent[i]
+                    return i
+                for i, a in enumerate(boxes):
+                    for j, b in enumerate(boxes[:i]):
+                        if a[0] <= b[3] + .05 and b[0] <= a[3] + .05 and a[1] <= b[4] + .05 and b[1] <= a[4] + .05:
+                            parent[find(i)] = find(j)
+                return len({find(i) for i in range(len(boxes))})
+            last = len(panels[0][1]) - 1
+            on = last if strips(last) <= strips(0) else 0
+            on_value = _frame_position(on, last + 1, flags)
+            initial = groups[position] if 0 <= position < len(groups) else (1 if flags & 1 else 0)
+            powered = groups[power] > 0 if 0 <= power < len(groups) else not flags & 2
+            label = name or f'#{device}'
+            bridge = {
+                'name': label, 'device': device, 'value': on_value,
+                'always': abs(initial - on_value) < .01 and powered,
+                'scripted': name in opened_by_script or
+                            (0 <= position < len(group_names) and group_names[position] in opened_by_group),
+                'controls': [point for _, point in controls.get(position, [])] if position >= 0 else [],
+            }
+            self.bridges.append(bridge)
+            ox, oy, oz, yaw = pose[:4]
+            cosine, sine = math.cos(yaw), math.sin(yaw)
+            quads = []
+            for _, frames in panels:
+                x1, y1, _, x2, y2, z2 = frames[on]
+                corners = [(lx*cosine - ly*sine + ox, lx*sine + ly*cosine + oy, z2 + oz)
+                           for lx, ly in ((x1, y1), (x2, y1), (x2, y2), (x1, y2))]
+                # Campaign projection reflects Y: reverse the winding, as for the structure.
+                quads.append(((0.0, 0.0, 1.0), 0, 0, -1, [projection.point(c) for c in corners[::-1]]))
+            bridge['quads'] = quads
+
+    def add_floors(self, samples, tree, size, walls=None):
+        """Adds the extended decks to `samples` ({(x, y): levels}) and remembers their cells."""
+        for index, bridge in enumerate(self.bridges):
+            for xy, levels in floor_samples(bridge['quads'], tree, size).items():
+                for z in levels:
+                    if walls is not None and walls.blocked(xy[0], xy[1], z):
+                        continue
+                    self.cells[(xy[0], xy[1], z)] = index
+                    if z not in samples.get(xy, ()):
+                        samples[xy] = sorted(samples.get(xy, []) + [z])
+
+    def control_near(self, bridge, cell):
+        """Whether a control of the bridge is within the use reach of a body standing at `cell`."""
+        p = self.projection
+        for point in bridge['controls']:
+            cx, cy, cz = p.point(point)
+            if math.hypot(cx - cell[0], cy - cell[1]) <= 1.45 * p.scale and -1.5 * p.scale < cz - cell[2] / 4 < 3 * p.scale:
+                return True
+        return False
+
+    def entry(self, here, node):
+        index = self.cells.get(tuple(node))
+        if index is None or tuple(here) in self.cells:
+            return 0
+        bridge = self.bridges[index]
+        if bridge['always']:
+            return 0
+        if bridge['scripted'] or self.control_near(bridge, here):
+            return self.wait_cost
+        return None
+
+    def at(self, cell):
+        """The bridge whose extended deck holds a route cell (a Cell, or x, y, quarter-unit z), or None."""
+        index = self.cells.get((cell[0], cell[1], cell.z if hasattr(cell, 'z') else cell[2]))
+        return None if index is None else self.bridges[index]
+
+
+def lift_ride(halo, projection, output, name, near):
+    """Where a route boards the lift `name` at the landing nearest `near` (retail point).
+
+    Returns (board, value, send, call): `board` the retail point on the deck where the body
+    stands (beside the lift's control when one is within reach of the deck, else the deck's
+    centre), `value` the lift position with the deck at that landing, `send` whether the ride
+    starts from that control (use it once standing on the deck), and `call` whether the lift
+    has to be called from the landing (no script moves it). None when there is no such lift.
+    """
+    rows, program, groups, _ = _device_table(halo, output)
+    found = next((row for row_name, row in rows if row_name == name and not row[9]), None)
+    if found is None or found[3] < 0:
+        return None
+    elevator, flags, position = found[3], found[4], found[2]
+    pose, panels = found[-2], found[-1]
+    deck = next((frames for node, frames in panels if node == elevator), None)
+    if not deck:
+        return None
+    ox, oy, oz, yaw = pose[:4]
+    ends = (0, len(deck) - 1)
+    frame = min(ends, key=lambda f: abs(oz + deck[f][5] - near[2]))
+    x1, y1, _, x2, y2, z2 = deck[frame]
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    margin = (1.1 + .3) / projection.scale
+    best = None
+    for control_name, row in rows:
+        if not row[9] or row[2] != position or position < 0:
+            continue
+        cx, cy = row[-2][0] - ox, row[-2][1] - oy
+        lx, ly = cx*cosine + cy*sine, -cx*sine + cy*cosine
+        bx = min(max(lx, x1 + margin), x2 - margin)
+        by = min(max(ly, y1 + margin), y2 - margin)
+        reach = math.hypot(bx - lx, by - ly)
+        if reach <= 1.2 and (best is None or reach < best[0]):
+            best = (reach, bx, by)
+    bx, by = (best[1], best[2]) if best else ((x1 + x2) / 2, (y1 + y2) / 2)
+    board = (bx*cosine - by*sine + ox, bx*sine + by*cosine + oy, oz + z2)
+    return board, _frame_position(frame, len(deck), flags), best is not None, name not in moved_devices(program)
 
 
 class PolygonClearance:

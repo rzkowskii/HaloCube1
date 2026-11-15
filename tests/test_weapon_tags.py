@@ -36,8 +36,9 @@ def records():
         elif key == 'trigger':
             current['triggers'].append([float(x) for x in rest.split()])
         elif key == 'projectile':
-            parts = rest.split(' ', 9)
-            current['projectiles'].append(None if rest == '-' else [float(x) for x in parts[:9]] + [parts[9]])
+            # speeds, range, gravity, guided, damage lower, upper min, upper max, category, radius, path
+            parts = rest.split(' ', 10)
+            current['projectiles'].append(None if rest == '-' else [float(x) for x in parts[:10]] + [parts[10]])
     return weapons
 
 
@@ -68,9 +69,19 @@ plasma = weapon('plasma pistol')
 assert len(plasma['triggers']) == 2 and plasma['heat'] == [0.25, 1, 0.65] and close(plasma['triggers'][0][13], 0.6)
 assert plasma['magazines'][0][0] == 0, 'plasma weapons run on a battery'
 rocket = weapon('rocket launcher')
-assert rocket['projectiles'][0][8] > 0 and rocket['projectiles'][0][6] >= 100, 'rockets deal area damage'
+assert rocket['projectiles'][0][9] > 0 and rocket['projectiles'][0][6] >= 100, 'rockets deal area damage'
 shotgun = weapon('shotgun')
 assert shotgun['triggers'][0][5] >= 10, 'shotgun fires a spread of pellets'
+
+# jpt! damage layout (tools/halo_weapons.py JPT_*): lower bound, upper bound min and max, category.
+assert rocket['projectiles'][0][5:9] == [80, 300, 330, 4], rocket['projectiles'][0]
+assert shotgun['projectiles'][0][5:9] == [8, 18, 25, 12], shotgun['projectiles'][0]
+assert weapon('plasma rifle')['projectiles'][0][5:9] == [10, 12, 14, 10], weapon('plasma rifle')['projectiles'][0]
+assert ar['projectiles'][0][5:8] == [10, 10, 10] and sniper['projectiles'][0][5:9] == [101, 101, 101, 5]
+assert ar['melee'] == [40, 50, 60] and pistol['melee'] == [40, 50, 60], (ar['melee'], pistol['melee'])
+for w in weapons:
+    for p in w['projectiles']:
+        assert p is None or p[5] <= p[6] <= p[7], (w['path'], p)
 
 players = [w for w in weapons if w['class'] in ('assault', 'pistol', 'shotgun', 'sniper', 'projectile')]
 assert len(players) == 9, [w['path'] for w in players]

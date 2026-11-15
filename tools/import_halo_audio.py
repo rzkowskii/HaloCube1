@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Decode selected Halo CE Xbox A30 combat sounds to PCM WAV for AssaultCube."""
+"""Decode Halo CE Xbox combat sounds to PCM WAV for AssaultCube.
+
+The fixed SOUNDS come from the A30 cache. Every `sound <role> <tag>` line in
+packages/halo/weapons.txt and packages/halo/equipment.txt (tools/halo_weapons.py:
+weapon fire, reload, empty, melee, ready, overheat and pickup sounds, grenade and
+equipment sounds, the interface's shield and health warnings) is decoded from the
+first campaign cache next to the given map that holds the tag, to
+packages/audio/halo/tags/<sample>.wav; source/src/halo_weapons.cpp names the
+samples the same way (halosoundsample).
+"""
 
 import argparse
 import mmap
 from pathlib import Path
 import struct
+import sys
 import wave
 
 from import_halo_a30 import HaloMap
+from halo_weapons import CAMPAIGN
 
 
 WEAPONS = r'sound\sfx\weapons'
@@ -95,27 +106,86 @@ def decode_sound(halo, tag):
     return pcm, channel_id+1, (22050, 44100)[sample_rate_id]
 
 
+def sample_name(tag_name):
+    """The engine's sample for a sound tag: 'sound\\sfx\\weapons\\needler\\fire' becomes
+    'tags/sfx-weapons-needler-fire' (halosoundsample in source/src/halo_weapons.cpp)."""
+    name = tag_name.lower()
+    if name.startswith('sound\\'):
+        name = name[len('sound\\'):]
+    return 'tags/' + ''.join('-' if c == '\\' else '_' if c == ' ' else c for c in name)
+
+
+def table_sounds(root):
+    """Sound tags named by `sound <role> <tag>` lines in the weapon and equipment tables."""
+    names = set()
+    for table in ('weapons.txt', 'equipment.txt'):
+        path = root / 'packages/halo' / table
+        if not path.exists():
+            print(f'warning: {path} is missing; run tools/halo_weapons.py first', file=sys.stderr)
+            continue
+        for line in path.read_text().splitlines():
+            key, _, rest = line.partition(' ')
+            if key == 'sound':
+                _, _, name = rest.partition(' ')
+                if name:
+                    names.add(name)
+    return names
+
+
+def write_wav(path, pcm, channels, rate):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), 'wb') as output:
+        output.setnchannels(channels)
+        output.setsampwidth(2)
+        output.setframerate(rate)
+        output.writeframes(pcm)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('map', type=Path, help='expanded Xbox Halo CE a30.map')
+    parser.add_argument('map', type=Path,
+                        help='expanded Xbox Halo CE a30.map (the other campaign caches are read from its directory), '
+                             'or that directory')
     parser.add_argument('destination', type=Path, help='root of the AssaultCube runtime or mod')
     args = parser.parse_args()
+    maps = args.map if args.map.is_dir() else args.map.parent
+    first = args.map if not args.map.is_dir() else maps / 'a30.map'
     destination = args.destination / 'packages/audio/halo'
     try:
-        with args.map.open('rb') as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        with first.open('rb') as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
             sound_tags = {tag.name: tag for tag in halo.directory if tag.group == 'snd!'}
             decoded = {name: decode_sound(halo, sound_tags[tag_name]) for name, tag_name in SOUNDS.items()}
         destination.mkdir(parents=True, exist_ok=True)
         for name, (pcm, channels, rate) in decoded.items():
-            with wave.open(str(destination / (name + '.wav')), 'wb') as output:
-                output.setnchannels(channels)
-                output.setsampwidth(2)
-                output.setframerate(rate)
-                output.writeframes(pcm)
+            write_wav(destination / (name + '.wav'), pcm, channels, rate)
             print(f'{name}: {len(pcm)/2/channels/rate:.2f}s, {rate} Hz, {channels} channel(s)')
     except (OSError, ValueError, KeyError, struct.error) as error:
         parser.exit(1, f'Import failed: {error}\n')
+
+    # Weapon, grenade, equipment and interface sounds from the tables, from whichever cache has them.
+    wanted, done = table_sounds(args.destination), set()
+    for cache in CAMPAIGN:
+        path = maps / f'{cache}.map'
+        if not wanted - done or not path.exists():
+            continue
+        with path.open('rb') as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            halo = HaloMap(data)
+            for tag in halo.directory:
+                if tag.group != 'snd!' or tag.name not in wanted or tag.name in done:
+                    continue
+                try:
+                    pcm, channels, rate = decode_sound(halo, tag)
+                except (ValueError, struct.error) as error:
+                    print(f'warning: {cache}: {error}', file=sys.stderr)
+                    continue
+                write_wav(destination / (sample_name(tag.name) + '.wav'), pcm, channels, rate)
+                done.add(tag.name)
+    missing = sorted(wanted - done)
+    for name in missing:
+        print(f'warning: no decodable {name} in the campaign caches', file=sys.stderr)
+    print(f'{len(done)} weapon, equipment and interface sounds -> {destination / "tags"}'
+          + (f' ({len(missing)} missing)' if missing else ''))
 
 
 if __name__ == '__main__':

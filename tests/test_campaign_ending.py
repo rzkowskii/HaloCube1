@@ -2,7 +2,8 @@
 
 QA client, fresh profiles, real campaign play (not previews):
 - The Maw's last section: game_won raises the ending, the campaign is marked beaten
-  in config/halo-progress.txt and the credits finish into the Halo menu.
+  in config/halo-progress.txt (with no game left to continue) and the credits finish
+  into the Halo menu.
 - The same ending arrives when the finale cue plays out on that section.
 - game_won on an earlier section is ignored; game_lost reverts the player.
 """
@@ -38,7 +39,8 @@ rows = ending_rows(text)
 assert 'Halo ending reached' in text, text[-2000:]
 assert len(rows) == 2 and 'ending=1 done=0 beaten=1' in rows[0], rows
 assert 'ending=1 done=1' in rows[1] and 'Halo credits finished' in text, rows
-assert (profile / 'config/halo-progress.txt').read_text().strip() == '1 9 7 1'
+progress = read_progress(profile)
+assert progress['furthest'] == ['9', '7'] and progress['beaten'] == ['1'] and 'game' not in progress, progress
 print('game_won on The Maw raised the ending, marked the campaign beaten and finished the credits.')
 
 # 2. The finale cue playing out on the last section ends the campaign too.
@@ -47,7 +49,8 @@ text, profile = run('finale', 'qa_campaign_play 10 8', [
     (900, 'halo_next'), (1500, 'qa_halo_ending'), (1800, 'halo_next; qa_halo_ending; quit')])
 assert 'Halo scene: cinematic_finale start' in text, text[-2000:]
 assert 'Halo ending reached' in text, text[-2000:]
-assert (profile / 'config/halo-progress.txt').read_text().strip() == '1 9 7 1'
+progress = read_progress(profile)
+assert progress['furthest'] == ['9', '7'] and progress['beaten'] == ['1'], progress
 rows = ending_rows(text)
 assert 'ending=0' in rows[0] and 'cinematic=1' in rows[0], rows
 assert 'ending=1 done=0 beaten=1' in rows[1] and 'ending=1 done=1' in rows[2], rows
@@ -60,5 +63,7 @@ text, profile = run('early', 'qa_campaign_play 1 1', [
 rows = ending_rows(text)
 assert 'game_won ignored' in text and 'ending=0' in rows[0], rows
 assert 'Halo game over' in text and 'alive=0' in rows[1], rows
-assert not (profile / 'config/halo-progress.txt').exists(), 'early game_won must not mark the campaign beaten'
+# The section start saves the game (progress file version 2), but never as beaten.
+progress = read_progress(profile)
+assert progress is None or progress['beaten'] == ['0'], 'early game_won must not mark the campaign beaten'
 print('game_won is ignored mid-campaign and game_lost kills the player for a revert.')

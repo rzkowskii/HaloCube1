@@ -776,6 +776,30 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
         return;
     }
 
+    if(halotitleactive())
+    {
+        // The Halo title screen (halo_title): the title menu over a plain backdrop, with the console.
+        glEnable(GL_TEXTURE_2D);
+        halodrawtitle();
+        if(menuvisible()) rendermenu();
+        glLoadIdentity();
+        glOrtho(0, VIRTW*2, VIRTH*2, 0, -1, 1);
+        if(!hideconsole) renderconsole();
+        // The command line being typed, as the normal HUD pass draws it (VIRTW x VIRTH frame).
+        if(getcurcommand(NULL))
+        {
+            glLoadIdentity();
+            glOrtho(0, VIRTW, VIRTH, 0, -1, 1);
+            glEnable(GL_BLEND);
+            rendercommand(HUDPOS_X_BOTTOMLEFT, HUDPOS_Y_BOTTOMLEFT, VIRTW - FONTH);
+        }
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_DEPTH_TEST);
+        glMatrixMode(GL_MODELVIEW);
+        return;
+    }
+
     if(underwater)
     {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);

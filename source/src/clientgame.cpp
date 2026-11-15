@@ -3,6 +3,7 @@
 #include "cube.h"
 #include "halo.h"
 #include "halo_script.h"
+#include "halo_vehicle.h"
 #include "bot/bot.h"
 
 int nextmode = 0;   // nextmode becomes gamemode after next map load
@@ -520,6 +521,13 @@ void zapplayer(playerent *&d)
 void movelocalplayer()
 {
     if(halocinematic() || (ispaused && player1->state == CS_ALIVE)) return;
+    if(halodriving())
+    {
+        // In a vehicle seat (halo_vehicle.cpp) the vehicle moves and the player rides in it.
+        if(!intermission) halovehicledrive(curtime);
+        player1->strafe = player1->k_left - player1->k_right;
+        return;
+    }
     if(!player1->allowmove())
     {
         if(lastmillis-player1->lastpain<2000)
@@ -530,16 +538,7 @@ void movelocalplayer()
     }
     else if(!intermission)
     {
-        if(halodriving())
-        {
-            player1->yaw = fmodf(player1->yaw - player1->strafe * curtime * 0.1f + 360.0f, 360.0f);
-            player1->strafe = 0;
-            player1->jumpnext = false;
-            player1->trycrouch = false;
-            moveplayer(player1, 10, true);
-            player1->strafe = player1->k_left - player1->k_right;
-        }
-        else moveplayer(player1, 10, true);
+        moveplayer(player1, 10, true);
         checkitems(player1);
     }
 }

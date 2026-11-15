@@ -53,6 +53,7 @@ set(CLIENT_SOURCES
     halo_collision.cpp
     halo_counter.cpp
     halo_script.cpp
+    halo_vehicle.cpp
     halo_ai.cpp
     halo_hud.cpp
     halo_weapons.cpp

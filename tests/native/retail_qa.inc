@@ -28,6 +28,25 @@ namespace
     vector<vec> qaRetailDetour;   // feet points through the gap of a part-open door
     int qaRetailDetourStart = 0, qaRetailWaitAt = -1;
 
+    // Lifts and light bridges (route flags 16, 32, 64 and 128, with the device's name and position
+    // in a fifth column, name@position; tools/import_halo_campaign.py LIFT_RIDES and LightBridges).
+    // At a lift's deck row the walker stops on the landing until the deck is there (calling it
+    // with the control in reach if no script brings it, flag 32), walks onto the deck, uses the
+    // control beside it if the deck has one (flag 64) and rides: to the end of the section, or,
+    // when more rows follow (b40's c1 tower), until the lift stops and the next row (flag 4) is
+    // walked. Before the first row of a light bridge the walker stops two rows short until the
+    // bridge is extended, using its control there first if the row has flag 32.
+    vector<int> qaRetailFlags;
+    std::vector<std::string> qaRetailDevice;
+    vector<float> qaRetailValue;
+    enum { RIDE_NONE, RIDE_WAIT, RIDE_BOARD, RIDE_ON };
+    int qaRide = RIDE_NONE, qaRideStep = -1, qaRideSince = 0, qaRideUses = 0, qaRideUsed = 0, qaRideStill = 0;
+    float qaRideLast = -1;
+    int qaBridgeStep = -1, qaBridgeCleared = -1, qaBridgeSince = 0, qaBridgeUses = 0, qaBridgeUsed = 0;
+    int qaRetailRecoveries = 0;
+    vec qaRetailLastFeet;
+    bool qaRetailHaveFeet = false;
+
     // Movement feel. Once per section the walk stops at the first long straight, flat stretch
     // of the route and runs it twice from a standstill with a fixed heading: on the retail
     // collision, then on the stock AssaultCube geometry of the same map. Each run reports the
@@ -63,6 +82,7 @@ namespace
         if(qaWalkStretches) conoutf("RETAIL_QA walk-speed-min %.2f over %d stretches", qaWalkSpeedMin, qaWalkStretches);
         if(qaRetailCrouched) conoutf("RETAIL_QA crouched %d times", qaRetailCrouched);
         if(qaRetailJumps) conoutf("RETAIL_QA jumped %d times", qaRetailJumps);
+        if(qaRetailRecoveries) conoutf("RETAIL_QA recoveries %d", qaRetailRecoveries);
         player1->trycrouch = false;
         player1->strafe = 0;
         conoutf("RETAIL_QA %s map=%s waypoint=%d/%d feet=%.2f,%.2f,%.2f stage=%d alive=%d",
@@ -96,12 +116,15 @@ namespace
         {
             const entity &e = ents[i];
             if(e.type != PLAYERSTART && !isitem(e.type)) continue;
+            // Vehicle placements (102) stand at their retail point, which may hover (Banshees,
+            // Ghosts) or sit on a slope; the engine settles them itself (halo_vehicle.cpp).
+            if(e.type == PLAYERSTART && e.attr2 == 102) continue;
             // Markers, spawns and items are authored at floor height. Spawns (the player's and
             // the enemy waves') need room for a body; route markers (100), weapon placements
-            // (101) and items only need floor under a point.
+            // (101), equipment placements (103) and items only need floor under a point.
             const vec feet(e.x, e.y, e.z);
             HaloCollisionHit hit;
-            const bool body = e.type == PLAYERSTART && e.attr2 != 100 && e.attr2 != 101;
+            const bool body = e.type == PLAYERSTART && e.attr2 != 100 && e.attr2 != 101 && e.attr2 != 103;
             const float radius = body ? player1->radius : .35f;
             ++checked;
             if(!halocollisionsweep(vec(feet).add(vec(0, 0, 1.26f)), vec(0, 0, -4.26f), radius,
@@ -169,6 +192,7 @@ namespace
         player1->yaw = qaTrialYaw;
         player1->pitch = 0;
         player1->resetinterp();
+        haloplayermoved("QA teleport");
         forward(false);
         jumpn(false);
         player1->trycrouch = false;
@@ -228,9 +252,11 @@ namespace
         player1->o = vec(feet.x, feet.y, feet.z + player1->eyeheight + .05f);
         player1->vel = vec();
         player1->resetinterp();
+        haloplayermoved("QA teleport");
         qaRetailNext = resume;
         qaRetailClosest = 1e9f;
         qaRetailProgress = lastmillis;
+        qaRetailHaveFeet = false;
         qaTrialPhase = TRIAL_DONE;
     }
 
@@ -374,25 +400,212 @@ namespace
         qaRetailRoute.setsize(0);
         qaRetailCrouch.setsize(0);
         qaRetailJump.setsize(0);
+        qaRetailFlags.setsize(0);
+        qaRetailValue.setsize(0);
+        qaRetailDevice.clear();
         std::ifstream input(file);
         std::string line;
         while(std::getline(input, line))
         {
-            // x y z [flags]: 1 crouch, 2 jump
+            // x y z [flags [device@position]]: 1 crouch, 2 jump, 16 lift deck, 128 light bridge
             vec point;
             int flags = 0;
-            const int fields = sscanf(line.c_str(), "%f %f %f %d", &point.x, &point.y, &point.z, &flags);
+            char device[96] = "";
+            const int fields = sscanf(line.c_str(), "%f %f %f %d %95s", &point.x, &point.y, &point.z, &flags, device);
             if(fields < 3)
             {
                 if(line.find_first_not_of(" \t\r") != std::string::npos) return false;
                 continue;
             }
             if(fields < 4) flags = 0;
+            float value = 0;
+            if(char *at = strrchr(device, '@')) { value = float(atof(at + 1)); *at = 0; }
+            if((flags & (16 | 128)) && !*device) return false;
             qaRetailRoute.add(point);
             qaRetailCrouch.add((flags & 1) != 0);
             qaRetailJump.add((flags & 2) != 0);
+            qaRetailFlags.add(flags);
+            qaRetailDevice.push_back(device);
+            qaRetailValue.add(value);
         }
         return !qaRetailRoute.empty();
+    }
+
+    float qaDevicePosition(const std::string &name)
+    {
+        const int id = haloscenarioobject(name.c_str());
+        return id < 0 ? -1.0f : float(haloscenariocall("device_get_position", id, 0));
+    }
+
+    float qaRetailHeading(const vec &to) { return fmodf(atan2f(to.y, to.x) / RAD + 90.0f + 360.0f, 360.0f); }
+
+    void qaRetailHold()
+    {
+        forward(false);
+        jumpn(false);
+        player1->strafe = 0;
+        player1->trycrouch = false;
+        qaRetailProgress = lastmillis;
+    }
+
+    // The first route row from the follower's waypoint on that it must not count as reached by
+    // walking near it: a lift deck, or the first row of a light bridge that is not yet extended.
+    int qaRetailHoldRow()
+    {
+        for(int i = qaRetailNext; i < qaRetailRoute.length() && i <= qaRetailNext + 10; ++i)
+        {
+            if(qaRetailFlags[i] & 16) return i;
+            if((qaRetailFlags[i] & 128) && (!i || !(qaRetailFlags[i - 1] & 128)) && i != qaBridgeCleared) return i;
+        }
+        return INT_MAX;
+    }
+
+    // One tick of a lift ride; false when the follower walks on as usual.
+    bool qaRetailRide(const vec &feet)
+    {
+        const int n = qaRetailRoute.length();
+        if(qaRide == RIDE_NONE)
+        {
+            int board = -1;
+            for(int i = qaRetailNext; i < n && i <= qaRetailNext + 8 && board < 0; ++i) if(qaRetailFlags[i] & 16) board = i;
+            if(board < 0) return false;
+            // Wait on the landing: the row before the deck.
+            if(board != qaRetailNext && vec(qaRetailRoute[max(board - 1, 0)]).sub(feet).magnitudexy() > 1.5f) return false;
+            qaRide = RIDE_WAIT;
+            qaRideStep = board;
+            qaRideSince = qaRideStill = lastmillis;
+            qaRideUses = qaRideUsed = 0;
+            qaRideLast = qaDevicePosition(qaRetailDevice[board]);
+            conoutf("RETAIL_QA ride waiting for %s at waypoint %d: position %.2f, boards at %.2f", qaRetailDevice[board].c_str(),
+                    board, qaRideLast, qaRetailValue[board]);
+        }
+        const int board = qaRideStep;
+        const char *lift = qaRetailDevice[board].c_str();
+        const float position = qaDevicePosition(qaRetailDevice[board]), target = qaRetailValue[board];
+        if(fabsf(position - qaRideLast) > .001f) { qaRideLast = position; qaRideStill = lastmillis; }
+        const bool still = lastmillis - qaRideStill > 500, there = fabsf(position - target) < .01f;
+        auto use = [&](const char *why)
+        {
+            execute("halo_use");
+            ++qaRideUses;
+            qaRideUsed = lastmillis;
+            conoutf("RETAIL_QA ride uses the control to %s %s (position %.2f)", why, lift, position);
+        };
+        if(qaRide == RIDE_WAIT)
+        {
+            qaRetailHold();
+            if(there && still)
+            {
+                qaRide = RIDE_BOARD;
+                qaRideSince = lastmillis;
+                conoutf("RETAIL_QA ride boarding %s", lift);
+            }
+            // Call it from the landing (flag 32) once it has stood still somewhere else for 3 s.
+            else if((qaRetailFlags[board] & 32) && still && lastmillis - qaRideStill > 3000 && qaRideUses < 3 &&
+                    (!qaRideUsed || lastmillis - qaRideUsed > 15000)) use("call");
+            if(lastmillis - qaRideSince > qaRetailWaitLimit) qaRetailStop("FAIL ride-never-arrived");
+            return true;
+        }
+        if(qaRide == RIDE_BOARD)
+        {
+            const vec to = vec(qaRetailRoute[board]).sub(feet);
+            qaRetailProgress = lastmillis;
+            player1->strafe = 0;
+            jumpn(false);
+            if(to.magnitudexy() > .5f)
+            {
+                player1->yaw = qaRetailHeading(to);
+                player1->pitch = 0;
+                forward(true);
+                if(lastmillis - qaRideSince > 10000) qaRetailStop("FAIL ride-could-not-board");
+                return true;
+            }
+            forward(false);
+            qaRide = RIDE_ON;
+            qaRideSince = qaRideStill = lastmillis;
+            conoutf("RETAIL_QA ride on %s at %.2f,%.2f,%.2f", lift, feet.x, feet.y, feet.z);
+            return true;
+        }
+        // On the deck. A lift with a control on its deck (flag 64) leaves once that is used.
+        qaRetailHold();
+        if((qaRetailFlags[board] & 64) && there && lastmillis - qaRideSince > 1000 && qaRideUses < 4 &&
+           (!qaRideUsed || lastmillis - qaRideUsed > 8000)) use("send");
+        if(board + 1 < n && !there && still)
+        {
+            // It stopped at the other end: walk on from the step after the ride (flag 4).
+            conoutf("RETAIL_QA ride done: %s at %.2f, feet %.2f,%.2f,%.2f", lift, position, feet.x, feet.y, feet.z);
+            qaRetailNext = board + 1;
+            qaRide = RIDE_NONE;
+            qaRideStep = -1;
+            qaRetailClosest = 1e9f;
+            return false;
+        }
+        if(lastmillis - qaRideSince > 90000) qaRetailStop("FAIL ride-timeout");
+        return true;
+    }
+
+    // Waiting for a light bridge to extend; false when the follower walks on as usual.
+    bool qaRetailBridge(const vec &feet)
+    {
+        int entry = -1;
+        for(int i = qaRetailNext; i < qaRetailRoute.length() && i <= qaRetailNext + 6 && entry < 0; ++i)
+            if((qaRetailFlags[i] & 128) && (!i || !(qaRetailFlags[i - 1] & 128))) entry = i;
+        if(entry < 0 || entry == qaBridgeCleared) return false;
+        const char *bridge = qaRetailDevice[entry].c_str();
+        const float position = qaDevicePosition(qaRetailDevice[entry]), target = qaRetailValue[entry];
+        if(target > .5f ? position >= target - .02f : position <= target + .02f)
+        {
+            if(qaBridgeStep == entry) conoutf("RETAIL_QA bridge %s extended after %d ms", bridge, lastmillis - qaBridgeSince);
+            qaBridgeStep = -1;
+            qaBridgeCleared = entry;
+            return false;
+        }
+        // Not extended: stop two rows short of it, stepping back there after any overshoot.
+        if(qaRetailNext < entry - 3 && entry > 3) return false;
+        if(qaBridgeStep != entry)
+        {
+            qaBridgeStep = entry;
+            qaBridgeSince = lastmillis;
+            qaBridgeUses = qaBridgeUsed = 0;
+            conoutf("RETAIL_QA bridge waiting for %s at waypoint %d: position %.2f, extended at %.2f", bridge, entry, position, target);
+        }
+        const vec back = vec(qaRetailRoute[max(entry - 2, 0)]).sub(feet);
+        qaRetailHold();
+        if(back.magnitudexy() > .6f)
+        {
+            player1->yaw = qaRetailHeading(back);
+            forward(true);
+        }
+        else if((qaRetailFlags[entry] & 32) && qaBridgeUses < 3 && (!qaBridgeUsed || lastmillis - qaBridgeUsed > 6000))
+        {
+            // The control is beside the bridge's end, in reach of the rows before it.
+            execute("halo_use");
+            ++qaBridgeUses;
+            qaBridgeUsed = lastmillis;
+            conoutf("RETAIL_QA bridge uses the control of %s", bridge);
+        }
+        if(lastmillis - qaBridgeSince > qaRetailWaitLimit) qaRetailStop("FAIL bridge-never-extended");
+        return true;
+    }
+
+    // The engine put the player back after a fall or a wedge (Halo recovery): carry on from the
+    // route row nearest to where they now stand, and wait for a bridge again if one is ahead.
+    void qaRetailResync(const vec &feet)
+    {
+        int best = qaRetailNext;
+        float distance = 1e9f;
+        for(int i = max(qaRetailNext - 400, 0); i <= qaRetailNext && i < qaRetailRoute.length(); ++i)
+        {
+            const float d = vec(qaRetailRoute[i]).sub(feet).magnitude();
+            if(d < distance) { distance = d; best = i; }
+        }
+        ++qaRetailRecoveries;
+        conoutf("RETAIL_QA recovered to %.2f,%.2f,%.2f: waypoint %d -> %d", feet.x, feet.y, feet.z, qaRetailNext, best);
+        qaRetailNext = best;
+        qaBridgeCleared = qaBridgeStep = -1;
+        qaRide = RIDE_NONE;
+        qaRetailClosest = 1e9f;
+        qaRetailProgress = lastmillis;
     }
 
     // Starts the next chained section: the player arrived there through the transition, with
@@ -411,6 +624,10 @@ namespace
         qaRetailDetour.setsize(0);
         qaRetailClosest = 1e9f;
         qaRetailStarted = lastmillis;
+        qaRide = RIDE_NONE;
+        qaRideStep = qaBridgeStep = qaBridgeCleared = -1;
+        qaRetailRecoveries = 0;
+        qaRetailHaveFeet = false;
         qaTrialPhase = TRIAL_NONE;
         qaWalkStretchFrom = -1;
         qaWalkSpeedMin = 1e9f;
@@ -527,6 +744,11 @@ namespace
             return;
         }
         const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        // A jump of more than 6 units in one tick is the engine's fall or wedge recovery.
+        if(qaRetailHaveFeet && feet.dist(qaRetailLastFeet) > 6.0f && qaRide != RIDE_ON) qaRetailResync(feet);
+        qaRetailLastFeet = feet;
+        qaRetailHaveFeet = true;
+        if(qaRetailRide(feet) || qaRetailBridge(feet)) return;
         if(!qaRetailDetour.empty() || qaRetailRetreat >= 0) player1->strafe = 0;
         if(!qaRetailDetour.empty())
         {
@@ -573,10 +795,12 @@ namespace
         }
         qaWalkStretch(feet);
         // A waypoint counts once the player is within reach of it or of any of the next few,
-        // so cutting a corner is not mistaken for missing it.
+        // so cutting a corner is not mistaken for missing it. A lift deck or a bridge still to
+        // extend is reached only through qaRetailRide and qaRetailBridge.
+        const int hold = qaRetailHoldRow();
         for(int ahead = 6; ahead >= 0; --ahead)
         {
-            if(qaRetailNext + ahead >= qaRetailRoute.length()) continue;
+            if(qaRetailNext + ahead >= qaRetailRoute.length() || qaRetailNext + ahead >= hold) continue;
             const vec offset = vec(qaRetailRoute[qaRetailNext + ahead]).sub(feet);
             if(offset.magnitudexy() <= 1.2f && fabsf(offset.z) < 2.0f)
             {
@@ -756,4 +980,43 @@ COMMANDF(qa_retail_overlap, "fff", (float *x, float *y, float *z)
     conoutf("RETAIL_QA overlap %.2f,%.2f,%.2f = %d surface=%d depth=%.3f normal=%.2f,%.2f,%.2f", *x, *y, *z, overlap, hit.surface,
             hit.penetration, hit.normal.x, hit.normal.y, hit.normal.z);
     fflush(stdout);
+});
+// qa_retail_where: the player's feet and state, for tests/test_retail_recovery.py.
+COMMANDF(qa_retail_where, "", ()
+{
+    const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+    conoutf("RETAIL_QA where map=%s collision=%d feet=%.2f,%.2f,%.2f onfloor=%d alive=%d", getclientmap(), halocollisionactive(),
+            feet.x, feet.y, feet.z, player1->onfloor, player1->state == CS_ALIVE);
+    fflush(stdout);
+});
+// qa_halo_moved: what every teleport does to the recovery (halo.cpp haloplayermoved), without
+// moving: the safe floors go and the wedge check waits a second (tests/test_retail_recovery.py).
+COMMANDF(qa_halo_moved, "", () { haloplayermoved("QA teleport"); });
+// qa_retail_recover fall|void|wedge puts the player where the engine's retail-collision recovery
+// (halo.cpp updateRecovery) has to take over: 20 units below the section's mesh, in the open air
+// 16 units beyond the mesh's east edge with nothing below, or with the feet sunk 0.6 units into
+// the floor they stand on. It stands in for a fall or a wedge, not a teleport, so unlike the other
+// QA moves it does not call haloplayermoved: the safe floors stay and the wedge check starts at once.
+COMMANDF(qa_retail_recover, "s", (const char *kind)
+{
+    vec low;
+    vec high;
+    if(!halocollisionbounds(low, high) || player1->state != CS_ALIVE)
+    {
+        conoutf("RETAIL_QA recover-unavailable %s", kind);
+        fflush(stdout);
+        return;
+    }
+    const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+    vec to = feet;
+    if(!strcmp(kind, "fall")) to.z = low.z - 20;
+    else if(!strcmp(kind, "void")) to.x = high.x + 16;
+    else if(!strcmp(kind, "wedge")) to.z -= .6f;
+    else { conoutf("RETAIL_QA recover-unknown %s", kind); fflush(stdout); return; }
+    conoutf("RETAIL_QA recover-from %s feet=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f", kind, feet.x, feet.y, feet.z, to.x, to.y, to.z);
+    fflush(stdout);
+    player1->o = vec(to).add(vec(0, 0, player1->eyeheight));
+    player1->vel = vec();
+    player1->onfloor = false;
+    player1->resetinterp();
 });

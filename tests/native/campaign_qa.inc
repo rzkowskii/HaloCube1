@@ -22,6 +22,7 @@ COMMANDF(qa_halo_position, "fff", (float *x, float *y, float *yaw)
     player1->vel = vec();
     entinmap(player1);
     player1->resetinterp();
+    haloplayermoved("QA teleport");
 });
 COMMANDF(qa_halo_damage, "i", (int *amount) { dodamage(*amount, player1, player1, GUN_ASSAULT); });
 COMMANDF(qa_halo_revert, "", () { tryrespawn(); });
@@ -63,6 +64,7 @@ static void qaPlaceFeet(const vec &feet)
     player1->o = vec(feet.x, feet.y, feet.z + player1->eyeheight);
     player1->vel = vec();
     player1->resetinterp();
+    haloplayermoved("QA teleport");
 }
 
 // Runs a command once the queued section is in live gameplay, skipping any
@@ -122,6 +124,7 @@ COMMANDF(qa_campaign_advance, "", ()
     player1->o = target;
     entinmap(player1);
     player1->resetinterp();
+    haloplayermoved("QA teleport");
 });
 
 // Steps through the current stage's route markers, one per poll, until the
@@ -193,6 +196,7 @@ COMMANDF(qa_campaign_full, "", ()
             const vec transition = qaLibraryExit(section);
             player1->o = transition;
             player1->resetinterp();
+            haloplayermoved("QA teleport");
             addsleep(50, "qa_campaign_full", true);
             return;
         }
@@ -220,6 +224,7 @@ COMMANDF(qa_campaign_full, "", ()
                 player1->o.z += .45f * player1->eyeheight;
                 player1->vel = vec();
                 player1->resetinterp();
+                haloplayermoved("QA teleport");
             }
             else if(halopelicanready())
             {
@@ -235,6 +240,7 @@ COMMANDF(qa_campaign_full, "", ()
             if(halocollisionactive()) player1->o.z += player1->eyeheight;
             entinmap(player1);
             player1->resetinterp();
+            haloplayermoved("QA teleport");
             if(stage == EXTRACTION && sectionInteraction()) execute("halo_use");
         }
     }
@@ -243,7 +249,7 @@ COMMANDF(qa_campaign_full, "", ()
 
 COMMANDF(qa_timeout, "", ()
 {
-    if(haloactive() && driving) escapeDeadline = lastmillis;
+    if(haloactive() && escaping) escapeDeadline = lastmillis;
 });
 COMMANDF(qa_maw_route, "", ()
 {
@@ -262,12 +268,14 @@ COMMANDF(qa_halo_warp, "fff", (float *x, float *y, float *z)
     player1->o = vec(*x, *y, *z);
     player1->vel = vec();
     player1->resetinterp();
+    haloplayermoved("QA teleport");
 });
 COMMANDF(qa_halo_feet, "fff", (float *x, float *y, float *z)
 {
     player1->o = vec(*x, *y, *z + player1->eyeheight);
     player1->vel = vec();
     player1->resetinterp();
+    haloplayermoved("QA teleport");
 });
 COMMANDF(qa_halo_block, "fff", (float *x, float *y, float *z)
 {
@@ -307,7 +315,7 @@ COMMANDF(qa_weapon_table, "", ()
         conoutf("WEAPON_TABLE %d %s %d %d %d %d %.3f %.3f %.3f %d", i, d->label.c_str(), int(d->kind),
                 m ? m->loaded : 0, m ? m->maximum : 0, int(d->triggers.size()),
                 t ? t->rate : 0.0f, t && t->projectile.valid ? t->projectile.speed : 0.0f,
-                t && t->projectile.valid ? t->projectile.damageUpper : 0.0f, d->zoomLevels);
+                t && t->projectile.valid ? t->projectile.damage.upperMax : 0.0f, d->zoomLevels);
     }
     fflush(stdout);
 });
@@ -375,6 +383,7 @@ COMMANDF(qa_weapon_goto_ground, "", ()
     player1->o = vec(groundWeapons[found].o).add(vec(0, 0, player1->eyeheight));
     player1->vel = vec();
     player1->resetinterp();
+    haloplayermoved("QA teleport");
 });
 COMMANDF(qa_weapon_switch, "", () { haloswitchweapon(); });
 COMMANDF(qa_weapon_zoom, "", () { halozoomstep(); });

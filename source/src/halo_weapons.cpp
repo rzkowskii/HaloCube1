@@ -6,7 +6,7 @@
 
 namespace
 {
-    constexpr int formatVersion = 1;
+    constexpr int formatVersion = 2;        // tools/halo_weapons.py FORMAT
     std::vector<HaloWeaponDef> definitions;
     bool attempted = false, loaded = false;
 
@@ -30,14 +30,19 @@ namespace
         return name;
     }
 
+    bool parseDamage(std::istringstream &in, HaloDamage &d)
+    {
+        return bool(in >> d.lower >> d.upperMin >> d.upperMax) && d.upperMax >= d.upperMin;
+    }
+
     bool parseProjectile(std::istringstream &in, HaloProjectileDef &p)
     {
         std::string first;
         in >> first;
         if(first == "-") return true;
         p.speed = float(atof(first.c_str()));
-        if(!(in >> p.finalSpeed >> p.range >> p.gravity >> p.guided >> p.damageLower >> p.damageUpper
-                >> p.category >> p.radius)) return false;
+        if(!(in >> p.finalSpeed >> p.range >> p.gravity >> p.guided) || !parseDamage(in, p.damage)
+           || !(in >> p.category >> p.radius)) return false;
         std::getline(in >> std::ws, p.path);
         p.valid = true;
         return true;
@@ -58,7 +63,13 @@ namespace
             std::string key;
             in >> key;
             bool ok = true;
-            if(key == "format") { int version = 0; in >> version; versioned = version == formatVersion; ok = versioned; }
+            if(key == "format")
+            {
+                int version = 0;
+                in >> version;
+                ok = versioned = version == formatVersion;
+                if(!ok) conoutf("\f3Halo weapons: packages/halo/weapons.txt is format %d, the game reads format %d; re-run tools/halo_weapons.py", version, formatVersion);
+            }
             else if(key == "weapon")
             {
                 definitions.emplace_back();
@@ -75,7 +86,7 @@ namespace
             else if(key == "heat") ok = bool(in >> weapon->heatRecover >> weapon->heatOverheat >> weapon->heatLoss);
             else if(key == "zoom") ok = bool(in >> weapon->zoomLevels >> weapon->zoomMin >> weapon->zoomMax);
             else if(key == "aim") ok = bool(in >> weapon->autoaimAngle >> weapon->autoaimRange >> weapon->magnetismAngle >> weapon->magnetismRange);
-            else if(key == "melee") ok = bool(in >> weapon->meleeLower >> weapon->meleeUpper);
+            else if(key == "melee") ok = parseDamage(in, weapon->melee);
             else if(key == "magazine")
             {
                 HaloMagazineDef m;
@@ -94,6 +105,14 @@ namespace
             {
                 ok = !weapon->triggers.empty() && parseProjectile(in, weapon->triggers.back().projectile);
             }
+            else if(key == "sound")
+            {
+                // Unknown roles are skipped, so a newer table still loads.
+                std::string role, tag;
+                in >> role;
+                std::getline(in >> std::ws, tag);
+                weapon->sounds.parse(role, tag);
+            }
             else if(key == "end") weapon = nullptr;
             if(!ok)
             {
@@ -102,8 +121,35 @@ namespace
                 return false;
             }
         }
+        // A table without a format line is refused too, and must not leave definitions behind.
+        if(!versioned) definitions.clear();
         return versioned && !definitions.empty();
     }
+}
+
+float HaloDamage::roll() const
+{
+    return upperMin + rndscale(upperMax - upperMin);
+}
+
+std::string halosoundsample(const std::string &tag)
+{
+    std::string name = tag;
+    for(char &c : name) c = char(tolower(c));
+    if(!name.compare(0, 6, "sound\\")) name.erase(0, 6);
+    for(char &c : name) c = c == '\\' ? '-' : c == ' ' ? '_' : c;
+    return "tags/" + name;
+}
+
+bool HaloSounds::parse(const std::string &role, const std::string &tag)
+{
+    static const char *const roles[HALO_SOUND_ROLES] = {
+        "fire", "charged", "empty", "cycle", "reload", "reload-empty", "melee", "ready", "overheat", "pickup",
+        "throw", "explode", "armed",
+    };
+    if(tag.empty()) return false;
+    loopi(HALO_SOUND_ROLES) if(role == roles[i]) { samples[i] = halosoundsample(tag); return true; }
+    return false;
 }
 
 int HaloWeaponDef::acgun() const
@@ -223,4 +269,146 @@ const HaloWeaponDef *haloweaponforgun(int gun)
         case GUN_SUBGUN: return haloweaponfind("weapons\\plasma rifle\\plasma rifle");
         default: return nullptr;
     }
+}
+
+namespace
+{
+    constexpr int equipmentFormat = 2;      // tools/halo_weapons.py EQUIPMENT_FORMAT
+    std::vector<HaloGrenadeDef> grenadeDefs;
+    std::vector<HaloEquipmentDef> equipmentDefs;
+    HaloSounds interfaceSounds;
+    bool equipmentAttempted = false, equipmentLoaded = false;
+
+    bool parseEquipment(const char *text)
+    {
+        std::istringstream lines(text);
+        std::string line;
+        HaloGrenadeDef *grenade = nullptr;
+        HaloEquipmentDef *item = nullptr;
+        bool versioned = false;
+        int number = 0;
+        while(std::getline(lines, line))
+        {
+            ++number;
+            if(line.empty() || line[0] == '#') continue;
+            std::istringstream in(line);
+            std::string key;
+            in >> key;
+            bool ok = true;
+            if(key == "format")
+            {
+                int version = 0;
+                in >> version;
+                ok = versioned = version == equipmentFormat;
+                if(!ok) conoutf("\f3Halo equipment: packages/halo/equipment.txt is format %d, the game reads format %d; re-run tools/halo_weapons.py", version, equipmentFormat);
+            }
+            else if(key == "grenade" && !item)
+            {
+                grenadeDefs.emplace_back();
+                grenade = &grenadeDefs.back();
+                int sticks = 0;
+                ok = bool(in >> grenade->type >> grenade->maximum >> sticks >> grenade->timerStarts >> grenade->arming
+                          >> grenade->fuse >> grenade->flags) && grenade->type == int(grenadeDefs.size()) - 1;
+                grenade->sticks = sticks != 0;
+            }
+            else if(key == "equipment" && !grenade && !item)
+            {
+                equipmentDefs.emplace_back();
+                item = &equipmentDefs.back();
+                ok = bool(in >> item->index) && item->index == int(equipmentDefs.size()) - 1;
+            }
+            else if(key == "end") grenade = nullptr, item = nullptr;
+            else if(key == "sound")
+            {
+                std::string role, tag;
+                in >> role;
+                std::getline(in >> std::ws, tag);
+                if(grenade) grenade->sounds.parse(role, tag);
+                else if(item) item->sounds.parse(role, tag);
+                else if(role == "shield-low") interfaceSounds.samples[0] = halosoundsample(tag);
+                else if(role == "health-low") interfaceSounds.samples[1] = halosoundsample(tag);
+            }
+            else if(grenade)
+            {
+                if(key == "blast") ok = bool(in >> grenade->innerRadius >> grenade->outerRadius) && parseDamage(in, grenade->blast)
+                                        && bool(in >> grenade->sideEffect >> grenade->category);
+                else if(key == "attached") ok = parseDamage(in, grenade->attached);
+                else if(key == "path") std::getline(in >> std::ws, grenade->path);
+                else if(key == "equipment") std::getline(in >> std::ws, grenade->equipment);
+            }
+            else if(item)
+            {
+                if(key == "path") { std::getline(in >> std::ws, item->path); item->name = displayName(item->path); }
+                else if(key == "kind") ok = bool(in >> item->powerup >> item->grenade >> item->powerupTime);
+                else if(key == "worldmodel") in >> item->worldmodel;
+                else if(key == "ammo") { HaloEquipmentAmmo a; ok = bool(in >> a.weapon >> a.rounds); if(ok) item->ammo.push_back(a); }
+            }
+            else ok = false;
+            if(!ok)
+            {
+                conoutf("\f3Halo equipment: invalid line %d in packages/halo/equipment.txt", number);
+                grenadeDefs.clear();
+                equipmentDefs.clear();
+                return false;
+            }
+        }
+        if(!versioned) { grenadeDefs.clear(); equipmentDefs.clear(); }
+        return versioned && !grenadeDefs.empty();
+    }
+}
+
+bool haloequipmentload()
+{
+    if(equipmentAttempted) return equipmentLoaded;
+    equipmentAttempted = true;
+    int size = 0;
+    char *text = loadfile(path("packages/halo/equipment.txt", true), &size);
+    if(!text)
+    {
+        // Without the table the frag grenade keeps AssaultCube's grenade and there is no plasma grenade.
+        conoutf("\f3Halo equipment: packages/halo/equipment.txt is missing; run tools/halo_weapons.py");
+        return false;
+    }
+    equipmentLoaded = parseEquipment(text);
+    delete[] text;
+    if(equipmentLoaded) conoutf("Halo equipment: %d grenade types, %d equipment definitions", int(grenadeDefs.size()), int(equipmentDefs.size()));
+    return equipmentLoaded;
+}
+
+const HaloGrenadeDef *halogrenadedef(int type)
+{
+    haloequipmentload();
+    return type >= 0 && type < int(grenadeDefs.size()) ? &grenadeDefs[type] : nullptr;
+}
+
+int haloequipmentcount() { haloequipmentload(); return int(equipmentDefs.size()); }
+
+const HaloEquipmentDef *haloequipment(int index)
+{
+    haloequipmentload();
+    return index >= 0 && index < int(equipmentDefs.size()) ? &equipmentDefs[index] : nullptr;
+}
+
+const HaloEquipmentDef *haloequipmentfind(const char *path)
+{
+    haloequipmentload();
+    for(const HaloEquipmentDef &d : equipmentDefs) if(d.path == path) return &d;
+    return nullptr;
+}
+
+const HaloEquipmentDef *halogrenadeequipment(int type)
+{
+    const HaloGrenadeDef *g = halogrenadedef(type);
+    if(!g) return nullptr;
+    if(const HaloEquipmentDef *d = haloequipmentfind(g->equipment.c_str())) return d;
+    for(const HaloEquipmentDef &d : equipmentDefs) if(d.powerup == HALO_POWERUP_GRENADE && d.grenade == type) return &d;
+    return nullptr;
+}
+
+const char *halointerfacesound(const char *role)
+{
+    haloequipmentload();
+    if(!strcmp(role, "shield-low")) return interfaceSounds.get(0);
+    if(!strcmp(role, "health-low")) return interfaceSounds.get(1);
+    return nullptr;
 }

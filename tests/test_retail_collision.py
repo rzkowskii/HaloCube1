@@ -25,7 +25,9 @@ For every section that has an imported packages/maps/<section>.hcol this checks 
     follower's speed on every straight it walks must be too.
 A mission's walk stops at the first section without an .hcol (stock geometry, reported and
 skipped, not failed). A missing .route or a route that stalls fails the section; the walk
-logs go to build/qa/.
+logs go to build/qa/. Lift rides, light-bridge waits and the engine's fall and wedge recoveries
+are printed under each section; PENDING_WALK lists the sections they are expected to make pass
+that have not been walked yet.
 """
 import argparse
 import os
@@ -36,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qa_common import *  # noqa: E402,F403
 sys.path.insert(0, str(root / 'tools'))
-from import_halo_campaign import MISSIONS  # noqa: E402
+from import_halo_campaign import DRIVEN_SECTIONS, MISSIONS  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument('missions', nargs='*', help='mission cache names, e.g. a10 b30 c10')
@@ -69,6 +71,20 @@ KNOWN_BLOCKED = {
     # controls and shot, and the section ends on the elevator, which enc5_3 raises to bsp 4,5.
     'halo_d40_05': 'manifolds to open and shoot, then the elevator ride to bsp 4,5: the walker does neither',
 }
+# Sections the lift and light-bridge machinery (route flags 16, 32, 64 and 128: the walker
+# boards, calls and sends lifts, and waits for bridges; the engine carries every body on a lift
+# deck and recovers falls) is expected to make pass, but which have not been walked in the game
+# yet. They are reported as PENDING with the reason; a KNOWN_BLOCKED one that passes still fails
+# the test until it is removed from KNOWN_BLOCKED (and this list), so the lists stay current.
+PENDING_WALK = {
+    'halo_b40_06': 'rides lift_d down from lift_d_control_a (deck row: send)',
+    'halo_c10_01': 'rides lift_a down from lift_a_cont_a on its deck (deck row: send)',
+    'halo_c10_02': 'new on retail collision: from the bottom of lift_a, drops into the lower hall beside bridge_a',
+    'halo_c10_04': 'rides lift_b down from lift_b_cont_a on its deck (deck row: send)',
+    'halo_c20_01': 'boards platform1 (0.38 units up: the engine lets a body step onto a lift deck) and rides up',
+    'halo_c20_02': 'boards platform2 and rides up',
+    'halo_c20_03': 'boards platform3 and rides up',
+}
 
 
 def section_name(mission, number):
@@ -87,7 +103,7 @@ for item in args.section:
     mission = next(m for m in MISSIONS if m.cache == cache)
     runs.append((mission, [int(number)]))
 
-failures, skipped, passed, known = [], [], [], []
+failures, skipped, passed, known, driven = [], [], [], [], []
 
 
 def check(name, log):
@@ -146,6 +162,21 @@ def check(name, log):
     return problems, summary
 
 
+def report_traversal(name, log):
+    """Prints the lift rides, light-bridge waits and fall or wedge recoveries of a section's walk."""
+    start = log.find(f'RETAIL_QA spawn map={name} ')
+    if start < 0:
+        return
+    end = re.search(rf'RETAIL_QA (PASS|FAIL) \S+ map={name}\b.*', log[start:])
+    body = log[start:start + end.end()] if end else log[start:]
+    lines = [line for line in body.splitlines()
+             if line.startswith(('RETAIL_QA ride', 'RETAIL_QA bridge', 'RETAIL_QA recover', 'Halo recovery:', 'Halo lift:'))]
+    for line in lines[:12]:
+        print('   ', line)
+    if len(lines) > 12:
+        print(f'    ... {len(lines) - 12} more ride, bridge and recovery lines')
+
+
 def walk_run(mission, walk):
     """Walks sections `walk` of a mission in one client. Returns the sections not reached."""
     mission_index = MISSIONS.index(mission) + 1
@@ -176,21 +207,28 @@ def walk_run(mission, walk):
         exit_only = all(problem.startswith('exit not reached') for problem in problems)
         if problems and name in KNOWN_BLOCKED and exit_only:
             known.append(name)
-            print(f'{name}: KNOWN {KNOWN_BLOCKED[name]}: {problems[0]}{fresh}', flush=True)
+            pending = f' (expected to pass, pending walk: {PENDING_WALK[name]})' if name in PENDING_WALK else ''
+            print(f'{name}: KNOWN {KNOWN_BLOCKED[name]}{pending}: {problems[0]}{fresh}', flush=True)
+            report_traversal(name, log)
             return walk[position + 1:]
         if problems:
-            failures.append((name, '; '.join(problems) + fresh))
-            print(f'{name}: FAIL {"; ".join(problems)}{fresh}', flush=True)
+            pending = ' (pending its first walk)' if name in PENDING_WALK else ''
+            failures.append((name, '; '.join(problems) + fresh + pending))
+            print(f'{name}: FAIL {"; ".join(problems)}{fresh}{pending}', flush=True)
             for line in log.splitlines():
                 if line.startswith('RETAIL_QA') and (f'map={name}' in line or not re.search(r'map=\S+', line)) and \
-                   any(w in line for w in ('PASS', 'FAIL', 'stuck', 'floorless', 'audit', 'feel', 'blocked', 'waiting', 'crouching', 'squeezing')):
+                   any(w in line for w in ('PASS', 'FAIL', 'stuck', 'floorless', 'audit', 'feel', 'blocked', 'waiting',
+                                           'crouching', 'squeezing', 'ride', 'bridge', 'recover')):
                     print('   ', line)
+            report_traversal(name, log)
             print(f'    log {logfile}', flush=True)
             return walk[position + 1:]
         passed.append(name)
         print(f'{name}: PASS {summary}{fresh}', flush=True)
+        report_traversal(name, log)
         if name in KNOWN_BLOCKED:
-            failures.append((name, 'now passes: remove it from KNOWN_BLOCKED and docs/macos-build.md'))
+            failures.append((name, 'now passes: remove it from KNOWN_BLOCKED' +
+                             (' and PENDING_WALK' if name in PENDING_WALK else '') + ' and update docs/macos-build.md'))
     return []
 
 
@@ -201,6 +239,11 @@ for mission, numbers in runs:
         if not (maps / f'{name}.hcol').is_file():
             skipped.extend(section_name(mission, n) for n in numbers[numbers.index(number):])
             print(f'{name}: no .hcol, stock AssaultCube geometry (skipped with the rest of the run)', flush=True)
+            break
+        if (mission.cache, number - 1) in DRIVEN_SECTIONS:
+            # The Warthog run has an .hcol for the vehicle but no walking route (tests/test_maw_drive.py).
+            driven.extend(section_name(mission, n) for n in numbers[numbers.index(number):])
+            print(f'{name}: driven in a Warthog, not walked (skipped with the rest of the run)', flush=True)
             break
         if not (maps / f'{name}.route').is_file():
             failures.append((name, 'no .route; re-run tools/import_halo_campaign.py'))
@@ -215,8 +258,13 @@ for mission, numbers in runs:
 print(f'\n{len(passed)} passed, {len(failures)} failed, {len(known)} known blocked, {len(skipped)} on stock geometry')
 if known:
     print('known blocked:', ', '.join(f'{n} ({KNOWN_BLOCKED[n]})' for n in known))
+pending = [n for n in known + [n for n, _ in failures] if n in PENDING_WALK]
+if pending:
+    print('expected to pass, pending walk:', ', '.join(f'{n} ({PENDING_WALK[n]})' for n in pending))
 if skipped:
     print('stock geometry:', ', '.join(skipped))
+if driven:
+    print('driven, not walked:', ', '.join(driven))
 if failures:
     raise SystemExit('retail collision failed: ' + '; '.join(f'{n} ({why})' for n, why in failures))
 print('Retail collision route passed.')

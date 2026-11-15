@@ -26,21 +26,27 @@ QUICK = [
     'test_library_platform.py',       # Library elevated platform
     'test_b30_retail_collision.py',   # Silent Cartographer on retail BSP collision
     'test_retail_collision.py',       # a10 (its default) on retail collision: active, spawn on floor, route walks to the exit
+    'test_retail_recovery.py',        # falls below or past the retail mesh and wedges put the player back on floor; teleport grace
+    'test_traversal_routes.py',       # lift deck and light-bridge route rows are consistent (route files only)
     'test_campaign_replay.py',        # all 55 sections complete in one run
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
+    'test_combat_equipment.py',       # grenade types, sticky plasma, equipment pickups, overshield, camouflage, weapon sounds
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine
     'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands
     'test_campaign_ending.py',        # game_won/game_lost raise the ending, credits, beaten flag
+    'test_frontend_progress.py',      # title menu, Continue with the script's state (v3), fallbacks, loadout carry, backup, corruption
+    'test_nav_points.py',             # script nav points and HUD show/blink commands, waypoint arrows in hud.txt
     'test_script_coverage.py',        # every sleep_until/if condition command is bound; a10 tutorial, d40 timer
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
     'test_flood.py',                  # squad cap counts living actors; carrier burst, corpse infection, infection leap
+    'test_vehicles.py',               # vehicle table and placements, Warthog in/out/drive/flip/gunner, turret, seat commands
     'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
 ]
 SLOW = [
     'test_autumn_opening.py',         # four-minute Autumn opening at normal speed
     'test_package_input.py',          # real keystrokes into the packaged app
-    'test_maw_drive.py',              # Warthog escape with keystrokes
+    'test_maw_drive.py',              # Warthog escape driven by the QA autopilot to the finale, plus keystrokes
 ]
 
 parser = argparse.ArgumentParser()

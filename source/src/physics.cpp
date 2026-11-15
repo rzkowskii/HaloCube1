@@ -7,6 +7,7 @@
 #include "halo.h"
 #include "halo_collision.h"
 #include "halo_script.h"
+#include "halo_vehicle.h"
 
 float raycube(const vec &o, const vec &ray, vec &surface)
 {
@@ -236,7 +237,7 @@ static bool collidedynamic(physent *d, float &hi, float &lo, float &headspace)
         if(d != player1 && plcollide(d, player1, headspace, hi, lo)) return true;
     }
     headspace -= 0.01f;
-    return mmcollide(d, hi, lo) || haloscenariocollide(d, hi, lo);
+    return mmcollide(d, hi, lo) || haloscenariocollide(d, hi, lo) || halovehiclecollide(d, hi, lo);
 }
 
 static const float retailSkin = 0.015f, retailStep = 1.26f, retailSlope = 0.65f;
@@ -432,8 +433,11 @@ static bool retailmove(physent *d, vec delta, float gravity)
     // the player dead.
     const float climb = lo - feet.z;
     const vec raised(feet.x, feet.y, lo + retailSkin);
+    // A lift deck at rest may stand higher above its landing than a step (the Library's
+    // platforms): a grounded body boards it all the same (Scenario::liftBoard).
+    const float climbLimit = actor && grounded && climb > retailStep ? max(retailStep, haloscenarioliftboard(d, lo)) : retailStep;
     if(feet.z < lo && (original.z - d->eyeheight >= lo - retailSkin ||
-       (actor && climb <= retailStep && raised.z + retailheight(d) <= hi + retailSkin && !retailoverlap(d, raised))))
+       (actor && climb <= climbLimit && raised.z + retailheight(d) <= hi + retailSkin && !retailoverlap(d, raised))))
     {
         d->o.z = lo + d->eyeheight + retailSkin;
         floor = true;

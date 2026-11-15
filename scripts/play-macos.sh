@@ -14,7 +14,7 @@ if [[ "${1:-}" == "--stock" ]]; then
     profile="${HALO_AC_PROFILE:-$root/build/stock-profile}"
 else
     profile="${HALO_AC_PROFILE:-$HOME/Library/Application Support/Halo in AssaultCube}"
-    set -- --halo "--mod=$root" -ehalo_campaign "$@"
+    set -- --halo "--mod=$root" -ehalo_title "$@"
 fi
 mkdir -p -- "$profile"
 profile="$(cd -- "$profile" && pwd -P)"

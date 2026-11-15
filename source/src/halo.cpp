@@ -7,8 +7,12 @@
 #include "halo_weapons.h"
 #include "halo_ai.h"
 #include "halo_hud.h"
+#include "halo_vehicle.h"
+#include "halo_state.h"
+#include <string>
 
 extern void startgame(const char *name, int mode, int minutes, bool notify);
+extern int halo_scripttrace;     // halo_script.cpp: trace logging
 
 namespace
 {
@@ -25,11 +29,57 @@ namespace
     bool campaignBeaten = false, ending = false, endingDone = false, winPending = false;
     int endingStart = 0;
     const int creditsTime = 34000;
-    bool driving = false;
-    int escapeDeadline = 0, incomingEscapeTime = 0;
+    // The Maw's timed escape (sections 6 to 8), driven in a Warthog (halo_vehicle.cpp).
+    bool escaping = false, escapeOffered = false;
+    int escapeDeadline = 0, incomingEscapeTime = 0, escapeStarted = 0;
     const int escapeTime = 180000;
     const int playerShield = 75, playerHealth = 75;
     const int shieldDelay = 6000, shieldRecharge = 4000;
+
+    // What the player carries: the two weapons, grenades, health and shield. Carried from one
+    // section to the next within a mission, restored by Continue, and the loadout a revert before
+    // the section's first checkpoint returns to.
+    struct Loadout
+    {
+        bool valid = false;
+        HaloWeaponState carried[2];
+        int current = 0;
+        int weapon = GUN_ASSAULT;                          // the AssaultCube slot, without weapons.txt
+        int mag[2] = {60, 12}, ammo[2] = {180, 48};        // assault rifle and pistol, without weapons.txt
+        int health = playerHealth;
+        float shield = playerShield;
+        int frags = 2, plasmas = 0, grenadeType = HALO_GRENADE_FRAG;
+    };
+    Loadout sectionLoadout, carryLoadout;
+    int sectionLoadoutMission = -1, sectionLoadoutSection = -1;
+
+    // The game Continue resumes (progress file version 2): the section and, once one was reached,
+    // the last checkpoint in it (position, mission stage and route marker), with the loadout,
+    // the difficulty and the escape countdown left at the section's start (The Maw's run).
+    struct SavedGame
+    {
+        bool valid = false, checkpoint = false;
+        int mission = 0, section = 0, difficulty = 1;
+        vec position;
+        float yaw = 0;
+        int stage = 0, marker = 0, escapeMillis = 0;
+        Loadout loadout;
+        string weaponPath[2];                               // retail weapon tags, resolved on restore
+        // Version 3: the state block (its `state` header and the s, v, w and p records, verbatim):
+        // the mission script, vehicles, ground items and player limits at the checkpoint, or the
+        // script carried into the section at its start. Empty when there is none.
+        std::string state;
+    };
+    SavedGame savedGame;
+    bool restorePending = false;                            // Continue: apply savedGame once the section starts
+    // The section's script was carried in (from the section before, or restored by Continue), so
+    // a save at its start keeps the script's state; pendingStartState: that save waits for the
+    // section's opening scene to end.
+    bool scriptCarried = false;
+    bool pendingStartState = false;
+    string progressNote = "";                               // the last load's warning (corrupt file), for the menus
+    bool titleScreen = false;                               // the title menu (halo_title) is up
+    bool keepSectionLoadout = false;                        // halo_restart: keep what the player brought in
     const int eliteDelay = 12000, eliteRecharge = 10000;
     const float markerRadius = 8.0f, firstContactRadius = 62.0f;
 
@@ -118,6 +168,41 @@ namespace
     int nearbyWeapon = -1, pickupMessage = 0;
     string pickupText = "";
 
+    // Grenades. The frag count stays player1->mag[GUN_GRENADE], which the scripts and
+    // AssaultCube read; the plasma count and the selected type live here.
+    int plasmaGrenades = 0, grenadeType = HALO_GRENADE_FRAG, checkpointPlasma = 0, checkpointGrenadeType = HALO_GRENADE_FRAG;
+    // Powerups. The overshield is shield beyond the cap (up to two more layers, tripling it):
+    // it charges over overshieldCharge ms, then drains over the powerup's time. Active
+    // camouflage lasts its powerup time and fades over the last camoFade ms.
+    float overshield = 0, overshieldTarget = 0;
+    int overshieldCharged = 0, overshieldDrain = 60000, camoUntil = 0;
+    const int overshieldCharge = 1500, camoFade = 3000;
+    int lowShieldSound = 0, lowHealthSound = 0;
+
+    // Equipment lying in the world: scenario placements (ammo, health packs, grenades, the
+    // overshield and active camouflage) and the grenades killed actors drop.
+    struct GroundItem
+    {
+        vec o;
+        float yaw;
+        int def, object, flags;             // equipment.txt index, scenario object (-1 none), not-placed flags
+        bool exists, created;               // on the ground now; the script has created it (flag 1)
+    };
+    vector<GroundItem> groundItems, checkpointItemsHalo;
+
+    int &grenadeCount(int type) { return type == HALO_GRENADE_PLASMA ? plasmaGrenades : player1->mag[GUN_GRENADE]; }
+    int grenadeMaximum(int type) { const HaloGrenadeDef *g = halogrenadedef(type); return g ? g->maximum : 4; }
+    // Without packages/halo/equipment.txt only the frag grenade exists.
+    bool grenadeKnown(int type) { return type == HALO_GRENADE_FRAG || halogrenadedef(type); }
+
+    // Retail not-placed flags: 1 the script creates it, 2 not on Easy, 4 not on Normal, 8 not on
+    // Heroic (Legendary follows Heroic), as for the scenario vehicles.
+    bool itemDifficultyAllows(int flags)
+    {
+        static const int bits[4] = {2, 4, 8, 8};
+        return !(flags & bits[halodifficulty()]);
+    }
+
     vec position(const entity &e) { return vec(e.x, e.y, e.z); }
     bool near(int i, float radius)
     {
@@ -184,7 +269,8 @@ namespace
         info.magsize = d->usesBattery() ? 1 : max(1, m->loaded);
         info.attackdelay = t ? carried[i].delay(*t) : 100;
         info.reloadtime = m ? int(m->reload * 1000) : 0;
-        info.damage = t && t->projectile.valid ? int(t->projectile.damageUpper + .5f) : 10;
+        // Nominal only: the tag weapon's shots roll their own damage in halofiretrigger.
+        info.damage = t && t->projectile.valid ? int(t->projectile.damage.upperMin + .5f) : 10;
         info.spread = 0;
         info.recoil = 3;
         info.mdl_kick_back = info.mdl_kick_rot = 0;
@@ -217,6 +303,55 @@ namespace
         player1->setnextprimary(carriedGun[0]);
         player1->setprimary(carriedGun[0]);
         selectCarried(currentCarried, immediate);
+    }
+
+    void captureLoadout(Loadout &l)
+    {
+        syncCarried();
+        l.valid = true;
+        loopi(2) l.carried[i] = carried[i];
+        l.current = currentCarried;
+        l.weapon = player1->weaponsel ? player1->weaponsel->type : GUN_ASSAULT;
+        l.mag[0] = player1->mag[GUN_ASSAULT]; l.ammo[0] = player1->ammo[GUN_ASSAULT];
+        l.mag[1] = player1->mag[GUN_PISTOL]; l.ammo[1] = player1->ammo[GUN_PISTOL];
+        l.health = player1->health;
+        l.shield = shield;
+        l.frags = grenadeCount(HALO_GRENADE_FRAG);
+        l.plasmas = plasmaGrenades;
+        l.grenadeType = grenadeType;
+    }
+
+    // Puts a saved loadout on the player over the default one. Weapons the table no longer has
+    // keep the default in that slot.
+    void applyLoadout(const Loadout &l)
+    {
+        if(!l.valid) return;
+        loopi(2) if(haloweapon(l.carried[i].def))
+        {
+            carried[i] = l.carried[i];
+            carried[i].heat = 0;
+            carried[i].overheated = carried[i].charged = false;
+            carried[i].lastShot = carried[i].chargeStart = carried[i].zoom = 0;
+        }
+        currentCarried = l.current ? 1 : 0;
+        if(tagWeapons())
+        {
+            loopi(NUMGUNS) if(i != GUN_GRENADE && i != GUN_KNIFE) player1->mag[i] = player1->ammo[i] = 0;
+            equipCarried(true);
+        }
+        else
+        {
+            player1->mag[GUN_ASSAULT] = l.mag[0]; player1->ammo[GUN_ASSAULT] = l.ammo[0];
+            player1->mag[GUN_PISTOL] = l.mag[1]; player1->ammo[GUN_PISTOL] = l.ammo[1];
+            player1->selectweapon(l.weapon == GUN_PISTOL ? GUN_PISTOL : GUN_ASSAULT);
+            player1->nextweaponsel = player1->weaponsel;
+            player1->weaponchanging = 0;
+        }
+        player1->health = clamp(l.health, 1, playerHealth);
+        shield = clamp(l.shield, 0.0f, shieldCap);
+        grenadeCount(HALO_GRENADE_FRAG) = clamp(l.frags, 0, grenadeMaximum(HALO_GRENADE_FRAG));
+        plasmaGrenades = grenadeKnown(HALO_GRENADE_PLASMA) ? clamp(l.plasmas, 0, grenadeMaximum(HALO_GRENADE_PLASMA)) : 0;
+        grenadeType = grenadeKnown(l.grenadeType) && grenadeCount(l.grenadeType) > 0 ? l.grenadeType : HALO_GRENADE_FRAG;
     }
 
     void resetLoadout()
@@ -259,16 +394,28 @@ namespace
         player1->health = atCheckpoint ? checkpointHealth : playerHealth;
         player1->armour = 0;
         player1->mag[GUN_GRENADE] = atCheckpoint ? checkpointMag[GUN_GRENADE] : 2;
-        // Reverting restores the weapons lying in the world as they were saved;
+        plasmaGrenades = atCheckpoint ? checkpointPlasma : 0;
+        grenadeType = atCheckpoint ? checkpointGrenadeType : HALO_GRENADE_FRAG;
+        overshield = overshieldTarget = 0;
+        camoUntil = 0;
+        // Reverting restores the weapons and equipment lying in the world as they were saved;
         // before the first checkpoint that is the section's placements.
         groundWeapons.setsize(0);
         loopv(checkpointGround) groundWeapons.add(checkpointGround[i]);
+        groundItems.setsize(0);
+        loopv(checkpointItemsHalo) groundItems.add(checkpointItemsHalo[i]);
         shield = shieldCap;
         shieldHit = 0;
         shieldRecharging = false;
+        // Before the section's first checkpoint a revert returns to what the player brought into
+        // the section (from the section before, or a continued game), not the default loadout.
+        if(!atCheckpoint) applyLoadout(sectionLoadout);
     }
 
-    void saveCheckpoint(bool scripted = false)
+    void recordProgress(bool atCheckpointNow);
+
+    // Takes the checkpoint a revert returns to (without saving it to the progress file).
+    void takeCheckpoint(bool scripted)
     {
         atCheckpoint = true;
         checkpointStage = scripted ? stage : SECOND_CONTACT;
@@ -284,10 +431,22 @@ namespace
         checkpointCurrent = currentCarried;
         checkpointGround.setsize(0);
         loopv(groundWeapons) checkpointGround.add(groundWeapons[i]);
+        checkpointPlasma = plasmaGrenades;
+        checkpointGrenadeType = grenadeType;
+        checkpointItemsHalo.setsize(0);
+        loopv(groundItems) checkpointItemsHalo.add(groundItems[i]);
         checkpointItems.setsize(0);
         loopv(ents) checkpointItems.add(ents[i].spawned);
         haloscenariocheckpoint();
+        halovehiclescheckpoint();
+    }
+
+    void saveCheckpoint(bool scripted = false)
+    {
+        pendingStartState = false;
+        takeCheckpoint(scripted);
         conoutf("Halo: checkpoint reached");
+        recordProgress(true);
     }
 
     botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw, int weaponIndex = -1, int actorIndex = -1,
@@ -332,11 +491,12 @@ namespace
         bot->nextweaponsel = bot->weaponsel;
         bot->weaponchanging = 0;
         loopj(NUMGUNS) bot->mag[j] = bot->ammo[j] = 0;
-        // Damage is the retail projectile's, scaled by the variant's damage modifier;
-        // the variant's rate of fire sets the cadence inside a burst.
+        // Damage is the low end of the retail projectile's full-strength range (the jpt! upper
+        // bound's min, the value this balance was set with), scaled by the variant's damage
+        // modifier; the variant's rate of fire sets the cadence inside a burst.
         const HaloTriggerDef *t = def ? def->trigger() : nullptr;
         const float damageScale = actor && actor->damageScale > 0 ? actor->damageScale : aiDamageScale;
-        const int damage = t && t->projectile.valid ? max(1, int(t->projectile.damageUpper * damageScale + .5f)) : profile.damage;
+        const int damage = t && t->projectile.valid ? max(1, int(t->projectile.damage.upperMin * damageScale + .5f)) : profile.damage;
         const int delay = actor && actor->rate > 0 ? int(1000 / actor->rate) :
                           t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
         campaignWeapon(bot, gun, 100, delay, 0, damage, kind == ELITE ? 36 : 56);
@@ -411,6 +571,8 @@ namespace
         campaignFinished = !preview && mission == haloMissionCount - 1 && section == haloMissions[mission].sections - 1;
     }
 
+    void clearRecovery();   // fall and wedge recovery on retail collision (below)
+
     void resetEncounter()
     {
         haloclearbolts();
@@ -431,11 +593,20 @@ namespace
         else if(halocollisionactive()) player1->o.z += player1->eyeheight;
         entinmap(player1);
         player1->resetinterp();
+        haloplayermoved(atCheckpoint ? "revert to the checkpoint" : "spawn");
         resetLoadout();
-        driving = escapeRun();
-        player1->maxspeed = driving ? 36.0f : 16.0f;
-        escapeDeadline = driving ? lastmillis + (incomingEscapeTime > 0 ? incomingEscapeTime : escapeTime) : 0;
+        halovehiclesrestart(atCheckpoint);
+        escaping = escapeRun();
+        player1->maxspeed = 16.0f;
+        escapeDeadline = escaping ? lastmillis + (incomingEscapeTime > 0 ? incomingEscapeTime : escapeTime) : 0;
         incomingEscapeTime = 0;
+        escapeStarted = lastmillis;
+        // A checkpoint revert may already have put the player back in their seat.
+        escapeOffered = escaping && halodriving();
+        // The run is driven. Past its first section, and on the retail collision (where the
+        // walking body does not fit the floors), the player starts at the wheel of a Warthog.
+        if(escaping && !escapeOffered && (section > 5 || halocollisionactive()))
+            escapeOffered = halovehicleescape(position(ents[insertion]), ents[insertion].attr1 / 10.0f);
         loopv(ents) if(isitem(ents[i].type))
         {
             bool available = !atCheckpoint || (checkpointItems.inrange(i) && checkpointItems[i]);
@@ -443,7 +614,7 @@ namespace
             ents[i].lastmillis = 0;
         }
         intermission = false;
-        if(driving) setStage(EXTRACTION);
+        if(escaping) setStage(EXTRACTION);
         else if(atCheckpoint)
         {
             setStage(checkpointStage);
@@ -571,7 +742,7 @@ namespace
             g.state.reserve -= fromReserve;
             g.state.loaded -= take - fromReserve;
             player1->ammo[carriedGun[holder]] = c.reserve;
-            audiomgr.playsound(S_ITEMAMMO, SP_HIGH);
+            haloplaysound(d->sound(HALO_SOUND_PICKUP), S_ITEMAMMO);
             defformatstring(text)("%s ammo", d->name.c_str());
             showPickup(text);
             if(g.state.loaded + g.state.reserve <= 0) groundWeapons.remove(i--);
@@ -586,42 +757,383 @@ namespace
         syncCarried();
         dropWeapon(carried[currentCarried], feetOf(player1), player1->yaw);
         carried[currentCarried] = picked.state;
+        const int slot = carriedGun[currentCarried];
         equipCarried(false);
-        audiomgr.playsound(S_ITEMAMMO, SP_HIGH);
         const HaloWeaponDef *d = haloweapon(picked.state.def);
+        // A new AssaultCube slot readies the weapon with its own sound (weapon::onselecting);
+        // a weapon taking over the same slot plays it here.
+        if(carriedGun[currentCarried] == slot) haloplaysound(d ? d->sound(HALO_SOUND_READY) : NULL, S_ITEMAMMO);
         showPickup(d ? d->name.c_str() : "Weapon");
         return true;
     }
+
+    // How far the weapon the player would pick up lies from their feet; a vehicle seat nearer than it wins E.
+    float nearbyWeaponDistance()
+    {
+        return groundWeapons.inrange(nearbyWeapon) ? feetOf(player1).dist(groundWeapons[nearbyWeapon].o) : 1e9f;
+    }
+
+    void dropItem(const HaloEquipmentDef *d, const vec &feet, float yaw)
+    {
+        if(!d) return;
+        GroundItem &item = groundItems.add();
+        item.o = feet;
+        item.yaw = yaw;
+        item.def = d->index;
+        item.object = -1;
+        item.flags = 0;
+        item.exists = item.created = true;
+    }
+
+    // Equipment the player walks over is taken when it does them any good, as in Halo.
+    bool takeItem(const HaloEquipmentDef &d)
+    {
+        switch(d.powerup)
+        {
+            case HALO_POWERUP_NONE:
+            {
+                // Ammunition for a carried weapon, up to the weapon's tag maximum.
+                if(!tagWeapons()) return false;
+                syncCarried();
+                loopi(2)
+                {
+                    const HaloWeaponDef *w = haloweapon(carried[i].def);
+                    const HaloMagazineDef *m = w ? w->magazine() : NULL;
+                    const int rounds = w ? d.roundsFor(w->index) : 0;
+                    if(!m || rounds <= 0) continue;
+                    const int room = m->maximum - carried[i].loaded - carried[i].reserve;
+                    if(room <= 0) continue;
+                    carried[i].reserve += min(room, rounds);
+                    player1->ammo[carriedGun[i]] = carried[i].reserve;
+                    defformatstring(text)("%s ammo", w->name.c_str());
+                    showPickup(text);
+                    return true;
+                }
+                return false;
+            }
+            case HALO_POWERUP_HEALTH:
+                if(player1->health >= playerHealth) return false;
+                player1->health = playerHealth;
+                showPickup("Health pack");
+                return true;
+            case HALO_POWERUP_GRENADE:
+            {
+                if(!grenadeKnown(d.grenade)) return false;
+                int &count = grenadeCount(d.grenade);
+                if(count >= grenadeMaximum(d.grenade)) return false;
+                ++count;
+                // With none of the selected type left, the pickup becomes the selection.
+                if(grenadeCount(grenadeType) <= 0) grenadeType = d.grenade;
+                showPickup(d.grenade == HALO_GRENADE_PLASMA ? "Plasma grenade" : "Fragmentation grenade");
+                return true;
+            }
+            case HALO_POWERUP_OVERSHIELD:
+                if(shieldCap <= 0 || (overshieldTarget > 0 && overshield >= overshieldTarget * .99f)) return false;
+                shield = shieldCap;
+                overshieldTarget = 2 * shieldCap;
+                overshieldCharged = lastmillis + overshieldCharge;
+                overshieldDrain = max(1000, int(d.powerupTime * 1000));
+                showPickup("Overshield");
+                return true;
+            case HALO_POWERUP_CAMO:
+                camoUntil = lastmillis + max(1000, int(d.powerupTime * 1000));
+                showPickup("Active camouflage");
+                return true;
+            // Double speed and full-spectrum vision are not campaign pickups.
+            default: return false;
+        }
+    }
+
+    void updateItems(int elapsed)
+    {
+        const vec feet = feetOf(player1);
+        // A seated player rides over equipment without taking it, as in Halo.
+        if(!halodriving()) loopv(groundItems)
+        {
+            GroundItem &item = groundItems[i];
+            const HaloEquipmentDef *d = haloequipment(item.def);
+            if(!item.exists || !d || feet.dist(item.o) > 2.5f || !takeItem(*d)) continue;
+            item.exists = false;
+            haloplaysound(d->sound(HALO_SOUND_PICKUP), S_ITEMAMMO);
+        }
+        if(overshieldTarget > 0)
+        {
+            if(lastmillis < overshieldCharged) overshield = min(overshieldTarget, overshield + overshieldTarget * elapsed / overshieldCharge);
+            else overshield -= overshieldTarget * elapsed / float(overshieldDrain);
+            if(overshield <= 0 && lastmillis >= overshieldCharged) overshield = overshieldTarget = 0;
+        }
+        // The retail warnings: the low-shield alarm while the shield is nearly gone and not yet
+        // recharging, the heartbeat while health is low with no shield left.
+        const bool lowShield = shieldCap > 0 && shield + overshield < shieldCap * .25f && !shieldRecharging;
+        if(lowShield && lastmillis - lowShieldSound >= 3700)
+        {
+            lowShieldSound = lastmillis;
+            haloplaysound(halointerfacesound("shield-low"), S_NULL);
+        }
+        if(shield <= 0 && player1->health * 3 <= playerHealth && lastmillis - lowHealthSound >= 1750)
+        {
+            lowHealthSound = lastmillis;
+            haloplaysound(halointerfacesound("health-low"), S_NULL);
+        }
+    }
+
+    void switchGrenade()
+    {
+        if(!haloactive() || halocinematic() || halodriving() || player1->state != CS_ALIVE) return;
+        const int next = grenadeType ^ 1;
+        if(!grenadeKnown(next) || grenadeCount(next) <= 0) return;
+        grenadeType = next;
+        audiomgr.playsound(S_GUNCHANGE, SP_HIGH);
+    }
+
+    // Campaign progress, config/halo-progress.txt in the profile. Version 2 is line based:
+    //   halo-progress 2
+    //   furthest <mission> <section>          the furthest section reached (unlocks missions)
+    //   beaten <0|1>
+    //   game <mission> <section> <difficulty> <checkpoint 0|1> <escape ms>
+    //   checkpoint <x> <y> <z> <yaw> <stage> <marker>
+    //   vitals <health> <shield>
+    //   grenades <frag> <plasma> <selected type>
+    //   weapon <slot> <loaded> <reserve> <battery> <weapon tag path>
+    //   current <slot>
+    //   stock <weapon> <assault mag> <assault ammo> <pistol mag> <pistol ammo>
+    //   state <format> <mission> <section> <checkpoint 0|1> <.hscb hash> <section map hash> <records> <records' FNV-1a>
+    //   s ... / v ... / w ... / p ...           version 3: the state block's records (see below)
+    //   check <FNV-1a of everything above, hex>
+    // The game lines are present only while there is a game to continue. Version 2 files (no
+    // state block) and version 1 ("1 m s [1]") still load. Each save first moves a valid file to
+    // halo-progress.txt.bak; a file that fails its check is moved to halo-progress.txt.corrupt
+    // and the backup restored, with a warning.
+    //
+    // The state block makes Continue resume the mission script where the checkpoint left it,
+    // instead of starting it afresh on the section: "s" records are the script's state
+    // (halo_script.cpp), "v" the vehicles (halo_vehicle.cpp), "w" the weapons and equipment on the
+    // ground and the stock items, "p" the script's limits on the player and the powerups. At a
+    // checkpoint it holds what the in-memory checkpoint keeps for a revert; at a section's start,
+    // only when the script was carried in from the section before (its "s" and "p" records).
+    // Continue loads it into the in-memory checkpoint and reverts to it, as a death would. When
+    // it does not fit (another .hscb, a damaged block, a record that names nothing) the script
+    // restarts on the section as before, with a warning in the log and the menus; when only the
+    // section map changed, the script's state is kept and the vehicles and ground items return to
+    // their placements.
+    const int progressVersion = 3, stateFormat = 1;
+    const size_t maxProgressSize = 32u << 20;
+
+    struct ProgressData
+    {
+        int furthestMission = 0, furthestSection = 0;
+        bool beaten = false;
+        SavedGame game;
+    };
+
+    unsigned progressHash(const char *text, size_t length)
+    {
+        unsigned hash = 2166136261u;
+        loopi(int(length)) { hash ^= uchar(text[i]); hash *= 16777619u; }
+        return hash;
+    }
+
+    bool validSection(int m, int s) { return m >= 0 && m < haloMissionCount && s >= 0 && s < haloMissions[m].sections; }
+
+    bool parseProgress(const char *text, ProgressData &out)
+    {
+        out = ProgressData();
+        int version = 0, m = 0, sec = 0, beaten = 0;
+        if(strncmp(text, "halo-progress ", 14))
+        {
+            // Version 1: "1 <mission> <section> [1]".
+            const int fields = sscanf(text, "%d %d %d %d", &version, &m, &sec, &beaten);
+            if(fields < 3 || version != 1 || !validSection(m, sec)) return false;
+            out.furthestMission = m;
+            out.furthestSection = sec;
+            out.beaten = fields == 4 && beaten == 1;
+            if(!out.beaten)
+            {
+                // The section reached is where Continue starts, from its beginning.
+                out.game.valid = true;
+                out.game.mission = m;
+                out.game.section = sec;
+                out.game.difficulty = halodifficulty();
+            }
+            return true;
+        }
+        if(sscanf(text, "halo-progress %d", &version) != 1 || version < 2 || version > progressVersion) return false;
+        const char *check = strstr(text, "\ncheck ");
+        unsigned stored = 0;
+        if(!check || sscanf(check + 7, "%x", &stored) != 1 || stored != progressHash(text, check - text + 1)) return false;
+        bool furthest = false;
+        int slot = 0;
+        for(const char *line = text; line && line < check + 1; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+        {
+            SavedGame &g = out.game;
+            Loadout &l = g.loadout;
+            int a = 0, b = 0, c = 0, d = 0, e = 0;
+            float x = 0, y = 0, z = 0, w = 0;
+            // The state block's lines are kept verbatim; Continue checks them (restoreSavedState).
+            if(!strncmp(line, "state ", 6) || (strchr("svwp", line[0]) && line[0] && line[1] == ' '))
+            {
+                const char *eol = strchr(line, '\n');
+                g.state.append(line, eol ? size_t(eol - line + 1) : strlen(line));
+            }
+            else if(sscanf(line, "furthest %d %d", &a, &b) == 2) { furthest = validSection(a, b); out.furthestMission = a; out.furthestSection = b; }
+            else if(sscanf(line, "beaten %d", &a) == 1) out.beaten = a == 1;
+            else if(sscanf(line, "game %d %d %d %d %d", &a, &b, &c, &d, &e) == 5)
+            {
+                if(!validSection(a, b) || c < 0 || c > 3) return false;
+                g.valid = l.valid = true;
+                g.mission = a; g.section = b; g.difficulty = c; g.checkpoint = d != 0; g.escapeMillis = max(e, 0);
+            }
+            else if(sscanf(line, "checkpoint %f %f %f %f %d %d", &x, &y, &z, &w, &a, &b) == 6)
+            {
+                g.position = vec(x, y, z); g.yaw = w; g.stage = clamp(a, 0, 4); g.marker = max(b, 0);
+            }
+            else if(sscanf(line, "vitals %d %f", &a, &x) == 2) { l.health = clamp(a, 1, playerHealth); l.shield = clamp(x, 0.0f, float(playerShield)); }
+            else if(sscanf(line, "grenades %d %d %d", &a, &b, &c) == 3) { l.frags = clamp(a, 0, 9); l.plasmas = clamp(b, 0, 9); l.grenadeType = c == HALO_GRENADE_PLASMA ? c : HALO_GRENADE_FRAG; }
+            else if(sscanf(line, "current %d", &a) == 1) l.current = a ? 1 : 0;
+            else if(sscanf(line, "stock %d %d %d %d %d", &a, &b, &c, &d, &e) == 5)
+            {
+                l.weapon = a == GUN_PISTOL ? GUN_PISTOL : GUN_ASSAULT;
+                l.mag[0] = max(b, 0); l.ammo[0] = max(c, 0); l.mag[1] = max(d, 0); l.ammo[1] = max(e, 0);
+            }
+            else if(!strncmp(line, "weapon ", 7) && slot < 2)
+            {
+                int consumed = 0;
+                if(sscanf(line, "weapon %d %d %d %f %n", &a, &b, &c, &x, &consumed) < 4 || consumed <= 0 || a < 0 || a > 1) return false;
+                HaloWeaponState &st = l.carried[a];
+                st = HaloWeaponState();
+                st.loaded = max(b, 0);
+                st.reserve = max(c, 0);
+                st.battery = clamp(x, 0.0f, 1.0f);
+                const char *path = line + consumed, *eol = strchr(path, '\n');
+                copystring(g.weaponPath[a], path, min(size_t(MAXSTRLEN), size_t((eol ? eol : path + strlen(path)) - path + 1)));
+                ++slot;
+            }
+        }
+        if(!furthest) return false;
+        if(out.game.valid && out.game.checkpoint && out.game.position.iszero()) out.game.checkpoint = false;
+        if(!out.game.valid) out.game.state.clear();
+        return true;
+    }
+
+    // 1: read and valid, 0: no file, -1: there but unreadable or failing its check.
+    int readProgress(const char *path, ProgressData &out)
+    {
+        FILE *file = fopen(path, "rb");
+        if(!file) return 0;
+        // Version 3 files carry the script's state: a few hundred kilobytes.
+        std::string text;
+        char chunk[65536];
+        size_t length;
+        while((length = fread(chunk, 1, sizeof(chunk), file)) > 0 && text.size() <= maxProgressSize) text.append(chunk, length);
+        const bool failed = ferror(file) != 0 || text.size() > maxProgressSize;
+        fclose(file);
+        if(failed || text.empty() || strlen(text.c_str()) != text.size()) return -1;
+        return parseProgress(text.c_str(), out) ? 1 : -1;
+    }
+
+    void applyProgress(const ProgressData &d)
+    {
+        savedMission = d.furthestMission;
+        savedSection = d.furthestSection;
+        campaignBeaten = d.beaten;
+        savedGame = d.game;
+    }
+
+    void saveProgress();
 
     void loadProgress()
     {
         if(progressLoaded) return;
         progressLoaded = true;
-        FILE *file = fopen(findfile(progressFile, "rb"), "rb");
-        if(!file) return;
-        int version = 0, m = 0, s = 0;
-        int beaten = 0;
-        const int fields = fscanf(file, "%d %d %d %d", &version, &m, &s, &beaten);
-        if(fields >= 3 && version == 1 && m >= 0 && m < haloMissionCount && s >= 0 && s < haloMissions[m].sections)
+        progressNote[0] = '\0';
+        string mainPath, homePath, backup, broken, temporary;
+        copystring(mainPath, findfile(progressFile, "rb"));
+        copystring(homePath, findfile(progressFile, "wb"));
+        formatstring(backup)("%s.bak", homePath);
+        formatstring(broken)("%s.corrupt", homePath);
+        formatstring(temporary)("%s.tmp", homePath);
+        ProgressData d;
+        const int state = readProgress(mainPath, d);
+        if(state > 0) { applyProgress(d); return; }
+        if(state == 0)
         {
-            savedMission = m;
-            savedSection = s;
-            campaignBeaten = fields == 4 && beaten == 1;
+            // A save interrupted between its two renames leaves only the finished temporary file.
+            if(readProgress(temporary, d) > 0 && rename(temporary, homePath) == 0)
+            {
+                applyProgress(d);
+                conoutf("Halo: campaign progress recovered from an interrupted save");
+            }
+            return;
         }
-        fclose(file);
+        // The file is there but damaged: keep it aside and fall back to the backup.
+        rename(mainPath, broken);
+        if(readProgress(backup, d) > 0)
+        {
+            applyProgress(d);
+            copystring(progressNote, "Campaign progress was corrupt and has been restored from the backup");
+            conoutf("\f3Halo: campaign progress was corrupt (kept as %s); restored from the backup", broken);
+            saveProgress();
+        }
+        else
+        {
+            copystring(progressNote, "Campaign progress was corrupt and no backup could be read; progress was reset");
+            conoutf("\f3Halo: campaign progress was corrupt (kept as %s) and the backup is unusable; progress reset", broken);
+        }
+    }
+
+    void appendf(std::string &out, const char *fmt, ...) PRINTFARGS(2, 3);
+    void appendf(std::string &out, const char *fmt, ...)
+    {
+        char line[600];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(line, sizeof(line), fmt, args);
+        va_end(args);
+        out += line;
     }
 
     void saveProgress()
     {
-        string destination, temporary;
+        loadProgress();
+        std::string text;
+        appendf(text, "halo-progress %d\nfurthest %d %d\nbeaten %d\n", progressVersion, savedMission, savedSection, campaignBeaten ? 1 : 0);
+        const SavedGame &g = savedGame;
+        if(g.valid)
+        {
+            const Loadout &l = g.loadout;
+            appendf(text, "game %d %d %d %d %d\n", g.mission, g.section, g.difficulty, g.checkpoint ? 1 : 0, g.escapeMillis);
+            if(g.checkpoint) appendf(text, "checkpoint %.4f %.4f %.4f %.3f %d %d\n", g.position.x, g.position.y, g.position.z, g.yaw, g.stage, g.marker);
+            appendf(text, "vitals %d %.3f\ngrenades %d %d %d\n", l.health, l.shield, l.frags, l.plasmas, l.grenadeType);
+            loopi(2)
+            {
+                const HaloWeaponDef *d = haloweapon(l.carried[i].def);
+                if(d && !strchr(d->path.c_str(), '\n'))
+                    appendf(text, "weapon %d %d %d %.4f %s\n", i, l.carried[i].loaded, l.carried[i].reserve, l.carried[i].battery, d->path.c_str());
+            }
+            appendf(text, "current %d\nstock %d %d %d %d %d\n", l.current, l.weapon, l.mag[0], l.ammo[0], l.mag[1], l.ammo[1]);
+            text += g.state;
+        }
+        appendf(text, "check %08x\n", progressHash(text.c_str(), text.length()));
+
+        string destination, temporary, backup;
         copystring(destination, findfile(progressFile, "wb"));
         formatstring(temporary)("%s.tmp", destination);
+        formatstring(backup)("%s.bak", destination);
         FILE *file = fopen(temporary, "wb");
         if(!file) { conoutf("Halo: unable to open campaign progress"); return; }
-        bool written = (campaignBeaten ? fprintf(file, "1 %d %d 1\n", savedMission, savedSection)
-                                       : fprintf(file, "1 %d %d\n", savedMission, savedSection)) > 0;
-        if(fclose(file) != 0 || !written || rename(temporary, destination) != 0)
+        const bool written = fwrite(text.data(), 1, text.length(), file) == text.length();
+        if(fclose(file) != 0 || !written)
         {
+            remove(temporary);
+            conoutf("Halo: unable to save campaign progress");
+            return;
+        }
+        // Keep the last good file as the backup; a damaged one never replaces it.
+        ProgressData previous;
+        const bool backedUp = readProgress(destination, previous) > 0 && rename(destination, backup) == 0;
+        if(rename(temporary, destination) != 0)
+        {
+            if(backedUp) rename(backup, destination);
             remove(temporary);
             conoutf("Halo: unable to save campaign progress");
         }
@@ -636,6 +1148,8 @@ namespace
         campaignBeaten = true;
         savedMission = mission;
         savedSection = section;
+        // The campaign is over: nothing to continue, every mission is unlocked.
+        savedGame.valid = false;
         saveProgress();
         player1->attacking = false;
         player1->stopmoving();
@@ -682,13 +1196,396 @@ namespace
         int m = mission, s = section + 1;
         if(s == haloMissions[m].sections) { ++m; s = 0; }
         if(m >= haloMissionCount) return;
-        int remainingTime = driving ? max(1, escapeDeadline - lastmillis) : 0;
+        int remainingTime = escaping ? max(1, escapeDeadline - lastmillis) : 0;
+        // Within a mission the player keeps what they carry into the next section.
+        Loadout carry;
+        captureLoadout(carry);
         queueSection(m, s);
         if(launchPending && m == mission)
         {
             incomingEscapeTime = remainingTime;
             pendingContinuation = true;
+            carryLoadout = carry;
         }
+    }
+
+    // Saves the game Continue resumes: this section, with the checkpoint just taken or (at the
+    // section's start) none, the loadout, the difficulty and the escape countdown.
+    // FNV-1a of the section's map file (the state block is only good for the map it was saved on).
+    unsigned sectionMapHash()
+    {
+        static string cachedName = "";
+        static unsigned cachedHash = 0;
+        string name;
+        halosectionname(mission, section, name, sizeof(name));
+        if(strcmp(name, cachedName))
+        {
+            defformatstring(file)("packages/maps/%s.cgz", name);
+            cachedHash = halofilehash(file);
+            copystring(cachedName, name);
+        }
+        return cachedHash;
+    }
+
+    void writeWeaponState(std::string &out, const HaloWeaponState &w)
+    {
+        const HaloWeaponDef *d = haloweapon(w.def);
+        halostateword(out, d ? d->path : std::string());
+        halostatef(out, " %d %d %.9g %.9g %.9g %.9g %d", w.loaded, w.reserve, w.battery, w.heat, w.error, w.rate, w.overheated);
+    }
+
+    bool readWeaponState(HaloStateReader &r, HaloWeaponState &w)
+    {
+        const std::string path = r.word();
+        w = HaloWeaponState();
+        w.loaded = r.i(); w.reserve = r.i(); w.battery = r.f(); w.heat = r.f(); w.error = r.f(); w.rate = r.f(); w.overheated = r.b();
+        const HaloWeaponDef *d = path.empty() ? nullptr : haloweaponfind(path.c_str());
+        w.def = d ? d->index : -1;
+        return r.ok;
+    }
+
+    // The "p" records: what the scripts set on the player (unit_set_maximum_vitality, unit_impervious),
+    // which a revert keeps, and the powerups running now (the time left on each).
+    void writePlayerState(std::string &out)
+    {
+        halostatef(out, "p vitality %.9g %.9g %.9g %d\n", maxVitalityHealth, maxVitalityShield, shieldCap, playerProtected);
+        halostatef(out, "p powerup %.9g %.9g %d %d %d\n", overshield, overshieldTarget, max(0, overshieldCharged - lastmillis),
+                   overshieldDrain, max(0, camoUntil - lastmillis));
+    }
+
+    // The "w" records: the in-memory checkpoint's weapons and equipment on the ground and the
+    // stock items' spawned flags (halo.cpp takeCheckpoint), for the section map they belong to.
+    void writeWorldState(std::string &out)
+    {
+        loopv(checkpointGround)
+        {
+            const GroundWeapon &g = checkpointGround[i];
+            halostatef(out, "w weapon %.9g %.9g %.9g %.9g", g.o.x, g.o.y, g.o.z, g.yaw);
+            writeWeaponState(out, g.state);
+            out += '\n';
+        }
+        loopv(checkpointItemsHalo)
+        {
+            const GroundItem &item = checkpointItemsHalo[i];
+            const HaloEquipmentDef *d = haloequipment(item.def);
+            halostatef(out, "w item %.9g %.9g %.9g %.9g", item.o.x, item.o.y, item.o.z, item.yaw);
+            halostateword(out, d ? d->path : std::string());
+            halostatef(out, " %d", item.object);
+            halostateword(out, haloscenarioobjectname(item.object));
+            halostatef(out, " %d %d %d\n", item.flags, item.exists, item.created);
+        }
+        halostatef(out, "w items %d =", checkpointItems.length());
+        loopv(checkpointItems) out += checkpointItems[i] ? '1' : '0';
+        out += '\n';
+    }
+
+    // Puts the state block on the saved game: at a checkpoint, what the in-memory checkpoint
+    // keeps; at a section's start, the script carried into it. None during a cutscene, or when
+    // the section's script starts afresh anyway.
+    void buildSavedState(SavedGame &g)
+    {
+        g.state.clear();
+        if(halocinematic() || (!g.checkpoint && !scriptCarried)) return;
+        std::string body;
+        if(!haloscenariostatesave(body, !g.checkpoint)) return;
+        writePlayerState(body);
+        if(g.checkpoint)
+        {
+            writeWorldState(body);
+            halovehiclesstatesave(body);
+        }
+        int records = 0;
+        for(char c : body) records += c == '\n';
+        halostatef(g.state, "state %d %d %d %d %08x %08x %d %08x\n", stateFormat, mission, section, g.checkpoint ? 1 : 0,
+                   haloscenarioprogramhash(), sectionMapHash(), records, halostatehash(body.data(), body.size()));
+        g.state += body;
+    }
+
+    void recordProgress(bool atCheckpointNow)
+    {
+        if(preview || ending || !haloactive()) return;
+        loadProgress();
+        SavedGame &g = savedGame;
+        g.valid = true;
+        g.mission = mission;
+        g.section = section;
+        g.difficulty = halodifficulty();
+        g.checkpoint = atCheckpointNow && atCheckpoint;
+        if(g.checkpoint)
+        {
+            g.position = checkpointPosition;
+            g.yaw = checkpointYaw;
+            g.stage = checkpointStage;
+            g.marker = checkpointMarker;
+        }
+        g.escapeMillis = !g.checkpoint && escaping ? max(0, escapeDeadline - lastmillis) : 0;
+        captureLoadout(g.loadout);
+        loopi(2)
+        {
+            const HaloWeaponDef *d = haloweapon(g.loadout.carried[i].def);
+            copystring(g.weaponPath[i], d ? d->path.c_str() : "");
+        }
+        buildSavedState(g);
+        saveProgress();
+        if(halo_scripttrace)
+            conoutf("Halo: game saved on %s, section %d (%s%s)", haloMissions[mission].title, section + 1,
+                    g.checkpoint ? "checkpoint" : "section start", g.state.empty() ? "" : ", with the mission script");
+    }
+
+    // Continue: once the saved section has started, put the player back at the saved checkpoint
+    // (the loadout is already on them). The mission script starts afresh on the section, as it
+    // does for a section started on its own; its opening scene is skipped. The restored spot is
+    // taken as the checkpoint, so a death reverts there instead of restarting the script.
+    void restoreSavedCheckpoint()
+    {
+        const SavedGame &g = savedGame;
+        if(!g.checkpoint) return;
+        if(halocinematic()) halocinematicskip();
+        player1->o = g.position;
+        player1->yaw = g.yaw;
+        player1->pitch = 0;
+        player1->vel = vec(0, 0, 0);
+        entinmap(player1);
+        player1->resetinterp();
+        haloplayermoved("continue");
+        if(!escaping && g.stage != COMPLETE)
+        {
+            setStage(MissionStage(g.stage));
+            nextRouteMarker = g.marker;
+        }
+        takeCheckpoint(true);
+        conoutf("Halo: continued from the checkpoint on %s, section %d", haloMissions[mission].title, section + 1);
+    }
+
+    // The state block split into its records (without their "x " prefixes).
+    struct StateBlock
+    {
+        int format = 0, mission = -1, section = -1, checkpoint = 0;
+        unsigned script = 0, map = 0;
+        std::vector<std::string> s, v, w, p;
+    };
+
+    bool splitState(const std::string &text, StateBlock &b)
+    {
+        const char *header = text.c_str();
+        unsigned hash = 0;
+        int count = -1;
+        if(sscanf(header, "state %d %d %d %d %x %x %d %x", &b.format, &b.mission, &b.section, &b.checkpoint, &b.script, &b.map,
+                  &count, &hash) != 8 || b.format != stateFormat) return false;
+        const char *body = strchr(header, '\n');
+        if(!body) return false;
+        ++body;
+        if(halostatehash(body, text.size() - size_t(body - header)) != hash) return false;
+        int lines = 0;
+        for(const char *line = body; *line; ++lines)
+        {
+            const char *eol = strchr(line, '\n');
+            if(!eol || eol - line < 2 || line[1] != ' ') return false;
+            std::string record(line + 2, eol);
+            switch(line[0])
+            {
+                case 's': b.s.push_back(record); break;
+                case 'v': b.v.push_back(record); break;
+                case 'w': b.w.push_back(record); break;
+                case 'p': b.p.push_back(record); break;
+                default: return false;
+            }
+            line = eol + 1;
+        }
+        return lines == count;
+    }
+
+    struct SavedPlayer
+    {
+        float maxHealth = 100, maxShield = 75, cap = playerShield;
+        bool protectedPlayer = false;
+        float overshield = 0, overshieldTarget = 0;
+        int chargeLeft = 0, drain = 60000, camoLeft = 0;
+    };
+
+    bool parsePlayerState(const std::vector<std::string> &records, SavedPlayer &p)
+    {
+        bool vitality = false, powerup = false;
+        for(const std::string &record : records)
+        {
+            HaloStateReader r(record.c_str());
+            if(r.key("vitality"))
+            {
+                p.maxHealth = r.f(); p.maxShield = r.f(); p.cap = r.f(); p.protectedPlayer = r.b();
+                vitality = r.ok && p.maxHealth >= 1 && p.maxShield >= 0 && p.cap >= 0 && p.cap <= playerShield;
+            }
+            else if(r.key("powerup"))
+            {
+                p.overshield = r.f(); p.overshieldTarget = r.f(); p.chargeLeft = r.i(); p.drain = r.i(); p.camoLeft = r.i();
+                powerup = r.ok && p.overshield >= 0 && p.overshieldTarget >= 0 && p.chargeLeft >= 0 && p.drain > 0 && p.camoLeft >= 0;
+            }
+            else return false;
+            if(!r.ok || r.more()) return false;
+        }
+        return vitality && powerup;
+    }
+
+    struct SavedWorld
+    {
+        vector<GroundWeapon> weapons;
+        vector<GroundItem> items;
+        vector<uchar> spawned;
+    };
+
+    bool parseWorldState(const std::vector<std::string> &records, SavedWorld &w, std::string &why)
+    {
+        bool spawned = false;
+        for(const std::string &record : records)
+        {
+            HaloStateReader r(record.c_str());
+            if(r.key("weapon"))
+            {
+                GroundWeapon g;
+                g.o.x = r.f(); g.o.y = r.f(); g.o.z = r.f(); g.yaw = r.f();
+                if(!readWeaponState(r, g.state)) { why = "a ground weapon record is damaged"; return false; }
+                // A weapon the table no longer has is left out.
+                if(haloweapon(g.state.def)) w.weapons.add(g);
+            }
+            else if(r.key("item"))
+            {
+                GroundItem item;
+                item.o.x = r.f(); item.o.y = r.f(); item.o.z = r.f(); item.yaw = r.f();
+                const std::string path = r.word();
+                item.object = r.i();
+                const std::string name = r.word();
+                item.flags = r.i(); item.exists = r.b(); item.created = r.b();
+                if(!r.ok) { why = "an equipment record is damaged"; return false; }
+                if(name != haloscenarioobjectname(item.object)) { why = "an equipment record names another scenario object"; return false; }
+                const HaloEquipmentDef *d = haloequipmentfind(path.c_str());
+                if(!d) continue;
+                item.def = d->index;
+                w.items.add(item);
+            }
+            else if(r.key("items"))
+            {
+                const int count = r.i();
+                const std::string bits = r.word();
+                if(!r.ok || count != ents.length() || int(bits.size()) != count) { why = "the stock items do not match the section map"; return false; }
+                loopi(count) w.spawned.add(bits[i] == '1');
+                spawned = true;
+            }
+            else { why = "unknown ground record"; return false; }
+            if(!r.ok || r.more()) { why = "malformed ground record"; return false; }
+        }
+        if(!spawned) { why = "the stock items are missing"; return false; }
+        return true;
+    }
+
+    void warnState(const char *what, const std::string &why)
+    {
+        formatstring(progressNote)("%s (%s)", what, why.c_str());
+        conoutf("\f3Halo: %s", progressNote);
+    }
+
+    // Continue with a version 3 state block: the saved checkpoint (or the section's start with
+    // the script carried in) becomes the in-memory checkpoint, and the section reverts to it as
+    // it does after a death: the mission script resumes with its threads, globals, devices,
+    // objects and squads as they were, the vehicles (the player in their seat), the weapons and
+    // equipment on the ground and the stock items as they were, and the loadout. Called once
+    // the section has started, with the saved loadout already on the player. False (nothing
+    // changed, the opening scene perhaps skipped) when the block is missing or does not fit;
+    // the caller then falls back to restarting the script.
+    bool restoreSavedState()
+    {
+        const SavedGame &g = savedGame;
+        if(g.state.empty())
+        {
+            conoutf("Halo: the saved game holds no mission script state; the script starts afresh on this section");
+            return false;
+        }
+        StateBlock block;
+        std::string why;
+        SavedPlayer player;
+        if(!splitState(g.state, block)) why = "the saved state is damaged";
+        else if(block.mission != mission || block.section != section || (block.checkpoint != 0) != g.checkpoint) why = "the saved state is for another section";
+        else if(!haloscenarioprogramhash() || block.script != haloscenarioprogramhash()) why = "the mission scripts were re-imported since the game was saved";
+        else if(!parsePlayerState(block.p, player)) why = "the saved player state is damaged";
+        else haloscenariostaterestore(block.s, false, why);
+        if(!why.empty())
+        {
+            warnState("The checkpoint's mission script state could not be restored; the script restarted on this section", why);
+            return false;
+        }
+        // The section map: the ground items and vehicles are only good for the map they were saved on.
+        SavedWorld world;
+        std::string worldWhy, vehicleWhy;
+        bool worldOk = g.checkpoint, vehiclesOk = g.checkpoint;
+        if(g.checkpoint && block.map != sectionMapHash()) { worldOk = vehiclesOk = false; worldWhy = "the section map was re-imported"; }
+        if(worldOk && !parseWorldState(block.w, world, worldWhy)) worldOk = vehiclesOk = false;
+        // The opening scene has to end before the script's state goes in (it wakes the threads).
+        if(halocinematic()) halocinematicskip();
+        if(!haloscenariostaterestore(block.s, true, why))
+        {
+            warnState("The checkpoint's mission script state could not be restored; the script restarted on this section", why);
+            return false;
+        }
+        if(vehiclesOk && !halovehiclesstaterestore(block.v, vehicleWhy)) vehiclesOk = false;
+        maxVitalityHealth = player.maxHealth;
+        maxVitalityShield = player.maxShield;
+        shieldCap = player.cap;
+        playerProtected = player.protectedPlayer;
+        if(g.checkpoint)
+        {
+            // The loadout the section started with is the saved one: it is the checkpoint's.
+            checkpointPosition = g.position;
+            checkpointYaw = g.yaw;
+            checkpointStage = MissionStage(clamp(g.stage, int(INSERTION), int(EXTRACTION)));
+            checkpointMarker = g.marker;
+            checkpointHealth = player1->health;
+            checkpointWeapon = player1->weaponsel->type;
+            memcpy(checkpointMag, player1->mag, sizeof(checkpointMag));
+            memcpy(checkpointAmmo, player1->ammo, sizeof(checkpointAmmo));
+            syncCarried();
+            loopi(2) checkpointCarried[i] = carried[i];
+            checkpointCurrent = currentCarried;
+            checkpointPlasma = plasmaGrenades;
+            checkpointGrenadeType = grenadeType;
+            checkpointGround.setsize(0);
+            checkpointItemsHalo.setsize(0);
+            checkpointItems.setsize(0);
+            if(worldOk)
+            {
+                loopv(world.weapons) checkpointGround.add(world.weapons[i]);
+                loopv(world.items) checkpointItemsHalo.add(world.items[i]);
+                loopv(world.spawned) checkpointItems.add(world.spawned[i]);
+            }
+            else
+            {
+                // The section's placements, as the map has them now.
+                loopv(groundWeapons) checkpointGround.add(groundWeapons[i]);
+                loopv(groundItems) checkpointItemsHalo.add(groundItems[i]);
+                loopv(ents) checkpointItems.add(ents[i].spawned);
+            }
+            atCheckpoint = true;
+        }
+        // The escape countdown keeps the time it had at the section's start.
+        incomingEscapeTime = escaping ? max(1, escapeDeadline - lastmillis) : 0;
+        resetEncounter();
+        haloscenariorevert();
+        halovehiclessync();
+        haloequipmentsync();
+        resetcamera();
+        // Without the saved vehicles the placements (and what the script created) are the checkpoint's.
+        if(g.checkpoint && !vehiclesOk) halovehiclescheckpoint();
+        if(player.overshieldTarget > 0)
+        {
+            overshieldTarget = min(player.overshieldTarget, 2 * max(shieldCap, 1.0f));
+            overshield = min(player.overshield, overshieldTarget);
+            overshieldCharged = lastmillis + min(player.chargeLeft, overshieldCharge);
+            overshieldDrain = player.drain;
+        }
+        if(player.camoLeft > 0) camoUntil = lastmillis + player.camoLeft;
+        if(!worldOk && g.checkpoint) warnState("The vehicles and items on the ground went back to their placements", worldWhy);
+        else if(!vehiclesOk && g.checkpoint) warnState("The vehicles went back to their placements", vehicleWhy);
+        if(g.checkpoint)
+            conoutf("Halo: continued from the checkpoint on %s, section %d, with the mission script where it was", haloMissions[mission].title, section + 1);
+        else conoutf("Halo: continued %s, section %d, with the mission script carried in from the section before", haloMissions[mission].title, section + 1);
+        return true;
     }
 
     void shieldTick(float &value, float capacity, int hit, int delay, int recharge, int elapsed)
@@ -734,7 +1631,7 @@ namespace
         if(stage == EXTRACTION)
         {
             int marker = nextRouteMarker;
-            if(driving) for(int i = 0; i < 2; ++i)
+            if(escaping) for(int i = 0; i < 2; ++i)
             {
                 if(route[i].inrange(marker)) return position(ents[route[i][marker]]);
                 marker -= route[i].length();
@@ -761,6 +1658,75 @@ namespace
         glScalef(scale, scale, 1);
         draw_text(text, alignRight ? -text_width(text) : 0, 0, 146, 231, 250, 245);
         glPopMatrix();
+    }
+
+    HaloHudUnit hudUnit()
+    {
+        HaloHudUnit u;
+        u.shield = clamp(shield / playerShield, 0.0f, 1.0f);
+        u.health = clamp(player1->health / float(playerHealth), 0.0f, 1.0f);
+        u.grenadeType = grenadeType;
+        u.grenades = grenadeCount(grenadeType);
+        u.overshield = shieldCap > 0 ? clamp(overshield / shieldCap, 0.0f, 2.0f) : 0;
+        u.hidden = haloscenariohudhidden(&u.blinking);
+        return u;
+    }
+
+    // The motion sensor's contacts: actors that move or fire, as the retail tracker shows them.
+    int sensorBlips(HaloHudBlip *blips, int capacity, float yaw)
+    {
+        int count = 0;
+        const float scale = haloscenarioscale();
+        loopv(enemies)
+        {
+            const botent *bot = enemies[i].bot;
+            if(!bot || bot->state != CS_ALIVE || count >= capacity || (bot->vel.sqrxy() < 0.01f && lastmillis - bot->lastaction > 500)) continue;
+            vec delta = vec(bot->o).sub(player1->o);
+            delta.rotate_around_z(-yaw);
+            blips[count++] = HaloHudBlip{delta.x / scale, delta.y / scale, enemies[i].team == HALO_TEAM_HUMAN};
+        }
+        return count;
+    }
+
+    // In a vehicle seat: the unit panel and sensor, the vehicle, the seat, speed or the gun's heat.
+    void drawVehicleHud(bool tagHud, int right, float yaw)
+    {
+        HaloVehicleStatus st;
+        if(!halovehiclestatus(st)) return;
+        if(tagHud)
+        {
+            // The seat's gun has a retail HUD of its own when the HUD tags carry one.
+            HaloHudWeapon w;
+            w.weapon = st.weapon;
+            w.battery_weapon = true;
+            w.heat = st.heat;
+            w.overheated = st.overheated;
+            w.firing = st.firing;
+            HaloHudBlip blips[64];
+            const int count = sensorBlips(blips, 64, yaw);
+            halohuddraw(w, hudUnit(), blips, count);
+        }
+        string title;
+        copystring(title, st.name);
+        for(char *c = title; *c; ++c) *c = toupper(*c);
+        label(title, right, VIRTH-212, 0.60f, true);
+        const char *seat = st.role == HALO_SEAT_DRIVER ? "DRIVER" : st.role == HALO_SEAT_GUNNER ? "GUNNER" : "PASSENGER";
+        if(st.vehicleClass == HALO_VEHICLE_CAR && st.role == HALO_SEAT_DRIVER)
+        {
+            // Halo world units are 10 feet.
+            defformatstring(speed)("%s  %3d KM/H%s", seat, int(st.speed * 3.048f * 3.6f + .5f), st.airborne ? "  AIR" : "");
+            label(speed, right, VIRTH-173, 0.70f, true);
+        }
+        else label(seat, right, VIRTH-173, 0.70f, true);
+        if(st.weapon >= 0)
+        {
+            glDisable(GL_TEXTURE_2D);
+            box(right-260, VIRTH-140, 260, 10, 18, 60, 81, 210);
+            box(right-260, VIRTH-140, 260 * st.heat, 10, 255, st.overheated ? 60 : 160, 40, 235);
+            glEnable(GL_TEXTURE_2D);
+            if(st.overheated) label("OVERHEATED", right-270, VIRTH-146, 0.5f, true);
+        }
+        label(st.flipped ? "Upside down  -  E  Get out" : "E  Get out", VIRTW/2-200, VIRTH/2+90, 0.6f);
     }
 
     void drawEnding()
@@ -791,14 +1757,28 @@ namespace
 
 bool haloactive() { return active && gamemode == GMODE_BOTTEAMDEATHMATCH && !multiplayer(NULL); }
 
+unsigned halofilehash(const char *path)
+{
+    stream *file = openfile(path, "rb");
+    if(!file) return 0;
+    unsigned hash = 2166136261u;
+    char chunk[65536];
+    for(int length; (length = file->read(chunk, sizeof(chunk))) > 0;) hash = halostatehash(chunk, size_t(length), hash);
+    delete file;
+    return hash;
+}
+
 void halomapstart(const char *name)
 {
     haloscenariostop();
     halocollisionmap(nullptr);
+    haloplayermoved("section start");
     authoredTransition = false;
     ending = endingDone = winPending = false;
-    active = startPending = driving = false;
+    active = startPending = escaping = false;
+    pendingStartState = false;
     player1->maxspeed = 16.0f;
+    halovehiclesclear();
     haloclearbolts();
     enemies.setsize(0);
     clearFlood();
@@ -809,6 +1789,8 @@ void halomapstart(const char *name)
     playerProtected = false;
     groundWeapons.setsize(0);
     checkpointGround.setsize(0);
+    groundItems.setsize(0);
+    checkpointItemsHalo.setsize(0);
     nearbyWeapon = -1;
     loopi(NUMGUNS) player1->weapons[i]->info = guns[i];
     if(gamemode != GMODE_BOTTEAMDEATHMATCH || multiplayer(NULL) || !haloparsemap(behindpath(name), mission, section)) return;
@@ -844,6 +1826,26 @@ void halomapstart(const char *name)
                 g.state.reset(def);
                 break;
             }
+            case 102:
+                // Scenario vehicle placement (halo_vehicle.cpp).
+                halovehicleplace(e);
+                break;
+            case 103:
+            {
+                // Scenario equipment placement: attr3 the equipment.txt index, attr4 the
+                // not-placed flags, attr5 the scenario object index + 1.
+                const HaloEquipmentDef *def = haloequipment(e.attr3);
+                if(!def) break;
+                GroundItem &item = groundItems.add();
+                item.o = position(e);
+                item.yaw = e.attr1 / 10.0f;
+                item.def = def->index;
+                item.object = e.attr5 - 1;
+                item.flags = e.attr4;
+                item.created = !(item.flags & 1);
+                item.exists = item.created && itemDifficultyAllows(item.flags);
+                break;
+            }
         }
     }
     if(insertion < 0 || checkpoint < 0 || extraction < 0)
@@ -852,6 +1854,7 @@ void halomapstart(const char *name)
         return;
     }
     loopv(groundWeapons) checkpointGround.add(groundWeapons[i]);
+    loopv(groundItems) checkpointItemsHalo.add(groundItems[i]);
     atCheckpoint = false;
     active = startPending = true;
     halocollisionmap(behindpath(name));
@@ -895,7 +1898,7 @@ playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int act
 }
 
 // Milliseconds left on the escape countdown, or -1 outside the escape run.
-int haloescapemillis() { return driving ? max(0, escapeDeadline - lastmillis) : -1; }
+int haloescapemillis() { return escaping ? max(0, escapeDeadline - lastmillis) : -1; }
 float haloplayershieldfraction() { return clamp(shield / float(playerShield), 0.0f, 1.0f); }
 
 float haloenemyshieldfraction(const playerent *p)
@@ -960,7 +1963,7 @@ bool haloenemymove(playerent *p, const vec &point)
 
 void haloscenarioplayersave()
 {
-    if(haloactive() && player1->state == CS_ALIVE && !driving && stage != FIRST_CONTACT &&
+    if(haloactive() && player1->state == CS_ALIVE && !escaping && stage != FIRST_CONTACT &&
        stage != SECOND_CONTACT && stage != COMPLETE) saveCheckpoint(true);
 }
 
@@ -971,9 +1974,230 @@ bool halorespawn()
     {
         resetEncounter();
         haloscenariorevert();
+        halovehiclessync();
+        haloequipmentsync();
         resetcamera();
     }
     return true;
+}
+
+// Recovery on retail collision. The retail structure has holes and seams the stock cube grid
+// never had: a body can fall out of the world below the section's mesh, or end up wedged where
+// no move gets it out (a door or a lift deck closing on it, a crease between two slopes too
+// steep to stand on). The player is put back on the last retail floor they stood on, or, when
+// none of those is clear any more, reverts to the checkpoint; actors that fall out of the world
+// die, as they would in Halo. Ordinary movement never trips these checks.
+namespace
+{
+    struct SafeSpot { vec feet; int millis; };
+    vector<SafeSpot> safeSpots;            // the newest last, each at least safeSpacing from the one before
+    const int safeSpotCount = 8, safeSpotInterval = 100;
+    const float safeSpacing = 2.0f;
+    const float killDepth = 8.0f;          // world units below the mesh's lowest point
+    const int fallTime = 2000;             // airborne with nothing at all below for this long: out of the world
+    const int wedgeTime = 750, stallTime = 1500;
+    const int moveGrace = 1000;            // after a move that is not walking, before the wedge check may nudge
+    int safeSpotChecked = 0, embeddedSince = 0, stalledSince = 0, lastRecovery = 0, movedAt = 0;
+    bool stoodSafe = false;                // a safe spot was recorded since the last move that was not walking
+    vec stalledAt;
+
+    float bodyHeight(const physent *d) { return max(d->eyeheight + d->aboveeye, 2 * d->radius); }
+
+    // Forgets the floors recorded before a move that was not walking (haloplayermoved).
+    void clearRecovery()
+    {
+        safeSpots.setsize(0);
+        safeSpotChecked = embeddedSince = stalledSince = lastRecovery = 0;
+        stoodSafe = false;
+        movedAt = lastmillis;
+        stalledAt = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+    }
+
+    bool inMoveGrace() { return unsigned(lastmillis - movedAt) < unsigned(moveGrace); }
+
+    // Whether the player's body fits with its feet near `feet`, on retail floor (not a device
+    // top: lift decks and light bridges move or vanish), clear of the structure, of every
+    // device box and (unless `vehicles` is false) of every vehicle (one may have been parked
+    // there since; a body put back part way into a vehicle's box could not move). `ground` gets
+    // the feet on that floor.
+    bool standable(const vec &feet, vec &ground, bool vehicles = true)
+    {
+        const float height = bodyHeight(player1), radius = player1->radius;
+        const vec top = vec(feet).add(vec(0, 0, .5f));
+        HaloCollisionHit hit;
+        if(halocollisionoverlap(top, radius, height, hit) && hit.penetration > .015f) return false;
+        if(!halocollisionsweep(top, vec(0, 0, -2.5f), radius, height, hit) || hit.normal.z < .65f) return false;
+        ground = vec(top).add(vec(0, 0, -2.5f * hit.fraction + .015f));
+        if(vehicles && halovehicleat(vec(ground).add(vec(0, 0, .5f)), radius) >= 0) return false;
+        const vec saved = player1->o;
+        player1->o = vec(ground).add(vec(0, 0, player1->eyeheight));
+        float hi = 1e9f, lo = -1e9f;
+        const bool blocked = haloscenariocollide(player1, hi, lo) || ground.z + height > hi || lo > ground.z + .1f;
+        player1->o = saved;
+        return !blocked;
+    }
+
+    void placePlayer(const vec &ground, const char *why)
+    {
+        player1->o = vec(ground).add(vec(0, 0, player1->eyeheight));
+        player1->vel = vec(0, 0, 0);
+        player1->timeinair = 0;
+        player1->onfloor = true;
+        player1->resetinterp();
+        embeddedSince = stalledSince = 0;
+        stalledAt = ground;
+        conoutf("Halo recovery: %s, player put back at %.1f,%.1f,%.1f", why, ground.x, ground.y, ground.z);
+    }
+
+    void trackSafeSpot(const vec &feet)
+    {
+        if(!player1->onfloor || player1->timeinair || lastmillis - safeSpotChecked < safeSpotInterval) return;
+        safeSpotChecked = lastmillis;
+        vec ground;
+        if(!standable(feet, ground) || ground.dist(feet) > .3f) return;
+        stoodSafe = true;
+        if(!safeSpots.empty() && safeSpots.last().feet.dist(ground) < safeSpacing)
+        {
+            safeSpots.last() = SafeSpot{ground, lastmillis};
+            return;
+        }
+        if(safeSpots.length() >= safeSpotCount) safeSpots.remove(0);
+        safeSpots.add(SafeSpot{ground, lastmillis});
+    }
+
+    // Back to the newest safe spot that is still clear. A second recovery within five seconds
+    // means that spot did not hold (a ledge the body slides off again): drop it and go further back.
+    // `falling`: the body is falling out of the world, not wedged or stalled where it stands.
+    bool restoreSafeSpot(const char *why)
+    {
+        while(!safeSpots.empty())
+        {
+            vec ground;
+            if(standable(safeSpots.last().feet, ground)) { placePlayer(ground, why); return true; }
+            safeSpots.pop();
+        }
+        return false;
+    }
+
+    void recoverPlayer(const char *why, bool falling)
+    {
+        if(lastRecovery && lastmillis - lastRecovery < 5000 && !safeSpots.empty()) safeSpots.pop();
+        lastRecovery = lastmillis;
+        // Just thrown out of a vehicle with no room for the body (a Warthog over on its back in
+        // the Maw's run, where the walking body fits almost nowhere): back into its seat, rather
+        // than onto a floor walked long before boarding or a revert.
+        if(halovehiclereclaim(why))
+        {
+            embeddedSince = stalledSince = 0;
+            return;
+        }
+        if(restoreSafeSpot(why)) return;
+        if(!falling && !stoodSafe)
+        {
+            // Wedged since the spawn or the revert, before standing on any retail floor (a
+            // checkpoint on a lift deck): reverting would put the body back in the same place
+            // and loop. Leave it, and look again in five seconds.
+            conoutf("Halo recovery: %s, no safe floor since the checkpoint, player left in place", why);
+            embeddedSince = embeddedSince ? lastmillis + 5000 - wedgeTime : 0;
+            stalledSince = stalledSince ? lastmillis + 5000 - stallTime : 0;
+            return;
+        }
+        conoutf("Halo recovery: %s, no safe floor left, reverting to the checkpoint", why);
+        dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+    }
+
+    // A wedged body is first moved to the nearest clear floor within three units.
+    bool nudgePlayer(const vec &feet, const char *why)
+    {
+        for(float radius : {0.0f, .5f, 1.0f, 1.5f, 2.25f, 3.0f})
+            loopi(radius > 0 ? 12 : 1)
+            {
+                const float angle = i * 30 * RAD;
+                for(float up : {0.0f, 1.26f})
+                {
+                    vec ground;
+                    if(!standable(vec(feet).add(vec(cosf(angle) * radius, sinf(angle) * radius, up)), ground)) continue;
+                    placePlayer(ground, why);
+                    return true;
+                }
+            }
+        return false;
+    }
+
+    void updateRecovery()
+    {
+        // A seated player rides the vehicle, which keeps itself out of the walls (halo_vehicle.cpp).
+        if(!halocollisionactive() || halocinematic() || player1->state != CS_ALIVE || stage == COMPLETE || ending || halodriving())
+        {
+            embeddedSince = stalledSince = 0;
+            return;
+        }
+        vec low, high;
+        if(!halocollisionbounds(low, high)) return;
+        const float kill = low.z - killDepth;
+        loopv(enemies)
+        {
+            botent *bot = enemies[i].bot;
+            if(!bot || bot->state != CS_ALIVE || bot->o.z - bot->eyeheight >= kill) continue;
+            conoutf("Halo recovery: %s fell out of the world", bot->name);
+            dodamage(INT_MAX, bot, bot, GUN_GRENADE);
+        }
+        const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        trackSafeSpot(feet);
+        if(feet.z < kill) { recoverPlayer("fell below the retail collision", true); return; }
+        if(!player1->onfloor && player1->timeinair > fallTime)
+        {
+            // Nothing below at all (structure or device) down to the kill depth: a hole in the mesh.
+            HaloCollisionHit hit;
+            if(!haloscenariotrace(feet, vec(feet.x, feet.y, kill), hit)) { recoverPlayer("fell out of the world", true); return; }
+        }
+        HaloCollisionHit hit;
+        float hi = 1e9f, lo = -1e9f;
+        const bool embedded = (halocollisionoverlap(feet, player1->radius, bodyHeight(player1), hit) && hit.penetration > .1f) ||
+                              haloscenariocollide(player1, hi, lo);
+        if(!embedded) embeddedSince = 0;
+        else if(!embeddedSince) embeddedSince = lastmillis;
+        // Just moved there by a teleport, a revert or a seat: the body settles (entinmap, a
+        // door finishing its swing) before the wedge and stall checks start counting.
+        if(inMoveGrace())
+        {
+            embeddedSince = stalledSince = 0;
+            stalledAt = feet;
+            return;
+        }
+        // Airborne yet not moving at all: caught in a crease too steep to stand on.
+        if(player1->onfloor || feet.dist(stalledAt) > .05f)
+        {
+            stalledSince = 0;
+            stalledAt = feet;
+        }
+        else if(!stalledSince) stalledSince = lastmillis;
+        const bool wedged = embeddedSince && lastmillis - embeddedSince >= wedgeTime;
+        if(!wedged && !(stalledSince && lastmillis - stalledSince >= stallTime)) return;
+        const char *why = wedged ? "wedged in the collision" : "stuck in mid-air";
+        if(!nudgePlayer(feet, why)) recoverPlayer(why, false);
+    }
+}
+
+bool halorecoverplayer(const char *why)
+{
+    if(!haloactive() || !halocollisionactive() || player1->state != CS_ALIVE) return false;
+    return restoreSafeSpot(why);
+}
+
+void haloplayermoved(const char *why, const vec *kept)
+{
+    const int dropped = safeSpots.length();
+    clearRecovery();
+    // The floor the player got into a seat from: retail floor they walked to, clear of the
+    // structure and the devices (the vehicle beside it is not counted: it is about to move off,
+    // and restoreSafeSpot checks the vehicles again before using the spot).
+    vec ground;
+    if(kept && halocollisionactive() && standable(*kept, ground, false) && ground.dist(*kept) <= .3f)
+        safeSpots.add(SafeSpot{ground, lastmillis});
+    if(halo_scripttrace && haloactive())
+        conoutf("Halo moved: %s, %d safe floor%s dropped%s", why ? why : "?", dropped, dropped == 1 ? "" : "s",
+                safeSpots.empty() ? "" : ", the boarding floor kept");
 }
 
 bool haloscenariotransition()
@@ -1010,18 +2234,55 @@ void haloupdate(int elapsed)
     {
         if(getclientnum() < 0) return;
         startPending = false;
+        // What the player brings into the section: from the section before (within a mission),
+        // from a continued game, or (restarting the section) what they brought in last time.
+        const bool restoring = restorePending && !preview && savedGame.valid && savedGame.mission == mission && savedGame.section == section;
+        restorePending = false;
+        if(preview) sectionLoadout.valid = false;
+        else if(pendingContinuation && carryLoadout.valid) sectionLoadout = carryLoadout;
+        else if(restoring)
+        {
+            sectionLoadout = savedGame.loadout;
+            loopi(2)
+            {
+                const HaloWeaponDef *d = savedGame.weaponPath[i][0] ? haloweaponfind(savedGame.weaponPath[i]) : NULL;
+                sectionLoadout.carried[i].def = d ? d->index : -1;
+            }
+        }
+        else if(!keepSectionLoadout || sectionLoadoutMission != mission || sectionLoadoutSection != section) sectionLoadout.valid = false;
+        carryLoadout.valid = keepSectionLoadout = false;
+        sectionLoadoutMission = mission;
+        sectionLoadoutSection = section;
         resetEncounter();
         resetcamera();
         conoutf("Halo: %s, section %d", haloMissions[mission].title, section + 1);
         haloscenariostart(mission, section, preview, pendingContinuation);
+        halovehiclessync();
+        haloequipmentsync();
+        // A save at this section's start keeps the script's state only when the script was
+        // carried in; Continue (with a state block that fits) restores it where it was saved.
+        scriptCarried = !preview && pendingContinuation;
+        if(restoring)
+        {
+            if(restoreSavedState()) scriptCarried = true;
+            else restoreSavedCheckpoint();
+        }
+        if(!preview) loadProgress();
         if(!preview && (mission > savedMission || (mission == savedMission && section > savedSection)))
         {
             savedMission = mission;
             savedSection = section;
-            saveProgress();
         }
+        if(!preview) recordProgress(atCheckpoint);
+        // Carried in under an opening scene: the save that keeps the script waits for it to end.
+        pendingStartState = !preview && scriptCarried && !atCheckpoint && halocinematic();
     }
     haloscenariotick(elapsed);
+    if(pendingStartState && !halocinematic())
+    {
+        pendingStartState = false;
+        if(!atCheckpoint && stage != COMPLETE && player1->state == CS_ALIVE) recordProgress(false);
+    }
     if(haloscenariocomplete()) finishSection(true);
     if(haloscenariogamewon())
     {
@@ -1048,8 +2309,18 @@ void haloupdate(int elapsed)
         nextSection();
         return;
     }
+    halovehiclesupdate(elapsed);
     if(halocinematic() || player1->state != CS_ALIVE || stage == COMPLETE) return;
-    if(driving && lastmillis >= escapeDeadline)
+    // The run's first section on stock geometry starts on foot by the parked Warthogs; when the
+    // script has not created them (a section launched on its own runs no script), one waits there.
+    if(escaping && !escapeOffered && !halodriving() && lastmillis - escapeStarted > 2500)
+    {
+        escapeOffered = true;
+        halovehicleensure(feetOf(player1), player1->yaw, 80.0f);
+    }
+    updateRecovery();
+    if(player1->state != CS_ALIVE) return;
+    if(escaping && lastmillis >= escapeDeadline)
     {
         if(haloscenarioescapefailed() || !haloscenarioescapetimeout())
             dodamage(INT_MAX, player1, player1, GUN_GRENADE);
@@ -1058,7 +2329,7 @@ void haloupdate(int elapsed)
     if(!retailCartographer() && (stage == INSERTION || stage == REACH_PASS || stage == EXTRACTION))
     {
         const vector<int> &markers = route[stage == INSERTION ? 0 : stage == REACH_PASS ? 1 : 2];
-        if(driving)
+        if(escaping)
         {
             const vec target = objective();
             if(player1->o.distxy(target) <= 13.0f && nextRouteMarker < route[0].length() + route[1].length() + route[2].length())
@@ -1073,6 +2344,7 @@ void haloupdate(int elapsed)
     }
     shieldTick(shield, shieldCap, shieldHit, shieldDelay, shieldRecharge, elapsed);
     updateWeapons(elapsed);
+    updateItems(elapsed);
     updateFlood();
     loopv(enemies)
     {
@@ -1096,7 +2368,7 @@ void haloupdate(int elapsed)
             if(!remaining()) setStage(EXTRACTION);
             break;
         case EXTRACTION:
-            if(nextRouteMarker >= route[2].length() + (driving ? route[0].length() + route[1].length() : 0) &&
+            if(nextRouteMarker >= route[2].length() + (escaping ? route[0].length() + route[1].length() : 0) &&
                near(extraction, markerRadius) && !sectionInteraction()) finishSection();
             break;
         case COMPLETE: break;
@@ -1114,10 +2386,20 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     {
         // Enemy fire hurts more on the higher difficulties.
         if(attacker != player1 && halodifficulty() != 1) damage = max(1, int(damage * halodifficultydamage() + .5f));
+        // In a Warthog the body takes some of the fire.
+        if(halodriving()) damage = halovehicledamage(damage);
         shieldHit = lastmillis;
         shieldRecharging = false;
-        const bool hadShield = shield > 0;
         int factor = attacker != player1 && gun == GUN_SUBGUN ? 2 : 1;
+        // The overshield's extra layers take the hit first.
+        if(overshield > 0)
+        {
+            const float layer = min(overshield, float(damage * factor));
+            overshield -= layer;
+            damage = max(0, int(ceilf(damage - layer / factor - 0.001f)));
+            if(damage <= 0) { haloplaysound("shield-hit", S_NULL); return; }
+        }
+        const bool hadShield = shield > 0;
         float absorbed = min(shield, float(damage * factor));
         shield -= absorbed;
         if(hadShield) haloplaysound(shield > 0 ? "shield-hit" : "shield-depleted", S_NULL);
@@ -1180,7 +2462,7 @@ bool halopickup(int index, playerent *p)
             if(!refill(defaultWeapons[1], GUN_PISTOL, 12, 120)) return true;
             break;
         case I_GRENADE:
-            if(grenades >= 4) return true;
+            if(grenades >= grenadeMaximum(HALO_GRENADE_FRAG)) return true;
             ++grenades;
             break;
         default: return true;
@@ -1225,6 +2507,10 @@ void halodrawhud()
     const vec target = objective();
     vec bearing = vec(target).sub(player1->o);
     bearing.rotate_around_z(-yaw);
+    // The script's nav points (halo_hud.cpp draws them) stand in for the route marker.
+    HaloHudNav navs[16];
+    const int navCount = haloscenarionavpoints(navs, 16);
+    const int hidden = haloscenariohudhidden(NULL);
 
     glDisable(GL_TEXTURE_2D);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1241,14 +2527,18 @@ void halodrawhud()
     const bool tagHud = halohudready() && tagWeapons();
     if(!tagHud)
     {
-    box(right-318, 72, 318, 120, 7, 24, 44, 160);
-    box(right-299, 123, 278, 16, 18, 60, 81, 210);
-    box(right-299, 123, 278 * shield / playerShield, 16, 91, 216, 255, 235);
-    loopi(8) box(right-299 + i*35, 151, 30, 13,
+    if((hidden & (HALO_HUD_SHIELD | HALO_HUD_HEALTH)) != (HALO_HUD_SHIELD | HALO_HUD_HEALTH)) box(right-318, 72, 318, 120, 7, 24, 44, 160);
+    if(!(hidden & HALO_HUD_SHIELD))
+    {
+        box(right-299, 123, 278, 16, 18, 60, 81, 210);
+        box(right-299, 123, 278 * shield / playerShield, 16, 91, 216, 255, 235);
+    }
+    if(!(hidden & HALO_HUD_HEALTH)) loopi(8) box(right-299 + i*35, 151, 30, 13,
         player1->health * 8 > i * playerHealth ? 114 : 24,
         player1->health * 8 > i * playerHealth ? 217 : 61,
         player1->health * 8 > i * playerHealth ? 232 : 86, 225);
-
+    if(!(hidden & HALO_HUD_MOTION))
+    {
     glColor4ub(8, 30, 48, 164);
     glBegin(GL_TRIANGLE_FAN);
     glVertex2f(trackerX, trackerY);
@@ -1273,7 +2563,8 @@ void halodrawhud()
         box(trackerX + delta.x*2-7, trackerY + delta.y*2-7, 14, 14, 255, ally ? 220 : 74, ally ? 60 : 81, 250);
     }
     }
-    if(stage != COMPLETE)
+    }
+    if(stage != COMPLETE && !navCount)
     {
         const float direction = atan2f(bearing.x, -bearing.y);
         float x = VIRTW * 0.5f + clamp(direction / PI, -0.9f, 0.9f) * VIRTW * 0.42f;
@@ -1299,8 +2590,9 @@ void halodrawhud()
         drawEnding();
         return;
     }
-    if(!tagHud) label("SHIELD", right-299, 79);
-    if(driving && stage != COMPLETE)
+    if(stage != COMPLETE) halohuddrawnav(navs, navCount);
+    if(!tagHud && !(hidden & HALO_HUD_SHIELD)) label("SHIELD", right-299, 79);
+    if(escaping && stage != COMPLETE)
     {
         int seconds = max(0, (escapeDeadline - lastmillis + 999) / 1000);
         defformatstring(timer)("ESCAPE  %d:%02d", seconds / 60, seconds % 60);
@@ -1358,9 +2650,9 @@ void halodrawhud()
         defformatstring(distance)("%d m", int(bearing.magnitudexy()/2.75f + 0.5f));
         label(distance, left, 353);
     }
-    if(driving)
+    if(halodriving())
     {
-        label("WARTHOG", right, VIRTH-155, 0.70f, true);
+        drawVehicleHud(tagHud, right, yaw);
         return;
     }
     const weapon *current = player1->weaponsel;
@@ -1384,23 +2676,9 @@ void halodrawhud()
         w.zoom = st.zoom;
         vec from = player1->o, aim = vec(worldpos).sub(from);
         w.locked = !aim.iszero() && haloaimtarget(from, aim.normalize(), *def);
-        HaloHudUnit u;
-        u.shield = clamp(shield / playerShield, 0.0f, 1.0f);
-        u.health = clamp(player1->health / float(playerHealth), 0.0f, 1.0f);
-        u.grenades = player1->mag[GUN_GRENADE];
         HaloHudBlip blips[64];
-        int count = 0;
-        const float scale = haloscenarioscale();
-        loopv(enemies)
-        {
-            const botent *bot = enemies[i].bot;
-            // The sensor shows contacts that move or fire, as the retail tracker does.
-            if(!bot || bot->state != CS_ALIVE || count >= 64 || (bot->vel.sqrxy() < 0.01f && lastmillis - bot->lastaction > 500)) continue;
-            vec delta = vec(bot->o).sub(player1->o);
-            delta.rotate_around_z(-yaw);
-            blips[count++] = HaloHudBlip{delta.x / scale, delta.y / scale, enemies[i].team == HALO_TEAM_HUMAN};
-        }
-        halohuddraw(w, u, blips, count);
+        const int count = sensorBlips(blips, 64, yaw);
+        halohuddraw(w, hudUnit(), blips, count);
     }
     else if(def)
     {
@@ -1442,17 +2720,34 @@ void halodrawhud()
         defformatstring(ammo)("%02d / %03d", current->mag, current->ammo);
         label(ammo, right, VIRTH-173, 0.96f, true);
     }
-    if(groundWeapons.inrange(nearbyWeapon))
+    if(const char *vehicle = halovehicleprompt(nearbyWeaponDistance())) label(vehicle, VIRTW/2-200, VIRTH/2+90, 0.6f);
+    else if(groundWeapons.inrange(nearbyWeapon))
     {
         const HaloWeaponDef *d = haloweapon(groundWeapons[nearbyWeapon].state.def);
         defformatstring(prompt)("E  Pick up %s", d ? d->name.c_str() : "weapon");
         label(prompt, VIRTW/2-200, VIRTH/2+90, 0.6f);
     }
     if(pickupMessage && lastmillis - pickupMessage < 1600) label(pickupText, VIRTW/2-200, VIRTH/2+130, 0.55f);
-    if(!tagHud)
+    // Both grenade counts, the selected type in brackets (H switches); the retail panel above
+    // shows the selected type's count.
+    const int frags = grenadeCount(HALO_GRENADE_FRAG), plasmas = grenadeCount(HALO_GRENADE_PLASMA);
+    defformatstring(grenades)(grenadeType == HALO_GRENADE_PLASMA ? "FRAG %d   [PLASMA %d]" : "[FRAG %d]   PLASMA %d", frags, plasmas);
+    if(tagHud) label(grenades, left, 212, 0.5f);
+    else label(grenades, right, VIRTH-100, 0.57f, true);
+    if(overshield > 0 && !tagHud)
     {
-        defformatstring(grenades)("FRAG  %d", player1->mag[GUN_GRENADE]);
-        label(grenades, right, VIRTH-100, 0.57f, true);
+        glDisable(GL_TEXTURE_2D);
+        box(right-299, 141, 278 * clamp(overshield / max(shieldCap, 1.0f) * .5f, 0.0f, 1.0f), 6, 120, 255, 120, 235);
+        glEnable(GL_TEXTURE_2D);
+    }
+    const float camo = haloplayercamo();
+    if(camo > 0)
+    {
+        glDisable(GL_TEXTURE_2D);
+        box(0, 0, VIRTW, VIRTH, 150, 190, 230, int(22 * camo));
+        glEnable(GL_TEXTURE_2D);
+        defformatstring(cloak)("ACTIVE CAMOUFLAGE  %d", max(0, (camoUntil - lastmillis + 999) / 1000));
+        label(cloak, VIRTW/2 - 230, 120, 0.5f);
     }
 }
 
@@ -1469,7 +2764,12 @@ COMMANDF(halo_section, "ii", (int *m, int *s)
     if(*m >= 1 && *m <= haloMissionCount && *s >= 1 && *s <= haloMissions[*m - 1].sections)
         queueSection(*m - 1, *s - 1, true);
 });
-COMMANDF(halo_restart, "", () { if(haloactive()) queueSection(mission, section, preview); });
+COMMANDF(halo_restart, "", ()
+{
+    if(!haloactive()) return;
+    keepSectionLoadout = true;
+    queueSection(mission, section, preview);
+});
 COMMANDF(halo_next, "", ()
 {
     if(ending) { finishEnding(); return; }
@@ -1477,7 +2777,11 @@ COMMANDF(halo_next, "", ()
 });
 COMMANDF(halo_use, "", ()
 {
+    // In a seat E gets out (or, upside down, is thrown clear).
+    if(halodriving()) { halovehicleuse(0); return; }
     if(haloscenariouse()) return;
+    // A vehicle seat or a weapon on the ground, whichever is nearer.
+    if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && halovehicleuse(nearbyWeaponDistance())) return;
     if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && swapWeapon()) return;
     if(retailCartographer() && (section != 2 || !halopelicanready())) return;
     if(haloactive() && !halocinematic() && player1->state == CS_ALIVE && stage == EXTRACTION && sectionInteraction() &&
@@ -1492,16 +2796,191 @@ COMMANDF(halo_mission, "i", (int *index)
     loadProgress();
     if(*index >= 1 && *index <= haloMissionCount) queueSection(*index - 1, 0);
 });
+
+// ---- Title menu and saved games (config/halo.cfg builds the menus from these)
+
+// Missions the player may pick: up to the furthest reached, every one once the campaign is beaten.
+static int halounlockedmissions()
+{
+    loadProgress();
+    return campaignBeaten ? haloMissionCount : clamp(savedMission + 1, 1, haloMissionCount);
+}
+
+// Shows the title menu: on launch, or from the pause menu (the campaign stays paused under it).
+static void halotitle()
+{
+    loadProgress();
+    if(!controlsLoaded) controlsLoaded = execfile("config/halo.cfg");
+    titleScreen = true;
+    if(haloactive())
+    {
+        player1->attacking = false;
+        player1->stopmoving();
+    }
+    closemenu(NULL);
+    showmenu("Halo");
+}
+COMMANDN(halo_title, halotitle, "");
+
+// New Game: the difficulty, then The Pillar of Autumn from its start. Unlocked missions stay.
+static void halonewgame(int *difficulty)
+{
+    loadProgress();
+    defformatstring(set)("halo_difficulty %d", clamp(*difficulty, 0, 3));
+    execute(set);
+    sectionLoadout.valid = carryLoadout.valid = restorePending = false;
+    if(!installed(0, 0) && installed(1, 0)) queueSection(1, 0, true);
+    else queueSection(0, 0);
+}
+COMMANDN(halo_new_game, halonewgame, "i");
+
+// Continue: the saved section at the saved checkpoint, with the saved loadout and difficulty.
+static void halocontinue()
+{
+    loadProgress();
+    if(!savedGame.valid || !installed(savedGame.mission, savedGame.section))
+    {
+        conoutf("Halo: no saved game to continue");
+        return;
+    }
+    defformatstring(set)("halo_difficulty %d", savedGame.difficulty);
+    execute(set);
+    carryLoadout.valid = false;
+    queueSection(savedGame.mission, savedGame.section);
+    if(!launchPending) return;
+    restorePending = true;
+    incomingEscapeTime = savedGame.escapeMillis;
+}
+COMMANDN(halo_continue, halocontinue, "");
+
+static void halocancontinue()
+{
+    loadProgress();
+    intret(savedGame.valid && installed(savedGame.mission, savedGame.section) ? 1 : 0);
+}
+COMMANDN(halo_can_continue, halocancontinue, "");
+
+static const char *const difficultyNames[4] = {"Easy", "Normal", "Heroic", "Legendary"};
+
+// "The Pillar of Autumn  2/7  Normal  (checkpoint)" for the Continue entry.
+static void halocontinuelabel()
+{
+    loadProgress();
+    if(!savedGame.valid) { result(""); return; }
+    // A state block saved with another .hscb cannot resume the script: say so before Continue.
+    unsigned script = 0;
+    int format = 0;
+    const bool stale = !savedGame.state.empty() && sscanf(savedGame.state.c_str(), "state %d %*d %*d %*d %x", &format, &script) == 2 &&
+                       script != haloscenariofilehash(savedGame.mission);
+    defformatstring(label)("%s  %d/%d  %s%s%s", haloMissions[savedGame.mission].title, savedGame.section + 1,
+        haloMissions[savedGame.mission].sections, difficultyNames[clamp(savedGame.difficulty, 0, 3)],
+        savedGame.checkpoint ? "  (checkpoint)" : "", stale ? "  (scripts changed: the section's script restarts)" : "");
+    result(label);
+}
+COMMANDN(halo_continue_label, halocontinuelabel, "");
+
+static void halounlocked() { intret(halounlockedmissions()); }
+COMMANDN(halo_unlocked, halounlocked, "");
+
+// 1-based mission: 1 can be played, 0 locked, 2 not imported.
+static void halomissionstate(int *index)
+{
+    const int m = *index - 1;
+    if(m < 0 || m >= haloMissionCount) { intret(0); return; }
+    if(!installed(m, 0)) { intret(2); return; }
+    intret(m < halounlockedmissions() ? 1 : 0);
+}
+COMMANDN(halo_mission_state, halomissionstate, "i");
+
+static void halomissiontitle(int *index)
+{
+    result(*index >= 1 && *index <= haloMissionCount ? haloMissions[*index - 1].title : "");
+}
+COMMANDN(halo_mission_title, halomissiontitle, "i");
+
+static void halodifficultyname() { result(difficultyNames[halodifficulty()]); }
+COMMANDN(halo_difficulty_name, halodifficultyname, "");
+
+// The warning from loading the progress file (a corrupt file restored from its backup), or "".
+static void haloprogressnote() { loadProgress(); result(progressNote); }
+COMMANDN(halo_progress_note, haloprogressnote, "");
 COMMANDF(halo_switch, "d", (bool down) { if(down) haloswitchweapon(); });
+
+int haloenemykind(const playerent *p, int *team)
+{
+    HaloEnemy *enemy = p ? enemyState(p) : NULL;
+    if(team) *team = enemy ? enemy->team : -1;
+    return enemy ? int(enemy->kind) : -1;
+}
 
 void haloremoveactor(const playerent *p)
 {
     loopv(enemies) if(enemies[i].bot == p) enemies[i].bot = NULL;
+    halogrenadeforget(p);
+    halovehicleforget(p);
     haloactordetach(p);
     haloscenarioremovebot(p);
 }
 
 COMMANDF(halo_frag, "d", (bool down) { if(down) halofrag(); });
+COMMANDF(halo_grenade_switch, "d", (bool down) { if(down) switchGrenade(); });
+
+int haloplayergrenades(int type)
+{
+    if(type < 0) return grenadeCount(HALO_GRENADE_FRAG) + grenadeCount(HALO_GRENADE_PLASMA);
+    return type < HALO_GRENADE_TYPES ? grenadeCount(type) : 0;
+}
+
+int haloplayergrenadetype() { return grenadeType; }
+
+int haloplayerusegrenade()
+{
+    if(grenadeCount(grenadeType) <= 0)
+    {
+        // Halo throws the other type once the selected one has run out.
+        if(!grenadeKnown(grenadeType ^ 1) || grenadeCount(grenadeType ^ 1) <= 0) return -1;
+        grenadeType ^= 1;
+    }
+    const int type = grenadeType;
+    --grenadeCount(type);
+    if(grenadeCount(type) <= 0 && grenadeKnown(type ^ 1) && grenadeCount(type ^ 1) > 0) grenadeType ^= 1;
+    return type;
+}
+
+float haloplayercamo()
+{
+    if(!haloactive() || player1->state != CS_ALIVE || lastmillis >= camoUntil) return 0;
+    return clamp((camoUntil - lastmillis) / float(camoFade), 0.0f, 1.0f);
+}
+
+// Script hooks for scenario equipment with a name: object_create shows it, object_destroy takes it away.
+void haloequipmentobject(int object, bool exists, bool reset)
+{
+    if(object < 0) return;
+    loopv(groundItems)
+    {
+        GroundItem &item = groundItems[i];
+        if(item.object != object) continue;
+        if(!exists) { item.exists = false; continue; }
+        if(item.exists && !reset) continue;
+        item.exists = itemDifficultyAllows(item.flags);
+        item.created = true;
+    }
+}
+
+// After the mission script started (or resumed) on this section: equipment the script has already created is there.
+void haloequipmentsync()
+{
+    loopv(groundItems)
+    {
+        GroundItem &item = groundItems[i];
+        if(!item.created && item.object >= 0 && haloscenarioobjectvisible(item.object))
+        {
+            item.created = true;
+            item.exists = itemDifficultyAllows(item.flags);
+        }
+    }
+}
 COMMANDF(halo_melee, "d", (bool down) { if(down) halomelee(); });
 
 COMMANDF(halo_slot, "i", (int *slot)
@@ -1538,19 +3017,50 @@ COMMANDF(halo_pause, "", ()
         player1->stopmoving();
         showmenu("Halo Campaign");
     }
+    // Before a campaign has started, Escape brings the title menu back.
+    else if(titleScreen) showmenu("Halo");
     else execute("key_escape");
 });
 
+// The title screen behind the title menu: before a campaign starts it hides the stock level the
+// engine boots into; over a paused campaign it stays until the title menu is closed.
+bool halotitleactive()
+{
+    if(!titleScreen) return false;
+    if(haloactive() && !menuvisible()) titleScreen = false;
+    return titleScreen;
+}
 
-bool halodriving() { return haloactive() && driving && !editmode && player1->state == CS_ALIVE; }
+void halodrawtitle()
+{
+    glDisable(GL_TEXTURE_2D);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBegin(GL_TRIANGLE_STRIP);
+    glColor4ub(4, 10, 22, 255); glVertex2f(0, 0); glVertex2f(VIRTW, 0);
+    glColor4ub(10, 32, 52, 255); glVertex2f(0, VIRTH); glVertex2f(VIRTW, VIRTH);
+    glEnd();
+    glEnable(GL_TEXTURE_2D);
+    label("HALO", VIRTW/2 - int(text_width("HALO") * 1.6f), VIRTH/8, 3.2f);
+    label("Combat Evolved", VIRTW/2 - int(text_width("Combat Evolved") * 0.45f), VIRTH/8 + 230, 0.9f);
+    if(progressNote[0])
+    {
+        glPushMatrix();
+        glTranslatef(VIRTW/2 - text_width(progressNote) * 0.3f, VIRTH - 260, 0);
+        glScalef(0.6f, 0.6f, 1);
+        draw_text(progressNote, 0, 0, 255, 120, 90, 255);
+        glPopMatrix();
+    }
+    if(!menuvisible()) label("Esc  Menu", VIRTW/2 - int(text_width("Esc  Menu") * 0.3f), VIRTH - 160, 0.6f);
+}
+
+
+// The player is in a vehicle seat (halo_vehicle.cpp): its controls replace walking and the carried weapons.
+bool halodriving() { return haloactive() && !editmode && halovehicleseated(); }
 
 void halorendervehicle()
 {
     halorenderweapons();
-    if(!halodriving()) return;
-    vec origin = player1->o;
-    origin.z -= player1->eyeheight;
-    rendermodel("halo/warthog", ANIM_MAPMODEL, 0, -1, origin, 0, player1->yaw + 90, 0, 0, 0);
+    halovehiclesrender();
 }
 
 const HaloWeaponDef *haloweaponof(const playerent *p, int gun, HaloWeaponState **state)
@@ -1580,7 +3090,7 @@ bool halocarriesgun(int gun)
 
 void haloswitchweapon()
 {
-    if(!haloactive() || halocinematic() || player1->state != CS_ALIVE) return;
+    if(!haloactive() || halocinematic() || halodriving() || player1->state != CS_ALIVE) return;
     if(!tagWeapons())
     {
         execute(player1->weaponsel->type == GUN_ASSAULT ? "weapon pistol" : "weapon assault");
@@ -1611,6 +3121,7 @@ void haloattackinput(bool down)
     vec from = player1->o, to = worldpos;
     from.z -= weapon::weaponbeloweye;
     halofiretrigger(player1, *d, s, 1, from, to);
+    haloplaysound(d->sound(HALO_SOUND_CHARGED) ? d->sound(HALO_SOUND_CHARGED) : d->sound(HALO_SOUND_FIRE), S_NULL);
     player1->weaponsel->updatetimers(lastmillis);
     player1->lastaction = lastmillis;
 }
@@ -1633,7 +3144,8 @@ void halounzoom()
 int halomeleedamage()
 {
     const HaloWeaponDef *d = tagWeapons() ? haloweapon(carried[currentCarried].def) : NULL;
-    return d && d->meleeUpper > 0 ? int(d->meleeUpper + .5f) : 50;
+    // A full-strength melee hit rolls the jpt! upper bound (50-60 for the human weapons).
+    return d && d->melee.upperMax > 0 ? int(d->melee.roll() + .5f) : 50;
 }
 
 playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeaponDef &def)
@@ -1666,6 +3178,7 @@ void halokilled(playerent *victim, playerent *killer)
 {
     if(!haloactive() || !victim || victim == player1) return;
     const bool keepsItems = !(haloactorflags(victim) & HALO_AI_NO_DROPS);
+    const int grenadeKind = haloactorgrenadetype(victim);
     haloactordeath(victim, killer);
     HaloEnemy *enemy = enemyState(victim);
     if(!enemy) return;
@@ -1673,9 +3186,17 @@ void halokilled(playerent *victim, playerent *killer)
     if(enemy->kind == CARRIER) floodSpawns.add(FloodSpawn{feet, victim->yaw, INFECTION, 4 + rnd(5), lastmillis});
     else if((enemy->kind == MARINE || enemy->kind == ELITE) && corpses.length() < 32)
         corpses.add(Corpse{feet, victim->yaw, enemy->kind, lastmillis + corpseLife});
+    // unit_doesnt_drop_items leaves nothing behind. Actors drop the grenades they still
+    // carry (at most two), beside the body, then their weapon.
+    if(!keepsItems) return;
+    const HaloEquipmentDef *grenade = grenadeKind >= 0 ? halogrenadeequipment(grenadeKind) : NULL;
+    loopi(min(victim->mag[GUN_GRENADE], 2))
+    {
+        const float angle = (victim->yaw + 90 + i * 140) * RAD;
+        dropItem(grenade, vec(feet).add(vec(cosf(angle), sinf(angle), 0).mul(.8f)), victim->yaw + i * 60);
+    }
     const HaloWeaponDef *d = haloweapon(enemy->weapon.def);
-    // unit_doesnt_drop_items leaves nothing behind.
-    if(!keepsItems || !d || !d->playable()) return;
+    if(!d || !d->playable()) return;
     // A dropped weapon keeps part of its battery or magazine.
     HaloWeaponState dropped;
     dropped.reset(d);
@@ -1716,11 +3237,23 @@ void halorenderweapons()
         o.z += 0.35f + 0.12f * sinf(lastmillis / 400.0f + i);
         rendermodel(d->worldmodel.c_str(), ANIM_MAPMODEL|ANIM_LOOP, 0, -1, o, 0, g.yaw + 90, 0, 0, 0);
     }
+    loopv(groundItems)
+    {
+        const GroundItem &item = groundItems[i];
+        const HaloEquipmentDef *d = haloequipment(item.def);
+        if(!item.exists || !d || d->worldmodel == "-") continue;
+        // Powerups float and turn; ammunition, grenades and health packs lie on the floor.
+        const bool powerup = d->powerup == HALO_POWERUP_OVERSHIELD || d->powerup == HALO_POWERUP_CAMO;
+        vec o = item.o;
+        o.z += powerup ? 1.2f + 0.15f * sinf(lastmillis / 500.0f + i) : 0.1f;
+        const float yaw = powerup ? fmodf(lastmillis / 20.0f, 360.0f) : item.yaw + 90;
+        rendermodel(d->worldmodel.c_str(), ANIM_MAPMODEL|ANIM_LOOP, 0, -1, o, 0, yaw, 0, 0, 0);
+    }
 }
 
 void halozoomstep()
 {
-    if(!haloactive() || !tagWeapons() || halocinematic() || player1->state != CS_ALIVE) return;
+    if(!haloactive() || !tagWeapons() || halocinematic() || halodriving() || player1->state != CS_ALIVE) return;
     HaloWeaponState &s = carried[currentCarried];
     const HaloWeaponDef *d = haloweapon(s.def);
     if(!d || d->zoomLevels <= 0 || player1->weaponsel->reloading) return;
@@ -1737,4 +3270,7 @@ COMMANDF(halo_zoom, "d", (bool down) { if(down) halozoomstep(); });
 #include "campaign_qa.inc"
 #include "b30_qa.inc"
 #include "retail_qa.inc"
+#include "vehicle_qa.inc"
+#include "combat_qa.inc"
+#include "frontend_qa.inc"
 #endif

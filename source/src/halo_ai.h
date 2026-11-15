@@ -73,6 +73,8 @@ playerent *haloactortarget(const playerent *bot);
 // Current health over the health the actor spawned with; the player uses 75.
 float haloactorhealthfraction(const playerent *bot);
 int haloactorflags(const playerent *bot);
+// The grenade type the actor throws (and drops when killed), or -1 for anything that is not an actor.
+int haloactorgrenadetype(const playerent *bot);
 // ai_grenades: whether any actor may throw grenades (on by default; the scenario resets it per section).
 void haloaisetgrenades(bool on);
 bool haloaigrenades();

@@ -19,18 +19,32 @@ struct HaloHudWeapon
 
 struct HaloHudBlip { float x, y; bool ally; };   // offsets from the player in Halo world units, rotated to view
 
+// HUD parts the mission scripts hide (hud_show_* false) or flash (hud_blink_* true).
+enum { HALO_HUD_HEALTH = 1, HALO_HUD_SHIELD = 2, HALO_HUD_MOTION = 4, HALO_HUD_CROSSHAIR = 8 };
+
 struct HaloHudUnit
 {
     float shield = 1, health = 1;          // fractions
+    float overshield = 0;                  // overshield layers beyond the full shield, 0 to 2
     bool shieldHit = false;
-    int grenades = 0, grenadeType = 0;
+    int grenades = 0, grenadeType = 0;     // the selected type's count and the type (0 frag, 1 plasma)
     bool flashlight = false;
     float flashlightCharge = 1;
+    int hidden = 0, blinking = 0;          // HALO_HUD_* bits
 };
+
+// A nav point a mission script shows (activate_nav_point_*, activate_team_nav_point_*): a world
+// point (AssaultCube units) and the retail waypoint arrow type ("default", "default_red", ...).
+struct HaloHudNav { float x, y, z; const char *type; };
 
 bool halohudload();
 bool halohudready();
 // Draws everything; call inside the 2D HUD pass (glOrtho over VIRTW x VIRTH).
 void halohuddraw(const HaloHudWeapon &weapon, const HaloHudUnit &unit, const HaloHudBlip *blips, int blipCount);
+// Draws nav points with the retail waypoint arrows (hud globals, `waypoint`/`arrow` lines in
+// hud.txt): the on-screen marker over the point, or the off-screen arrow at the screen edge
+// pointing towards it. Without those lines, plain diamonds in the arrow type's colour.
+// Uses the last 3D frame's view (mvpmatrix); call inside the 2D HUD pass.
+void halohuddrawnav(const HaloHudNav *navs, int count);
 
 #endif

@@ -5,6 +5,7 @@
 #include "halo.h"
 #include "halo_script.h"
 #include "halo_world.h"
+#include "halo_vehicle.h"
 
 bool hasTE = false, hasMT = false, hasMDA = false, hasDRE = false, hasstencil = false, hasST2 = false, hasSTW = false, hasSTS = false, hasAF;
 
@@ -517,16 +518,15 @@ void recomputecamera()
     }
     if(halodriving())
     {
+        // Third person behind the vehicle (halo_vehicle.cpp), orbiting with the mouse.
         static physent vehicleCamera;
         vehicleCamera = *static_cast<physent *>(player1);
         vehicleCamera.type = ENT_CAMERA;
-        const float yaw = player1->yaw * RAD;
-        vec target = vec(player1->o).add(vec(-sinf(yaw) * 12, cosf(yaw) * 12, 6));
-        intersectgeometry(player1->o, target);
-        vehicleCamera.o = target;
-        vehicleCamera.pitch = clamp(player1->pitch - 12.0f, -35.0f, 30.0f);
-        camera1 = &vehicleCamera;
-        return;
+        if(halovehiclecamera(vehicleCamera))
+        {
+            camera1 = &vehicleCamera;
+            return;
+        }
     }
     if((player1->state==CS_SPECTATE || player1->state==CS_DEAD) && !editmode)
     {
@@ -1181,6 +1181,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
         renderclients();
         halorendervehicle();
         endmodelbatches();
+        halovehiclesrenderplaceholders();
 
         startmodelbatches();
         renderentities();

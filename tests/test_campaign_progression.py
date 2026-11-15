@@ -24,5 +24,8 @@ def completed_first():
     return first is not None and second is not None and any(row=='Halo: mission complete' for row in rows[first:second])
 assert completed_first(),rows[-30:]
 assert any('map=halo_a10_02 stage=' in row for row in rows),rows[-30:]
-assert (profile/'config/halo-progress.txt').read_text().strip()=='1 0 1'
+# Progress file version 2: the furthest section reached and the game Continue resumes.
+progress=read_progress(profile)
+assert progress and progress['furthest']==['0','1'],progress
+assert progress['game'][:2]==['0','1'],progress
 print('Scripted sector completion advanced to the next map and saved progression.')

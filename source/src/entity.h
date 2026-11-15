@@ -610,7 +610,7 @@ struct flaginfo
 
 // nades, gibs
 
-enum { BT_NONE, BT_NADE, BT_GIB };
+enum { BT_NONE, BT_NADE, BT_GIB, BT_HALO };   // BT_HALO: a retail grenade (weapon.cpp halogrenade)
 
 class bounceent : public physent
 {

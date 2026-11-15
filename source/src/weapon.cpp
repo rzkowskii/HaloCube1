@@ -7,6 +7,7 @@
 #include "halo_weapons.h"
 #include "halo_ai.h"
 #include "halo_hud.h"
+#include "halo_vehicle.h"
 #include "bot/bot.h"
 #include "hudgun.h"
 
@@ -702,7 +703,7 @@ void movebounceents()
     loopv(bounceents) if(bounceents[i])
     {
         bounceent *p = bounceents[i];
-        if((p->bouncetype==BT_NADE || p->bouncetype==BT_GIB) && p->applyphysics()) movebounceent(p, 1, false);
+        if((p->bouncetype==BT_NADE || p->bouncetype==BT_GIB || p->bouncetype==BT_HALO) && p->applyphysics()) movebounceent(p, 1, false);
         if(!p->isalive(lastmillis))
         {
             p->destroy();
@@ -719,6 +720,9 @@ void clearbounceents()
     loopv(bounceents) if(bounceents[i]) { delete bounceents[i]; bounceents.remove(i--); }
 }
 
+// The model of a retail grenade (below), or null when it is not drawn.
+static const char *halobouncemodel(const bounceent *p);
+
 void renderbounceents()
 {
     loopv(bounceents)
@@ -734,6 +738,13 @@ void renderbounceents()
             case BT_NADE:
                 copystring(model, "weapons/grenade/static");
                 break;
+            case BT_HALO:
+            {
+                const char *halo = halobouncemodel(p);
+                if(!halo) continue;
+                copystring(model, halo);
+                break;
+            }
             case BT_GIB:
             default:
             {
@@ -999,9 +1010,14 @@ void weapon::attacksound()
     bool local = (owner == player1);
     if(haloactive())
     {
-        const char *sample = type == GUN_ASSAULT ? "ma5b-fire" : type == GUN_PISTOL ? "pistol-fire" :
+        // The weapon tag's firing sound (and its mechanism: the shotgun's pump, the rocket's
+        // cycle), for the player and the actors alike; the three original samples otherwise.
+        const HaloWeaponDef *def = haloweaponof(owner, type);
+        const char *sample = def ? def->sound(HALO_SOUND_FIRE) : NULL;
+        if(!sample) sample = type == GUN_ASSAULT ? "ma5b-fire" : type == GUN_PISTOL ? "pistol-fire" :
             type == GUN_SUBGUN || type == GUN_CARBINE ? "plasma-fire" : NULL;
         haloplaysound(sample, info.sound, owner);
+        if(const char *cycle = def ? def->sound(HALO_SOUND_CYCLE) : NULL) haloplaysound(cycle, S_NULL, owner);
     }
     else audiomgr.playsound(info.sound, owner, local ? SP_HIGH : SP_NORMAL);
 }
@@ -1013,12 +1029,16 @@ bool weapon::reload(bool autoreloaded)
     reloading = lastmillis;
     gunwait += info.reloadtime;
 
+    const bool empty = mag <= 0;
     int numbullets = min(info.magsize - mag, ammo);
     mag += numbullets;
     ammo -= numbullets;
 
     bool local = (player1 == owner);
-    if(haloactive() && local && (type == GUN_ASSAULT || type == GUN_PISTOL))
+    const HaloWeaponDef *halodef = haloactive() && local ? haloweaponof(owner, type) : NULL;
+    const char *halosample = halodef ? halodef->sound(empty ? HALO_SOUND_RELOAD_EMPTY : HALO_SOUND_RELOAD) : NULL;
+    if(halosample) haloplaysound(halosample, info.reload, owner);
+    else if(haloactive() && local && (type == GUN_ASSAULT || type == GUN_PISTOL))
         haloplaysound(type == GUN_ASSAULT ? "ma5b-reload" : "pistol-reload", info.reload, owner);
     else if(info.reload != S_NULL) audiomgr.playsound(info.reload, owner, local ? SP_HIGH : SP_NORMAL);
     if(local)
@@ -1123,7 +1143,11 @@ void weapon::onselecting(bool sound)
 {
     updatelastaction(owner);
     bool local = (owner == player1);
-    if(sound) audiomgr.playsound(S_GUNCHANGE, owner, local ? SP_HIGH : SP_NORMAL);
+    if(!sound) return;
+    // A retail weapon readies with its first-person ready animation's sound.
+    const HaloWeaponDef *halodef = haloactive() && local ? haloweaponof(owner, type) : NULL;
+    if(const char *ready = halodef ? halodef->sound(HALO_SOUND_READY) : NULL) haloplaysound(ready, S_GUNCHANGE, owner);
+    else audiomgr.playsound(S_GUNCHANGE, owner, local ? SP_HIGH : SP_NORMAL);
 }
 
 void weapon::renderhudmodel() { renderhudmodel(owner->lastaction); }
@@ -1133,6 +1157,8 @@ void weapon::renderaimhelp(bool teamwarning)
     if(!editmode && haloactive() && halohudready() && haloweaponof(owner, type)) return;
     if(!editmode && haloactive())
     {
+        // hud_show_crosshair false (a10's tutorial) hides the fallback reticle as it does the retail one.
+        if(haloscenariohudhidden(NULL) & HALO_HUD_CROSSHAIR) return;
         // The reticle turns red while aim assist has an enemy in range.
         const HaloWeaponDef *def = haloweaponof(owner, type);
         static color red(1.0f, 0.25f, 0.2f, 1.0f);
@@ -1464,7 +1490,13 @@ bool gun::attack(vec &targ)
     const HaloWeaponDef *halodef = haloactive() ? haloweaponof(owner, type, &halostate) : NULL;
     if(halodef && halostate && halodef->usesBattery() && !halostate->canfire(*halodef))
     {
-        // Overheated or empty Covenant weapons wait without the dry-fire click.
+        // Overheated or empty Covenant weapons wait; a fresh pull plays the tag's empty sound.
+        static int halodry = 0;
+        if(owner == player1 && lastmillis - halodry > 600 && !shots)
+        {
+            halodry = lastmillis;
+            haloplaysound(halodef->sound(HALO_SOUND_EMPTY), S_NULL);
+        }
         gunwait += 100;
         shots = 0;
         if(!info.isauto) owner->attacking = false;
@@ -1474,7 +1506,8 @@ bool gun::attack(vec &targ)
     if(!mag)
     {
         bool local = (owner == player1);
-        audiomgr.playsound(S_NOAMMO, owner, local ? SP_HIGH : SP_NORMAL);
+        if(const char *dry = halodef ? halodef->sound(HALO_SOUND_EMPTY) : NULL) haloplaysound(dry, S_NOAMMO, owner);
+        else audiomgr.playsound(S_NOAMMO, owner, local ? SP_HIGH : SP_NORMAL);
         gunwait += 250;
         owner->lastattackweapon = NULL;
         shots = 0;
@@ -1934,7 +1967,9 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
     const HaloTriggerDef *t = def.trigger(index);
     if(!t || !t->projectile.valid) return;
     const HaloProjectileDef &p = t->projectile;
+    const bool wasOverheated = state.overheated;
     const float cone = state.shoot(def, *t, lastmillis);
+    if(state.overheated && !wasOverheated) haloplaysound(def.sound(HALO_SOUND_OVERHEAT), S_NULL, owner);
     vec aim = vec(to).sub(from);
     if(aim.iszero()) return;
     aim.normalize();
@@ -1957,8 +1992,8 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
     loopi(count)
     {
         const vec dir = halocone(aim, cone + (count > 1 ? t->distribution * 0.5f : 0));
-        // Enemies use their slot's pre-scaled damage; the player rolls the tag range.
-        const int damage = owner == player1 ? max(1, int(p.damageLower + rndscale(max(0.0f, p.damageUpper - p.damageLower)) + .5f))
+        // Enemies use their slot's pre-scaled damage; the player rolls a full-strength hit.
+        const int damage = owner == player1 ? max(1, int(p.damage.roll() + .5f))
                                             : owner->weapons[GUN_SUBGUN]->info.damage;
         if(!instant)
         {
@@ -2023,6 +2058,7 @@ void haloaddbolt(playerent *owner, const vec &position, const vec &direction, in
 void haloupdatebolts(int elapsed)
 {
     if(intermission || ispaused || elapsed <= 0) return;
+    halogrenadesupdate();
     const float seconds = elapsed / 1000.0f, scale = haloscenarioscale();
     loopv(haloShots)
     {
@@ -2076,20 +2112,251 @@ void haloupdatebolts(int elapsed)
     }
 }
 
+extern physent *hitplayer;      // physics.cpp: the body the last move collided with
+
+namespace
+{
+    // A retail grenade in flight, at rest or stuck to a unit or a vehicle (equipment.txt).
+    // AssaultCube's bounce physics move it; the fuse, stickiness and blast are the tag's.
+    class halogrenade : public bounceent
+    {
+    public:
+        int type, thrown, timerStart = 0;
+        bool bounced = false, exploded = false;
+        playerent *stuckTo = NULL, *touched = NULL;   // touched: the body the last bounce hit
+        int stuckVehicle = -1;
+        vec stuckOffset;                    // in the unit's or the vehicle's frame
+
+        halogrenade(playerent *thrower, int grenadeType) : type(grenadeType)
+        {
+            owner = thrower;
+            millis = thrown = lastmillis;
+            // A fuse that never starts (wedged in a seam, never at rest) still ends.
+            timetolive = 15000;
+            bouncetype = BT_HALO;
+            maxspeed = 30.0f;
+            rotspeed = 6.0f;
+        }
+
+        bool attached() const { return stuckTo || stuckVehicle >= 0; }
+        bool applyphysics() { return !attached() && !exploded; }
+        void destroy() { explode(); }
+        void oncollision()
+        {
+            bounced = true;
+            if(hitplayer && (hitplayer->type == ENT_PLAYER || hitplayer->type == ENT_BOT)) touched = (playerent *)hitplayer;
+        }
+
+        void launch(const vec &velocity, playerent *thrower)
+        {
+            vel = velocity;
+            o = thrower->o;
+            inwater = waterlevel > o.z;
+            thrower->cancollide = false;
+            loopi(10) moveplayer(this, 10, true, 10);
+            thrower->cancollide = true;
+            resetinterp();
+        }
+
+        void detach()
+        {
+            stuckTo = NULL;
+            stuckVehicle = -1;
+            vel = vec(0, 0, 0);
+            onfloor = false;
+        }
+
+        void stick(playerent *unit)
+        {
+            stuckTo = unit;
+            stuckOffset = vec(o).sub(unit->o);
+            stuckOffset.rotate_around_z(-unit->yaw * RAD);
+            vel = vec(0, 0, 0);
+        }
+
+        // Follows what it is stuck to; once that is gone it falls.
+        void follow()
+        {
+            if(stuckTo)
+            {
+                if(stuckTo != player1 && players.find(stuckTo) < 0) { detach(); return; }
+                vec offset = stuckOffset;
+                offset.rotate_around_z(stuckTo->yaw * RAD);
+                o = vec(stuckTo->o).add(offset);
+            }
+            else if(stuckVehicle >= 0 && !halovehicleattached(stuckVehicle, stuckOffset, o)) detach();
+        }
+
+        void explode();
+    };
+
+    // Plasma grenades stick to a unit or a vehicle whose body they touch; a thrower is
+    // safe from their own grenade for its first half second.
+    void trystick(halogrenade &g)
+    {
+        const float reach = .45f;
+        auto valid = [&](playerent *p)
+        {
+            return p && (p == player1 || players.find(p) >= 0) && p->state == CS_ALIVE && !(p == g.owner && lastmillis - g.thrown < 500);
+        };
+        auto touches = [&](playerent *p)
+        {
+            if(!valid(p)) return false;
+            const float bottom = p->o.z - p->eyeheight - reach, top = p->o.z + p->aboveeye + reach;
+            return g.o.z >= bottom && g.o.z <= top && g.o.distxy(p->o) <= p->radius + reach;
+        };
+        // A body the grenade bounced off this frame, else any body it is now touching.
+        playerent *hit = g.touched;
+        g.touched = NULL;
+        if(valid(hit)) { g.stick(hit); return; }
+        if(touches(player1)) { g.stick(player1); return; }
+        loopv(players) if(players[i] && touches(players[i])) { g.stick(players[i]); return; }
+        const int vehicle = halovehicleat(g.o, reach);
+        if(vehicle >= 0 && halovehicleattach(vehicle, g.o, g.stuckOffset))
+        {
+            g.stuckVehicle = vehicle;
+            g.vel = vec(0, 0, 0);
+        }
+    }
+
+    void halogrenade::explode()
+    {
+        if(exploded) return;
+        exploded = true;
+        timetolive = 0;
+        const HaloGrenadeDef *def = halogrenadedef(type);
+        const bool plasma = def && def->sideEffect == 3;
+        particle_splash(plasma ? PART_PLASMA : PART_SPARK, 50, 300, o);
+        particle_fireball(PART_FIREBALL, o);
+        addscorchmark(o);
+        if(plasma) adddynlight(NULL, o, 16, 300, 150, 90, 170, 255);
+        else
+        {
+            adddynlight(NULL, o, 16, 200, 100, 255, 255, 224);
+            adddynlight(NULL, o, 16, 600, 600, 192, 160, 128);
+        }
+        haloplaysound(def ? def->sound(HALO_SOUND_EXPLODE) : NULL, S_FEXPLODE, NULL, &o);
+        if(!def || !owner) return;
+        haloactornoise(owner);
+        // Full damage inside the inner radius, falling off to none at the outer; the unit a
+        // sticky grenade is stuck to takes the attached damage as well. Difficulty scales what
+        // reaches the player in halodamage, as it does for every enemy weapon.
+        const float scale = haloscenarioscale();
+        const float inner = def->innerRadius * scale, outer = max(def->outerRadius * scale, inner + .1f);
+        auto blast = [&](playerent *victim)
+        {
+            if(!victim || victim->state != CS_ALIVE) return;
+            const vec centre = vec(victim->o).sub(vec(0, 0, victim->eyeheight * .5f));
+            const float distance = centre.dist(o);
+            const bool stuck = victim == stuckTo;
+            if(!stuck && (distance >= outer || !raycubelos(o, centre, .3f))) return;
+            const float falloff = stuck || distance <= inner ? 1.0f : 1.0f - (distance - inner) / (outer - inner);
+            int damage = int(def->blast.roll() * falloff + .5f);
+            if(stuck) damage += int(def->attached.roll() + .5f);
+            if(damage <= 0) return;
+            vec dir = vec(victim->o).sub(o);
+            if(dir.iszero()) dir = vec(0, 0, 1);
+            hit(damage, victim, owner, dir.normalize(), GUN_GRENADE, true, int(distance * DMF));
+        };
+        blast(player1);
+        loopv(players) blast(players[i]);
+    }
+}
+
+static const char *halobouncemodel(const bounceent *p)
+{
+    const halogrenade *g = (const halogrenade *)p;
+    if(g->exploded) return NULL;
+    const HaloEquipmentDef *item = halogrenadeequipment(g->type);
+    return item && item->worldmodel != "-" ? item->worldmodel.c_str() : "weapons/grenade/static";
+}
+
+bool halothrowgrenade(playerent *owner, int type, const vec &velocity)
+{
+    const HaloGrenadeDef *def = halogrenadedef(type);
+    if(!haloactive() || !owner || !def) return false;
+    halogrenade *g = new halogrenade(owner, type);
+    bounceents.add(g);
+    g->launch(velocity, owner);
+    haloplaysound(def->sound(HALO_SOUND_THROW), S_GRENADETHROW, owner == player1 ? NULL : owner);
+    // The plasma grenade's hiss, from where it leaves the hand.
+    if(const char *armed = def->sound(HALO_SOUND_ARMED)) haloplaysound(armed, S_NULL, NULL, &g->o);
+    return true;
+}
+
+void halogrenadesupdate()
+{
+    loopv(bounceents)
+    {
+        if(!bounceents[i] || bounceents[i]->bouncetype != BT_HALO) continue;
+        halogrenade &g = *(halogrenade *)bounceents[i];
+        if(g.exploded) continue;
+        const HaloGrenadeDef *def = halogrenadedef(g.type);
+        if(!def) { g.explode(); continue; }
+        if(g.attached()) g.follow();
+        else if(def->sticks) trystick(g);
+        if(!g.timerStart)
+        {
+            const bool rest = g.attached() || (g.onfloor && g.vel.magnitude() < .08f);
+            bool start = false;
+            switch(def->timerStarts)
+            {
+                case HALO_TIMER_IMMEDIATELY: start = true; break;
+                case HALO_TIMER_AT_REST: start = rest; break;
+                default: start = g.bounced || g.attached(); break;
+            }
+            if(start) g.timerStart = lastmillis;
+        }
+        const bool armed = lastmillis - g.thrown >= int(def->arming * 1000);
+        if(g.timerStart && armed && lastmillis - g.timerStart >= int(def->fuse * 1000)) g.explode();
+    }
+}
+
+void halogrenadeforget(const playerent *unit)
+{
+    loopv(bounceents)
+    {
+        if(!bounceents[i] || bounceents[i]->bouncetype != BT_HALO) continue;
+        halogrenade &g = *(halogrenade *)bounceents[i];
+        if(g.touched == unit) g.touched = NULL;
+        if(g.stuckTo == unit) g.detach();
+    }
+}
+
+int halogrenadedump(const char *label)
+{
+    int count = 0;
+    loopv(bounceents)
+    {
+        if(!bounceents[i] || bounceents[i]->bouncetype != BT_HALO) continue;
+        const halogrenade &g = *(halogrenade *)bounceents[i];
+        conoutf("GRENADE %s type=%d owner=%s pos=%.2f,%.2f,%.2f age=%d fuse=%d bounced=%d stuck=%s vehicle=%d exploded=%d",
+                label, g.type, g.owner ? g.owner->name : "-", g.o.x, g.o.y, g.o.z, lastmillis - g.thrown,
+                g.timerStart ? lastmillis - g.timerStart : -1, g.bounced, g.stuckTo ? g.stuckTo->name : "-", g.stuckVehicle, g.exploded);
+        ++count;
+    }
+    return count;
+}
+
 void halofrag()
 {
     if(!haloactive() || halocinematic() || halodriving() || intermission || editmode || ispaused || menuvisible() || player1->state != CS_ALIVE ||
-        player1->mag[GUN_GRENADE] <= 0 || lastmillis < haloActionEnd ||
+        haloplayergrenades(-1) <= 0 || lastmillis < haloActionEnd ||
         player1->weaponchanging || player1->weaponsel->reloading) return;
+    const int type = haloplayerusegrenade();
+    if(type < 0) return;
     const float yaw = player1->yaw * RAD, pitch = player1->pitch * RAD;
     vec velocity(sinf(yaw)*cosf(pitch), -cosf(yaw)*cosf(pitch), sinf(pitch)+0.14f);
     velocity.mul(1.8f);
-    grenadeent *grenade = new grenadeent(player1);
-    bounceents.add(grenade);
-    grenade->activate(player1->o, worldpos);
-    grenade->moveoutsidebbox(velocity, player1);
-    grenade->_throw(grenade->o, velocity);
-    --player1->mag[GUN_GRENADE];
+    if(!halothrowgrenade(player1, type, velocity))
+    {
+        // Without packages/halo/equipment.txt: AssaultCube's frag grenade.
+        grenadeent *grenade = new grenadeent(player1);
+        bounceents.add(grenade);
+        grenade->activate(player1->o, worldpos);
+        grenade->moveoutsidebbox(velocity, player1);
+        grenade->_throw(grenade->o, velocity);
+    }
     haloAction = ANIM_GUN_THROW;
     haloActionStart = lastmillis;
     haloActionEnd = lastmillis + (player1->weaponsel->type == GUN_PISTOL ? 844 : 822);
@@ -2108,7 +2375,9 @@ void halomelee()
     int zone;
     playerent *target = intersectclosest(from, to, player1, distance, zone);
     if(target) hit(halomeleedamage(), target, player1, direction, GUN_KNIFE, false, 0);
-    haloplaysound("melee", S_KNIFE);
+    // Each weapon's melee animation has its own sound; the MA5B's stands in without the tags.
+    const HaloWeaponDef *def = haloweaponof(player1, player1->weaponsel->type);
+    haloplaysound(def && def->sound(HALO_SOUND_MELEE) ? def->sound(HALO_SOUND_MELEE) : "melee", S_KNIFE);
     haloAction = ANIM_GUN_MELEE;
     haloActionStart = lastmillis;
     haloActionEnd = lastmillis + (player1->weaponsel->type == GUN_PISTOL ? 1000 : 822);

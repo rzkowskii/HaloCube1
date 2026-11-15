@@ -25,7 +25,7 @@ for asset in ('maps/halo_a30.cgz', 'maps/halo_a30.cfg', 'maps/halo_a30.mesh',
     if not (packages / asset).is_file():
         missing.append(asset)
 if not partial:
-    for table in ('weapons.txt', 'actors.txt'):
+    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'vehicles.txt'):
         if not (packages / 'halo' / table).is_file():
             missing.append(f'halo/{table}')
     for mission in MISSIONS:
@@ -77,7 +77,7 @@ profile="${HALO_AC_PROFILE:-$HOME/Library/Application Support/Halo in AssaultCub
 mkdir -p -- "$profile"
 profile="$(cd -- "$profile" && pwd -P)"
 cd -- "$resources/runtime"
-exec "$executables/halo-ac" "--home=$profile" --init --halo "--mod=$resources/mod" -ehalo_campaign "$@"
+exec "$executables/halo-ac" "--home=$profile" --init --halo "--mod=$resources/mod" -ehalo_title "$@"
 SH
 chmod +x "$contents/MacOS/Halo in AssaultCube"
 cat > "$contents/Info.plist" <<'PLIST'
