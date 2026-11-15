@@ -420,6 +420,14 @@ def write_scenery(halo, output, xy_scale, z_scale):
             command.append(f'md3skin part{i} {skins[texture]}')
             meshes.append((points, uv, triangles))
         command.append('md3anim mapmodel 0 1 1')
+        # MD3 vertices are 16-bit in 1/64 units of 16/mdlscale-percent: a model too big for that at
+        # this scale (the Crash Site's retail layout, 4.1, against the authored 2.75 by 2.0) gets a
+        # larger mdlscale, which leaves its size in the level unchanged.
+        extent = max((abs(v) * max(xy_scale, z_scale) for points, _, _ in meshes for point in points for v in point), default=0)
+        needed = math.ceil(extent * 1600 * 64 / 32000 / 25) * 25
+        if needed > scale_percent:
+            command[1] = f'mdlscale {needed}'
+            scale_percent = needed
         write_md3(directory / 'tris.md3', name, meshes, xy_scale, z_scale, scale_percent)
         (directory / 'md3.cfg').write_text('\n'.join(command) + '\n')
 
@@ -520,7 +528,9 @@ def autumn_nozzles(halo, coronas):
         yield cx, rear + .25, cz, radius
 
 
-def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', bsp=0, include_sky=True, sky_index=None):
+def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', bsp=0, include_sky=True, sky_index=None, extra_bsps=()):
+    # `extra_bsps`: other BSPs drawn in the same mesh (import_halo_campaign.EXTRA_BSPS: c40 section 1's
+    # pulse generator room).
     legacy = map_name == 'halo_a30'
     xmin, xmax, ymin, ymax = bounds
     flyby = map_name == 'halo_scene_a10_07'
@@ -528,7 +538,7 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
     resolution = 64 if flyby else None
     draw_batches, lightmaps = {}, {}
     textures = output / 'textures' / map_name / 'bsp'
-    for shader, lightmap_tag, lightmap_index, vertices in halo.surfaces(bsp):
+    for shader, lightmap_tag, lightmap_index, vertices in (s for b in (bsp, *extra_bsps) for s in halo.surfaces(b)):
         positions = [vertex[0] for vertex in vertices]
         xs, ys, zs = zip(*positions)
         if max(xs) < xmin or min(xs) > xmax or max(ys) < ymin or min(ys) > ymax or (legacy and max(zs) < 28):
@@ -546,15 +556,17 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
         batch = draw_batches.setdefault(key, bytearray())
         lightmap = None
         if lightmap_index >= 0 and flags != 2:
-            if lightmap_index not in lightmaps:
+            # Each BSP has its own lightmap bitmap: with extra BSPs the cache is keyed by both.
+            cached = (getattr(lightmap_tag, 'name', ''), lightmap_index) if extra_bsps else lightmap_index
+            if cached not in lightmaps:
                 try:
                     w, h, (pixels,) = decode_bitmap(halo, lightmap_tag, image=lightmap_index)
-                    lightmaps[lightmap_index] = filter_lightmap(w, h, pixels, resolution) if flyby else (w, h, pixels)
+                    lightmaps[cached] = filter_lightmap(w, h, pixels, resolution) if flyby else (w, h, pixels)
                 except ValueError:
                     if legacy:
                         raise
-                    lightmaps[lightmap_index] = None
-            lightmap = lightmaps[lightmap_index]
+                    lightmaps[cached] = None
+            lightmap = lightmaps[cached]
         for (x, y, z), (u, v), (lu, lv) in vertices:
             if use_lightmap:
                 color = tuple(round(255 * max(0, min(1, c))) for c in halo.tags.read('3f', shader.address + 0x10c))

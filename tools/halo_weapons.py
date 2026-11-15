@@ -69,6 +69,10 @@ EFFECT_EVENTS, EVENT_STRIDE, EVENT_PARTS, PART_STRIDE, PART_TYPE = 52, 68, 44, 1
 GLOBALS_GRENADES, GRENADE_STRIDE = 0x128, 68
 PROJECTILE_FLAGS, PROJECTILE_TIMER_STARTS, PROJECTILE_ARMING, PROJECTILE_EFFECT = 0, 4, 40, 48
 PROJECTILE_TIMER, PROJECTILE_ATTACHED = 64, 152
+# The super detonation (the needle's "has super combining explosion", flag 0x8): its effect at +16
+# (weapons\needler\effects\explosion, whose jpt! weapons\needler\explosion is EMP, 0.5-1.0 world
+# units, 60 down to 40). The tags hold no needle count; the engine decides it (halo_supercombine).
+PROJECTILE_SUPER_DETONATION, PROJECTILE_SUPER_COMBINING = 16, 0x8
 # The projectile's air damage range (2f, world units): an impact closer than the first deals
 # full strength, falling to the jpt! lower bound at the second (shotgun pellet 1.5-3, plasma
 # rifle and pistol bolts 20-50, charged plasma bolt 5-20, assault rifle bullet 5-15). The water
@@ -106,9 +110,11 @@ WEAPON_FIELDS = '''# path <tag>                 retail weapon tag
 # heat <recover> <overheat> <loss/s>
 # zoom <levels> <min> <max>   magnification
 # aim <autoaim angle> <autoaim range> <magnetism angle> <magnetism range>
-# melee <lower> <upper min> <upper max>
+# melee <lower> <upper min> <upper max> <side effect>
 #   jpt! damage: a full-strength hit deals a random amount in [upper min, upper max]; the lower
-#   bound is what Halo scales a hit down to (range or area falloff, fall speed)
+#   bound is what Halo scales a hit down to (range or area falloff, fall speed); side effect 2 is
+#   "lethal to the unsuspecting" (every campaign weapon's melee), 3 EMP (the energy sword's); older
+#   games read the first three fields only
 # magazine <loaded> <initial total> <max total> <reload s> <rounds reloaded> <recharged/s>
 # trigger <rate initial> <rate final> <rate accel s> <rate decel s> <rounds/shot> <projectiles/shot>
 #         <distribution angle> <error initial> <error final> <error accel s> <error decel s>
@@ -119,8 +125,18 @@ WEAPON_FIELDS = '''# path <tag>                 retail weapon tag
 #   area damage is full inside the inner radius and falls to the lower bound at the outer (none
 #   beyond); an impact falls from full strength at the near damage range to the lower bound at
 #   the far one (far 0: no falloff); side effect 3 is EMP (the charged plasma bolt)
+# core <radius>                after a projectile (and its materials line): the jpt! AOE core radius,
+#                              world units (frag and plasma grenade 0.4, rocket 0.6); older games
+#                              skip the line
+# supercombine <timer s> <inner radius> <outer radius> <damage lower> <damage upper min>
+#              <damage upper max> <side effect> <category>
+#                              after a projectile whose stuck rounds super-detonate together (the
+#                              needle): the timer the stuck rounds detonate after and the super
+#                              detonation's area damage (its effect's jpt!); the sound role
+#                              `supercombine` names its sound; older games skip the line
 # sound <role> <snd! tag>      fire, charged, empty, cycle, reload, reload-empty, melee, ready, overheat, pickup,
-#                              zoom-in, zoom-out, loop (held while the trigger is: the flamethrower)
+#                              zoom-in, zoom-out, loop (held while the trigger is: the flamethrower),
+#                              supercombine (the needles' super detonation)
 # ammo <rounds> <eqip tag>     an ammo pickup this weapon's magazine takes, and the rounds it gives
 # materials <33 modifiers>     after a melee or projectile line: its jpt! damage modifier per retail
 #                              material type (0 dirt ... 12 hunter armor, 13 hunter skin, 25 sentinel,
@@ -136,6 +152,7 @@ EQUIPMENT_FIELDS = '''# grenade <type> <maximum carried> <sticks to units 0|1> <
 #   damage as in weapons.txt: a full-strength hit rolls [upper min, upper max]
 # attached <damage lower> <damage upper min> <damage upper max>   to the unit a sticky grenade is stuck to
 # materials <33 modifiers>      after a blast or attached line: the jpt! damage modifier per material type
+# core <radius>                 after the blast (and its materials line): the jpt! AOE core radius
 # path <proj tag> / equipment <eqip tag> / sound <role> <snd! tag>   (throw, explode, armed)
 # equipment <index>
 #   path <eqip tag>
@@ -328,11 +345,34 @@ def projectile_record(halo, proj):
             max(0.0, near), max(0.0, far), d.side_effect, proj.name)
 
 
+def projectile_core(halo, proj):
+    """The AOE core radius of the jpt! a projectile deals its damage with (world units)."""
+    tag = projectile_jpt(halo, proj)
+    return max(0.0, jpt_damage(halo, tag).core) if tag else 0.0
+
+
+def super_detonation(halo, proj):
+    """A projectile whose stuck rounds super-detonate together (the needle): (the supercombine
+    line's values, its sound), or None."""
+    t, a = halo.tags, proj.address + OBJECT
+    flags, = t.read('I', a + PROJECTILE_FLAGS)
+    if not flags & PROJECTILE_SUPER_COMBINING:
+        return None
+    effect = halo.reference(t, a + PROJECTILE_SUPER_DETONATION)
+    tag = effect_jpt(halo, effect) if effect and effect.group == 'effe' else None
+    if tag is None:
+        return None
+    _, timer = t.read('2f', a + PROJECTILE_TIMER)
+    inner, outer, lower, upper_min, upper_max, side, category = jpt_values(halo, tag)
+    return (max(0.0, timer), min(inner, outer), outer, lower, upper_min, upper_max, side, category), effect_sound(halo, effect)
+
+
 def weapon_record(halo, tag, viewmodels, models):
     t, a = halo.tags, tag.address + WEAPON
     model = halo.reference(t, tag.address + 40)     # the object's third-person model
     melee_tag = halo.reference(t, a + 140)
-    melee = damage_values(halo, melee_tag)[:3] if melee_tag and melee_tag.group == 'jpt!' else (0.0, 0.0, 0.0)
+    melee = ((*damage_values(halo, melee_tag)[:3], jpt_damage(halo, melee_tag).side_effect)
+             if melee_tag and melee_tag.group == 'jpt!' else (0.0, 0.0, 0.0, 0))
     record = {
         'path': tag.name,
         'label': t.name(a + 4, 32) or '-',
@@ -369,7 +409,11 @@ def weapon_record(halo, tag, viewmodels, models):
                        charge, heat, age, magazine),
             'projectile': projectile_record(halo, proj) if proj and proj.group == 'proj' else None,
             'materials': jpt_materials(halo, projectile_jpt(halo, proj)) if proj and proj.group == 'proj' else None,
+            'core': projectile_core(halo, proj) if proj and proj.group == 'proj' else 0.0,
+            'supercombine': super_detonation(halo, proj) if proj and proj.group == 'proj' else None,
         })
+        if record['triggers'][-1]['supercombine'] and record['triggers'][-1]['supercombine'][1]:
+            record['sounds'].setdefault('supercombine', record['triggers'][-1]['supercombine'][1])
     return record
 
 
@@ -398,6 +442,12 @@ def write(records, path):
             lines.append('projectile ' + (' '.join(map(number, p[:-1])) + ' ' + p[-1] if p else '-'))
             if p and materials_line(trigger.get('materials')):
                 lines.append(materials_line(trigger['materials']))
+            # Optional lines older games skip; they come after the materials line, which belongs
+            # to the projectile.
+            if p and trigger.get('core', 0) > 0:
+                lines.append(f'core {number(trigger["core"])}')
+            if p and trigger.get('supercombine'):
+                lines.append('supercombine ' + ' '.join(map(number, trigger['supercombine'][0])))
         lines += [f'sound {role} {name}' for role, name in sorted(record['sounds'].items())]
         lines += [f'ammo {rounds} {name}' for rounds, name in record['ammo']]
         lines.append('end')
@@ -464,6 +514,7 @@ def grenade_records(halo):
             'equipment': equipment.name if equipment and equipment.group == 'eqip' else None,
             'blast': effect_damage(halo, detonation) or (0.0, 0.0, 0.0, 0.0, 0.0, 0, 0),
             'blast_materials': jpt_materials(halo, effect_jpt(halo, detonation)),
+            'core': max(0.0, jpt_damage(halo, effect_jpt(halo, detonation)).core) if effect_jpt(halo, detonation) else 0.0,
             'attached_materials': jpt_materials(halo, attached) if attached and attached.group == 'jpt!' else None,
             'attached': jpt_values(halo, attached)[2:5] if attached and attached.group == 'jpt!' else (0.0, 0.0, 0.0),
             'sounds': {role: name for role, name in sounds.items() if name},
@@ -498,6 +549,8 @@ def write_equipment(grenades, equipment, weapons, ui_sounds, path):
                   'blast ' + ' '.join(map(number, g['blast']))]
         if materials_line(g.get('blast_materials')):
             lines.append(materials_line(g['blast_materials']))
+        if g.get('core', 0) > 0:
+            lines.append(f'core {number(g["core"])}')
         lines.append('attached ' + ' '.join(map(number, g['attached'])))
         if materials_line(g.get('attached_materials')):
             lines.append(materials_line(g['attached_materials']))

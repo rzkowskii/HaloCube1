@@ -23,7 +23,8 @@ ACTORS = {
         ('monitor', 'monitor', 'stand unarmed idle', 'stand unarmed idle', 'stand unarmed idle'),
     ),
     # Named and passive bodies (halo.cpp haloactormodel): Captain Keyes for the captain and
-    # captain_ingame variants, the Engineer (b30's cache is the only one that carries it).
+    # captain_ingame variants, the Engineer (b30's cache is the only one that carries it; its idle
+    # and move clips, the alert idle as its 'attack': it never fights).
     'a50': (
         ('keyes', 'captain', 'stand unarmed idle%1', 'stand unarmed move-front', 'alert unarmed idle%1'),
     ),
@@ -33,7 +34,9 @@ ACTORS = {
 }
 # Bodies whose graph has no landing-dead clip die on their idle.
 NO_DEATH = {'monitor', 'engineer'}
-# Bodies exported in their bind pose when their animation tracks cannot be read.
+# Bodies exported in their bind pose if their animation tracks cannot be read. b30's Engineer graph
+# has no node table of its own (its animations name the model's 25 nodes in order, as the device
+# graphs do: tools/halo_devices.py); with the model's hierarchy its tracks read, so it is animated.
 STATIC_FALLBACK = {'engineer'}
 
 
@@ -58,7 +61,8 @@ def main():
             for name, folder, idle, walk, attack in actors:
                 path = rf'characters\{folder}\{folder}'
                 model = Model(halo, path, 'biped')
-                graph = AnimationGraph(halo, path)
+                # A graph without a node table animates the model's nodes in order.
+                graph = AnimationGraph(halo, path, model.hierarchy)
                 death = idle if name in NO_DEATH else 'stand landing-dead'
                 clips = [('idle', idle), ('run', walk), ('death', death), ('lying dead', death)]
                 kind, = graph.tags.read('H', graph.animations[attack] + 32)
@@ -69,8 +73,8 @@ def main():
                 except ValueError as error:
                     if name not in STATIC_FALLBACK:
                         raise
-                    # A graph whose tracks the exporter cannot read (b30's Engineer): the body
-                    # in its bind pose, which still floats and turns in the game.
+                    # A graph whose tracks the exporter cannot read: the body in its bind pose,
+                    # which still floats and turns in the game.
                     print(f'{name}: {error}; exported in its bind pose')
                     export(halo, directory, name, [model], None, (), 5.6, markers)
 

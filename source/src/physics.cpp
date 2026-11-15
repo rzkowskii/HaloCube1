@@ -253,10 +253,17 @@ static float retailheight(const physent *d)
     return max(d->eyeheight + d->aboveeye, 2 * d->radius);
 }
 
+// Walking assists (the .hcol's AST1 trailer) are floor for bodies only: grenades, gibs and the
+// camera pass through them, as there is nothing there in Halo.
+static bool retailbody(const physent *d)
+{
+    return d->type == ENT_PLAYER || d->type == ENT_BOT;
+}
+
 static bool retailoverlap(const physent *d, const vec &feet)
 {
     HaloCollisionHit hit;
-    return halocollisionoverlap(feet, d->radius, retailheight(d), hit) && hit.penetration > retailSkin;
+    return halocollisionoverlap(feet, d->radius, retailheight(d), hit, retailbody(d)) && hit.penetration > retailSkin;
 }
 
 static bool retailplacement(physent *d, bool spawn)
@@ -268,7 +275,7 @@ static bool retailplacement(physent *d, bool spawn)
     {
         feet.z += retailStep;
         const vec down(0, 0, -(retailStep + 3.0f));
-        if(retailoverlap(d, feet) || !halocollisionsweep(feet, down, d->radius, retailheight(d), floor) ||
+        if(retailoverlap(d, feet) || !halocollisionsweep(feet, down, d->radius, retailheight(d), floor, retailbody(d)) ||
            floor.normal.z < retailSlope) return true;
         feet.z += down.z * floor.fraction + retailSkin;
         d->o.z = feet.z + d->eyeheight;
@@ -287,7 +294,7 @@ static bool retailplacement(physent *d, bool spawn)
 
 static bool retailsweep(const physent *d, const vec &feet, const vec &delta, HaloCollisionHit &hit)
 {
-    return halocollisionsweep(feet, delta, d->radius, retailheight(d), hit);
+    return halocollisionsweep(feet, delta, d->radius, retailheight(d), hit, retailbody(d));
 }
 
 static void retailadvance(vec &feet, const vec &delta, const HaloCollisionHit &hit)

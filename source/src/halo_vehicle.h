@@ -48,6 +48,35 @@ float halovehicledamage(float damage);                 // what reaches a seated 
 // nothing) and the seat's gun cannot fire, the player's or an actor gunner's. Returns how many.
 int halovehicleemp(const vec &centre, float radius, int stuck, int millis);
 bool halovehicleriderstunned(const playerent *unit);    // `unit` sits in a stunned vehicle's gun seat
+// Vehicle damage (vehicles.txt `vitality`, the retail collision model's body vitality and flags).
+// Only vehicles with a body vitality stop shots and take damage: the Wraith, and the Ghost and the
+// Banshee while someone rides them (their coll's "only damaged while occupied"). The Warthog, the
+// Scorpion and the turret have none (indestructible in Halo) and shots pass through them as before.
+// halovehicletrace: the first such vehicle whose body box (yaw only) the segment passes through,
+// with the fraction along it, or -1; `shooter`'s own vehicle is left out, and for an actor shooter
+// so is any vehicle no one hostile to it rides (its shots pass friends, as haloactorhit). `met` is the body the
+// shot reached at `to`, or null: a rider of that vehicle in an open seat (the Ghost's) takes the
+// shot itself (-1); one the hull covers does not, and the vehicle takes it: a rider in an invisible
+// seat (seat flag 1: the Wraith's driver) or of a vehicle whose coll "takes body damage for its
+// children" (flag 2: the Banshee's pilot, the player included).
+struct HaloDamage;
+int halovehicletrace(const vec &from, const vec &to, float &fraction, const playerent *shooter, const playerent *met);
+// The vehicles with a body vitality a blast at `centre` reaches within `radius` (AssaultCube
+// units, to the nearest point of the box), with those distances; returns how many.
+int halovehiclesnear(const vec &centre, float radius, int *vehicles, float *distances, int capacity);
+// `damage` (jpt! points, the hit's falloff applied) from `attacker` to vehicle `index`: times the
+// jpt! modifier for the vehicle's material (`source`, may be null) and its body multiplier, over
+// its body vitality. `explosive`: area damage (a vehicle "only damaged by explosives" takes only
+// that). Enemy fire on the player's vehicle is scaled by the difficulty as on the player; damage
+// to any other vehicle by the difficulty's enemy health. At no health it explodes (its body
+// depleted effect), its riders die, it is gone and so is the scripts' object (unit_get_health -1).
+// Returns the damage taken (0: none, for an indestructible, empty or protected vehicle).
+float halovehiclehit(int index, float damage, const HaloDamage *source, bool explosive, playerent *attacker);
+// unit_get_health of scenario object `object`'s vehicle: its body health 0..1 (1 for one with no
+// vitality), -1 when it does not exist (destroyed, or not created yet).
+float halovehiclehealth(int object);
+// The middle of vehicle `vehicle`'s body box (a grenade's line to it), false when it does not exist.
+bool halovehiclecentre(int vehicle, vec &centre);
 // The secondary trigger while seated (halo_zoom, Mouse 2 or Z): the second trigger of the seat's
 // gun, the Banshee's fuel rod and the Scorpion's machine gun.
 void halovehiclesecondary(bool down);
@@ -128,6 +157,13 @@ int halovehiclecount();
 int halovehicledefcount();                              // vehicles.txt records (1: the built-in Warthog)
 int halovehicleengineloops();                           // engine loops playing now (presentation)
 void halovehicledump(const char *label);
+// QA: damage vehicle `vehicle` as the player would (no jpt! source).
+float halovehicleqadamage(int vehicle, float amount, bool explosive);
+// QA vehicle walker (tests/native/retail_qa.inc): the player's vehicle's position (its floor point
+// or a flyer's origin, as the importer's vehicle rows give it) and yaw; and the existing vehicle of
+// vehicles.txt type `name` nearest `near` whose driver's seat is free, with that seat's entry point.
+bool halovehicleqapose(vec &pos, float &yaw);
+int halovehicleqafind(const char *name, const vec &near, vec &entry);
 void halovehicleqainput(float throttle, float steer, int millis);
 // Flight input for a piloted Banshee: throttle, strafe and climb (-1..1) held for `millis`; the
 // camera's yaw and pitch still aim the nose.

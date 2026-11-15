@@ -94,8 +94,13 @@ namespace
     int blurIterations = 1, videoMode = 0;
     float videoIntensity = 0;
     vec tint(1, 1, 1);
+    // The blur's copy of the frame: `screenW`x`screenH` copied into a texture of `texW`x`texH` (the
+    // next powers of two where the driver lacks non-power-of-two textures). Recreated when the
+    // viewport changes size and after a GL context rebuild (halofxcleanupgl, glIsTexture).
     GLuint screenTexture = 0;
-    int screenW = 0, screenH = 0;
+    int screenW = 0, screenH = 0, texW = 0, texH = 0;
+    int npotTextures = -1;                  // -1 not asked yet in this context
+    int screenRebuilds = 0, spotRebuilds = 0;   // QA (halofxdump)
 
     // The flashlight.
     bool flashOn = false;
@@ -231,6 +236,33 @@ namespace
         glBegin(GL_TRIANGLE_STRIP);
         glVertex2f(x, y); glVertex2f(x + w, y); glVertex2f(x, y + h); glVertex2f(x + w, y + h);
         glEnd();
+    }
+
+    // Whether this GL context takes non-power-of-two textures (OpenGL 2.0, or the ARB extension).
+    bool npot()
+    {
+        if(npotTextures < 0)
+        {
+            const char *version = (const char *)glGetString(GL_VERSION), *extensions = (const char *)glGetString(GL_EXTENSIONS);
+            npotTextures = (version && atoi(version) >= 2) || (extensions && strstr(extensions, "GL_ARB_texture_non_power_of_two")) ? 1 : 0;
+        }
+        return npotTextures > 0;
+    }
+
+    int powerOfTwo(int n)
+    {
+        int p = 1;
+        while(p < n && p < (1 << 14)) p <<= 1;
+        return p;
+    }
+
+    // A texture name that is no longer one in the current context (the context was rebuilt without
+    // halofxcleanupgl, or the driver dropped it) is forgotten, so the caller makes it anew.
+    bool stale(GLuint &id)
+    {
+        if(!id || glIsTexture(id)) return false;
+        id = 0;
+        return true;
     }
 
     GLuint makeSpot()
@@ -465,6 +497,16 @@ void halofxfilter(float from, float to, float tintFrom, float tintTo, float seco
 void halofxfiltertint(float r, float g, float b) { tint = vec(clamp(r, 0.0f, 1.0f), clamp(g, 0.0f, 1.0f), clamp(b, 0.0f, 1.0f)); }
 void halofxvideo(int mode, float intensity) { videoMode = mode; videoIntensity = clamp(intensity, 0.0f, 1.0f); }
 
+void halofxcleanupgl()
+{
+    // Called with the old context still current (cleanupgl in resetgl), before it is destroyed.
+    if(screenTexture) glDeleteTextures(1, &screenTexture);
+    if(spotTexture) glDeleteTextures(1, &spotTexture);
+    screenTexture = spotTexture = 0;
+    screenW = screenH = texW = texH = 0;
+    npotTextures = -1;
+}
+
 void halofxdrawscreen(int w, int h)
 {
     if(!halo_screeneffects || !screenOn || !haloactive() || w <= 0 || h <= 0) return;
@@ -473,9 +515,11 @@ void halofxdrawscreen(int w, int h)
     // Blur: the frame copied once and laid back over itself in rings of offset copies, each at the
     // weight that keeps the result an even average (the retail radius is in 480-line pixels).
     const float radius = blur.value() * h / 480.0f * .5f;
-    if(radius >= .5f)
+    const int wantW = npot() ? w : powerOfTwo(w), wantH = npot() ? h : powerOfTwo(h);
+    if(radius >= .5f && (hwtexsize <= 0 || (wantW <= hwtexsize && wantH <= hwtexsize)))
     {
-        if(!screenTexture) glGenTextures(1, &screenTexture);
+        if(stale(screenTexture)) { screenW = screenH = texW = texH = 0; ++screenRebuilds; }
+        if(!screenTexture) { glGenTextures(1, &screenTexture); screenW = screenH = texW = texH = 0; }
         glBindTexture(GL_TEXTURE_2D, screenTexture);
         if(screenW != w || screenH != h)
         {
@@ -483,11 +527,18 @@ void halofxdrawscreen(int w, int h)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+            if(texW != wantW || texH != wantH)
+            {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, wantW, wantH, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+                texW = wantW;
+                texH = wantH;
+            }
             screenW = w;
             screenH = h;
         }
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+        // The frame fills the copy's lower left w x h; a power-of-two copy is larger.
+        const float u = float(w) / max(texW, 1), v = float(h) / max(texH, 1);
         glEnable(GL_TEXTURE_2D);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         int layer = 1;
@@ -497,10 +548,10 @@ void halofxdrawscreen(int w, int h)
             const float dx = cosf(a) * r * VIRTW / w, dy = sinf(a) * r * VIRTH / h;
             glColor4f(1, 1, 1, 1.0f / (++layer));
             glBegin(GL_TRIANGLE_STRIP);
-            glTexCoord2f(0, 1); glVertex2f(dx, dy);
-            glTexCoord2f(1, 1); glVertex2f(VIRTW + dx, dy);
+            glTexCoord2f(0, v); glVertex2f(dx, dy);
+            glTexCoord2f(u, v); glVertex2f(VIRTW + dx, dy);
             glTexCoord2f(0, 0); glVertex2f(dx, VIRTH + dy);
-            glTexCoord2f(1, 0); glVertex2f(VIRTW + dx, VIRTH + dy);
+            glTexCoord2f(u, 0); glVertex2f(VIRTW + dx, VIRTH + dy);
             glEnd();
         }
         glDisable(GL_TEXTURE_2D);
@@ -554,6 +605,7 @@ bool halofxflashlight(float *charge)
 void halofxflashlightworld()
 {
     if(!flashOn || !haloworldready() || halocinematic() || !hasMT || maxtmus < 2) return;
+    if(stale(spotTexture)) ++spotRebuilds;
     if(!spotTexture) spotTexture = makeSpot();
     const float range = flashRadius * max(haloscenarioscale(), .5f);
     // Unit 1: the spot, projected from the eye (eye-linear texture coordinates divided by depth).
@@ -677,6 +729,23 @@ void halofxsetclassgain(const char *prefix, float gain, float seconds)
     if(halo_fxtrace) conoutf("Halo sound class: %s to %.2f over %.2fs (%d classes)", prefix, gain, seconds, changed);
 }
 
+bool halofxgains(float gains[HALO_SOUND_CLASSES])
+{
+    bool changed = false;
+    loopi(HALO_SOUND_CLASSES)
+    {
+        gains[i] = gainsReady ? clamp(classGain[i].to, 0.0f, 1.0f) : 1.0f;
+        changed |= gains[i] < .999f;
+    }
+    return changed;
+}
+
+void halofxsetgains(const float gains[HALO_SOUND_CLASSES])
+{
+    if(!gainsReady) resetGains();
+    loopi(HALO_SOUND_CLASSES) classGain[i].hold(std::isfinite(gains[i]) ? clamp(gains[i], 0.0f, 1.0f) : 1.0f);
+}
+
 float halofxclassgain(int soundClass)
 {
     if(!gainsReady || soundClass < 0 || soundClass >= HALO_SOUND_CLASSES) return 1;
@@ -748,10 +817,13 @@ void halofxdump(const char *label)
     for(char &c : last) if(c == ' ') c = '_';
     conoutf("FX_QA %s loaded=%d table=%d effects=%d visual=%d unknown=%d last=%s shake=%.3f impulse=%d camera=%.3f,%.3f,%.3f "
             "screen=%d blur=%.3f desat=%.3f tint=%.3f video=%d flashlight=%d charge=%.3f hits=%d "
-            "music=%.3f ambient_nature=%.3f vehicle_engine=%.3f weapon_fire=%.3f unit_dialog=%.3f",
+            "music=%.3f ambient_nature=%.3f vehicle_engine=%.3f weapon_fire=%.3f unit_dialog=%.3f "
+            "copy=%dx%d copytex=%dx%d npot=%d screen_tex=%d spot_tex=%d screen_rebuilds=%d spot_rebuilds=%d",
             label, int(loadEffects()), int(effects.size()), effectCount, effectVisual, effectUnknown, last.c_str(),
             shake.value(), int(lastmillis < impulseEnd), y, p, r, int(screenOn), blur.value(), desaturation.value(),
             tintAmount.value(), videoMode, int(flashOn), flashCharge, active, halofxclassgain(32), halofxclassgain(33),
-            halofxclassgain(23), halofxclassgain(4), halofxclassgain(19));
+            halofxclassgain(23), halofxclassgain(4), halofxclassgain(19), screenW, screenH, texW, texH, npotTextures,
+            int(screenTexture != 0 && glIsTexture(screenTexture)), int(spotTexture != 0 && glIsTexture(spotTexture)),
+            screenRebuilds, spotRebuilds);
     fflush(stdout);
 }

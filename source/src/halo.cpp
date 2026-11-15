@@ -69,6 +69,7 @@ namespace
         int stage = 0, marker = 0, escapeMillis = 0;
         Loadout loadout;
         string weaponPath[2];                               // retail weapon tags, resolved on restore
+        bool slotEmpty[2] = {false, false};                 // an `empty <slot>` line: no weapon there (a10's unarmed start)
         // Version 3: the state block (its `state` header and the s, v, w and p records, verbatim):
         // the mission script, vehicles, ground items and player limits at the checkpoint, or the
         // script carried into the section at its start. Empty when there is none.
@@ -133,7 +134,17 @@ namespace
 
     // The hit weapon.cpp is dealing (halohit): its exact amount and jpt! side effect, which
     // halodamage uses in place of the whole number hit() carries.
-    struct PendingHit { const playerent *target = NULL; float damage = 0; int sideEffect = 0; const HaloDamage *source = NULL; };
+    // `at` is where it struck the body, when the caller knows (shots and the player's melee): the
+    // Hunter's head and belly and the head material of the general model go by its height.
+    struct PendingHit
+    {
+        const playerent *target = NULL;
+        float damage = 0;
+        int sideEffect = 0;
+        const HaloDamage *source = NULL;
+        bool hasAt = false;
+        vec at = vec(0, 0, 0);
+    };
     PendingHit pendingHit;
     // The fraction of a health point exact hits on the player have left over.
     float playerHealthCarry = 0;
@@ -251,18 +262,31 @@ namespace
         info.maxrecoil = 8;
     }
 
-    bool tagWeapons() { return haloweapon(carried[0].def) && haloweapon(carried[1].def); }
+    // The carried weapons come from packages/halo/weapons.txt when it loads and has the default
+    // assault rifle and pistol; a slot may then be empty (a weapon state with no definition: a10
+    // starts unarmed, its starting profile carrying none). Without the table the player has
+    // AssaultCube's own assault rifle and pistol.
+    bool tagWeapons()
+    {
+        static int usable = -1;
+        if(usable < 0) usable = haloweaponsload() && haloweaponfind(defaultWeapons[0]) && haloweaponfind(defaultWeapons[1]) ? 1 : 0;
+        return usable == 1;
+    }
+    bool slotArmed(int i) { return haloweapon(carried[i].def) != NULL; }
+    // Unarmed: the selected slot holds no weapon (its AssaultCube slot is the knife, which neither
+    // fires nor draws a viewmodel here; melee still strikes).
+    bool unarmed() { return tagWeapons() && !slotArmed(currentCarried); }
 
     // Two carried weapons need distinct AssaultCube slots; projectile weapons
-    // share the carbine and submachine-gun slots between them.
+    // share the carbine and submachine-gun slots between them. An empty slot is the knife.
     void assignGuns()
     {
         loopi(2)
         {
             const HaloWeaponDef *d = haloweapon(carried[i].def);
-            carriedGun[i] = d ? d->acgun() : (i ? GUN_PISTOL : GUN_ASSAULT);
+            carriedGun[i] = d ? d->acgun() : tagWeapons() ? GUN_KNIFE : (i ? GUN_PISTOL : GUN_ASSAULT);
         }
-        if(carriedGun[0] == carriedGun[1]) carriedGun[1] = carriedGun[0] == GUN_CARBINE ? GUN_SUBGUN : GUN_CARBINE;
+        if(carriedGun[0] == carriedGun[1] && carriedGun[0] != GUN_KNIFE) carriedGun[1] = carriedGun[0] == GUN_CARBINE ? GUN_SUBGUN : GUN_CARBINE;
     }
 
     // Copy the slot's live rounds back into the carried weapon.
@@ -272,7 +296,7 @@ namespace
         loopi(2)
         {
             const HaloWeaponDef *d = haloweapon(carried[i].def);
-            if(d->usesBattery()) continue;
+            if(!d || d->usesBattery()) continue;
             carried[i].loaded = player1->mag[carriedGun[i]];
             carried[i].reserve = player1->ammo[carriedGun[i]];
         }
@@ -320,8 +344,11 @@ namespace
     {
         assignGuns();
         loopi(2) applyCarried(i);
-        player1->setnextprimary(carriedGun[0]);
-        player1->setprimary(carriedGun[0]);
+        // With an armed slot the selection never rests on an empty one.
+        if(!slotArmed(currentCarried) && slotArmed(currentCarried ^ 1)) currentCarried ^= 1;
+        const int primary = slotArmed(0) || !slotArmed(1) ? carriedGun[0] : carriedGun[1];
+        player1->setnextprimary(primary);
+        player1->setprimary(primary);
         selectCarried(currentCarried, immediate);
     }
 
@@ -346,7 +373,8 @@ namespace
     void applyLoadout(const Loadout &l)
     {
         if(!l.valid) return;
-        loopi(2) if(haloweapon(l.carried[i].def))
+        // With the weapon table an empty slot stays empty (a10's unarmed start, carried on).
+        loopi(2) if(haloweapon(l.carried[i].def) || (tagWeapons() && l.carried[i].def < 0))
         {
             carried[i] = l.carried[i];
             carried[i].heat = 0;
@@ -434,6 +462,28 @@ namespace
     }
 
     void recordProgress(bool atCheckpointNow);
+
+    // Starting profiles a fresh start of a later section adds to the mission's profile 0, for what
+    // its script gives the player in an earlier section and does not give again when started
+    // afresh there: a10's pistol at the bridge (mission_shoot, just past cinematic_x20 at the start
+    // of section 3).
+    struct FreshProfile { int mission, section; const char *profile; };
+    const FreshProfile freshProfiles[] = { {0, 2, "bridge0_profile"} };
+
+    // A fresh start's loadout: the scenario's player starting profile 0 (tools/import_halo_scripts.py,
+    // .hscb version 9), which also becomes what a revert before the section's first checkpoint
+    // returns to. An older .hscb has no profiles: the default assault rifle, pistol and two frags.
+    void applyStartingProfile()
+    {
+        HaloStartingProfile profile;
+        if(!haloscenarioprofile(0, NULL, profile)) return;
+        haloplayeraddequipment(profile, true);
+        for(const FreshProfile &f : freshProfiles)
+            if(f.mission == mission && section >= f.section && haloscenarioprofile(-1, f.profile, profile)) haloplayeraddequipment(profile, false);
+        captureLoadout(sectionLoadout);
+        sectionLoadoutMission = mission;
+        sectionLoadoutSection = section;
+    }
 
     // Takes the checkpoint a revert returns to (without saving it to the progress file).
     void takeCheckpoint(bool scripted)
@@ -774,6 +824,7 @@ namespace
         loopi(2)
         {
             const HaloWeaponDef *d = haloweapon(carried[i].def);
+            if(!d) continue;
             carried[i].tick(*d, elapsed);
             if(d->usesBattery()) player1->mag[carriedGun[i]] = carried[i].canfire(*d) ? 1 : 0;
             const HaloTriggerDef *t = d->trigger();
@@ -825,7 +876,10 @@ namespace
         GroundWeapon picked = groundWeapons.remove(nearbyWeapon);
         nearbyWeapon = -1;
         syncCarried();
-        dropWeapon(carried[currentCarried], feetOf(player1), player1->yaw);
+        // An empty slot takes the weapon (and is selected), as in Halo: the selected one first,
+        // else the other; with both armed the selected weapon is dropped for it.
+        if(slotArmed(currentCarried) && !slotArmed(currentCarried ^ 1)) currentCarried ^= 1;
+        else dropWeapon(carried[currentCarried], feetOf(player1), player1->yaw);
         carried[currentCarried] = picked.state;
         const int slot = carriedGun[currentCarried];
         equipCarried(false);
@@ -965,6 +1019,8 @@ namespace
     //   vitals <health> <shield>
     //   grenades <frag> <plasma> <selected type>
     //   weapon <slot> <loaded> <reserve> <battery> <weapon tag path>
+    //   empty <slot>                          a slot with no weapon (a starting profile's: a10 begins unarmed);
+    //                                         a slot with neither line (older saves) gets the default weapon
     //   current <slot>
     //   stock <weapon> <assault mag> <assault ammo> <pistol mag> <pistol ammo>
     //   state <format> <mission> <section> <checkpoint 0|1> <.hscb hash> <section map hash> <records> <records' FNV-1a>
@@ -1063,6 +1119,7 @@ namespace
             else if(sscanf(line, "vitals %d %f", &a, &x) == 2 && std::isfinite(x)) { l.health = clamp(a, 1, playerHealth); l.shield = clamp(x, 0.0f, float(playerShield)); }
             else if(sscanf(line, "grenades %d %d %d", &a, &b, &c) == 3) { l.frags = clamp(a, 0, 9); l.plasmas = clamp(b, 0, 9); l.grenadeType = c == HALO_GRENADE_PLASMA ? c : HALO_GRENADE_FRAG; }
             else if(sscanf(line, "current %d", &a) == 1) l.current = a ? 1 : 0;
+            else if(sscanf(line, "empty %d", &a) == 1 && a >= 0 && a <= 1) g.slotEmpty[a] = true;
             else if(sscanf(line, "stock %d %d %d %d %d", &a, &b, &c, &d, &e) == 5)
             {
                 l.weapon = a == GUN_PISTOL ? GUN_PISTOL : GUN_ASSAULT;
@@ -1182,6 +1239,7 @@ namespace
                 const HaloWeaponDef *d = haloweapon(l.carried[i].def);
                 if(d && !strchr(d->path.c_str(), '\n'))
                     appendf(text, "weapon %d %d %d %.4f %s\n", i, l.carried[i].loaded, l.carried[i].reserve, l.carried[i].battery, d->path.c_str());
+                else if(!d && tagWeapons()) appendf(text, "empty %d\n", i);
             }
             appendf(text, "current %d\nstock %d %d %d %d %d\n", l.current, l.weapon, l.mag[0], l.ammo[0], l.mag[1], l.ammo[1]);
             text += g.state;
@@ -1414,6 +1472,7 @@ namespace
         {
             const HaloWeaponDef *d = haloweapon(g.loadout.carried[i].def);
             copystring(g.weaponPath[i], d ? d->path.c_str() : "");
+            g.slotEmpty[i] = !d && tagWeapons();
         }
         buildSavedState(g);
         saveProgress();
@@ -1786,7 +1845,7 @@ namespace
         if(!halovehiclestatus(st))
         {
             // Aboard a Pelican (haloscenarioboard): it flies, the player rides.
-            if(haloscenarioboarded()) label("E  Get out", VIRTW/2-200, VIRTH/2+90, 0.6f);
+            if(haloscenarioboarded() && !haloscenarioscriptseated()) label("E  Get out", VIRTW/2-200, VIRTH/2+90, 0.6f);
             return;
         }
         // Without the HUD tags the seat's gun still gets a reticle.
@@ -2009,6 +2068,72 @@ float haloenemyshieldfraction(const playerent *p)
 {
     HaloEnemy *enemy = enemyState(p);
     return enemy && enemy->shieldMax > 0 ? enemy->shield / enemy->shieldMax : 0;
+}
+
+// A starting profile's weapon as a carried weapon state. Judgement call, not checked against the
+// retail executable: the profile's "rounds total" is the reserve beyond the magazine (a30's assault
+// rifle starts 60 + 120), clamped to the magazine's maximum; a battery weapon starts charged.
+static bool profileWeapon(const HaloStartingProfile &p, int i, HaloWeaponState &out)
+{
+    const HaloWeaponDef *d = p.weapon[i].empty() ? NULL : haloweaponfind(p.weapon[i].c_str());
+    if(!d || !d->playable()) return false;
+    out.reset(d);
+    if(const HaloMagazineDef *m = d->usesBattery() ? NULL : d->magazine())
+    {
+        out.loaded = clamp(p.loaded[i], 0, max(1, m->loaded));
+        out.reserve = clamp(p.total[i], 0, max(0, m->maximum - out.loaded));
+    }
+    return true;
+}
+
+void haloplayeraddequipment(const HaloStartingProfile &profile, bool reset)
+{
+    if(!haloactive()) return;
+    if(tagWeapons())
+    {
+        syncCarried();
+        const bool wasArmed = slotArmed(currentCarried);
+        if(reset)
+        {
+            // Replaces what the player carries: an empty profile slot empties theirs.
+            loopi(2) if(!profileWeapon(profile, i, carried[i])) carried[i] = HaloWeaponState();
+            currentCarried = 0;
+        }
+        else loopi(2)
+        {
+            HaloWeaponState given;
+            if(!profileWeapon(profile, i, given)) continue;
+            int slot = carried[0].def == given.def ? 0 : carried[1].def == given.def ? 1 : -1;
+            if(slot >= 0)
+            {
+                // A weapon already carried takes the rounds, up to its maximum.
+                const HaloWeaponDef *d = haloweapon(given.def);
+                const HaloMagazineDef *m = d ? d->magazine() : NULL;
+                if(m && !d->usesBattery())
+                    carried[slot].reserve = clamp(carried[slot].reserve + given.loaded + given.reserve, 0, max(0, m->maximum - carried[slot].loaded));
+                else carried[slot].battery = 1;
+                continue;
+            }
+            // Otherwise an empty slot, the selected one first; with both armed it is not taken.
+            slot = !slotArmed(currentCarried) ? currentCarried : !slotArmed(currentCarried ^ 1) ? currentCarried ^ 1 : -1;
+            if(slot < 0) continue;
+            carried[slot] = given;
+            if(!wasArmed) currentCarried = slot;
+        }
+        loopi(NUMGUNS) if(i != GUN_GRENADE && i != GUN_KNIFE) player1->mag[i] = player1->ammo[i] = 0;
+        equipCarried(true);
+        conoutf("Halo: starting profile %s %s: %s / %s", profile.name.empty() ? "(unnamed)" : profile.name.c_str(),
+                    reset ? "replaces the loadout" : "added", haloweapon(carried[0].def) ? haloweapon(carried[0].def)->name.c_str() : "-",
+                    haloweapon(carried[1].def) ? haloweapon(carried[1].def)->name.c_str() : "-");
+    }
+    // Grenades: set by a reset, else added; health and shield by their modifiers (0 keeps them).
+    const int frags = reset ? profile.frags : grenadeCount(HALO_GRENADE_FRAG) + profile.frags;
+    grenadeCount(HALO_GRENADE_FRAG) = clamp(frags, 0, grenadeMaximum(HALO_GRENADE_FRAG));
+    if(grenadeKnown(HALO_GRENADE_PLASMA))
+        plasmaGrenades = clamp(reset ? profile.plasmas : plasmaGrenades + profile.plasmas, 0, grenadeMaximum(HALO_GRENADE_PLASMA));
+    if(grenadeCount(grenadeType) <= 0 && grenadeKnown(grenadeType ^ 1) && grenadeCount(grenadeType ^ 1) > 0) grenadeType ^= 1;
+    if(profile.health > 0 && player1->state == CS_ALIVE) player1->health = clamp(int(playerHealth * min(profile.health, 1.0f) + .5f), 1, playerHealth);
+    if(profile.shield > 0) shield = clamp(shieldCap * min(profile.shield, 1.0f), 0.0f, shieldCap);
 }
 
 // Script control of the player's and the enemies' vitality (unit_set_*_vitality, unit_impervious, ai_renew, ai_teleport_*).
@@ -2395,8 +2520,13 @@ void haloupdate(int elapsed)
             sectionLoadout = savedGame.loadout;
             loopi(2)
             {
+                // An `empty` line: an empty slot. A weapon the table no longer has, or neither line
+                // (a save from before empty slots, or one made without weapons.txt): the default
+                // weapon for that slot, with its own rounds.
                 const HaloWeaponDef *d = savedGame.weaponPath[i][0] ? haloweaponfind(savedGame.weaponPath[i]) : NULL;
-                sectionLoadout.carried[i].def = d ? d->index : -1;
+                if(d) sectionLoadout.carried[i].def = d->index;
+                else if(savedGame.slotEmpty[i] && !savedGame.weaponPath[i][0]) sectionLoadout.carried[i] = HaloWeaponState();
+                else sectionLoadout.carried[i].reset(haloweaponfind(defaultWeapons[i]));
             }
         }
         else if(!keepSectionLoadout || sectionLoadoutMission != mission || sectionLoadoutSection != section) sectionLoadout.valid = false;
@@ -2406,7 +2536,11 @@ void haloupdate(int elapsed)
         resetEncounter();
         resetcamera();
         conoutf("Halo: %s, section %d", haloMissions[mission].title, section + 1);
+        // A fresh start (nothing carried in, restored or kept by a restart) takes the mission's
+        // starting profile once its script is loaded (below).
+        const bool freshLoadout = !preview && !restoring && !sectionLoadout.valid;
         haloscenariostart(mission, section, preview, pendingContinuation);
+        if(freshLoadout) applyStartingProfile();
         halovehiclessync();
         haloequipmentsync();
         // A save at this section's start keeps the script's state only when the script was
@@ -2555,14 +2689,28 @@ void haloupdate(int elapsed)
 // DAMAGE_TRACE attacker=<name> target=<name> exact=<0|1> amount=<before shields> side=<n> gun=<n>
 //              health=<whole points taken> shield=<left> carry=<fraction left over>
 VAR(halo_damagetrace, 0, 0, 1);
+// "Lethal to the unsuspecting" (the melee jpt!'s side effect 2): halo_meleeunsuspecting 0 turns
+// the kill from behind off. halo_damagetrace 1 logs each one:
+// DAMAGE_UNSUSPECTING target=<name> kind=<ActorKind> status=<ai_status> facing=<cosine> amount=<dealt>
+VAR(halo_meleeunsuspecting, 0, 1, 1);
 
-void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source)
+void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source, const vec *at)
 {
     pendingHit.target = target;
     pendingHit.damage = damage;
     pendingHit.sideEffect = sideEffect;
     pendingHit.source = target ? source : NULL;
+    pendingHit.hasAt = target && at && std::isfinite(at->x) && std::isfinite(at->y) && std::isfinite(at->z);
+    pendingHit.at = pendingHit.hasAt ? *at : vec(0, 0, 0);
 }
+
+// The Hunter's head and belly (materialScale): halo_hunterregions 0 leaves every hit that is not
+// on the shield arm or the back on the armour, as before.
+VAR(halo_hunterregions, 0, 1, 1);
+// The retail material model for every other actor (materialScale): off by default, for a later
+// balance pass (it moves every time to kill: the sniper rifle's modifier on Flood combat forms is
+// 0.05, the assault rifle's on an Elite's shield 0.7, the plasma rifle's 2).
+VAR(halo_actormaterials, 0, 0, 1);
 
 float haloactordamagescale(const playerent *p)
 {
@@ -2583,21 +2731,58 @@ namespace
         return whole;
     }
 
+    // Where on the body a hit struck, 0 the feet and 1 the top, or -1 when the hit carries no point.
+    float hitHeight(const playerent *target, const PendingHit *hit)
+    {
+        if(!hit || !hit->hasAt) return -1;
+        const float feet = target->o.z - target->eyeheight, height = max(target->eyeheight + target->aboveeye, .1f);
+        return clamp((hit->at.z - feet) / height, 0.0f, 1.0f);
+    }
+
+    // The retail material model for an actor that has no special body (halo_actormaterials 1): the
+    // hit material is the variant's head-flagged material for a hit at head height (the top fifth),
+    // else its first other material; the hit takes that material's body multiplier times the jpt!
+    // damage's modifier for its type. An Elite's energy shield takes the modifier for the elite
+    // energy shield (30) in `shieldScale` (in place of the assault rifle's 0.7). Without the
+    // weapon's `materials` line or the variant's `material` lines nothing changes.
+    float generalMaterial(const HaloEnemy &enemy, const playerent *target, const HaloDamage *source, const PendingHit *hit,
+                          int &region, float &shieldScale)
+    {
+        region = -1;
+        const HaloActorDef *def = haloactorvariant(target);
+        if(!halo_actormaterials || !source || !source->hasMaterials || !def || def->materials.empty()) return 1;
+        if(enemy.kind == ELITE) shieldScale = source->material(30);
+        const bool head = hitHeight(target, hit) >= .8f;
+        const HaloActorDef::Material *chosen = NULL;
+        for(const HaloActorDef::Material &m : def->materials) if(((m.flags & 1) != 0) == head) { chosen = &m; break; }
+        if(!chosen) chosen = &def->materials[0];
+        region = chosen->type;
+        return max(chosen->body, 0.0f) * source->material(chosen->type);
+    }
+
     // Bodies whose retail collision materials decide what hurts them: the hit material's body
     // multiplier (the unit's coll tag, actors.txt) times the jpt! damage's modifier for that
     // material type (weapons.txt and equipment.txt `materials` lines). Every other body takes its
-    // damage as before (the general material model is not applied to them yet).
+    // damage as before unless halo_actormaterials is on (generalMaterial).
     //   Hunter: a direct hit from within 60 degrees of where it faces lands on the shield arm
     //   (hunter shield: body multiplier 0, and every campaign weapon but the energy sword has
     //   modifier 0 for it); from behind (beyond 130 degrees) on the exposed skin (hunter skin);
-    //   anything else, blasts included, on the armour plates (hunter armor).
+    //   anything else, blasts included, on the armour plates (hunter armor). With
+    //   halo_hunterregions (on by default) two more hits reach the skin, Halo's weak spots in
+    //   front of the back: the head (the coll's head-flagged material is hunter skin), a hit in the
+    //   top fifth of the body from outside the shield arm's 60 degrees; and the belly, a hit from
+    //   the front between 30% and 60% of its height while it fires its cannon (the 0.6 s after a
+    //   shot, when the shield arm swings aside). Engine judgements: the retail coll tag's regions
+    //   are not traced, the body is a cylinder here.
     //   Sentinel, Monitor and Engineer have one material each (sentinel, monitor, engineer skin);
     //   the Monitor's body multiplier is 0, so nothing hurts it.
-    // `region` returns the material type used (-1: none applies).
+    // `region` returns the material type used (-1: none applies); `shieldScale` multiplies what an
+    // energy shield takes of the hit (generalMaterial).
     float materialScale(const HaloEnemy &enemy, const playerent *target, const playerent *attacker, int gun,
-                        const HaloDamage *source, int &region)
+                        const HaloDamage *source, int &region, const PendingHit *hit, float &shieldScale)
     {
         region = -1;
+        shieldScale = 1;
         switch(enemy.kind)
         {
             case HUNTER:
@@ -2610,15 +2795,18 @@ namespace
                     {
                         const float yaw = target->yaw * RAD;
                         const float facing = delta.normalize().dot(vec(sinf(yaw), -cosf(yaw), 0));
-                        if(facing > cosf(60 * RAD)) region = HALO_MATERIAL_HUNTER_SHIELD;
-                        else if(facing < cosf(130 * RAD)) region = HALO_MATERIAL_HUNTER_SKIN;
+                        const float height = halo_hunterregions ? hitHeight(target, hit) : -1;
+                        const bool firing = lastmillis - target->lastaction >= 0 && lastmillis - target->lastaction < 600;
+                        if(facing > cosf(60 * RAD))
+                            region = height >= .3f && height <= .6f && firing ? HALO_MATERIAL_HUNTER_SKIN : HALO_MATERIAL_HUNTER_SHIELD;
+                        else if(facing < cosf(130 * RAD) || height >= .8f) region = HALO_MATERIAL_HUNTER_SKIN;
                     }
                 }
                 break;
             case SENTINEL: region = HALO_MATERIAL_SENTINEL; break;
             case MONITOR: region = HALO_MATERIAL_MONITOR; break;
             case ENGINEER: region = HALO_MATERIAL_ENGINEER_SKIN; break;
-            default: return 1;
+            default: return generalMaterial(enemy, target, source, hit, region, shieldScale);
         }
         const HaloActorDef *def = haloactorvariant(target);
         float body = def ? def->bodyMultiplier(region) : -1;
@@ -2670,6 +2858,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     const bool emp = exact && pendingHit.sideEffect == HALO_SIDE_EFFECT_EMP;
     const int side = exact ? pendingHit.sideEffect : 0;
     const HaloDamage *pendingSource = pendingHit.source;
+    const PendingHit pendingAt = pendingHit;
     pendingHit.target = NULL;
     pendingHit.source = NULL;
     const float given = amount;
@@ -2726,25 +2915,66 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     if(!enemy) { trace(0, 0); return; }
     enemy->hurtAt = lastmillis;
     int region = -1;
-    const float material = materialScale(*enemy, target, attacker, gun, exact ? pendingSource : NULL, region);
+    float shieldScale = 1;
+    const float material = materialScale(*enemy, target, attacker, gun, exact ? pendingSource : NULL, region,
+                                         exact ? &pendingAt : NULL, shieldScale);
+    // The general material model's body multiplier (generalMaterial) is for the body: an energy
+    // shield takes the hit at its own modifier (shieldScale), and only what passes it is scaled by
+    // the body's. The special bodies (no shields) take theirs on the whole hit.
+    const bool special = enemy->kind == HUNTER || enemy->kind == SENTINEL || enemy->kind == MONITOR || enemy->kind == ENGINEER;
+    float bodyScale = 1;
     if(region >= 0)
     {
-        amount *= material;
+        if(special) amount *= material;
+        else bodyScale = material;
         if(halo_damagetrace) conoutf("DAMAGE_MATERIAL target=%s kind=%d material=%d scale=%.3f", target->name, int(enemy->kind), region, material);
+    }
+    // Lethal to the unsuspecting (side effect 2, every campaign weapon's melee): the player's melee
+    // on an actor from behind (beyond 120 degrees of where it faces) that is not fighting the player
+    // (not in combat, or fighting someone else) takes the actor's whole shield and health, whatever
+    // the shield's modifier (applied below, after the shield). A body its material leaves unhurt
+    // (the Monitor, a Hunter's shield arm) stays unhurt; the actors' own melee is not affected.
+    bool unsuspecting = false;
+    if(side == HALO_SIDE_EFFECT_UNSUSPECTING && halo_meleeunsuspecting && attacker == player1 && amount > 0 &&
+       (region < 0 || material > 0))
+    {
+        vec delta = vec(attacker->o).sub(target->o);
+        delta.z = 0;
+        const float yaw = target->yaw * RAD;
+        const float facing = delta.iszero() ? 1.0f : delta.normalize().dot(vec(sinf(yaw), -cosf(yaw), 0));
+        const int status = haloactorstatus(target);
+        if(facing < cosf(120 * RAD) && (status < 6 || haloactortarget(target) != attacker))
+        {
+            unsuspecting = true;
+            if(halo_damagetrace)
+                conoutf("DAMAGE_UNSUSPECTING target=%s kind=%d status=%d facing=%.3f amount=%.2f", target->name, int(enemy->kind),
+                        status, facing, max(amount, enemy->shield + float(max(target->health, 0)) + 1));
+        }
+    }
+    if(unsuspecting && enemy->shieldMax > 0 && enemy->shield > 0)
+    {
+        enemy->hitTime = lastmillis;
+        enemy->shield = 0;
+        particle_splash(PART_PLASMA, 6, 220, target->o);
     }
     if(enemy->shieldMax > 0)
     {
         enemy->hitTime = lastmillis;
-        const float modifier = gun == GUN_ASSAULT ? 0.7f : 1.0f;
-        const float absorbed = min(enemy->shield, amount * modifier);
-        if(absorbed > 0 || (emp && enemy->shield > 0))
+        // The assault rifle's 0.7 on shields is its jpt! modifier for the elite energy shield; with
+        // the general material model the shield takes the weapon's own modifier (generalMaterial).
+        const float modifier = shieldScale != 1 ? shieldScale : gun == GUN_ASSAULT ? 0.7f : 1.0f;
+        const float absorbed = modifier > 0 ? min(enemy->shield, amount * modifier) : 0;
+        if(absorbed > 0 || (emp && enemy->shield > 0) || (modifier <= 0 && enemy->shield > 0))
         {
             enemy->shield -= absorbed;
-            amount = max(0.0f, amount - absorbed / modifier);
+            // A modifier of 0 (a weapon the shield is immune to): the shield stops the hit whole.
+            amount = modifier > 0 ? max(0.0f, amount - absorbed / modifier) : 0;
             if(emp) enemy->shield = 0;
             particle_splash(PART_PLASMA, emp ? 12 : 6, 220, target->o);
         }
     }
+    amount *= bodyScale;
+    if(unsuspecting) amount = max(amount, float(max(target->health, 0)) + 1);
     damage = wholeDamage(amount, enemy->healthCarry);
     trace(enemy->shield, enemy->healthCarry);
 }
@@ -3050,7 +3280,15 @@ void halodrawhud()
     }
     const weapon *current = player1->weaponsel;
     const HaloWeaponDef *def = tagWeapons() ? haloweapon(carried[currentCarried].def) : NULL;
-    if(def && tagHud)
+    if(!def && tagHud)
+    {
+        // Unarmed (a10 before the bridge): the retail HUD's unit panels, no weapon or reticle.
+        HaloHudWeapon w;
+        HaloHudBlip blips[64];
+        const int count = sensorBlips(blips, 64, yaw);
+        halohuddraw(w, hudUnit(), blips, count);
+    }
+    else if(def && tagHud)
     {
         // Feed the retail HUD: weapon state, shields and health, grenades and contacts.
         const HaloWeaponState &st = carried[currentCarried];
@@ -3122,8 +3360,9 @@ void halodrawhud()
             label(zoom, VIRTW/2+40, VIRTH/2+30, 0.55f);
         }
     }
-    else
+    else if(def || !tagWeapons())
     {
+        // Without the retail HUD (or without weapons.txt): the plain weapon labels.
         const char *name = current->type == GUN_PISTOL ? "M6D MAGNUM" : current->type == GUN_KNIFE ? "MELEE" : "MA5B ASSAULT RIFLE";
         label(name, right, VIRTH-212, 0.60f, true);
         defformatstring(ammo)("%02d / %03d", current->mag, current->ammo);
@@ -3317,6 +3556,22 @@ int haloenemykind(const playerent *p, int *team)
     HaloEnemy *enemy = p ? enemyState(p) : NULL;
     if(team) *team = enemy ? enemy->team : -1;
     return enemy ? int(enemy->kind) : -1;
+}
+
+void haloerasebot(playerent *p)
+{
+    if(!p || p->type != ENT_BOT) return;
+    loopv(bots) if(bots[i] == p)
+    {
+        // The grenades it threw go with it: a live one would explode with a deleted owner
+        // (haloactornoise reads it). Its bolts in flight are dropped by haloupdatebolts.
+        removebounceents(p);
+        botent *d = bots.remove(i);
+        delete d->pBot;
+        d->pBot = NULL;
+        freebotent(d);
+        return;
+    }
 }
 
 void haloremoveactor(const playerent *p)
@@ -3521,8 +3776,12 @@ const HaloWeaponDef *haloweaponof(const playerent *p, int gun, HaloWeaponState *
 bool halocarriesgun(int gun)
 {
     if(!tagWeapons()) return gun == GUN_ASSAULT || gun == GUN_PISTOL;
-    return gun == carriedGun[0] || gun == carriedGun[1];
+    // An empty slot's knife is not a weapon to select while the other slot is armed.
+    loopi(2) if(gun == carriedGun[i] && (slotArmed(i) || !slotArmed(i ^ 1))) return true;
+    return false;
 }
+
+bool haloplayerunarmed() { return haloactive() && unarmed(); }
 
 void haloswitchweapon()
 {
@@ -3532,6 +3791,8 @@ void haloswitchweapon()
         execute(player1->weaponsel->type == GUN_ASSAULT ? "weapon pistol" : "weapon assault");
         return;
     }
+    // With one weapon (or none) there is nothing to switch to.
+    if(!slotArmed(currentCarried ^ 1)) return;
     if(!player1->weaponsel->deselectable() || player1->weaponchanging) return;
     syncCarried();
     selectCarried(currentCarried ^ 1, false);

@@ -144,3 +144,6 @@ COMMANDF(qa_actor_kill_one, "i", (int *kind)
     }
     fflush(stdout);
 });
+
+// ATTACH_QA (tests/test_ai_attach.py): the actors ai_attach made of scripted bipeds, and those waiting.
+COMMANDF(qa_attach_state, "s", (const char *label) { haloscenarioattachdump(label); });

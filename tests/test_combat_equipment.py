@@ -14,7 +14,7 @@ needs grenades of the other type; a thrown plasma grenade leaves the count, flie
 explodes; the last grenade of a type switches to the other; dropped plasma grenade, health
 pack, overshield, active camouflage and assault rifle ammo are picked up with their effects
 (the overshield triples the shield, takes the next hit and drains; camouflage counts down);
-a revert puts the loadout back (two frags, no plasma, no powerups).
+a revert puts the loadout back (a30's starting profile: no frags, no plasma; no powerups).
 
 On a30 section 3 (Covenant in the second wave): the Covenant throw plasma grenades, a plasma
 grenade thrown at an actor sticks to it and kills it, killed actors drop the grenades they
@@ -128,7 +128,9 @@ def run(name, section, schedule, timeout=120):
 # ---- Player: sounds, grenades, pickups, powerups, revert (a30 section 2)
 text, s, log = run('player', 2, [
     (100, 'botsshoot 0; qa_sound_table; qa_combat_state start; qa_combat_items start'),
-    (300, 'qa_grenade_switch switch-empty'),              # no plasma grenades: stays on frag
+    # a30's starting profile carries no grenades: two frags first, so the switch and auto-switch
+    # back to frag below have frags to go to.
+    (300, 'qa_grenade_give 0 2; qa_grenade_switch switch-empty'),   # no plasma grenades: stays on frag
     (500, 'qa_grenade_give 1 2; qa_grenade_switch switch'),   # now plasma
     (800, 'qa_grenade_throw'),
     (1000, 'qa_grenade_state flying'),
@@ -165,7 +167,9 @@ f = lambda n, k: float(s[n][k])
 sounds = re.findall(r'^SOUND_QA (\S+) (\S+) (\S+) (\d)', text, re.M)
 assert len(sounds) >= 40 and all(present == '1' for *_, present in sounds), \
     ([row for row in sounds if row[3] != '1'], log)
-assert i('start', 'frag') == 2 and i('start', 'plasma') == 0 and i('start', 'type') == 0, s['start']
+# a30's player starting profile (.hscb version 9) gives no grenades; an older .hscb the default two.
+START_FRAGS = 0 if read_hscb(root / 'packages/halo/a30.hscb')['version'] >= 9 else 2
+assert i('start', 'frag') == START_FRAGS and i('start', 'plasma') == 0 and i('start', 'type') == 0, s['start']
 assert i('switch-empty', 'type') == 0, ('no switch to a type with no grenades', s['switch-empty'])
 assert i('switch', 'type') == 1 and i('switch', 'plasma') == 2, s['switch']
 assert i('flying', 'grenades') == 1 and re.search(r'^GRENADE flying type=1 ', text, re.M), log
@@ -185,7 +189,7 @@ for line in text.splitlines():
         fields = line.split()
         weapon[fields[1]] = dict(x.split('=', 1) for x in fields[2:] if '=' in x)
 assert int(weapon['ammo']['ammo']) > int(weapon['fired']['ammo']), ('AR ammo pack refills the reserve', weapon)
-assert i('reverted', 'frag') == 2 and i('reverted', 'plasma') == 0 and f('reverted', 'overshield') == 0 \
+assert i('reverted', 'frag') == START_FRAGS and i('reverted', 'plasma') == 0 and f('reverted', 'overshield') == 0 \
     and f('reverted', 'camo') == 0, s['reverted']
 print('Player: sounds decoded, grenade switch, plasma throw and fuse, auto-switch, pickups, overshield, camouflage, revert.')
 

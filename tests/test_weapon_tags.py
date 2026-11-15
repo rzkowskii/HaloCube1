@@ -35,6 +35,13 @@ def records():
             current['magazines'].append([float(x) for x in rest.split()])
         elif key == 'trigger':
             current['triggers'].append([float(x) for x in rest.split()])
+        elif key == 'core':
+            current['core'] = current.get('core', []) + [float(rest)]
+        elif key == 'supercombine':
+            current['supercombine'] = [float(x) for x in rest.split()]
+        elif key == 'sound':
+            role, _, tag = rest.partition(' ')
+            current.setdefault('sounds', {})[role] = tag
         elif key == 'projectile':
             # speeds, range, gravity, guided, damage lower, upper min, upper max, category, radius,
             # inner radius, damage range near and far, side effect, path (format 3)
@@ -80,7 +87,10 @@ assert rocket['projectiles'][0][5:9] == [80, 300, 330, 4], rocket['projectiles']
 assert shotgun['projectiles'][0][5:9] == [8, 18, 25, 12], shotgun['projectiles'][0]
 assert weapon('plasma rifle')['projectiles'][0][5:9] == [10, 12, 14, 10], weapon('plasma rifle')['projectiles'][0]
 assert ar['projectiles'][0][5:8] == [10, 10, 10] and sniper['projectiles'][0][5:9] == [101, 101, 101, 5]
-assert ar['melee'] == [40, 50, 60] and pistol['melee'] == [40, 50, 60], (ar['melee'], pistol['melee'])
+# The melee line carries the jpt! side effect after its bounds: 2, lethal to the unsuspecting.
+assert ar['melee'] == [40, 50, 60, 2] and pistol['melee'] == [40, 50, 60, 2], (ar['melee'], pistol['melee'])
+assert all(w['melee'][3] == 2 for w in weapons if w['class'] in ('assault', 'pistol', 'shotgun', 'sniper', 'projectile')
+           and w['melee'][2] > 0 and 'energy sword' not in w['path']), [(w['path'], w['melee']) for w in weapons]
 for w in weapons:
     for p in w['projectiles']:
         assert p is None or p[5] <= p[6] <= p[7], (w['path'], p)
@@ -93,6 +103,13 @@ assert plasma['projectiles'][0][11:13] == [20, 50] and plasma['projectiles'][0][
 assert plasma['projectiles'][1][11:14] == [5, 20, 3], ('the charged plasma bolt is EMP', plasma['projectiles'][1])
 assert weapon('plasma rifle')['projectiles'][0][11:13] == [20, 50], weapon('plasma rifle')['projectiles'][0]
 assert ar['projectiles'][0][11:13] == [5, 15] and sniper['projectiles'][0][11:13] == [1000, 1000]
+
+# Optional lines (no format change): the AOE core radius after the rocket's projectile, and the
+# needle's super detonation (timer, inner, outer, lower, upper min, upper max, side effect, category).
+assert rocket.get('core') == [0.6], rocket.get('core')
+assert 'supercombine' not in rocket and 'supercombine' not in ar
+assert needler.get('supercombine', [])[:8] == [0.75, 0.5, 1, 40, 60, 60, 3, 3], needler.get('supercombine')
+assert needler.get('sounds', {}).get('supercombine') == r'sound\sfx\impulse\impacts\needler_super_expl', needler.get('sounds')
 
 players = [w for w in weapons if w['class'] in ('assault', 'pistol', 'shotgun', 'sniper', 'projectile')]
 assert len(players) == 9, [w['path'] for w in players]

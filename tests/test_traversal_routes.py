@@ -11,14 +11,33 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
   * the deck row is within reach of the row before it (the landing the walker waits on), and
     a section's light-bridge rows come in runs whose first row follows a floor row,
   * the sections in STOCK_SECTIONS have neither an .hcol nor a .route, and the DRIVEN_SECTIONS
-    (d40's Warthog run) have an .hcol and no .route,
+    (d40's Warthog run, c40's flown sections 1 and 4) have an .hcol, and a .route exactly when
+    VEHICLE_ROUTES plans one (gap 5, written while testing was on hold, not yet run): vehicle rows
+    (4096 drive or fly, 8192 board, 16384 get out) name a vehicles.txt type; a driven section's rows
+    are all 4096 Warthog rows, steps of at most one cell but at a jump's landing (flag 2); a flown
+    section boards a Banshee before its first flight row and gets out after its last, its flight rows
+    at most two flight cells (8 units) apart; every 16384 row follows a 4096 row; its metrics record
+    the vehicle route (`vehicle_route`) and c40 section 1's .hcol holds BSP 12 (EXTRA_BSPS),
   * action rows (written while testing was on hold, not yet run): a row with flag 256 (use a
     control) names the machine and the position it waits for, 512 (shoot a damage target) the
     target, the health it shoots it down to and an aim point (eight columns), 1024 (wait at a
-    scripted door) the door; each repeats the position of the step row before it. d40 section 5
-    uses its four manifold controls (enc5_1_pistons1, _pistonn1, _pistonn3, _pistons3, in that
-    order) and shoots the detectors of s1, n1 and n3 (no walkable spot sees s3's); a10 section 5
-    waits at tunnel_door_2 and section 6 at cryo_door_2 on rows of their own (DOOR_WAITS),
+    scripted door) the door, 2048 (throw frags at a damage target) the target, the health and an aim
+    point; each repeats the position of the step row before it. d40 section 5 uses its four manifold
+    controls (enc5_1_pistons1, _pistonn1, _pistonn3, _pistons3, in that order), shoots the detectors
+    of s1, n1 and n3, and throws frags at s3's (ThrowTarget: no walkable spot sees them) from one
+    spot after the s3 control's row, its aims straight after one another; a10 section 5 waits at
+    tunnel_door_2 and section 6 at cryo_door_2 on rows of their own (DOOR_WAITS), and section 5's
+    route passes tunnel_trigger_close before tunnel_door_2's row (the importer's `door_order` in
+    halo_a10_05.metrics.json, DOOR_PREREQUISITES),
+  * b30's return (halo_b30_03) is a walked route now (not RASTER_ROUTES): no action rows, and it ends
+    within 1.5 retail units of the ledge beside the extraction Pelican's ramp (its end marker),
+  * with CRASH_SITE, the Crash Site (halo_a30) has an .hcol and a route of plain, crouch, jump and
+    ledge-drop rows only (written while testing was on hold, not yet run),
+  * walking assists (ASSISTS in tools/import_halo_campaign.py, written while testing was on hold, not
+    yet run): a section's .hcol has an AST1 trailer exactly when ASSISTS lists the section, naming
+    its last len(ASSISTS[section]) surfaces, each two-sided (flag 1) and walkable (normal z 0.65 or
+    more); its metrics count them (`assists`), and its route has a row on every assist (the route
+    uses each one, or it would not be needed),
   * no route row stands inside a vehicle parked when the section starts (the section map's
     PLAYERSTART team 102 placements that no script creates, with their box from
     packages/halo/vehicles.txt as halo_vehicle.cpp sizes it): the importer's planner goes round
@@ -26,6 +45,7 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
 Needs the imported campaign maps, not the game.
 """
 import gzip
+import json
 import math
 import struct
 import sys
@@ -33,7 +53,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qa_common import *  # noqa: E402,F403
 sys.path.insert(0, str(root / 'tools'))
-from import_halo_campaign import DRIVEN_SECTIONS, LIFT_RIDES, MISSIONS, STOCK_SECTIONS  # noqa: E402
+from import_halo_campaign import (ASSISTS, CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, EXTRA_BSPS, FLIGHT_CELL,  # noqa: E402
+                                  FLOWN_SECTIONS, LIFT_RIDES, MISSIONS, ROUTE_BOARD, ROUTE_GET_OUT, ROUTE_VEHICLE, STOCK_SECTIONS,
+                                  VEHICLE_ROUTES)
 
 maps = root / 'packages/maps'
 require(maps, 'run scripts/import-macos-assets.sh')
@@ -52,13 +74,18 @@ def rows(path):
         flags = int(fields[3]) if len(fields) > 3 else 0
         device, value = None, None
         if len(fields) > 4:
-            device, _, value = fields[4].rpartition('@')
-            value = float(value)
-        if flags & (16 | 128 | 256 | 512 | 1024) and not device:
+            if '@' in fields[4]:
+                device, _, value = fields[4].rpartition('@')
+                value = float(value)
+            else:
+                device = fields[4]        # a vehicle row's vehicles.txt type
+        if flags & (ROUTE_VEHICLE | ROUTE_BOARD | ROUTE_GET_OUT) and not device:
+            raise ValueError(f'{path.name}:{number}: vehicle row {flags} without a vehicle type')
+        if flags & (16 | 128 | 256 | 512 | 1024 | 2048) and not device:
             raise ValueError(f'{path.name}:{number}: flag {flags} without a device')
-        if bool(flags & 512) != (len(fields) == 8):
-            raise ValueError(f'{path.name}:{number}: a shoot row (512) has an aim point, and only it: {line!r}')
-        if flags & (256 | 512 | 1024) and (not result or result[-1][0] != (x, y, z)):
+        if bool(flags & (512 | 2048)) != (len(fields) == 8):
+            raise ValueError(f'{path.name}:{number}: a shoot or throw row (512, 2048) has an aim point, and only it: {line!r}')
+        if flags & (256 | 512 | 1024 | 2048) and (not result or result[-1][0] != (x, y, z)):
             raise ValueError(f'{path.name}:{number}: action row {flags} not at the step row before it')
         result.append(((x, y, z), flags, device, value))
     return result
@@ -73,11 +100,54 @@ for mission in MISSIONS:
                 problems.append(f'{name}: in STOCK_SECTIONS but has a {"hcol" if hcol.exists() else "route"}')
             continue
         if (mission.cache, part) in DRIVEN_SECTIONS:
-            # The Warthog run: an .hcol to drive on, no walking route.
-            if route.exists():
-                problems.append(f'{name}: in DRIVEN_SECTIONS but has a route')
+            # The Warthog run and the flown sections: an .hcol to drive or fly on, and the planned
+            # vehicle route when VEHICLE_ROUTES has one (gap 5).
+            key = (mission.cache, part)
             if not hcol.exists():
                 problems.append(f'{name}: in DRIVEN_SECTIONS but has no hcol (re-run import_halo_campaign.py --mission {mission.cache})')
+            if key not in VEHICLE_ROUTES:
+                if route.exists():
+                    problems.append(f'{name}: in DRIVEN_SECTIONS with no VEHICLE_ROUTES entry but has a route')
+                continue
+            if not route.exists():
+                problems.append(f'{name}: VEHICLE_ROUTES plans a route but there is no .route (re-run the import)')
+                continue
+            try:
+                table = rows(route)
+            except ValueError as error:
+                problems.append(str(error))
+                continue
+            checked += 1
+            vehicle = [i for i, (_, f, _, _) in enumerate(table) if f & ROUTE_VEHICLE]
+            boards = [i for i, (_, f, _, _) in enumerate(table) if f & ROUTE_BOARD]
+            outs = [i for i, (_, f, _, _) in enumerate(table) if f & ROUTE_GET_OUT]
+            if not vehicle:
+                problems.append(f'{name}: a vehicle route without drive or fly rows')
+            for i in outs:
+                if not i or not table[i - 1][1] & ROUTE_VEHICLE:
+                    problems.append(f'{name}: get-out row {i} does not follow a drive or fly row')
+            if key in FLOWN_SECTIONS:
+                if not boards or (vehicle and boards[0] > vehicle[0]):
+                    problems.append(f'{name}: flown, but no Banshee boarded before the first flight row')
+                if any(table[i][2] != 'banshee' for i in vehicle + boards + outs):
+                    problems.append(f'{name}: flown with another vehicle than the Banshee')
+                for a, b in zip(vehicle, vehicle[1:]):
+                    if b == a + 1 and math.dist(table[a][0], table[b][0]) > 2 * FLIGHT_CELL + .5:
+                        problems.append(f'{name}: flight rows {a} and {b} {math.dist(table[a][0], table[b][0]):.1f} apart')
+                        break
+            else:
+                if boards or outs or len(vehicle) != len(table) or any(table[i][2] != 'warthog' for i in vehicle):
+                    problems.append(f'{name}: driven, but not all Warthog drive rows')
+                for (a, fa, _, _), (b, fb, _, _) in zip(table, table[1:]):
+                    if math.hypot(b[0] - a[0], b[1] - a[1]) > 1.5 and not fb & 2:
+                        problems.append(f'{name}: a step of {math.hypot(b[0] - a[0], b[1] - a[1]):.1f} cells that is not a jump')
+                        break
+            metrics_path = maps / f'{name}.metrics.json'
+            vehicle_metrics = json.loads(metrics_path.read_text()).get('vehicle_route') if metrics_path.is_file() else None
+            if not vehicle_metrics or vehicle_metrics.get('rows') != len(table):
+                problems.append(f'{name}: metrics do not record its vehicle route (re-run the import)')
+            elif list(EXTRA_BSPS.get(key, ())) != vehicle_metrics.get('extra_bsps'):
+                problems.append(f'{name}: metrics name extra BSPs {vehicle_metrics.get("extra_bsps")}, EXTRA_BSPS {EXTRA_BSPS.get(key)}')
             continue
         if not route.exists():
             continue
@@ -117,12 +187,26 @@ for mission in MISSIONS:
         uses = [device for _, flags, device, _ in table if flags & 256]
         shots = [device for _, flags, device, _ in table if flags & 512]
         waits = [device for _, flags, device, _ in table if flags & 1024]
+        throws = [i for i, (_, flags, _, _) in enumerate(table) if flags & 2048]
         expected_actions = {
             'halo_d40_05': (['enc5_1_pistons1', 'enc5_1_pistonn1', 'enc5_1_pistonn3', 'enc5_1_pistons3'],
-                            ['enc5_1_detector_s1', 'enc5_1_detector_n1', 'enc5_1_detector_n3'], []),
-            'halo_a10_05': ([], [], ['tunnel_door_2']),
-            'halo_a10_06': ([], [], ['cryo_door_2']),
-        }.get(name, ([], [], []))
+                            ['enc5_1_detector_s1', 'enc5_1_detector_n1', 'enc5_1_detector_n3'], [], ['enc5_1_detector_s3']),
+            'halo_a10_05': ([], [], ['tunnel_door_2'], []),
+            'halo_a10_06': ([], [], ['cryo_door_2'], []),
+        }.get(name, ([], [], [], []))
+        thrown = sorted({table[i][2][:-1] if table[i][2].endswith('b') else table[i][2] for i in throws})
+        if thrown != expected_actions[3]:
+            problems.append(f'{name}: throw rows at {thrown}, expected {expected_actions[3]} (or their b detectors)')
+        if throws:
+            # One spot, its aims one after another, after the control that opens the channel.
+            if throws != list(range(throws[0], throws[0] + len(throws))) or len({table[i][0] for i in throws}) != 1:
+                problems.append(f'{name}: throw rows {throws} are not consecutive rows at one spot')
+            used = [i for i, (_, flags, device, _) in enumerate(table) if flags & 256 and device == 'enc5_1_pistons3']
+            if not used or used[0] > throws[0]:
+                problems.append(f'{name}: throw rows before enc5_1_pistons3 is opened (use rows {used})')
+            for i in throws:
+                if table[i][3] is None or not 0 <= table[i][3] < 1:
+                    problems.append(f'{name}: throw row {i} health {table[i][3]}')
         if uses != expected_actions[0]:
             problems.append(f'{name}: use rows {uses}, expected {expected_actions[0]}')
         # Either detector of a manifold destroys it (enc5_1_destroyed_poll): s1 or s1b, and so on.
@@ -130,7 +214,114 @@ for mission in MISSIONS:
             problems.append(f'{name}: shoot rows {shots}, expected {expected_actions[1]} (or their b detectors)')
         if [wait for wait in waits if wait in expected_actions[2]] != expected_actions[2]:
             problems.append(f'{name}: door rows {waits}, expected {expected_actions[2]} among them')
+        if name == 'halo_a10_05':
+            # mission_tunnel powers tunnel_door_2 only after every player has been in tunnel_trigger_close.
+            metrics = maps / f'{name}.metrics.json'
+            order = json.loads(metrics.read_text()).get('door_order') if metrics.is_file() else None
+            entry = next((e for e in order or () if e.get('door') == 'tunnel_door_2'), None)
+            if entry is None or 'tunnel_trigger_close' not in entry.get('passed', ()):
+                problems.append(f'{name}: the route does not pass tunnel_trigger_close before tunnel_door_2 '
+                                f'(door_order {order}; re-import a10 part 5)')
+        if name == 'halo_b30_03':
+            if any(flags & (256 | 512 | 1024 | 2048) for _, flags, _, _ in table):
+                problems.append(f'{name}: action rows on the walked return')
+            # It ends at the ledge beside the Pelican's ramp (SECTION_EXITS, a retail point): the
+            # importer's metrics say whether the route's last step is within reach of it.
+            metrics = maps / f'{name}.metrics.json'
+            m = json.loads(metrics.read_text()) if metrics.is_file() else {}
+            if m.get('mode') != 'walked' or m.get('ends_in_exit') is not True:
+                problems.append(f'{name}: mode {m.get("mode")}, ends at the Pelican ledge {m.get("ends_in_exit")} '
+                                '(expected a walked route ending there; re-import b30 part 3)')
 
+
+
+# The Crash Site (CRASH_SITE: imported from the retail BSP, the engine's first a30 section): an .hcol and
+# a walked route of plain steps and ledge drops (flag 8, its slides), no lift, bridge or action rows.
+if CRASH_SITE:
+    hcol, route = maps / f'{CRASH_SITE_NAME}.hcol', maps / f'{CRASH_SITE_NAME}.route'
+    if not hcol.is_file() or not route.is_file():
+        problems.append(f'{CRASH_SITE_NAME}: no hcol or route (CRASH_SITE: re-run import_halo_campaign.py --mission a30 --part 0)')
+    else:
+        try:
+            table = rows(route)
+            checked += 1
+            odd = sorted({flags for _, flags, _, _ in table if flags & ~(1 | 2 | 8)})
+            if odd:
+                problems.append(f'{CRASH_SITE_NAME}: route flags {odd} (only crouch, jump and ledge-drop rows expected)')
+        except ValueError as error:
+            problems.append(str(error))
+
+
+# Walking assists: the .hcol's AST1 trailer (halo_collision.write_structure_collision).
+def hcol_surfaces(path):
+    data = path.read_bytes()
+    if data[:4] != b'HCL1':
+        raise ValueError(f'{path.name}: not HCL1')
+    count, offset, surfaces = struct.unpack_from('<I', data, 4)[0], 8, []
+    for _ in range(count):
+        *normal, flags, _, _, points = struct.unpack_from('<3fBBhI', data, offset)
+        offset += 20
+        surfaces.append((normal, flags, [struct.unpack_from('<3f', data, offset + 12 * k) for k in range(points)]))
+        offset += 12 * points
+    trailers = {}
+    while offset < len(data):
+        tag, entries = struct.unpack_from('<4sI', data, offset)
+        trailers[tag.decode()] = list(struct.unpack_from(f'<{entries}I', data, offset + 8))
+        offset += 8 + 4 * entries
+    return surfaces, trailers
+
+
+def on_polygon(point, normal, points):
+    x, y, z = point
+    # Above the polygon's plane by at most a step, inside its outline seen from above.
+    height = sum((p - q) * n for p, q, n in zip((x, y, z), points[0], normal)) / max(normal[2], 1e-6)
+    if not -.6 <= height <= 1.3:
+        return False
+    sign = 0
+    for a, b in zip(points, points[1:] + points[:1]):
+        cross = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+        if abs(cross) < 1e-9:
+            continue
+        if sign and (cross > 0) != (sign > 0):
+            return False
+        sign = cross
+    return True
+
+
+assisted = 0
+for mission in MISSIONS:
+    for part in range(len(mission.sections)):
+        name = f'halo_{mission.cache}_{part + 1:02}'
+        hcol, route = maps / f'{name}.hcol', maps / f'{name}.route'
+        expected = len(ASSISTS.get((mission.cache, part), ()))
+        if not hcol.is_file():
+            if expected and (mission.cache, part) not in STOCK_SECTIONS:
+                problems.append(f'{name}: in ASSISTS but has no hcol (re-run import_halo_campaign.py --mission {mission.cache})')
+            continue
+        try:
+            surfaces, trailers = hcol_surfaces(hcol)
+        except (ValueError, struct.error) as error:
+            problems.append(f'{name}: unreadable hcol ({error})')
+            continue
+        listed = trailers.get('AST1', [])
+        if len(listed) != expected or listed != list(range(len(surfaces) - expected, len(surfaces))):
+            problems.append(f'{name}: AST1 lists surfaces {listed[:4]}..., expected the last {expected} (ASSISTS)')
+            continue
+        if not expected:
+            continue
+        assisted += 1
+        metrics = maps / f'{name}.metrics.json'
+        counted = json.loads(metrics.read_text()).get('assists') if metrics.is_file() else None
+        if counted != expected:
+            problems.append(f'{name}: metrics count {counted} assists, ASSISTS lists {expected}')
+        table = rows(route) if route.is_file() else []
+        for index in listed:
+            normal, flags, points = surfaces[index]
+            if not flags & 1 or normal[2] < .65:
+                problems.append(f'{name}: assist surface {index} flags {flags}, normal z {normal[2]:.2f} (two-sided, walkable)')
+            if not any(on_polygon(point, normal, points) for point, _, _, _ in table):
+                problems.append(f'{name}: no route row on assist surface {index}: the route does not use it')
+print(f'{assisted} sections with walking assists checked')
 
 
 # Parked vehicles: the engine's box (halo_vehicle.cpp dims) at the placement, widened by the

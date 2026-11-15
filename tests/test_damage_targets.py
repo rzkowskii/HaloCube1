@@ -2,8 +2,8 @@
 
 NOT YET RUN: written while testing was on hold.
 
-1. Every packages/halo/<cache>.hscb is version 8 (object rows carry a damage target's vitality,
-   collision box and whether it is placed at the start). With HALO_SOURCE set, the importer finds
+1. Every packages/halo/<cache>.hscb is version 8 or later (object rows carry a damage target's
+   vitality, collision box and whether it is placed at the start; version 9 adds a trailer). With HALO_SOURCE set, the importer finds
    d40's eight `invisible damage detector` bipeds (enc5_1_detector_n1, _n1b ... _s3b) as damage
    targets with the retail body vitality 125 and a flat 1.1 x 1.6 x 0.24 box, and no other
    mission has one. No game needed.
@@ -29,8 +29,8 @@ from qa_common import *  # noqa: E402,F403
 halo = root / 'packages/halo'
 require(halo / 'd40.hscb', 'run tools/import_halo_scripts.py')
 for path in sorted(halo.glob('*.hscb')):
-    assert path.read_bytes()[4:8] == (8).to_bytes(4, 'little'), f'{path.name} is not HSCB version 8; rerun tools/import_halo_scripts.py'
-print('Every .hscb is version 8.')
+    assert int.from_bytes(path.read_bytes()[4:8], 'little') in (8, 9), f'{path.name} is older than HSCB version 8; rerun tools/import_halo_scripts.py'
+print('Every .hscb is version 8 or 9.')
 
 if os.environ.get('HALO_SOURCE') or (HALO_SOURCE / 'd40.map').is_file():
     import mmap

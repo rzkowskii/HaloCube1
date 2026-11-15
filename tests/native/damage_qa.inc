@@ -5,6 +5,8 @@
 
 // DAMAGE_TABLE weapon=<index> trigger=<n> lower= umin= umax= start= end= inner= outer= side= cat=
 //              at0= atStart= atMid= atEnd= atFar=   (the upper min's hit at those distances, world units)
+//              core=<AOE core radius> super=<0|1> super_timer= super_inner= super_outer= super_umin=
+//              super_side= melee_side=<the weapon's melee side effect>
 // DAMAGE_GRENADE type=<n> inner= outer= lower= umin= umax= side= centre= mid= edge=   (the retail roll)
 //              actor_min= actor_max= player_min= player_max=   (400 rolls each: actors [lower, umax])
 //              attached_actor_min= attached_actor_max=
@@ -21,9 +23,12 @@ static void qaDamageTable()
             const HaloDamage &g = p.damage;
             auto at = [&](float distance) { return g.scaled(g.upperMin, halofalloff(distance, p.rangeStart, p.rangeEnd)); };
             conoutf("DAMAGE_TABLE weapon=%d trigger=%d lower=%.2f umin=%.2f umax=%.2f start=%.2f end=%.2f inner=%.2f outer=%.2f side=%d cat=%d "
-                    "at0=%.2f atStart=%.2f atMid=%.2f atEnd=%.2f atFar=%.2f path=%s",
+                    "at0=%.2f atStart=%.2f atMid=%.2f atEnd=%.2f atFar=%.2f core=%.2f super=%d super_timer=%.2f super_inner=%.2f "
+                    "super_outer=%.2f super_umin=%.2f super_side=%d melee_side=%d path=%s",
                     i, j, g.lower, g.upperMin, g.upperMax, p.rangeStart, p.rangeEnd, p.innerRadius, p.radius, p.sideEffect, p.category,
-                    at(0), at(p.rangeStart), at((p.rangeStart + p.rangeEnd) * .5f), at(p.rangeEnd), at(p.rangeEnd * 2 + 1), d->path.c_str());
+                    at(0), at(p.rangeStart), at((p.rangeStart + p.rangeEnd) * .5f), at(p.rangeEnd), at(p.rangeEnd * 2 + 1), g.core,
+                    int(p.super.valid), p.super.timer, p.super.innerRadius, p.super.radius, p.super.damage.upperMin, p.super.sideEffect,
+                    d->meleeSideEffect, d->path.c_str());
         }
     }
     loopi(HALO_GRENADE_TYPES)
@@ -41,10 +46,10 @@ static void qaDamageTable()
         const HaloDamage &b = d->blast;
         auto at = [&](float distance) { return b.scaled(b.upperMin, halofalloff(distance, d->innerRadius, d->outerRadius)); };
         conoutf("DAMAGE_GRENADE type=%d inner=%.2f outer=%.2f lower=%.2f umin=%.2f umax=%.2f side=%d centre=%.2f mid=%.2f edge=%.2f "
-                "actor_min=%.2f actor_max=%.2f player_min=%.2f player_max=%.2f attached_actor_min=%.2f attached_actor_max=%.2f",
+                "actor_min=%.2f actor_max=%.2f player_min=%.2f player_max=%.2f attached_actor_min=%.2f attached_actor_max=%.2f core=%.2f",
                 i, d->innerRadius, d->outerRadius, b.lower, b.upperMin, b.upperMax, d->sideEffect, at(0),
                 at((d->innerRadius + d->outerRadius) * .5f), at(d->outerRadius), actorMin, actorMax, playerMin, playerMax,
-                attachedMin, attachedMax);
+                attachedMin, attachedMax, b.core);
     }
     static const float cases[][3] = {{0, 1.5f, 3}, {1.5f, 1.5f, 3}, {2.25f, 1.5f, 3}, {3, 1.5f, 3}, {9, 1.5f, 3}, {50, 0, 0}, {999, 1000, 1000}, {1000, 1000, 1000}};
     for(const auto &c : cases) conoutf("DAMAGE_QA falloff %.3f %.3f %.3f = %.4f", c[0], c[1], c[2], halofalloff(c[0], c[1], c[2]));
@@ -183,4 +188,99 @@ COMMANDF(qa_target_aim, "fff", (float *x, float *y, float *z)
     player1->pitch = atan2f(look.z, max(look.magnitudexy(), .01f)) / RAD;
     conoutf("TARGET_QA aim distance=%.2f yaw=%.1f pitch=%.1f", look.magnitude(), player1->yaw, player1->pitch);
     fflush(stdout);
+});
+
+// ---- The fidelity gaps of batch 9 (tests/test_melee_materials.py)
+
+// The nearest living hostile actor of body kind `kind` (ActorKind; -1 any), renewed: full health
+// and shield, nothing carried.
+static HaloEnemy *qaDamageRenewed(int kind)
+{
+    HaloEnemy *found = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        HaloEnemy &e = enemies[i];
+        if(!e.bot || e.bot->state != CS_ALIVE || haloteamfriendly(e.team) || (kind >= 0 && int(e.kind) != kind)) continue;
+        const float d = player1->o.squareddist(e.bot->o);
+        if(d < best) { best = d; found = &e; }
+    }
+    if(found)
+    {
+        haloactorrenew(found->bot);
+        found->shield = found->shieldMax;
+        found->healthCarry = 0;
+    }
+    return found;
+}
+
+// The player's feet `gap` world units from the actor at `bearing` degrees from where it faces
+// (0 in front, 180 behind), facing the actor's middle.
+static void qaDamageStandBy(const playerent *bot, float bearing, float gap)
+{
+    const float yaw = (bot->yaw + bearing) * RAD, s = haloscenarioscale();
+    const vec feet = vec(bot->o).sub(vec(0, 0, bot->eyeheight)).add(vec(sinf(yaw), -cosf(yaw), 0).mul(gap * s));
+    player1->o = vec(feet).add(vec(0, 0, player1->eyeheight));
+    player1->vel = vec(0, 0, 0);
+    player1->resetinterp();
+    haloplayermoved("QA teleport");
+    vec body = bot->o;
+    body.z -= bot->eyeheight * .5f;
+    const vec look = vec(body).sub(player1->o);
+    player1->yaw = fmodf(atan2f(look.y, look.x) / RAD + 90.0f + 360.0f, 360.0f);
+    player1->pitch = atan2f(look.z, max(look.magnitudexy(), .01f)) / RAD;
+}
+
+static void qaDamageReport(const char *label, const HaloEnemy *e)
+{
+    const botent *bot = e->bot;
+    conoutf("DAMAGE_REGION %s name=%s kind=%d shield=%.3f shield_max=%.3f health=%d alive=%d status=%d", label, bot ? bot->name : "-",
+            int(e->kind), e->shield, e->shieldMax, bot ? bot->health : 0, bot && bot->state == CS_ALIVE, bot ? haloactorstatus(bot) : 0);
+    fflush(stdout);
+}
+
+// qa_damage_melee BEHIND AWARE LABEL: the nearest hostile actor, renewed, with the player put
+// 0.6 world units behind it (BEHIND 1) or in front of it, facing it; AWARE 1 puts it in combat
+// with the player, 0 unaware of everyone; then the player's melee (halomelee, with its jpt!
+// side effect: lethal to the unsuspecting). DAMAGE_REGION <label> ... alive=<0|1>
+COMMANDF(qa_damage_melee, "iis", (int *behind, int *aware, const char *label)
+{
+    HaloEnemy *e = qaDamageRenewed(-1);
+    if(!e) { conoutf("DAMAGE_REGION %s no-actor", label); fflush(stdout); return; }
+    qaDamageStandBy(e->bot, *behind ? 180.0f : 0.0f, .6f);
+    haloactorforceawareness(e->bot, *aware != 0, player1);
+    halomelee();
+    qaDamageReport(label, e);
+});
+
+// qa_damage_region KIND BEARING HEIGHT WEAPON AMOUNT LABEL: the nearest hostile actor of body kind
+// KIND (3 Hunter, -1 any), renewed, takes the player's exact hit of AMOUNT with the jpt! damage of
+// weapons.txt weapon WEAPON's first projectile, from 3 world units at BEARING degrees off where
+// it faces, struck at HEIGHT of its body (0 feet, 1 top). With halo_damagetrace 1 the hit's
+// DAMAGE_MATERIAL line names the material it landed on. DAMAGE_REGION <label> ...
+COMMANDF(qa_damage_region, "iffifs", (int *kind, float *bearing, float *height, int *weapon, float *amount, const char *label)
+{
+    HaloEnemy *e = qaDamageRenewed(*kind);
+    const HaloWeaponDef *w = haloweapon(*weapon);
+    const HaloTriggerDef *t = w ? w->trigger(0) : NULL;
+    if(!e || !t || !t->projectile.valid) { conoutf("DAMAGE_REGION %s no-actor-or-weapon", label); fflush(stdout); return; }
+    botent *bot = e->bot;
+    qaDamageStandBy(bot, *bearing, 3);
+    const float feet = bot->o.z - bot->eyeheight;
+    const float tall = bot->eyeheight + bot->aboveeye;
+    const vec at(bot->o.x, bot->o.y, feet + clamp(*height, 0.0f, 1.0f) * tall);
+    const vec dir = vec(at).sub(player1->o).normalize();
+    halohit(*amount, HALO_SIDE_EFFECT_NONE, bot, player1, dir, GUN_PISTOL, false, 0, &t->projectile.damage, &at);
+    qaDamageReport(label, e);
+});
+
+// qa_damage_needles COUNT LABEL: COUNT of the player's needles strike the nearest hostile actor
+// at once (haloqaneedles). DAMAGE_NEEDLES <label> needles= detonations= then its DAMAGE_REGION line.
+COMMANDF(qa_damage_needles, "is", (int *count, const char *label)
+{
+    HaloEnemy *e = qaDamageRenewed(-1);
+    if(!e) { conoutf("DAMAGE_NEEDLES %s no-actor", label); fflush(stdout); return; }
+    const int detonations = haloqaneedles(e->bot, *count);
+    conoutf("DAMAGE_NEEDLES %s needles=%d detonations=%d", label, *count, detonations);
+    qaDamageReport(label, e);
 });

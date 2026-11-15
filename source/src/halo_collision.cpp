@@ -57,6 +57,7 @@ namespace
         std::vector<Surface> surfaces;
         std::vector<Node> nodes;
         std::vector<int> devices; // scenario machines whose polygons are part of the mesh, sorted
+        unsigned assists = 0;     // surfaces that are walking assists (flag haloCollisionAssist)
 
         unsigned build(unsigned first, unsigned count)
         {
@@ -142,17 +143,42 @@ namespace
             if(area <= small) continue;
             data.surfaces.push_back(surface);
         }
-        if(file.tell() != bytes)
+        // Optional trailers, in this order: DEV1, the static scenario machines baked into the
+        // surfaces; AST1, the surfaces (file order) that are authored walking assists.
+        std::vector<unsigned> assists;
+        bool devicesRead = false, assistsRead = false;
+        while(file.tell() < bytes)
         {
-            // Optional trailer: the static scenario machines baked into the surfaces.
             char tag[4];
-            if(file.read(tag, sizeof(tag)) != sizeof(tag) || memcmp(tag, "DEV1", sizeof(tag))) return false;
-            const unsigned devices = file.getlil<uint>();
-            if(devices > 65536 || long(file.tell()) + long(devices) * 4 != bytes) return false;
-            loopi(int(devices)) data.devices.push_back(int(file.getlil<uint>()));
-            std::sort(data.devices.begin(), data.devices.end());
+            if(file.read(tag, sizeof(tag)) != sizeof(tag) || long(file.tell()) + 4 > bytes) return false;
+            const unsigned entries = file.getlil<uint>();
+            if(entries > 65536 || long(file.tell()) + long(entries) * 4 > bytes) return false;
+            if(!memcmp(tag, "DEV1", sizeof(tag)) && !devicesRead && !assistsRead)
+            {
+                loopi(int(entries)) data.devices.push_back(int(file.getlil<uint>()));
+                std::sort(data.devices.begin(), data.devices.end());
+                devicesRead = true;
+            }
+            else if(!memcmp(tag, "AST1", sizeof(tag)) && !assistsRead)
+            {
+                loopi(int(entries))
+                {
+                    const unsigned surface = file.getlil<uint>();
+                    if(surface >= count) return false;
+                    assists.push_back(surface);
+                }
+                std::sort(assists.begin(), assists.end());
+                assistsRead = true;
+            }
+            else return false;
         }
         if(file.tell() != bytes || data.surfaces.empty()) return false;
+        for(Surface &surface : data.surfaces)
+        {
+            if(!std::binary_search(assists.begin(), assists.end(), unsigned(surface.index))) continue;
+            surface.flags |= haloCollisionAssist;
+            ++data.assists;
+        }
         data.build(0, unsigned(data.surfaces.size()));
         return true;
     }
@@ -298,7 +324,9 @@ namespace
         if(!finite(path.delta) || path.delta.iszero()) return false;
         visit(0, path, hit, [&](const Surface &surface)
         {
-            if(surface.flags & ignoreFlags) return;
+            // Walking assists stand in for a jump the engine cannot make: nothing is there in
+            // Halo, so shots, sight and probes pass through them.
+            if(surface.flags & (ignoreFlags | haloCollisionAssist)) return;
             const Vertex *vertices = mesh.vertices.data() + surface.first;
             float direction = path.delta.dot(surface.normal);
             if(fabsf(direction) <= small || (direction > 0 && !(surface.flags & twoSided) && !allowBackfaces)) return;
@@ -334,7 +362,29 @@ void halocollisionmap(const char *name)
         return;
     }
     mesh = std::move(loaded);
-    conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines)", unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()));
+    if(mesh.assists)
+        conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines, %u walking assists)",
+                unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()), mesh.assists);
+    else
+        conoutf("Halo: loaded %u retail collision surfaces for %s (%u static machines)", unsigned(mesh.surfaces.size()), name, unsigned(mesh.devices.size()));
+}
+
+int halocollisionassist(int index, vec &centre, vec &normal)
+{
+    if(!halocollisionactive()) return 0;
+    // In file order (the AST1 trailer's, ASSISTS' order): the tree build reorders mesh.surfaces.
+    std::vector<const Surface *> assists;
+    for(const Surface &surface : mesh.surfaces) if(surface.flags & haloCollisionAssist) assists.push_back(&surface);
+    std::sort(assists.begin(), assists.end(), [](const Surface *a, const Surface *b) { return a->index < b->index; });
+    if(index >= 0 && index < int(assists.size()))
+    {
+        const Surface &surface = *assists[index];
+        centre = vec(0, 0, 0);
+        loopj(int(surface.count)) centre.add(mesh.vertices[surface.first + j].point);
+        centre.div(float(surface.count));
+        normal = surface.normal;
+    }
+    return int(assists.size());
 }
 
 bool halocollisionactive()
@@ -378,7 +428,7 @@ bool halocollisionopen(const vec &point)
     return false;
 }
 
-bool halocollisionsweep(const vec &feet, const vec &delta, float radius, float height, HaloCollisionHit &hit)
+bool halocollisionsweep(const vec &feet, const vec &delta, float radius, float height, HaloCollisionHit &hit, bool assists)
 {
     hit = {};
     if(!halocollisionactive() || !finite(feet) || !finite(delta) || delta.iszero() ||
@@ -388,6 +438,7 @@ bool halocollisionsweep(const vec &feet, const vec &delta, float radius, float h
     const vec origin = vec(feet).add(vec(0, 0, radius)), axis(0, 0, height - 2*radius);
     visit(0, path, hit, [&](const Surface &surface)
     {
+        if(!assists && (surface.flags & haloCollisionAssist)) return;
         // The closest-points normal defines a separating plane. Advancing to
         // that plane cannot cross the polygon, including at grazing angles.
         float fraction = 0;
@@ -411,7 +462,7 @@ bool halocollisionsweep(const vec &feet, const vec &delta, float radius, float h
     return hit.surface >= 0;
 }
 
-bool halocollisionoverlap(const vec &feet, float radius, float height, HaloCollisionHit &hit)
+bool halocollisionoverlap(const vec &feet, float radius, float height, HaloCollisionHit &hit, bool assists)
 {
     hit = {};
     if(!halocollisionactive() || !finite(feet) || !std::isfinite(radius) || !std::isfinite(height) || radius <= 0 || height <= 0) return false;
@@ -420,6 +471,7 @@ bool halocollisionoverlap(const vec &feet, float radius, float height, HaloColli
     const vec origin = vec(feet).add(vec(0, 0, radius)), axis(0, 0, height - 2*radius);
     visit(0, path, hit, [&](const Surface &surface)
     {
+        if(!assists && (surface.flags & haloCollisionAssist)) return;
         vec gap = capsulegap(surface, origin, axis);
         float distance = gap.magnitude(), depth = radius - distance;
         if(depth <= max(contactSlop, hit.penetration)) return;

@@ -70,11 +70,30 @@ COMMANDF(qa_loadout_state, "s", (const char *name)
     const HaloWeaponDef *w0 = haloweapon(carried[0].def);
     const HaloWeaponDef *w1 = haloweapon(carried[1].def);
     conoutf("QA_LOADOUT %s map=%s stage=%d checkpoint=%d pos=%.2f,%.2f,%.2f health=%d shield=%.1f frags=%d plasmas=%d type=%d current=%d "
-            "w0=%s:%d/%d w1=%s:%d/%d difficulty=%d",
+            "w0=%s:%d/%d w1=%s:%d/%d difficulty=%d unarmed=%d gun=%d",
         name, getclientmap(), stage, atCheckpoint, player1->o.x, player1->o.y, player1->o.z, player1->health, shield,
         grenadeCount(HALO_GRENADE_FRAG), plasmaGrenades, grenadeType, currentCarried,
         w0 ? w0->label.c_str() : "-", carried[0].loaded, carried[0].reserve,
-        w1 ? w1->label.c_str() : "-", carried[1].loaded, carried[1].reserve, halodifficulty());
+        w1 ? w1->label.c_str() : "-", carried[1].loaded, carried[1].reserve, halodifficulty(), unarmed(),
+        player1->weaponsel ? player1->weaponsel->type : -1);
+    fflush(stdout);
+});
+
+// QA_PROFILE: the loaded mission script's player starting profiles (.hscb version 9), one line
+// each (weapons by label, `-` for none), then a count (0 with an older .hscb).
+COMMANDF(qa_profile_state, "", ()
+{
+    int count = 0;
+    HaloStartingProfile p;
+    for(; haloscenarioprofile(count, NULL, p); ++count)
+    {
+        const HaloWeaponDef *w0 = p.weapon[0].empty() ? NULL : haloweaponfind(p.weapon[0].c_str());
+        const HaloWeaponDef *w1 = p.weapon[1].empty() ? NULL : haloweaponfind(p.weapon[1].c_str());
+        conoutf("QA_PROFILE %d name=%s health=%.2f shield=%.2f w0=%s:%d/%d w1=%s:%d/%d frags=%d plasmas=%d", count,
+                p.name.empty() ? "-" : p.name.c_str(), p.health, p.shield, w0 ? w0->label.c_str() : "-", p.loaded[0], p.total[0],
+                w1 ? w1->label.c_str() : "-", p.loaded[1], p.total[1], p.frags, p.plasmas);
+    }
+    conoutf("QA_PROFILE count=%d", count);
     fflush(stdout);
 });
 
@@ -84,6 +103,14 @@ COMMANDF(qa_loadout_mark, "iiii", (int *frags, int *plasmas, int *loaded, int *r
     grenadeCount(HALO_GRENADE_FRAG) = *frags;
     plasmaGrenades = *plasmas;
     syncCarried();
+    // An unarmed start (a10's starting profile) gets the default assault rifle in the selected slot
+    // first, so the rounds mark a weapon.
+    if(tagWeapons() && !slotArmed(currentCarried))
+    {
+        carried[currentCarried].reset(haloweaponfind(defaultWeapons[0]));
+        loopi(NUMGUNS) if(i != GUN_GRENADE && i != GUN_KNIFE) player1->mag[i] = player1->ammo[i] = 0;
+        equipCarried(true);
+    }
     carried[currentCarried].loaded = *loaded;
     carried[currentCarried].reserve = *reserve;
     if(tagWeapons()) applyCarried(currentCarried);

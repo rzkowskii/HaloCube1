@@ -100,7 +100,13 @@ namespace
             else if(key == "heat") ok = bool(in >> weapon->heatRecover >> weapon->heatOverheat >> weapon->heatLoss);
             else if(key == "zoom") ok = bool(in >> weapon->zoomLevels >> weapon->zoomMin >> weapon->zoomMax);
             else if(key == "aim") ok = bool(in >> weapon->autoaimAngle >> weapon->autoaimRange >> weapon->magnetismAngle >> weapon->magnetismRange);
-            else if(key == "melee") { ok = parseDamage(in, weapon->melee); damage = &weapon->melee; }
+            else if(key == "melee")
+            {
+                ok = parseDamage(in, weapon->melee);
+                damage = &weapon->melee;
+                // The side effect after the bounds (absent from older tables: none).
+                if(ok && !(in >> weapon->meleeSideEffect)) weapon->meleeSideEffect = 0;
+            }
             else if(key == "materials") ok = parseMaterials(in, lastDamage);
             else if(key == "magazine")
             {
@@ -120,6 +126,27 @@ namespace
             {
                 ok = !weapon->triggers.empty() && parseProjectile(in, weapon->triggers.back().projectile);
                 if(ok && weapon->triggers.back().projectile.valid) damage = &weapon->triggers.back().projectile.damage;
+            }
+            // Optional lines after a projectile (older games skip them): its AOE core radius and its
+            // super detonation. A table whose projectile is "-" has neither.
+            else if(key == "core")
+            {
+                HaloProjectileDef *p = weapon->triggers.empty() ? nullptr : &weapon->triggers.back().projectile;
+                ok = p && p->valid && bool(in >> p->damage.core) && p->damage.core >= 0 && std::isfinite(p->damage.core);
+            }
+            else if(key == "supercombine")
+            {
+                HaloProjectileDef *p = weapon->triggers.empty() ? nullptr : &weapon->triggers.back().projectile;
+                HaloProjectileDef::SuperDetonation d;
+                ok = p && p->valid && bool(in >> d.timer >> d.innerRadius >> d.radius) && parseDamage(in, d.damage) &&
+                     bool(in >> d.sideEffect >> d.category) && d.timer >= 0 && d.radius > 0 &&
+                     std::isfinite(d.timer) && std::isfinite(d.radius);
+                if(ok)
+                {
+                    d.innerRadius = clamp(d.innerRadius, 0.0f, d.radius);
+                    d.valid = true;
+                    p->super = d;
+                }
             }
             else if(key == "sound")
             {
@@ -190,7 +217,7 @@ bool HaloSounds::parse(const std::string &role, const std::string &tag)
 {
     static const char *const roles[HALO_SOUND_ROLES] = {
         "fire", "charged", "empty", "cycle", "reload", "reload-empty", "melee", "ready", "overheat", "pickup",
-        "throw", "explode", "armed", "zoom-in", "zoom-out", "loop",
+        "throw", "explode", "armed", "zoom-in", "zoom-out", "loop", "supercombine",
     };
     if(tag.empty()) return false;
     loopi(HALO_SOUND_ROLES) if(role == roles[i]) { samples[i] = halosoundsample(tag); return true; }
@@ -381,6 +408,8 @@ namespace
                 if(key == "blast") { ok = bool(in >> grenade->innerRadius >> grenade->outerRadius) && parseDamage(in, grenade->blast)
                                           && bool(in >> grenade->sideEffect >> grenade->category); damage = &grenade->blast; }
                 else if(key == "attached") { ok = parseDamage(in, grenade->attached); damage = &grenade->attached; }
+                // The blast's AOE core radius (older games skip the line).
+                else if(key == "core") ok = bool(in >> grenade->blast.core) && grenade->blast.core >= 0 && std::isfinite(grenade->blast.core);
                 else if(key == "materials") ok = parseMaterials(in, lastDamage);
                 else if(key == "path") std::getline(in >> std::ws, grenade->path);
                 else if(key == "equipment") std::getline(in >> std::ws, grenade->equipment);

@@ -25,10 +25,21 @@ For every section that has an imported packages/maps/<section>.hcol this checks 
     follower's speed on every straight it walks must be too.
 A mission's walk stops at the first section without an .hcol (stock geometry, reported and
 skipped, not failed). A missing .route or a route that stalls fails the section; the walk
-logs go to build/qa/. Lift rides, light-bridge waits, the actions of control, shoot and door rows
-(route flags 256, 512 and 1024: `RETAIL_QA act ...`) and the engine's fall and wedge recoveries
+logs go to build/qa/. Lift rides, light-bridge waits, the actions of control, shoot, door and throw
+rows (route flags 256, 512, 1024 and 2048: `RETAIL_QA act ...`, with `GRENADE throw` where each frag
+lay before it went off), b30's Pelican boarding at its route's end (`RETAIL_QA interact`) and the
+engine's fall and wedge recoveries
 are printed under each section; PENDING_WALK lists the sections they are expected to make pass
 that have not been walked yet.
+
+The driven and flown sections (DRIVEN_SECTIONS) with a planned vehicle route (VEHICLE_ROUTES in
+tools/import_halo_campaign.py: d40 sections 6 to 8, c40 sections 1 and 4) are walked too, by the QA
+vehicle walker (route flags 4096 drive or fly, 8192 board, 16384 get out: `RETAIL_QA vehicle ...`
+lines): full throttle at a row ahead, as the foot walker holds forward, with the vehicles kept from
+harm. Their movement feel is not required (a straight on foot is measured if their foot legs have
+one) and the route markers of a flown section's flight stand in the air (the engine's audit skips
+them). Driven sections without a route are skipped as before (tests/test_maw_drive.py drives them).
+Written while testing was on hold; the vehicle walker has not been run.
 """
 import argparse
 import os
@@ -39,7 +50,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qa_common import *  # noqa: E402,F403
 sys.path.insert(0, str(root / 'tools'))
-from import_halo_campaign import DRIVEN_SECTIONS, MISSIONS  # noqa: E402
+from import_halo_campaign import CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, MISSIONS, VEHICLE_ROUTES  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument('missions', nargs='*', help='mission cache names, e.g. a10 b30 c10')
@@ -55,7 +66,9 @@ NOMINAL_SPEED = 16.0
 # Sections whose walk is known to stop at a script-gated door (docs/macos-build.md). They are
 # walked and reported every time, but only fail the test once they pass (so the list is pruned).
 KNOWN_BLOCKED = {
-    'halo_a10_05': 'tunnel_door_2 stayed shut on the last walk (mission_tunnel powers it after the tunnel conversations)',
+    # mission_tunnel runs only once mission_a10 is past the bridge scene, so section 5 needs a walk
+    # carried in from sections 1 and 2; the last walk started at section 3 and never woke it.
+    'halo_a10_05': 'tunnel_door_2 stayed shut on the last walk (started at section 3: mission_tunnel never ran)',
     'halo_a10_06': 'reached only through section 5; on its own cryo_search never opens cryo_door_2',
     # The route rides lift_d down the c1 tower (flag 4). These reasons are what stopped the last walk,
     # made before the walker rode lifts (route flags 16 to 128); PENDING_WALK says what should pass now.
@@ -72,8 +85,17 @@ KNOWN_BLOCKED = {
     # d40's engine room: enc5_2_door opens only once the four manifolds are opened from their
     # controls and shot, and the section ends on the elevator, which enc5_3 raises to bsp 4,5.
     # The route uses all four controls (256 rows) and shoots the detectors of s1, n1 and n3 (512
-    # rows); no walkable spot sees s3's detectors (docs/macos-build.md), so enc5_2_door stays shut.
-    'halo_d40_05': "s3's detectors are out of sight of every walkable spot: enc5_2_door stays shut",
+    # rows); no walkable spot sees s3's detectors (docs/macos-build.md). It now throws frags into s3's
+    # channel from the top floor (2048 rows, ThrowTarget); never walked, so it stays here until it is.
+    'halo_d40_05': "s3's detectors are out of sight of every walkable spot: last walked before the frag throws (2048 rows)",
+    # Planned vehicle routes that stop short (the importer's WARNING; docs/macos-build.md): c40 section
+    # 1's flight lands on pulse generator 1's platform, but the doorway into its room (BSP 12) is
+    # narrower than the engine's body at the section's outdoor scale, so pulse_1_trigger, which powers
+    # door_c1, is never entered; d40 section 8's run meets gaps (from about x 876) that the engine's
+    # car, which jumps only at the rate it was climbing and falls at 40 units a second squared, cannot
+    # cross.
+    'halo_c40_01': "the walk from pulse generator 1's platform into pulse_1_trigger is not planned (doorway narrower than the body)",
+    'halo_d40_08': "the planned drive stops at the first gap of the run's last stretch (the engine's car cannot jump it)",
 }
 # Sections the lift and light-bridge machinery (route flags 16, 32, 64 and 128: the walker
 # boards, calls and sends lifts, and waits for bridges; the engine carries every body on a lift
@@ -84,6 +106,8 @@ PENDING_WALK = {
     'halo_b40_06': 'rides lift_d down from lift_d_control_a (deck row: send)',
     'halo_c10_01': 'rides lift_a down from lift_a_cont_a on its deck (deck row: send)',
     'halo_c10_02': 'new on retail collision: from the bottom of lift_a, drops into the lower hall beside bridge_a',
+    'halo_c10_03': 'new on retail collision (batch 6): over the two walking assists (ASSISTS) to bay B and the lab, '
+                   'x50 at control_lab_trigger, then out by the upper doorway once post_helmet_door_4 is powered',
     'halo_c10_04': 'rides lift_b down from lift_b_cont_a on its deck (deck row: send)',
     'halo_c20_01': 'boards platform1 (0.38 units up: the engine lets a body step onto a lift deck) and rides up',
     'halo_c20_02': 'boards platform2 and rides up',
@@ -91,12 +115,30 @@ PENDING_WALK = {
     # Door rows (1024, DOOR_WAITS): the walker stands at the door until it opens and logs its power
     # and position while it waits; a chained walk from section 1 carries cryo_search's open
     # cryo_door_2 into section 6.
-    'halo_a10_05': 'waits at tunnel_door_2 on its door row until mission_tunnel powers it',
+    'halo_a10_05': 'walked on from section 1: passes tunnel_trigger_close, then waits at tunnel_door_2 on its door row '
+                   'until mission_tunnel powers it (about 25 s; tunnel_door_3 needs no reopening)',
     'halo_a10_06': 'waits at cryo_door_2 on its door row (open when carried in from section 5)',
+    # Throw rows (2048, ThrowTarget): from one spot on the top floor the walker throws frags at the
+    # planned aims, four an aim, until s3's detector is down to 0.1; enc5_2_door then opens.
+    'halo_d40_05': "throws frags into s3's channel mouth from the top floor (2048 rows), then rides the elevator",
+    # Route fixes of this batch (not KNOWN_BLOCKED: never walked).
+    'halo_a30': 'the Crash Site on retail collision (CRASH_SITE, batch 6): from the lifepod up the valley, sliding down '
+                "two steep slopes (route flag 8) into the marines' basin, to first_marine_extraction",
+    'halo_a30_01': 'starts on the valley floor in front of the first structure, ends on the ledge above the cave floor',
+    'halo_b30_03': "walked return to the extraction Pelican's ledge; the walker presses E there until the Pelican hovers",
+    'halo_b40_03': "ends in the b3 tower's bottom doorway (bsp 1,8), the section ending at its end marker",
+    # Planned vehicle routes (VEHICLE_ROUTES, gap 5; never driven or flown by the walker).
+    'halo_d40_06': 'drives the planned Warthog route from the elevator landing up the ramp to bsp 5,6',
+    'halo_d40_07': 'drives on to bsp 6,7',
+    'halo_c40_04': "boards the engine's Banshee beside the start, flies to the landing pad and walks into bsp 0,5",
 }
 
 
 def section_name(mission, number):
+    # a30's section 0 here is the Crash Site (halo_a30, the engine's first a30 section), walked when it
+    # is imported from the retail BSP (CRASH_SITE); its imported parts are halo_a30_01 and _02.
+    if mission.cache == 'a30' and number == 0:
+        return CRASH_SITE_NAME
     return f'halo_{mission.cache}_{number:02}'
 
 
@@ -106,13 +148,15 @@ for cache in args.missions or ([] if args.section else ['a10']):
     mission = next((m for m in MISSIONS if m.cache == cache), None)
     if mission is None:
         raise SystemExit(f'unknown mission {cache}; choose from {[m.cache for m in MISSIONS]}')
-    runs.append((mission, list(range(1, len(mission.sections) + 1))))
+    first = 0 if CRASH_SITE and mission.cache == 'a30' else 1
+    runs.append((mission, list(range(first, len(mission.sections) + 1))))
 for item in args.section:
     cache, number = item.split(':')
     mission = next(m for m in MISSIONS if m.cache == cache)
     runs.append((mission, [int(number)]))
 
 failures, skipped, passed, known, driven = [], [], [], [], []
+VEHICLE_NAMES = {f'halo_{cache}_{part + 1:02}' for cache, part in VEHICLE_ROUTES}
 
 
 def check(name, log):
@@ -139,7 +183,7 @@ def check(name, log):
                      r'retail_apex=(\S+) stock_apex=(\S+) retail_air=\S+ stock_air=\S+ retail_ok=(\d) stock_ok=(\d)', body)
     note = ''
     if not feel:
-        if end and end.group(1) == 'PASS':
+        if end and end.group(1) == 'PASS' and name not in VEHICLE_NAMES:
             problems.append('movement feel not measured (no clear straight of 22+ steps on the route)')
     else:
         speed, stock_speed, accel, stock_accel, apex, stock_apex = map(float, feel.groups()[:6])
@@ -180,7 +224,8 @@ def report_traversal(name, log):
     body = log[start:start + end.end()] if end else log[start:]
     lines = [line for line in body.splitlines()
              if line.startswith(('RETAIL_QA ride', 'RETAIL_QA bridge', 'RETAIL_QA recover', 'RETAIL_QA act ', 'Halo recovery:',
-                                 'Halo lift:', 'Halo target:'))]
+                                 'Halo lift:', 'Halo target:', 'GRENADE throw', 'RETAIL_QA interact', 'RETAIL_QA vehicle',
+                                 'Halo vehicle recovery'))]
     for line in lines[:12]:
         print('   ', line)
     if len(lines) > 12:
@@ -191,7 +236,8 @@ def walk_run(mission, walk):
     """Walks sections `walk` of a mission in one client. Returns the sections not reached."""
     mission_index = MISSIONS.index(mission) + 1
     # qa_retail_start takes the engine's one-based section. a30's engine section 1 is the
-    # standalone halo_a30 map, so its imported parts (halo_a30_01, _02) are sections 2 and 3.
+    # Crash Site (halo_a30, walked here as a30 section 0), so its imported parts (halo_a30_01, _02)
+    # are sections 2 and 3.
     engine_section = walk[0] + (1 if mission.cache == 'a30' else 0)
     first = section_name(mission, walk[0])
     profile = scratch(f'retail-{first}-')
@@ -231,7 +277,7 @@ def walk_run(mission, walk):
             for line in log.splitlines():
                 if line.startswith('RETAIL_QA') and (f'map={name}' in line or not re.search(r'map=\S+', line)) and \
                    any(w in line for w in ('PASS', 'FAIL', 'stuck', 'floorless', 'audit', 'feel', 'blocked', 'waiting',
-                                           'crouching', 'squeezing', 'ride', 'bridge', 'recover', 'act ')):
+                                           'crouching', 'squeezing', 'ride', 'bridge', 'recover', 'act ', 'vehicle')):
                     print('   ', line)
             report_traversal(name, log)
             print(f'    log {logfile}', flush=True)
@@ -253,7 +299,7 @@ for mission, numbers in runs:
             skipped.extend(section_name(mission, n) for n in numbers[numbers.index(number):])
             print(f'{name}: no .hcol, stock AssaultCube geometry (skipped with the rest of the run)', flush=True)
             break
-        if (mission.cache, number - 1) in DRIVEN_SECTIONS:
+        if (mission.cache, number - 1) in DRIVEN_SECTIONS and (mission.cache, number - 1) not in VEHICLE_ROUTES:
             # The Warthog run has an .hcol for the vehicle but no walking route (tests/test_maw_drive.py).
             driven.extend(section_name(mission, n) for n in numbers[numbers.index(number):])
             print(f'{name}: driven in a Warthog, not walked (skipped with the rest of the run)', flush=True)

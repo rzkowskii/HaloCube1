@@ -927,6 +927,7 @@ void cleanupgl()
     if(minimaptex) glDeleteTextures(1, &minimaptex);
     reflecttex = refracttex = minimaptex = 0;
     minimapdirty = true;
+    halofxcleanupgl();
 }
 
 void drawzone(int *x1, int *x2, int *y1, int *y2, int *color)

@@ -926,6 +926,14 @@ const HaloActorDef *haloactordefault(int kind, int weaponIndex)
     return nullptr;
 }
 
+const HaloActorDef *haloactorfind(const char *path)
+{
+    haloactorsload();
+    if(!path || !*path) return nullptr;
+    for(const HaloActorDef &d : definitions) if(!strcasecmp(d.path.c_str(), path)) return &d;
+    return nullptr;
+}
+
 void haloactorattach(botent *bot, const HaloActorDef *def, int team)
 {
     if(!bot || !def) return;
@@ -1163,6 +1171,15 @@ int haloactorstatus(const playerent *bot)
 }
 
 playerent *haloactortarget(const playerent *bot) { const Actor *a = find(bot); return a ? a->target : nullptr; }
+
+void haloactorforceawareness(const playerent *bot, bool combat, playerent *target)
+{
+    Actor *a = find(bot);
+    if(!a) return;
+    a->awareness = combat && target ? COMBAT : UNAWARE;
+    a->target = combat ? target : nullptr;
+    if(combat && target) a->lastKnown = target->o;
+}
 
 bool haloactorintent(const playerent *bot, HaloActorIntent &intent)
 {

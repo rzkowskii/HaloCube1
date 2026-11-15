@@ -17,6 +17,10 @@ carry their fraction to the next hit; EMP drains the shield and the overshield.
 d40 section 3 (stock geometry): an EMP stuns a Warthog the player drives (the throttle does
 nothing until it wears off).
 
+b40 section 3: an EMP on a Ghost and on a Scorpion an Elite drives (qa_vehicle_pilot, then
+qa_damage_emp_vehicle) holds each where it is while stunned (it only coasts: aiDrive gives no
+throttle), and the Ghost drives again once the stun is over.
+
 a30 section 3 (Covenant): with halo_damagetrace, every shot an actor lands on the (protected)
 player is an exact hit within its weapon's [lower, upper max] times the variant's modifier
 (at least 1), some of them fractional; an actor's grenade blast deals at least the lower bound;
@@ -234,6 +238,45 @@ assert int(stunned['stunned']) > 2500, stunned
 assert moved(before, stalled) < 1.5, ('a stunned Warthog does not drive', before, stalled)
 assert int(driven['stunned']) == 0 and moved(stalled, driven) > 5, ('it drives once the stun wears off', stalled, driven)
 print(f'd40 section 3: EMP held the Warthog ({moved(before, stalled):.1f} units), then it drove {moved(stalled, driven):.1f}.')
+
+# ---- b40 section 3: EMP on vehicles an actor drives (the aiDrive fix): they hold while stunned
+text, log = run('ai-emp-find', 'halo_section 5 3', [(300, 'qa_vehicle_state find'), (600, 'quit')])
+found = [fields(l) for l in text.splitlines() if l.startswith('VEHICLE_QA find vehicle=')]
+ghost = next((int(r['vehicle']) for r in found if r.get('type') == 'ghost' and r.get('exists') == '1'), None)
+assert ghost is not None, ('b40 section 3 has a parked Ghost', log)
+tank = len([l for l in text.splitlines() if l.startswith('VEHICLE_QA find vehicle=')])  # the spawned Scorpion's index
+text, log = run('ai-emp', 'halo_section 5 3', [
+    (200, 'qa_combat_protect 1; qa_vehicle_spawn 3 14'),
+    (500, f'qa_vehicle_pilot {ghost} 1 0 ""'), (700, f'qa_vehicle_pilot {tank} 1 0 ""'),
+    (3500, 'qa_vehicle_state moving'),
+    (3600, f'qa_damage_emp_vehicle {ghost} 4000; qa_damage_emp_vehicle {tank} 4000'),
+    (4600, 'qa_vehicle_state stun1'), (7200, 'qa_vehicle_state stun2'),
+    (11000, 'qa_vehicle_state free'), (11200, 'quit'),
+], timeout=150)
+spawned = re.search(r'VEHICLE_QA spawn type=3 vehicle=(\d+)', text)
+assert spawned and int(spawned.group(1)) == tank, ('the spawned Scorpion is the vehicle after the parked ones', tank, log)
+pilots = [fields(l) for l in text.splitlines() if l.startswith('VEHICLE_QA pilot ')]
+assert len(pilots) == 2 and all(p['ok'] == '1' for p in pilots), ('Elites at the controls', pilots, log)
+assert f'DAMAGE_QA emp vehicle={ghost} stunned=1' in text and f'DAMAGE_QA emp vehicle={tank} stunned=1' in text, log
+
+
+def row(label, index):
+    rows = [fields(l) for l in text.splitlines() if l.startswith(f'VEHICLE_QA {label} vehicle={index} ')]
+    assert rows, (label, index, log)
+    return rows[0]
+
+
+for index, name in ((ghost, 'Ghost'), (tank, 'Scorpion')):
+    a, b = row('stun1', index), row('stun2', index)
+    assert int(a['stunned']) > 1500 and int(b['stunned']) > 0, ('still stunned', name, a, b)
+    assert moved(a, b) < 2.0, (f'the stunned {name} holds its position under its AI driver', moved(a, b), a, b)
+    assert a['pilot'] != '-', ('its pilot stays at the controls', name, a)
+print(f'b40 section 3: EMP held an AI-driven Ghost ({moved(row("stun1", ghost), row("stun2", ghost)):.2f} units) and '
+      f'Scorpion ({moved(row("stun1", tank), row("stun2", tank)):.2f}) while stunned.')
+free = row('free', ghost)
+assert int(free['stunned']) == 0, free
+if moved(row('stun2', ghost), free) <= 1.0:
+    print('  (the Ghost did not drive off after the stun within the window: its Elite had nowhere to go; not asserted)')
 
 # ---- a30 section 3: actors' exact shots and grenades on the player, EMP on an Elite
 text, log = run('actors', 'qa_campaign_resume 2 3', [

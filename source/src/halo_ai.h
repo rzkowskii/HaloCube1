@@ -92,6 +92,10 @@ int haloactordefcount();
 const HaloActorDef *haloactordef(int index);
 // The variant to use when only an actor family and weapon are known (wave sections, scripts).
 const HaloActorDef *haloactordefault(int kind, int weaponIndex);
+// The variant whose actv tag path is `path` (case-insensitive), or null: the vehicle variants
+// (vehicles.txt `variant` lines: "vehicles\banshee\banshee pilot") an actor seated at a
+// vehicle's gun fights as (halo_vehicle.cpp).
+const HaloActorDef *haloactorfind(const char *path);
 
 void haloactorattach(botent *bot, const HaloActorDef *def, int team);
 void haloactordetach(const playerent *bot);
@@ -113,6 +117,9 @@ void haloactorcommandadvance(const playerent *bot);
 // ai_status scale: 0 gone, 1 asleep, 2 idle, 4 alert, 6 in combat.
 int haloactorstatus(const playerent *bot);
 playerent *haloactortarget(const playerent *bot);
+// QA (tests/native/damage_qa.inc): puts an actor in combat with `target` (status 6) or unaware of
+// everyone (status 2), as its brain would have it, for the melee from behind.
+void haloactorforceawareness(const playerent *bot, bool combat, playerent *target);
 // A vehicle's AI driver or gunner (halo_vehicle.cpp drives and fires the vehicle for it): whom
 // its brain fights (null when nobody: not in combat, or the target is gone), whether it may fire
 // now (bots shoot, it has reacted to the target, it is not panicked or passive), where it is

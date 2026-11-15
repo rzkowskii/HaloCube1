@@ -36,6 +36,11 @@ QA client, throwaway profiles. NOT YET RUN: written while testing was on hold.
    entered from section 1) reverts to the script as it came in, as Continue from that section's
    start does: the script is not loaded again and its clock does not go back to zero.
 13. The warning about a corrupt progress file (item 5) is cleared once New Game starts a game.
+14. The state block's optional records (batch 8, not yet run): a checkpoint on a30 section 3 with
+   foehammer_cliff created and made enterable writes `s board` (Continue keeps it boardable, so the
+   scripts' seat test asks whether the player boarded instead of falling back to true) and, after
+   sound_class_set_gain music 0.25, `s gain` (Continue keeps the music class at 0.25); a checkpoint on
+   a50 section 4 after captain_keyes is attached writes `s attached` and Continue brings the actor back.
 """
 import shutil
 import struct
@@ -338,3 +343,30 @@ titles = rows(text, 'QA_TITLE')
 assert 'restored from the backup' in titles[0], titles
 assert titles[-1].endswith('note=[]'), ('New Game clears the warning', titles)
 print('The corrupt-file warning was cleared when New Game started.')
+
+# 14. Optional state records: boardable Pelicans, sound class gains, attached actors.
+text, profile = run('board-save', 'qa_campaign_play 2 3; qa_after_gameplay [qa_hs_cmd object_create "obj:foehammer_cliff"; '
+                    'qa_hs_cmd unit_set_enterable_by_player "obj:foehammer_cliff true"; qa_hs_cmd sound_class_set_gain "s:music 0.25 0"; '
+                    'sleep 400 [qa_checkpoint_save] 1; sleep 700 [quit] 1]')
+saved = read_progress(profile)
+cliff = read_hscb(root / 'packages/halo/a30.hscb')['objects'].index('foehammer_cliff')
+board = [r for r in saved['records']['s'] if r.startswith('board ')]
+assert board and str(cliff) in board[0].split()[2:], (cliff, board)
+gain = [r for r in saved['records']['s'] if r.startswith('gain ')]
+assert gain and abs(float(gain[0].split()[2 + 32]) - 0.25) < 1e-3, gain   # class 32: music
+text, profile = run('board-continue', 'halo_title; sleep 300 [halo_continue] 1; qa_after_gameplay [qa_hs_object boardable obj:foehammer_cliff; '
+                    'qa_fx_state continued; sleep 200 [quit] 1]', profile)
+assert rows(text, 'HS_OBJECT boardable obj:foehammer_cliff')[-1].split()[-1] == '1', rows(text, 'HS_OBJECT')
+fx = rows(text, 'FX_QA continued')
+assert fx and abs(float(field(fx[-1], 'music')) - 0.25) < 1e-3, fx
+text, profile = run('attach-save', 'halo_difficulty 1; qa_campaign_play 3 4; qa_after_gameplay [botsshoot 0; '
+                    'qa_hs_cmd object_create "obj:captain_keyes"; qa_hs_cmd ai_attach "obj:captain_keyes prison_captain"; '
+                    'sleep 600 [qa_checkpoint_save] 1; sleep 900 [quit] 1]', timeout=150)
+saved = read_progress(profile)
+assert any(r.startswith('attached ') and ' =captain_keyes ' in r for r in saved['records']['s']), \
+    [r for r in saved['records']['s'] if r.startswith('attached')]
+text, profile = run('attach-continue', 'halo_title; sleep 300 [halo_continue] 1; qa_after_gameplay [sleep 500 [qa_attach_state continued] 1; '
+                    'sleep 700 [quit] 1]', profile, timeout=150)
+keyes = [line for line in rows(text, 'ATTACH_QA continued') if 'object=captain_keyes' in line]
+assert keyes and 'alive=1' in keyes[0], rows(text, 'ATTACH_QA')
+print('Continue kept a boardable Pelican, the music class gain and an attached Keyes.')

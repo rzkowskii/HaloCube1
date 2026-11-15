@@ -8,6 +8,8 @@
 // hurt, so only movement and the exit are measured.
 #include "halo_collision.h"
 
+extern int halo_vehicledamage;   // halo_vehicle.cpp: 0 keeps every vehicle from harm
+
 namespace
 {
     vector<vec> qaRetailRoute;
@@ -27,6 +29,7 @@ namespace
     int qaRetailCrouchUntil = -1; // crouching under a part-open device up to this waypoint
     vector<vec> qaRetailDetour;   // feet points through the gap of a part-open door
     int qaRetailDetourStart = 0, qaRetailWaitAt = -1;
+    int qaRetailSeatedSince = 0;  // held in a scripted seat since (a10's cryotube during the tutorial)
 
     // Lifts and light bridges (route flags 16, 32, 64 and 128, with the device's name and position
     // in a fifth column, name@position; tools/import_halo_campaign.py LIFT_RIDES and LightBridges).
@@ -44,15 +47,34 @@ namespace
     float qaRideLast = -1;
     int qaBridgeStep = -1, qaBridgeCleared = -1, qaBridgeSince = 0, qaBridgeUses = 0, qaBridgeUsed = 0;
     int qaRetailRecoveries = 0;
-    // Action rows (tools/import_halo_campaign.py UseControl, ShootTarget and DOOR_WAITS): 256 uses the
-    // control in reach until the named device stands at the position after the @, 512 shoots the named
-    // damage target (aim point in the sixth to eighth columns) until its health is at most the value
-    // after the @, 1024 waits at a scripted door until it is open that far. Each follows the step row
-    // it stands on.
+    // Action rows (tools/import_halo_campaign.py UseControl, ShootTarget, ThrowTarget and DOOR_WAITS):
+    // 256 uses the control in reach until the named device stands at the position after the @, 512
+    // shoots the named damage target (aim point in the sixth to eighth columns) until its health is at
+    // most the value after the @, 1024 waits at a scripted door until it is open that far, 2048 throws
+    // frag grenades from the row's spot at the aim point (sixth to eighth columns, seen from the eye
+    // above the row) until the target's health is at most the value after the @. Each follows the
+    // step row it stands on; a run of 2048 rows is one target's aims, best first (each may name
+    // another of its detectors).
     vector<vec> qaRetailAim;
     int qaAct = -1, qaActDone = -1, qaActSince = 0, qaActUsed = 0, qaActLogged = 0, qaActShots = 0, qaActFire = 0;
+    // 2048: frags thrown at this row, when the last went, whether its spot was logged, and the
+    // throws at the target over all its rows.
+    int qaThrows = 0, qaThrowAt = 0, qaThrowTotal = 0;
+    bool qaThrowDumped = false;
     vec qaRetailLastFeet;
     bool qaRetailHaveFeet = false;
+
+    // Vehicle rows (tools/import_halo_campaign.py VEHICLE_ROUTES: the driven and flown sections), with
+    // the vehicles.txt type in the fifth column: 4096 drive or fly to the row's point (the vehicle's
+    // floor point when driven, a flyer's origin when flown; with 2 as well, a jump's landing), 8192
+    // board that type of vehicle from where the row stands (walk to the nearest one's driver seat and
+    // press use), 16384 get out at the row (a flyer hovers down over it first). The vehicle walker
+    // holds full throttle as the foot walker holds forward, steering at a row ahead.
+    enum { QA_ROUTE_VEHICLE = 4096, QA_ROUTE_BOARD = 8192, QA_ROUTE_GET_OUT = 16384,
+           QA_ROUTE_VEHICLE_ANY = QA_ROUTE_VEHICLE | QA_ROUTE_BOARD | QA_ROUTE_GET_OUT };
+    int qaVehRow = -1, qaVehSince = 0, qaVehUsed = 0, qaVehProgress = 0, qaVehStalled = 0, qaVehReverse = 0, qaVehChanged = 0;
+    int qaVehLogged = 0, qaVehBoards = 0, qaVehJumps = 0, qaVehUnflips = 0;
+    bool qaVehSeated = false;
 
     // Movement feel. Once per section the walk stops at the first long straight, flat stretch
     // of the route and runs it twice from a standstill with a fixed heading: on the retail
@@ -90,6 +112,8 @@ namespace
         if(qaRetailCrouched) conoutf("RETAIL_QA crouched %d times", qaRetailCrouched);
         if(qaRetailJumps) conoutf("RETAIL_QA jumped %d times", qaRetailJumps);
         if(qaRetailRecoveries) conoutf("RETAIL_QA recoveries %d", qaRetailRecoveries);
+        if(qaVehBoards || qaVehJumps || qaVehUnflips)
+            conoutf("RETAIL_QA vehicle boarded %d times, %d jump rows passed, flipped back %d times", qaVehBoards, qaVehJumps, qaVehUnflips);
         player1->trycrouch = false;
         player1->strafe = 0;
         conoutf("RETAIL_QA %s map=%s waypoint=%d/%d feet=%.2f,%.2f,%.2f stage=%d alive=%d",
@@ -126,6 +150,8 @@ namespace
             // Vehicle placements (102) stand at their retail point, which may hover (Banshees,
             // Ghosts) or sit on a slope; the engine settles them itself (halo_vehicle.cpp).
             if(e.type == PLAYERSTART && e.attr2 == 102) continue;
+            // A flown section's route markers follow its planned flight (VEHICLE_ROUTES): in the air.
+            if(e.type == PLAYERSTART && e.attr2 == 100 && e.attr3 != 0 && flownSection()) continue;
             // Markers, spawns and items are authored at floor height. Spawns (the player's and
             // the enemy waves') need room for a body; route markers (100), weapon placements
             // (101), equipment placements (103) and items only need floor under a point.
@@ -160,14 +186,15 @@ namespace
     // Length (in route steps) of the straight, flat run starting at route index i.
     int qaRetailStraight(int i)
     {
-        if(i + 1 >= qaRetailRoute.length()) return 0;
+        if(i + 1 >= qaRetailRoute.length() || (qaRetailFlags[i] & QA_ROUTE_VEHICLE_ANY) || (qaRetailFlags[i + 1] & QA_ROUTE_VEHICLE_ANY)) return 0;
         const vec step = vec(qaRetailRoute[i + 1]).sub(qaRetailRoute[i]);
         if(fabsf(step.z) > .01f || fabsf(step.magnitudexy() - 1) > .01f || qaRetailCrouch[i] || qaRetailCrouch[i + 1]) return 0;
         int j = i + 1;
         while(j + 1 < qaRetailRoute.length())
         {
             const vec next = vec(qaRetailRoute[j + 1]).sub(qaRetailRoute[j]);
-            if(next.dist(step) > .01f || fabsf(qaRetailRoute[j + 1].z - qaRetailRoute[i].z) > .01f || qaRetailCrouch[j + 1]) break;
+            if(next.dist(step) > .01f || fabsf(qaRetailRoute[j + 1].z - qaRetailRoute[i].z) > .01f || qaRetailCrouch[j + 1] ||
+               (qaRetailFlags[j + 1] & QA_ROUTE_VEHICLE_ANY)) break;
             ++j;
         }
         return j - i;
@@ -416,7 +443,8 @@ namespace
         while(std::getline(input, line))
         {
             // x y z [flags [device@position [ax ay az]]]: 1 crouch, 2 jump, 16 lift deck, 128 light
-            // bridge, 256 use a control, 512 shoot a target at the aim point, 1024 wait at a door
+            // bridge, 256 use a control, 512 shoot a target at the aim point, 1024 wait at a door,
+            // 2048 throw frags at the aim point
             vec point, aim(0, 0, 0);
             int flags = 0;
             char device[96] = "";
@@ -433,8 +461,8 @@ namespace
                !std::isfinite(aim.x) || !std::isfinite(aim.y) || !std::isfinite(aim.z) || flags < 0) return false;
             float value = 0;
             if(char *at = strrchr(device, '@')) { value = float(atof(at + 1)); *at = 0; }
-            if((flags & (16 | 128 | 256 | 512 | 1024)) && !*device) return false;
-            if((flags & 512) && fields < 8) return false;
+            if((flags & (16 | 128 | 256 | 512 | 1024 | 2048 | QA_ROUTE_VEHICLE_ANY)) && !*device) return false;
+            if((flags & (512 | 2048)) && fields < 8) return false;
             qaRetailRoute.add(point);
             qaRetailAim.add(aim);
             qaRetailCrouch.add((flags & 1) != 0);
@@ -469,8 +497,8 @@ namespace
     {
         for(int i = qaRetailNext; i < qaRetailRoute.length() && i <= qaRetailNext + 10; ++i)
         {
-            if(qaRetailFlags[i] & 16) return i;
-            if((qaRetailFlags[i] & (256 | 512 | 1024)) && i > qaActDone) return i;
+            if(qaRetailFlags[i] & (16 | QA_ROUTE_VEHICLE_ANY)) return i;
+            if((qaRetailFlags[i] & (256 | 512 | 1024 | 2048)) && i > qaActDone) return i;
             if((qaRetailFlags[i] & 128) && (!i || !(qaRetailFlags[i - 1] & 128)) && i != qaBridgeCleared) return i;
         }
         return INT_MAX;
@@ -610,20 +638,24 @@ namespace
         return id < 0 ? -1.0f : float(haloscenariocall("unit_get_health", id, 0));
     }
 
-    // One tick of an action row (256, 512, 1024) at the follower's waypoint; false when there is none.
+    // One tick of an action row (256, 512, 1024, 2048) at the follower's waypoint; false when there is none.
     bool qaRetailAct(const vec &feet)
     {
         const int row = qaRetailNext;
-        if(row >= qaRetailRoute.length() || !(qaRetailFlags[row] & (256 | 512 | 1024)) || row <= qaActDone) return false;
+        if(row >= qaRetailRoute.length() || !(qaRetailFlags[row] & (256 | 512 | 1024 | 2048)) || row <= qaActDone) return false;
         const int flags = qaRetailFlags[row];
         const char *what = qaRetailDevice[row].c_str();
         const float value = qaRetailValue[row];
-        const char *kind = flags & 256 ? "use" : flags & 512 ? "shoot" : "door";
+        const char *kind = flags & 256 ? "use" : flags & 512 ? "shoot" : flags & 2048 ? "throw" : "door";
         if(qaAct != row)
         {
+            // The first of a run of throw rows starts the count; the later rows (other aims) carry it on.
+            if((flags & 2048) && !(row > 0 && (qaRetailFlags[row - 1] & 2048))) qaThrowTotal = 0;
             qaAct = row;
             qaActSince = qaActLogged = lastmillis;
             qaActUsed = qaActShots = qaActFire = 0;
+            qaThrows = qaThrowAt = 0;
+            qaThrowDumped = false;
             conoutf("RETAIL_QA act %s %s at waypoint %d (position %.2f, health %.2f)", kind, what, row, qaDevicePosition(what), qaRetailHealth(what));
         }
         qaRetailHold();
@@ -638,9 +670,18 @@ namespace
             qaWalkStretchFrom = -1;
             return true;
         };
-        // Stand on the row first (it repeats the step the follower just reached).
+        // Stand on the row first (it repeats the step the follower just reached). A throw is planned
+        // from the row's spot exactly: walk onto it in short taps once close, and let the body stop.
         const vec to = vec(qaRetailRoute[row]).sub(feet);
-        if(to.magnitudexy() > .6f && lastmillis - qaActSince < 6000)
+        if((flags & 2048) && !qaThrows && lastmillis - qaActSince < 10000 &&
+           (to.magnitudexy() > .15f || vec(player1->vel.x, player1->vel.y, 0).magnitude() > .05f))
+        {
+            player1->yaw = qaRetailHeading(to);
+            player1->pitch = 0;
+            forward(to.magnitudexy() > .6f || (to.magnitudexy() > .15f && (lastmillis / 40) % 4 == 0));
+            return true;
+        }
+        if(!(flags & 2048) && to.magnitudexy() > .6f && lastmillis - qaActSince < 6000)
         {
             player1->yaw = qaRetailHeading(to);
             player1->pitch = 0;
@@ -699,6 +740,70 @@ namespace
             if(elapsed > 45000) { attack(false); qaRetailStop("FAIL target-not-destroyed"); }
             return true;
         }
+        if(flags & 2048)
+        {
+            // Frags from the planned spot at the planned aim (from the eye above the row, so the yaw and
+            // pitch are the planner's whatever the body's last centimetres). Damage adds up, so throws
+            // that only reach the blast's edge still count. Four a row, the second and third a
+            // half-degree either side; then the next aim row, and after the target's last row a failure.
+            // A run of throw rows is one target's aims; its rows may name either of its detectors (each
+            // destroys the manifold, enc5_1_destroyed_poll), so any of them down counts.
+            int first = row, last = row;
+            while(first > 0 && (qaRetailFlags[first - 1] & 2048)) --first;
+            while(last + 1 < qaRetailRoute.length() && (qaRetailFlags[last + 1] & 2048)) ++last;
+            for(int k = first; k <= last; ++k)
+            {
+                const float down = qaRetailHealth(qaRetailDevice[k]);
+                if(down >= 0 && down <= qaRetailValue[k]) return done("destroyed");
+            }
+            const float health = qaRetailHealth(what);
+            if(qaThrows && !qaThrowDumped && lastmillis - qaThrowAt > 1400)
+            {
+                qaThrowDumped = true;
+                halogrenadedump("throw");   // where the frag lies just before it goes off
+            }
+            if(qaThrows && lastmillis - qaThrowAt < 2800) return true;
+            if(qaThrows)
+            {
+                bool damageable = false;
+                vec centre;
+                float probe = -1;
+                haloscenariotargetstate(what, centre, probe, damageable);
+                conoutf("RETAIL_QA act throw %s health %.2f damageable %d after throw %d (%d at this target)", what, health,
+                        damageable, qaThrows, qaThrowTotal);
+            }
+            const bool lastRow = row == last;
+            if(qaThrows >= 4)
+            {
+                if(lastRow) { qaRetailStop("FAIL target-not-destroyed"); return true; }
+                return done("missed");
+            }
+            static const float jitter[4] = { 0, .5f, -.5f, 0 };
+            const vec eye = vec(qaRetailRoute[row]).add(vec(0, 0, player1->eyeheight));
+            const vec look = vec(qaRetailAim[row]).sub(eye);
+            player1->yaw = fmodf(qaRetailHeading(look) + jitter[qaThrows & 3] + 360.0f, 360.0f);
+            player1->pitch = atan2f(look.z, max(look.magnitudexy(), .01f)) / RAD;
+            // The walker carries the frags it needs, as a player would pick them up on the way.
+            if(grenadeCount(HALO_GRENADE_FRAG) <= 0) grenadeCount(HALO_GRENADE_FRAG) = 1;
+            grenadeType = HALO_GRENADE_FRAG;
+            const vec at = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+            const int before = grenadeCount(HALO_GRENADE_FRAG);
+            halofrag();
+            // Not thrown (a throw or melee still playing, a weapon switch or reload): try next tick,
+            // for as long as the shoot rows try (halofrag refusing for good would hang the walk).
+            if(grenadeCount(HALO_GRENADE_FRAG) == before)
+            {
+                if(elapsed > 45000) qaRetailStop("FAIL frag-never-thrown");
+                return true;
+            }
+            ++qaThrows;
+            ++qaThrowTotal;
+            qaThrowAt = lastmillis;
+            qaThrowDumped = false;
+            conoutf("RETAIL_QA act throw %s at waypoint %d: throw %d from %.2f,%.2f,%.2f yaw %.1f pitch %.1f", what, row, qaThrows,
+                    at.x, at.y, at.z, player1->yaw, player1->pitch);
+            return true;
+        }
         // 1024: a scripted door. The follower stands at it, inside its opening radius.
         const float position = qaDevicePosition(what);
         if(position >= value) return done("opened");
@@ -722,6 +827,186 @@ namespace
             conoutf("RETAIL_QA act door %s never opened: power %.2f position %.2f", what,
                     id < 0 ? -1.0f : float(haloscenariocall("device_get_power", id, 0)), position);
             qaRetailStop("FAIL door-never-opened");
+        }
+        return true;
+    }
+
+    void qaVehicleState(const char *label)
+    {
+        vec pos(0, 0, 0);
+        float yaw = 0;
+        halovehicleqapose(pos, yaw);
+        HaloVehicleStatus st;
+        const bool seated = halovehiclestatus(st);
+        conoutf("RETAIL_QA vehicle %s row=%d/%d seated=%d pos=%.2f,%.2f,%.2f yaw=%.1f speed=%.2f altitude=%.2f flipped=%d", label,
+                qaRetailNext, int(qaRetailRoute.length()), seated, pos.x, pos.y, pos.z, yaw, seated ? st.speed : 0.0f,
+                seated ? st.altitude : -1.0f, seated && st.flipped);
+    }
+
+    // One tick at a vehicle row; false when the follower's row is not one (it walks as usual).
+    bool qaRetailVehicle(const vec &feet)
+    {
+        const int n = qaRetailRoute.length(), row = qaRetailNext;
+        if(row >= n || !(qaRetailFlags[row] & QA_ROUTE_VEHICLE_ANY)) return false;
+        const int flags = qaRetailFlags[row];
+        const char *type = qaRetailDevice[row].c_str();
+        if(qaVehRow != row)
+        {
+            const bool kind = qaVehRow < 0 || (qaRetailFlags[qaVehRow] & QA_ROUTE_VEHICLE_ANY) != (flags & QA_ROUTE_VEHICLE_ANY);
+            if(kind) conoutf("RETAIL_QA vehicle %s %s at waypoint %d", flags & QA_ROUTE_BOARD ? "board" : flags & QA_ROUTE_GET_OUT ? "get-out" : "drive",
+                             type, row);
+            if(kind) qaVehSince = lastmillis;
+            qaVehRow = row;
+            qaVehProgress = lastmillis;
+        }
+        player1->strafe = 0;
+        jumpn(false);
+        player1->trycrouch = false;
+        const int elapsed = lastmillis - qaVehSince;
+        auto next = [&](const char *how)
+        {
+            if(how) conoutf("RETAIL_QA vehicle %s at waypoint %d after %d ms", how, row, elapsed);
+            qaRetailNext = row + 1;
+            qaRetailClosest = 1e9f;
+            qaRetailProgress = qaVehProgress = lastmillis;
+            qaVehChanged = lastmillis;
+            qaWalkStretchFrom = -1;
+            return true;
+        };
+        auto use = [&](int every)
+        {
+            if(lastmillis - qaVehUsed < every) return;
+            qaVehUsed = lastmillis;
+            execute("halo_use");
+        };
+        // Contact-stage and nearby hostiles are removed, as on foot.
+        if(lastmillis - qaVehLogged > 5000)
+        {
+            qaVehLogged = lastmillis;
+            qaVehicleState("at");
+            loopv(enemies) if(enemies[i].bot && enemies[i].bot->state == CS_ALIVE && !haloteamfriendly(enemies[i].team) &&
+                              !haloactorpassive(enemies[i].bot) && enemies[i].bot->o.dist(player1->o) < 40.0f)
+                dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
+        }
+        if(flags & QA_ROUTE_BOARD)
+        {
+            if(halodriving()) { ++qaVehBoards; qaVehSeated = true; return next("boarded"); }
+            vec entry;
+            if(halovehicleqafind(type, feet, entry) < 0)
+            {
+                // c40 section 4's Banshee appears beside the player a few seconds in.
+                qaRetailHold();
+                if(elapsed > 15000) qaRetailStop("FAIL vehicle-not-found");
+                return true;
+            }
+            const vec to = vec(entry).sub(feet);
+            const char *prompt = halovehicleprompt(1e9f);
+            if(prompt && to.magnitudexy() < 6.0f) { forward(false); use(1000); }
+            else
+            {
+                player1->yaw = qaRetailHeading(to);
+                player1->pitch = 0;
+                forward(to.magnitudexy() > .5f);
+                if(to.magnitudexy() <= .5f) use(1000);
+            }
+            qaRetailProgress = lastmillis;
+            if(elapsed > 30000) qaRetailStop("FAIL vehicle-never-boarded");
+            return true;
+        }
+        forward(false);
+        if(!halodriving())
+        {
+            if(flags & QA_ROUTE_GET_OUT) return next("out");
+            // A driven section seats the player at its start (the Maw's escape); otherwise, or after
+            // being thrown out, use gets in (or flips the vehicle back first).
+            qaRetailProgress = lastmillis;
+            use(1500);
+            if(qaVehSeated) { ++qaVehUnflips; qaVehSeated = false; conoutf("RETAIL_QA vehicle out of the seat at waypoint %d: using it again", row); }
+            if(elapsed > 20000) qaRetailStop("FAIL vehicle-not-seated");
+            return true;
+        }
+        qaVehSeated = true;
+        HaloVehicleStatus st;
+        halovehiclestatus(st);
+        vec pos;
+        float yaw;
+        if(!halovehicleqapose(pos, yaw)) return true;
+        const bool flyer = st.vehicleClass == HALO_VEHICLE_FLYER;
+        const float s = max(haloscenarioscale(), .1f);
+        if(st.flipped) { use(1500); qaVehProgress = lastmillis; return true; }
+        // Rows reached: any of the run's next 40 within reach of the vehicle (corners may be cut).
+        if(flags & QA_ROUTE_VEHICLE)
+        {
+            const float reach = flyer ? 1.6f * s : 1.2f * s + 1.5f;
+            int reached = -1;
+            for(int k = row; k < n && k <= row + 40 && (qaRetailFlags[k] & QA_ROUTE_VEHICLE); ++k)
+            {
+                const vec d = vec(qaRetailRoute[k]).sub(pos);
+                if(flyer ? d.magnitude() <= reach : d.magnitudexy() <= reach && fabsf(d.z) < 3 * s) reached = k;
+            }
+            if(reached >= row)
+            {
+                for(int k = row; k <= reached; ++k) if(qaRetailFlags[k] & 2) ++qaVehJumps;
+                if(reached / 100 != row / 100) conoutf("RETAIL_QA progress %d/%d", reached, n);
+                qaRetailNext = reached + 1;
+                qaVehRow = reached;
+                qaVehProgress = qaRetailProgress = lastmillis;
+                return true;
+            }
+        }
+        // Steer at a row a little ahead (the last of the run, or the get-out row).
+        int aim = row;
+        const float look = flyer ? 2.5f * s : max(8.0f, 2.0f * s);
+        while(aim + 1 < n && (qaRetailFlags[aim] & QA_ROUTE_VEHICLE) && (qaRetailFlags[aim + 1] & (QA_ROUTE_VEHICLE | QA_ROUTE_GET_OUT)) &&
+              vec(qaRetailRoute[aim]).sub(pos).magnitude() < look) ++aim;
+        const vec to = vec(qaRetailRoute[aim]).sub(pos);
+        const float heading = qaRetailHeading(to);
+        if(flags & QA_ROUTE_GET_OUT)
+        {
+            // Over the row: stop and come down until the engine lets the pilot out.
+            const vec over = vec(qaRetailRoute[row]).sub(pos);
+            const bool there = over.magnitudexy() < .6f * s;
+            player1->yaw = heading;
+            player1->pitch = 0;
+            if(flyer) halovehicleqaflight(there ? 0 : clamp(over.magnitudexy() / (3 * s), .15f, .6f), 0, there ? -1 : clamp(over.z / (2 * s), -1.0f, 1.0f), 150);
+            else halovehicleqainput(there ? 0 : .5f, 2, 150);
+            if(there && (!flyer || st.altitude < 0 || st.altitude < 1.3f)) use(1000);
+            if(elapsed > 30000) qaRetailStop("FAIL vehicle-could-not-get-out");
+            return true;
+        }
+        player1->yaw = heading;
+        if(flyer)
+        {
+            // The nose follows the camera: pitch at the row, full throttle, the climb trimming the height.
+            player1->pitch = clamp(atan2f(to.z, max(to.magnitudexy(), .01f)) / RAD, -45.0f, 45.0f);
+            const float distance = to.magnitude();
+            const bool lastRow = !(aim + 1 < n && (qaRetailFlags[aim + 1] & QA_ROUTE_VEHICLE));
+            halovehicleqaflight(lastRow ? clamp(distance / (4 * s), .2f, 1.0f) : 1.0f, 0, clamp(to.z / (2 * s), -1.0f, 1.0f), 150);
+        }
+        else
+        {
+            player1->pitch = 0;
+            // Full throttle, steering at the camera; backing off for a second when it stalls.
+            if(lastmillis < qaVehReverse) halovehicleqainput(-1, 0, 150);
+            else
+            {
+                halovehicleqainput(fabsf(fmodf(heading - yaw + 540.0f, 360.0f) - 180.0f) > 100 ? .5f : 1.0f, 2, 150);
+                if(st.speed < .3f) { if(!qaVehStalled) qaVehStalled = lastmillis; }
+                else qaVehStalled = 0;
+                if(qaVehStalled && lastmillis - qaVehStalled > 1500)
+                {
+                    qaVehStalled = 0;
+                    qaVehReverse = lastmillis + 900;
+                    conoutf("RETAIL_QA vehicle stalled at waypoint %d: backing off", row);
+                }
+            }
+        }
+        qaRetailProgress = lastmillis;
+        if(lastmillis - qaVehProgress > 25000)
+        {
+            qaVehicleState("stuck");
+            conoutf("RETAIL_QA vehicle stuck target=%.2f,%.2f,%.2f", qaRetailRoute[row].x, qaRetailRoute[row].y, qaRetailRoute[row].z);
+            qaRetailStop("FAIL vehicle-stuck");
         }
         return true;
     }
@@ -766,11 +1051,14 @@ namespace
         qaRetailDetour.setsize(0);
         qaRetailClosest = 1e9f;
         qaRetailStarted = lastmillis;
+        qaRetailSeatedSince = 0;
         qaRide = RIDE_NONE;
         qaRideStep = qaBridgeStep = qaBridgeCleared = -1;
         qaRetailRecoveries = 0;
         qaRetailHaveFeet = false;
         qaAct = qaActDone = -1;
+        qaVehRow = -1;
+        qaVehBoards = qaVehJumps = qaVehUnflips = 0;
         qaTrialPhase = TRIAL_NONE;
         qaWalkStretchFrom = -1;
         qaWalkSpeedMin = 1e9f;
@@ -783,7 +1071,9 @@ namespace
     {
         // Eight minutes a section; a long route (d40's engine room walks every manifold's bay, 5,000
         // rows) gets 90 ms more for each row past 3,000.
-        if(lastmillis - qaRetailStarted > 480000 + max(0, int(qaRetailRoute.length()) - 3000) * 90) { qaRetailStop("FAIL deadline"); return; }
+        // (The time held in a scripted seat does not count.)
+        const int held = qaRetailSeatedSince ? lastmillis - qaRetailSeatedSince : 0;
+        if(lastmillis - qaRetailStarted - held > 480000 + max(0, int(qaRetailRoute.length()) - 3000) * 90) { qaRetailStop("FAIL deadline"); return; }
         addsleep(12, "qa_retail_step", true);
         if(qaRetailStuckAt)
         {
@@ -798,6 +1088,8 @@ namespace
             qaRetailStable = live ? qaRetailStable + 1 : 0;
             if(qaRetailStable < 25) return;
             haloplayerprotect(true);
+            // Vehicles are kept from harm as the player is (a flown Banshee is destroyed by enough fire).
+            loopv(qaRetailFlags) if(qaRetailFlags[i] & QA_ROUTE_VEHICLE_ANY) { halo_vehicledamage = 0; break; }
             qaRetailWalking = true;
             qaRetailMap = getclientmap();
             qaRetailLive = lastmillis;
@@ -834,6 +1126,33 @@ namespace
             }
             halocinematicskip();
             return;
+        }
+        // A script holds the player in a seat (a10's cryotube until the tutorial's
+        // unit_exit_vehicle): wait, turning for the tutorial's look prompts, and take the time held
+        // off the section's deadline. The walk resumes from wherever the script puts the player
+        // (a script move, not a recovery: the feet are read afresh).
+        if(haloscenarioscriptseated())
+        {
+            if(!qaRetailSeatedSince)
+            {
+                qaRetailSeatedSince = lastmillis;
+                conoutf("RETAIL_QA held in a scripted seat at waypoint %d", qaRetailNext);
+            }
+            forward(false);
+            player1->strafe = 0;
+            player1->yaw = fmodf(player1->yaw + 1.5f, 360.0f);
+            qaRetailProgress = lastmillis;
+            qaRetailClosest = 1e9f;
+            qaRetailHaveFeet = false;
+            return;
+        }
+        if(qaRetailSeatedSince)
+        {
+            conoutf("RETAIL_QA let out of the scripted seat after %.1f s", (lastmillis - qaRetailSeatedSince) / 1000.0f);
+            qaRetailStarted += lastmillis - qaRetailSeatedSince;
+            qaRetailSeatedSince = 0;
+            qaRetailProgress = lastmillis;
+            fflush(stdout);
         }
         if(mission != qaRetailMission || section != qaRetailSection)
         {
@@ -883,17 +1202,36 @@ namespace
                 const vec last = vec(qaRetailRoute[n - 1]).sub(qaRetailRoute[n - 2]);
                 player1->yaw = fmodf(atan2f(last.y, last.x) / RAD + 90.0f + 360.0f, 360.0f);
             }
-            forward(lastmillis - qaRetailProgress < 400);
+            // b30's return ends with an interaction at its end marker (board the Pelican with E once it
+            // hovers at the ledge): stand there pressing use, as a player would, for up to two minutes
+            // while the Pelican comes in. Other sections end on their own, as before.
+            const char *interaction = retailCartographer() && section == 2 ? sectionInteraction() : nullptr;
+            forward(!interaction && lastmillis - qaRetailProgress < 400);
             player1->strafe = 0;
+            if(interaction)
+            {
+                static int pressed = 0;
+                if(lastmillis - pressed > 1500)
+                {
+                    pressed = lastmillis;
+                    conoutf("RETAIL_QA interact \"%s\" at the route's end", interaction);
+                    execute("halo_use");
+                }
+                if(lastmillis - qaRetailProgress > 120000) qaRetailStop("FAIL interaction-never-completed");
+                return;
+            }
             if(lastmillis - qaRetailProgress > 5000) qaRetailStop("FAIL route-ended-without-exit");
             return;
         }
         const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
         // A jump of more than 6 units in one tick is the engine's fall or wedge recovery.
-        if(qaRetailHaveFeet && feet.dist(qaRetailLastFeet) > 6.0f && qaRide != RIDE_ON) qaRetailResync(feet);
+        // (Not while seated or just in or out of a seat: the seat and the way out move the body.)
+        if(qaRetailHaveFeet && feet.dist(qaRetailLastFeet) > 6.0f && qaRide != RIDE_ON && !halodriving() && lastmillis - qaVehChanged > 1500)
+            qaRetailResync(feet);
+        if(halodriving()) qaVehChanged = lastmillis;
         qaRetailLastFeet = feet;
         qaRetailHaveFeet = true;
-        if(qaRetailRide(feet) || qaRetailBridge(feet) || qaRetailAct(feet)) return;
+        if(qaRetailVehicle(feet) || qaRetailRide(feet) || qaRetailBridge(feet) || qaRetailAct(feet)) return;
         if(!qaRetailDetour.empty() || qaRetailRetreat >= 0) player1->strafe = 0;
         if(!qaRetailDetour.empty())
         {
@@ -1114,6 +1452,7 @@ COMMANDF(qa_retail_start, "ii", (int *m, int *s)
     qaRetailSection = *s - 1;
     if(const char *wait = getenv("HALOQA_RETAIL_WAIT")) qaRetailWaitLimit = atoi(wait);
     qaRetailStarted = lastmillis;
+    qaRetailSeatedSince = 0;
     loadProgress();
     queueSection(qaRetailMission, qaRetailSection);
     addsleep(100, "qa_retail_step", true);
@@ -1125,6 +1464,58 @@ COMMANDF(qa_retail_overlap, "fff", (float *x, float *y, float *z)
     const bool overlap = halocollisionoverlap(vec(*x, *y, *z), player1->radius, player1->eyeheight + player1->aboveeye, hit);
     conoutf("RETAIL_QA overlap %.2f,%.2f,%.2f = %d surface=%d depth=%.3f normal=%.2f,%.2f,%.2f", *x, *y, *z, overlap, hit.surface,
             hit.penetration, hit.normal.x, hit.normal.y, hit.normal.z);
+    fflush(stdout);
+});
+// qa_retail_assists: the loaded .hcol's walking assists (its AST1 trailer, ASSISTS in
+// tools/import_halo_campaign.py), each checked the way the engine uses it: a ray (a shot, a sight
+// line, a probe) down through its centre must not stop on it, a body's capsule swept down onto it
+// must stand on it, and a grenade's sweep (bodies only collide with assists) must pass through it.
+// For tests/test_retail_assists.py.
+COMMANDF(qa_retail_assists, "", ()
+{
+    vec centre;
+    vec normal;
+    const int count = halocollisionassist(-1, centre, normal);
+    conoutf("RETAIL_QA assists map=%s collision=%d count=%d", getclientmap(), halocollisionactive(), count);
+    loopi(count)
+    {
+        halocollisionassist(i, centre, normal);
+        const vec above = vec(centre).add(vec(0, 0, 1.5f));
+        const vec down(0, 0, -3.0f);
+        HaloCollisionHit ray;
+        HaloCollisionHit body;
+        HaloCollisionHit bounce;
+        // The ray may stop on retail floor below the assist, never on the assist itself.
+        const bool rayHit = halocollisiontrace(above, vec(above).add(down), ray);
+        const bool rayThrough = !rayHit || (!(ray.flags & haloCollisionAssist) && above.z + down.z * ray.fraction < centre.z - .1f);
+        const bool bodyHit = halocollisionsweep(above, down, player1->radius, player1->eyeheight + player1->aboveeye, body);
+        const float standZ = above.z + down.z * body.fraction;
+        const bool bodyStands = bodyHit && (body.flags & haloCollisionAssist) && fabsf(standZ - centre.z) < .5f && body.normal.z >= .65f;
+        const bool bounceHit = halocollisionsweep(above, down, .2f, .4f, bounce, false);
+        const bool bounceThrough = !bounceHit || !(bounce.flags & haloCollisionAssist);
+        conoutf("RETAIL_QA assist %d centre=%.2f,%.2f,%.2f normal=%.2f,%.2f,%.2f ray_through=%d body_stands=%d stand_z=%.2f bounce_through=%d",
+                i, centre.x, centre.y, centre.z, normal.x, normal.y, normal.z, rayThrough, bodyStands, standZ, bounceThrough);
+    }
+    fflush(stdout);
+});
+// qa_retail_assist_stand i: puts the player one unit above walking assist i's centre (a QA move:
+// haloplayermoved), to fall onto it; qa_retail_where then reports where the feet came to rest.
+COMMANDF(qa_retail_assist_stand, "i", (int *index)
+{
+    vec centre;
+    vec normal;
+    if(*index < 0 || *index >= halocollisionassist(*index, centre, normal) || player1->state != CS_ALIVE)
+    {
+        conoutf("RETAIL_QA assist-stand-unavailable %d", *index);
+        fflush(stdout);
+        return;
+    }
+    player1->o = vec(centre).add(vec(0, 0, 1 + player1->eyeheight));
+    player1->vel = vec();
+    player1->onfloor = false;
+    player1->resetinterp();
+    haloplayermoved("QA assist stand");
+    conoutf("RETAIL_QA assist-stand %d at=%.2f,%.2f,%.2f", *index, centre.x, centre.y, centre.z);
     fflush(stdout);
 });
 // qa_retail_where: the player's feet and state, for tests/test_retail_recovery.py.

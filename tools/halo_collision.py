@@ -1,5 +1,6 @@
 """Export the retail structure collision polygons in campaign coordinates."""
 
+import heapq
 import math
 import re
 import struct
@@ -252,13 +253,59 @@ def static_device_surfaces(halo, bsp, projection, output, still=()):
     return surfaces, baked
 
 
-def write_structure_collision(halo, bsp, projection, destination, machines=((), ())):
-    """Write the section's .hcol; `machines` is static_device_surfaces' (surfaces, devices)."""
+def assist_surfaces(assists, projection):
+    """Campaign-space collision polygons of a section's authored walking assists
+    (import_halo_campaign.ASSISTS): each `points` is a convex, planar polygon in retail units.
+
+    An assist is not retail data. It is an invisible, two-sided walking surface (a plank or a
+    ramp) standing in for a jump or climb that Halo's biped makes and the engine's fixed jump
+    cannot. The polygons are wound to agree with their upward normal, as the structure's are, and
+    must be walkable (normal z at least 0.65, the planner's and retailmove's floor limit).
+    """
+    surfaces = []
+    for assist in assists:
+        points = [projection.point(p) for p in assist.points]
+        if not 3 <= len(points) <= 8:
+            raise ValueError(f'assist {assist.why!r}: needs 3 to 8 points')
+        # Newell's normal; the campaign projection reflects Y, so wind it to point up.
+        nx = sum((a[1] - b[1]) * (a[2] + b[2]) for a, b in zip(points, points[1:] + points[:1]))
+        ny = sum((a[2] - b[2]) * (a[0] + b[0]) for a, b in zip(points, points[1:] + points[:1]))
+        nz = sum((a[0] - b[0]) * (a[1] + b[1]) for a, b in zip(points, points[1:] + points[:1]))
+        length = math.hypot(nx, ny, nz)
+        if not length:
+            raise ValueError(f'assist {assist.why!r}: degenerate polygon')
+        if nz < 0:
+            points.reverse()
+            nx, ny, nz = -nx, -ny, -nz
+        normal = (nx / length, ny / length, nz / length)
+        if normal[2] < .65:
+            raise ValueError(f'assist {assist.why!r}: too steep to walk (normal z {normal[2]:.2f})')
+        for i, a in enumerate(points):
+            b, c = points[(i + 1) % len(points)], points[(i + 2) % len(points)]
+            u, v = [q - p for p, q in zip(a, b)], [q - p for p, q in zip(b, c)]
+            turn = (u[1]*v[2] - u[2]*v[1], u[2]*v[0] - u[0]*v[2], u[0]*v[1] - u[1]*v[0])
+            if sum(t * n for t, n in zip(turn, normal)) < -1e-6:
+                raise ValueError(f'assist {assist.why!r}: polygon is not convex')
+            if abs(sum((p - q) * n for p, q, n in zip(a, points[0], normal))) > .05:
+                raise ValueError(f'assist {assist.why!r}: polygon is not planar')
+        # Flag 1: two-sided, like the retail invisible ramps laid over stairs. Material -1: none.
+        surfaces.append((normal, 1, 0, -1, points))
+    return surfaces
+
+
+def write_structure_collision(halo, bsp, projection, destination, machines=((), ()), assists=()):
+    """Write the section's .hcol; `machines` is static_device_surfaces' (surfaces, devices) and
+    `assists` assist_surfaces' polygons (authored, non-retail), listed in an AST1 trailer."""
     surfaces, _ = structure_surfaces(halo, bsp, projection)
     extra, baked = machines
     surfaces = surfaces + list(extra)
+    first_assist = len(surfaces)
+    surfaces = surfaces + list(assists)
     # HCL1 stores little-endian surface records followed by their boundary vertices. An
-    # optional DEV1 trailer lists the scenario devices whose polygons are included.
+    # optional DEV1 trailer lists the scenario devices whose polygons are included, and an
+    # optional AST1 trailer after it the surface indices (file order) that are walking assists:
+    # the engine collides bodies with them but rays (shots, sight, probes) and grenades pass
+    # through, as there is nothing there in Halo.
     data = bytearray(struct.pack('<4sI', b'HCL1', len(surfaces)))
     for normal, flags, breakable, material, points in surfaces:
         data.extend(struct.pack('<3fBBhI', *normal, flags, breakable, material, len(points)))
@@ -266,6 +313,9 @@ def write_structure_collision(halo, bsp, projection, destination, machines=((), 
             data.extend(struct.pack('<3f', *point))
     if baked:
         data.extend(struct.pack(f'<4sI{len(baked)}I', b'DEV1', len(baked), *baked))
+    if assists:
+        indices = list(range(first_assist, len(surfaces)))
+        data.extend(struct.pack(f'<4sI{len(indices)}I', b'AST1', len(indices), *indices))
 
     with tempfile.TemporaryDirectory(dir=destination.parent) as directory:
         temporary = Path(directory) / destination.name
@@ -929,3 +979,499 @@ class SightLines:
                             return False
         ra, rb = self.retail(a), self.retail(b)
         return not any(_segment_box(ra, rb, place, box) for _, place, box in self.boxes)
+
+
+class GrenadeArcs:
+    """A frag grenade's flight on the retail collision, for the route planner's throws (ThrowTarget in
+    tools/import_halo_campaign.py). It follows the engine step by step: halofrag's velocity (1.8 along
+    the view, raised by 0.14), the halogrenade bounceent (radius 0.2, eye 0.3, maxspeed 30) moved by
+    moveplayer's ENT_BOUNCE branch (gravity on the velocity in the air, friction on the floor) and
+    retailmove (one contact a step, reflected at 1.5 times the inward speed and slowed to 0.7, a floor
+    contact stopping the fall), ten 10 ms launch steps and then 5 ms physics steps, and the device
+    boxes as Scenario::collideDevices sees them (a grenade that runs into one stays where it was, with
+    its velocity, and lands on a top it falls onto). The sphere sweep against the polygons ignores
+    their edges beyond the radius (an approximation: the engine's capsule sweep rounds them), so a
+    throw that grazes an edge can go otherwise in the game; the planner prefers throws whose
+    neighbours land too. Points are in campaign (cube) coordinates; `boxes` are machine_boxes entries
+    (retail) in the pose of the throw."""
+
+    RADIUS, EYE = .2, .3
+    SPEED = 30.0
+    GRAVITY = .5 * 9.81 / 4 / 1000
+    SKIN, SLOPE = .015, .65
+
+    def __init__(self, surfaces, projection, boxes=()):
+        self.p = projection
+        self.polygons, self.buckets = [], {}
+        for normal, flags, _, _, points in surfaces:
+            low = [min(q[i] for q in points) - 1 for i in range(3)]
+            high = [max(q[i] for q in points) + 1 for i in range(3)]
+            edges = []
+            for a, b in zip(points, points[1:] + points[:1]):
+                e = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
+                inward = (normal[1]*e[2]-normal[2]*e[1], normal[2]*e[0]-normal[0]*e[2], normal[0]*e[1]-normal[1]*e[0])
+                length = math.sqrt(sum(v*v for v in inward)) or 1
+                edges.append((a, tuple(v/length for v in inward)))
+            index = len(self.polygons)
+            self.polygons.append((normal, flags & 1, points, low, high, edges))
+            for gx in range(int(low[0]) >> 3, (int(high[0]) >> 3) + 1):
+                for gy in range(int(low[1]) >> 3, (int(high[1]) >> 3) + 1):
+                    self.buckets.setdefault((gx, gy), []).append(index)
+        # Each box with the radius round its origin that holds it, for a quick rejection.
+        self.boxes = [(ox, oy, oz, c, s, *box, (max(abs(box[0]), abs(box[3])) ** 2 + max(abs(box[1]), abs(box[4])) ** 2) ** .5 + .1)
+                      for _, (ox, oy, oz, c, s), box in boxes]
+        self.nearby = {}
+
+    def _sweep(self, centre, delta):
+        """The sphere's first contact moving centre -> centre + delta: (fraction, normal) or None."""
+        r = self.RADIUS
+        x0, y0, x1, y1 = centre[0], centre[1], centre[0] + delta[0], centre[1] + delta[1]
+        key = (int(min(x0, x1) - r) >> 3, int(max(x0, x1) + r) >> 3, int(min(y0, y1) - r) >> 3, int(max(y0, y1) + r) >> 3)
+        candidates = self.nearby.get(key)
+        if candidates is None:
+            found = set()
+            for gx in range(key[0], key[1] + 1):
+                for gy in range(key[2], key[3] + 1):
+                    found.update(self.buckets.get((gx, gy), ()))
+            candidates = self.nearby[key] = sorted(found)
+        lx, hx = min(x0, x1) - r, max(x0, x1) + r
+        ly, hy = min(y0, y1) - r, max(y0, y1) + r
+        z0, z1 = centre[2], centre[2] + delta[2]
+        lz, hz = min(z0, z1) - r, max(z0, z1) + r
+        best = None
+        polygons = self.polygons
+        for index in candidates:
+            n, two_sided, points, plow, phigh, edges = polygons[index]
+            if phigh[0] < lx or plow[0] > hx or phigh[1] < ly or plow[1] > hy or phigh[2] < lz or plow[2] > hz:
+                continue
+            a = points[0]
+            distance = n[0]*(centre[0]-a[0]) + n[1]*(centre[1]-a[1]) + n[2]*(centre[2]-a[2])
+            closing = n[0]*delta[0] + n[1]*delta[1] + n[2]*delta[2]
+            sign = 1
+            if distance < 0:
+                # Behind a one-sided surface: no contact (the engine's frontcontact).
+                if not two_sided:
+                    continue
+                sign, distance, closing = -1, -distance, -closing
+            if closing >= -1e-9:
+                continue
+            t = (distance - r) / -closing
+            if t > 1 or t < -.5:
+                continue
+            t = max(t, 0.0)
+            if best is not None and t >= best[0]:
+                continue
+            q = [centre[i] + delta[i]*t - sign*n[i]*min(r, distance) for i in range(3)]
+            if all((q[0]-e[0])*w[0] + (q[1]-e[1])*w[1] + (q[2]-e[2])*w[2] >= -r for e, w in edges):
+                best = (t, tuple(sign*v for v in n))
+        return best
+
+    def _devices(self, o):
+        """Scenario::collideDevices for the grenade at eye point o: (blocked, the top it may stand on)."""
+        p = self.p
+        rx, ry = (o[0] - 9) / p.scale + p.x0, p.y0 - (o[1] - 9) / p.scale
+        radius = self.RADIUS / p.scale
+        feet, height = o[2] - self.EYE, self.EYE
+        lo, hi = -1e9, 1e9
+        for ox, oy, oz, c, s, x1, y1, z1, x2, y2, z2, reach in self.boxes:
+            dx, dy = rx - ox, ry - oy
+            if dx*dx + dy*dy > reach*reach:
+                continue
+            lx, ly = dx*c + dy*s, -dx*s + dy*c
+            if not (x1 - radius < lx < x2 + radius and y1 - radius < ly < y2 + radius):
+                continue
+            bottom, top = (z1 + oz - p.z0) * p.scale, (z2 + oz - p.z0) * p.scale
+            if feet >= top - .23 * p.scale:
+                lo = max(lo, top)
+            elif feet + height <= bottom + .10 * p.scale:
+                hi = min(hi, bottom)
+            elif top - bottom > .05 * p.scale:
+                return True, lo
+            else:
+                lo = max(lo, top)
+            if hi - lo < height:
+                return True, lo
+        return False, lo
+
+    def throw(self, eye, yaw, pitch, fuse=(1500, 500), limit=4000, bounds=None):
+        """The blast point (campaign) and clock (ms) of a frag the player with eye point `eye` throws
+        facing `yaw`, `pitch` (the engine's degrees), or None if it leaves `bounds` ((low, high)
+        campaign corners) or has not gone off within `limit` ms. `fuse`: the arming time from the
+        throw and the time from the first bounce (packages/halo/equipment.txt)."""
+        ya, pa = math.radians(yaw), math.radians(pitch)
+        vel = [math.sin(ya)*math.cos(pa)*1.8, -math.cos(ya)*math.cos(pa)*1.8, (math.sin(pa) + .14)*1.8]
+        o = list(eye)
+        onfloor, bounced, clock = False, None, 0
+        # The launch moves it ten 10 ms steps in the frame it is thrown; then 5 ms physics steps.
+        schedule = [(10, False)] * 10
+        while True:
+            for curtime, ticking in schedule:
+                clock += curtime if ticking else 0
+                if onfloor:
+                    friction = max(6 * 20 / curtime, 1)
+                    vel = [v * (friction - 1) / friction for v in vel]
+                else:
+                    vel[2] -= self.GRAVITY * curtime
+                speed = curtime * self.SPEED / 1000
+                delta = [v * speed for v in vel]
+                original = list(o)
+                normal, floor, collided = None, False, False
+                if sum(v*v for v in delta) > 1e-8:
+                    hit = self._sweep([o[0], o[1], o[2] - self.EYE + self.RADIUS], delta)
+                    if hit is None:
+                        o = [o[i] + delta[i] for i in range(3)]
+                    else:
+                        t, normal = hit
+                        approach = -sum(delta[i]*normal[i] for i in range(3))
+                        margin = self.SKIN / approach if approach > self.SKIN else 0
+                        o = [o[i] + delta[i]*max(0.0, t - margin) for i in range(3)]
+                        collided, floor = True, normal[2] >= self.SLOPE
+                blocked, lo = self._devices(o)
+                if not blocked and o[2] - self.EYE < lo:
+                    if original[2] - self.EYE >= lo - self.SKIN:
+                        o[2], floor = lo + self.EYE + self.SKIN, True
+                    elif o[2] - self.EYE < lo - self.SKIN:
+                        blocked = True
+                if blocked:
+                    # retailmove puts it back, its velocity as it was; that counts as a bounce.
+                    o, collided = original, True
+                else:
+                    onfloor = floor
+                    if floor and vel[2] < 0:
+                        vel[2] = 0
+                    if normal is not None:
+                        inward = sum(vel[i]*normal[i] for i in range(3))
+                        if inward < 0:
+                            vel = [vel[i] - 1.5*inward*normal[i] for i in range(3)]
+                        vel = [v * .7 for v in vel]
+                if collided and bounced is None:
+                    bounced = clock
+                if bounds is not None and any(not bounds[0][i] <= o[i] <= bounds[1][i] for i in range(3)):
+                    return None
+                if ticking and bounced is not None and clock >= fuse[0] and clock - bounced >= fuse[1]:
+                    return tuple(o), clock
+                if clock > limit:
+                    return None
+            schedule = [(5, True)] * 50
+
+
+class VehicleGround:
+    """Where a ground vehicle (the Warthog) can drive on a section's retail collision, and a route for
+    it (import_halo_campaign.VEHICLE_ROUTES, the driven sections).
+
+    Floor samples on the campaign grid (one cell per AssaultCube unit) of every collision polygon
+    whose normal is at least `minimum_normal` (the slope limit; the engine's car treats faces under
+    0.3 as walls and climbs what its throttle and run-up carry it up, halo_vehicle.cpp simulate), with
+    open space round the chassis: the structure BSP's open-space test at the chassis bottom (`step`
+    above the floor, following the polygon's slope) and top (`height`) on a ring of `radius` (the
+    chassis capsule's radius and a margin), as the engine sweeps two capsules of the vehicle's
+    half-width (chassisBlocked). `length` is the distance from the body's centre to the front of
+    its capsules: each step of a route also needs open space that far ahead along the step.
+    Coordinates are campaign units, heights in quarter units, as floor_samples'."""
+
+    RING = tuple((math.cos(a * math.pi / 4), math.sin(a * math.pi / 4)) for a in range(8))
+
+    def __init__(self, surfaces, tree, size, radius, height, step, length, minimum_normal=.4, extra_walls=None):
+        self.tree, self.radius, self.height, self.step, self.length = tree, radius, height, step, length
+        self.walls = extra_walls
+        self.samples = {}
+        for normal, flags, _, _, points in surfaces:
+            nx, ny, nz = normal
+            if nz < minimum_normal or flags & 1:
+                continue
+            x0, y0, z0 = points[0]
+            low_x = max(6, math.ceil(min(p[0] for p in points)))
+            high_x = min(size - 7, math.floor(max(p[0] for p in points)))
+            low_y = max(6, math.ceil(min(p[1] for p in points)))
+            high_y = min(size - 7, math.floor(max(p[1] for p in points)))
+            if low_x > high_x or low_y > high_y:
+                continue
+            edges = [(b[1] - a[1], a[0] - b[0], b[0]*a[1] - a[0]*b[1]) for a, b in zip(points, points[1:] + points[:1])]
+            cx = sum(p[0] for p in points) / len(points)
+            cy = sum(p[1] for p in points) / len(points)
+            flip = -1 if sum(e[0]*cx + e[1]*cy + e[2] for e in edges) < 0 else 1
+
+            def plane(x, y):
+                return z0 - ((x - x0)*nx + (y - y0)*ny) / nz
+            for x in range(low_x, high_x + 1):
+                for y in range(low_y, high_y + 1):
+                    if any(flip*(e[0]*x + e[1]*y + e[2]) < -1e-6 for e in edges):
+                        continue
+                    z = plane(x, y)
+                    if self._fits(x, y, z, plane):
+                        self.samples.setdefault((x, y), set()).add(round(4 * z))
+        self.samples = {p: sorted(levels) for p, levels in self.samples.items()}
+
+    def _fits(self, x, y, z, plane):
+        tree, step, height = self.tree, self.step, self.height
+        if not tree.is_open(x, y, z + step + .05) or not tree.is_open(x, y, z + height):
+            return False
+        for dx, dy in self.RING:
+            px, py = x + dx * self.radius, y + dy * self.radius
+            base = max(z, plane(px, py))
+            if not tree.is_open(px, py, base + step + .05) or not tree.is_open(px, py, base + height):
+                return False
+        if self.walls is not None and self.walls.blocked(x, y, round(4 * (z + step))):
+            return False
+        return True
+
+    def nearest(self, point, limit=12):
+        """The sample (x, y, z4) nearest a campaign point (x, y, z), or None within `limit` cells."""
+        best = None
+        for x in range(round(point[0]) - limit, round(point[0]) + limit + 1):
+            for y in range(round(point[1]) - limit, round(point[1]) + limit + 1):
+                for z in self.samples.get((x, y), ()):
+                    d = (x - point[0])**2 + (y - point[1])**2 + (z / 4 - point[2])**2 * 4
+                    if best is None or d < best[0]:
+                        best = (d, (x, y, z))
+        return best and best[1]
+
+    def _ahead(self, node, dx, dy):
+        """Open space ahead of a body at `node` heading (dx, dy): the front of its chassis."""
+        length = math.hypot(dx, dy)
+        ux, uy = dx / length, dy / length
+        x, y, z = node[0] + ux * self.length, node[1] + uy * self.length, node[2] / 4
+        # Up a slope the chassis's front stands on the floor ahead, not at the body's height.
+        rise = 4 * (self.step + 1.25) * self.length
+        ahead = [o for o in self.samples.get((round(x), round(y)), ()) if abs(o - node[2]) <= rise]
+        if ahead:
+            z = max(z, max(ahead) / 4)
+        return self.tree.is_open(x, y, z + self.step + .05) and self.tree.is_open(x, y, z + self.height * .7)
+
+    def jump(self, here, back, dx, dy, speed, gravity, drop4):
+        """Where a vehicle driving off the edge at `here` (from `back`, the cell before) at `speed`
+        lands: the engine's car leaves the ground at the rate it was climbing (at most 0.8 of its
+        speed, simulate's launch) and falls at `gravity`; the first floor sample under its path, at
+        least three cells on, with open space above the path. None when it lands nowhere (or falls
+        further than `drop4` quarter units)."""
+        length = math.hypot(dx, dy)
+        ux, uy = dx / length, dy / length
+        rise = (here[2] - back[2]) / 4 if back is not None else 0.0
+        vz = max(0.0, min(.8 * speed, speed * rise / max(math.dist(here[:2], back[:2]) if back is not None else 1.0, 1e-3)))
+        x, y, z = float(here[0]), float(here[1]), here[2] / 4
+        dt, travelled, seen = 1 / 60, 0.0, set()
+        while travelled < 80:
+            x += ux * speed * dt
+            y += uy * speed * dt
+            z += vz * dt
+            vz -= gravity * dt
+            travelled += speed * dt
+            cell = (round(x), round(y))
+            if here[2] / 4 - z > drop4 / 4:
+                return None
+            if not self.tree.is_open(x, y, z + self.step + .05) or not self.tree.is_open(x, y, z + self.height * .8):
+                # Into a wall, or down onto something without floor samples there.
+                return None
+            if cell in seen:
+                continue
+            seen.add(cell)
+            if math.hypot(cell[0] - here[0], cell[1] - here[1]) < 3:
+                continue
+            for other in self.samples.get(cell, ()):
+                if z - .6 - abs(vz) * dt * 2 <= other / 4 <= z + self.step:
+                    return (cell[0], cell[1], other), travelled
+        return None
+
+    def route(self, start, inside, goal, drop=0, slope_rise=1.25, speed=0.0, gravity=40.0):
+        """The cheapest drive from `start` (a sample) to a sample `inside` accepts (x, y, z4), or, with
+        none reachable, the one nearest `goal` (campaign point): [(x, y, z4)], with whether it ended
+        inside. Eight neighbours a step; a step up may rise `step` plus `slope_rise` units a cell (the
+        slope limit already chose the floors); a step down may fall up to `drop` units (the vehicle
+        drives off a ledge or down a ramp too steep to stand on: up to eight cells on, open above).
+        Cells whose ring of four points at the radius has no floor near the body's height cost more,
+        so the route keeps to the middle of a corridor and off edges."""
+        samples, step4 = self.samples, 4 * (self.step + slope_rise)
+        drop4 = 4 * drop
+        best, parents = {start: 0.0}, {start: None}
+        queue = [(0.0, start)]
+        done, ahead_ok, edge_cost = set(), {}, {}
+
+        def edge(node):
+            if node not in edge_cost:
+                missing = 0
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    cell = (round(node[0] + dx * self.radius * 1.6), round(node[1] + dy * self.radius * 1.6))
+                    if not any(abs(z - node[2]) <= step4 * 2 for z in samples.get(cell, ())):
+                        missing += 1
+                edge_cost[node] = missing * 2.0
+            return edge_cost[node]
+
+        def push(here, node, price, dx, dy):
+            key = (node, dx, dy)
+            if key not in ahead_ok:
+                ahead_ok[key] = self._ahead(node, dx, dy)
+            if not ahead_ok[key]:
+                return
+            total = best[here] + price + edge(node)
+            if total < best.get(node, float('inf')):
+                best[node] = total
+                parents[node] = here
+                heapq.heappush(queue, (total, node))
+        found = None
+        self.jumps = set()
+        while queue:
+            cost, here = heapq.heappop(queue)
+            if here in done:
+                continue
+            done.add(here)
+            if inside is not None and inside(*here):
+                found = here
+                break
+            x, y, z = here
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                length = math.hypot(dx, dy)
+                ahead = False
+                for other in samples.get((x + dx, y + dy), ()):
+                    rise = other - z
+                    if rise <= step4 * length and -rise <= max(step4 * length, drop4):
+                        push(here, (x + dx, y + dy, other), length, dx, dy)
+                        ahead = True
+                if speed > 0 and not ahead:
+                    # The floor ends this way: a jump at speed across the gap (the Maw's run).
+                    back = parents.get(here)
+                    landed = self.jump(here, back, dx, dy, speed, gravity, drop4 or step4)
+                    if landed is not None:
+                        node, travelled = landed
+                        before = best.get(node, float('inf'))
+                        push(here, node, travelled + 20, dx, dy)
+                        if best.get(node, float('inf')) < before:
+                            self.jumps.add(node)
+                if drop4 and abs(dx) + abs(dy) == 1:
+                    # Off a ledge or down a ramp too steep for floor samples: land up to eight cells on.
+                    for reach in range(2, 9):
+                        cell = (x + dx * reach, y + dy * reach)
+                        landing = [o for o in samples.get(cell, ()) if step4 < z - o <= drop4]
+                        if not landing:
+                            continue
+                        between = [(x + dx * k, y + dy * k) for k in range(1, reach)]
+                        if any(abs(o - z) <= step4 for c in between for o in samples.get(c, ())):
+                            break
+                        other = max(landing)
+                        if all(self.tree.is_open(cx, cy, z / 4 + self.step + .05) and self.tree.is_open(cx, cy, z / 4 + self.height)
+                               for cx, cy in between):
+                            push(here, (cell[0], cell[1], other), reach + 4, dx, dy)
+                        break
+        ended = found is not None
+        if found is None:
+            if not best:
+                return [], False
+            found = min(best, key=lambda n: (n[0] - goal[0])**2 + (n[1] - goal[1])**2 + ((n[2] / 4 - goal[2]) * 2)**2)
+        path = [found]
+        while parents[path[-1]] is not None:
+            path.append(parents[path[-1]])
+        return path[::-1], ended
+
+
+class FlightSpace:
+    """Free space for a flyer (the Banshee) over a section's retail collision, on a coarse 3D grid, and
+    a flight through it (import_halo_campaign.VEHICLE_ROUTES, the flown c40 sections).
+
+    A node is a body position (the vehicle's origin, at the bottom of its body) on a grid of `cell`
+    campaign units. It is free when the body's box round it (`radius` across, `height` up, as the
+    engine's flight capsules, flightBlocked) is open space (`is_open(x, y, z)`: the structure BSP's
+    open-space test, with points outside the BSPs the section holds counting as open, as the engine
+    loads no collision there) and
+    no collision polygon (two-sided ones included) crosses the lines from its middle to its sides,
+    top and bottom (SightLines). A move to a neighbour (26) is free when both ends are and nothing
+    crosses the lines between their middles, tops and bottoms. Nodes are checked as the search
+    reaches them."""
+
+    def __init__(self, is_open, sights, cell, radius, height):
+        self._open, self.sights = is_open, sights
+        self.cell, self.radius, self.height = cell, radius, height
+        self.cache, self.edges = {}, {}
+        self.explored = 0
+
+    def point(self, node):
+        return (node[0] * self.cell, node[1] * self.cell, node[2] * self.cell)
+
+    def node(self, point):
+        return tuple(round(v / self.cell) for v in point)
+
+    def body_free(self, p):
+        """Whether the body with its origin at campaign point `p` is in open space."""
+        x, y, z = p
+        middle = (x, y, z + self.height / 2)
+        probes = [(x, y, z + .1), (x, y, z + self.height)] + \
+                 [(x + dx * self.radius, y + dy * self.radius, z + self.height * f) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                  for f in (.15, .85)]
+        if not self._open(*middle) or not all(self._open(*q) for q in probes):
+            return False
+        return all(self.sights.clear(middle, q) for q in probes)
+
+    def free(self, node):
+        if node not in self.cache:
+            self.cache[node] = self.body_free(self.point(node))
+        return self.cache[node]
+
+    def clear(self, a, b):
+        """Whether the body moves in a straight line between campaign points a and b."""
+        for f in (.1, .5, .9):
+            if not self.sights.clear((a[0], a[1], a[2] + self.height * f), (b[0], b[1], b[2] + self.height * f)):
+                return False
+        steps = max(1, int(math.dist(a, b) / self.cell))
+        return all(self.body_free(tuple(a[i] + (b[i] - a[i]) * k / steps for i in range(3))) for k in range(1, steps))
+
+    def route(self, start, goal, inside=None, limit=60000, weight=1.6):
+        """A* (the distance to `goal` weighted by `weight`, which finds a near-shortest flight much
+        sooner) from campaign point `start` to a free node `inside` accepts (a campaign point), else
+        the free node nearest `goal` once `limit` nodes are explored: a list of campaign points (start
+        first, then the straightened flight), and whether it arrived."""
+        first = self.node(start)
+        # Lift off: the nearest free node at or above the start.
+        for up in range(0, 12):
+            if self.free((first[0], first[1], first[2] + up)):
+                first = (first[0], first[1], first[2] + up)
+                break
+        else:
+            return [start], False
+        target = self.node(goal)
+
+        def h(n):
+            return math.dist(n, target) * weight
+        best, parents, queue, done = {first: 0.0}, {first: None}, [(h(first), first)], set()
+        steps = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1) if dx or dy or dz]
+        found = None
+        while queue and len(done) < limit:
+            _, here = heapq.heappop(queue)
+            if here in done:
+                continue
+            done.add(here)
+            if (inside(self.point(here)) if inside is not None else here == target):
+                found = here
+                break
+            for dx, dy, dz in steps:
+                node = (here[0] + dx, here[1] + dy, here[2] + dz)
+                if node in done or not self.free(node):
+                    continue
+                key = (here, node) if here < node else (node, here)
+                if key not in self.edges:
+                    self.edges[key] = self.sights.clear(*[(p[0], p[1], p[2] + self.height * f)
+                                                          for p in (self.point(here), self.point(node)) for f in (.5,)])
+                if not self.edges[key]:
+                    continue
+                total = best[here] + math.sqrt(dx*dx + dy*dy + dz*dz)
+                if total < best.get(node, float('inf')):
+                    best[node] = total
+                    parents[node] = here
+                    heapq.heappush(queue, (total + h(node), node))
+        self.explored = len(done)
+        arrived = found is not None
+        if found is None:
+            if not best:
+                return [start], False
+            found = min(best, key=h)
+        path = [found]
+        while parents[path[-1]] is not None:
+            path.append(parents[path[-1]])
+        points = [start] + [self.point(n) for n in reversed(path)]
+        # Straighten: keep a point only where the straight line from the last kept one is blocked.
+        kept = [points[0]]
+        i = 0
+        while i < len(points) - 1:
+            j = min(len(points) - 1, i + 10)
+            while j > i + 1 and not self.clear(points[i], points[j]):
+                j -= 1
+            kept.append(points[j])
+            i = j
+        return kept, arrived

@@ -25,7 +25,7 @@ from import_halo_scripts import difficulty_counts, squad_rows  # noqa: E402
 
 # Version 8 adds the damage targets' vitality and box to each object row; the squad counts are
 # those of version 7.
-assert int.from_bytes((root / 'packages/halo/a30.hscb').read_bytes()[4:8], 'little') in (7, 8), \
+assert int.from_bytes((root / 'packages/halo/a30.hscb').read_bytes()[4:8], 'little') in (7, 8, 9), \
     'a30.hscb is older than version 7; rerun tools/import_halo_scripts.py'
 
 # Expected sizes from the retail tags, through the importer.

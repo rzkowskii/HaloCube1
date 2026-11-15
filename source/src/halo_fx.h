@@ -45,6 +45,11 @@ void halofxvideo(int mode, float intensity);
 // Start of the 2D pass (renderhud.cpp gl_drawhud, after its ortho setup): `w`x`h` is the viewport.
 // Leaves GL_TEXTURE_2D disabled and the usual alpha blending.
 void halofxdrawscreen(int w, int h);
+// The GL context is about to be rebuilt (rendergl.cpp cleanupgl, from resetgl: a resolution or
+// display change that recreates the window): deletes the blur's copy and the flashlight's spot,
+// which are made again on their next use. A name that went stale some other way is caught by
+// glIsTexture before each use; a viewport of a new size reallocates the copy.
+void halofxcleanupgl();
 
 // The flashlight (X, halo_flashlight): a spot of the retail light's radius and cone from the eye,
 // added over the retail mesh (halofxflashlightworld, after the mesh's solid pass), a dynamic light
@@ -65,6 +70,11 @@ void halofxdrawdamage();
 enum { HALO_SOUND_CLASSES = 51, HALO_SOUND_CLASS_VEHICLE_ENGINE = 23 };
 void halofxsetclassgain(const char *prefix, float gain, float seconds);
 float halofxclassgain(int soundClass);                 // 1 for -1 (no class known)
+// Saved games (progress v3's optional `s gain` record, halo_script.cpp): each class's gain, a fade
+// in progress as where it is heading; false (nothing to save) when every class is at full gain.
+// halofxsetgains puts them back at once.
+bool halofxgains(float gains[HALO_SOUND_CLASSES]);
+void halofxsetgains(const float gains[HALO_SOUND_CLASSES]);
 int halofxsoundclass(const char *cache, int tagIndex); // a scenario sound's class, or -1
 int halofxsampleclass(const char *sample);             // a decoded tag sample's class, or -1
 

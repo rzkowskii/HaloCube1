@@ -1,6 +1,7 @@
 // weapon.cpp: all shooting and effects code
 
 #include "cube.h"
+#include <algorithm>
 #include "halo.h"
 #include "halo_collision.h"
 #include "halo_script.h"
@@ -1115,6 +1116,8 @@ void weapon::renderhudmodel(int lastaction, int index)
     float dist = worldpos.dist(p->o, unitv);
     unitv.div(dist);
 
+    // Unarmed in the campaign: no viewmodel (the empty slot's knife is not drawn).
+    if(p == player1 && haloplayerunarmed()) return;
     weaponmove wm;
     if(!intermission || !ispaused) wm.calcmove(unitv, lastaction, p);
     defformatstring(path)("weapons/%s", info.modelname);
@@ -1171,8 +1174,9 @@ void weapon::renderaimhelp(bool teamwarning)
     if(!editmode && haloactive() && halohudready() && haloweaponof(owner, type)) return;
     if(!editmode && haloactive())
     {
-        // hud_show_crosshair false (a10's tutorial) hides the fallback reticle as it does the retail one.
-        if(haloscenariohudhidden(NULL) & HALO_HUD_CROSSHAIR) return;
+        // hud_show_crosshair false (a10's tutorial) hides the fallback reticle as it does the retail
+        // one; an unarmed player has none.
+        if((haloscenariohudhidden(NULL) & HALO_HUD_CROSSHAIR) || (owner == player1 && haloplayerunarmed())) return;
         // The reticle turns red while aim assist has an enemy in range.
         const HaloWeaponDef *def = haloweaponof(owner, type);
         static color red(1.0f, 0.25f, 0.2f, 1.0f);
@@ -1833,7 +1837,7 @@ void shoot(playerent *p, vec &targ)
     weapon *weap = p->weaponsel, *bweap = p->weapons[GUN_GRENADE];
     if(bweap->busy()) bweap->attack(targ); // continue ongoing nade action
     else bweap = NULL;
-    if(p == player1 && haloactive() && (halocinematic() || halodriving() || lastmillis < haloActionEnd)) return;
+    if(p == player1 && haloactive() && (halocinematic() || halodriving() || lastmillis < haloActionEnd || haloplayerunarmed())) return;
     if(weap && !p->weaponchanging && weap != bweap) weap->attack(targ);
 }
 
@@ -1915,6 +1919,12 @@ void checkweaponstate()
     checkakimbo();
 }
 
+// The needles' supercombine (supercombine below): how many stuck at once detonate together; 0 off.
+VAR(halo_supercombine, 0, 7, 64);
+// The jpt! AOE core radius (areadamage, halogrenade::explode): 0 ignores it.
+VAR(halo_aoecore, 0, 1, 1);
+extern int halo_damagetrace;
+
 namespace
 {
     // A retail projectile in flight: plasma, needles, rockets, pellets and the
@@ -1962,11 +1972,12 @@ namespace
 
     // Rolls a shot's damage: the player's full-strength roll as it is; an actor's the same roll
     // (the jpt! upper bound) times the variant's modifier, kept exact instead of rounded per shot.
-    void rollshot(HaloShot &shot, const HaloProjectileDef &p, playerent *owner)
+    // `modifier` above 0 stands in for the actor's own (a vehicle gun's variant).
+    void rollshot(HaloShot &shot, const HaloProjectileDef &p, playerent *owner, float modifier)
     {
         shot.full = p.damage.roll();
         shot.lower = p.damage.lower;
-        shot.modifier = owner == player1 ? 1.0f : haloactordamagescale(owner);
+        shot.modifier = owner == player1 ? 1.0f : modifier > 0 ? modifier : haloactordamagescale(owner);
     }
 
     // What a shot deals at `scale` (1 full strength, 0 the weakest): from the full roll down to the
@@ -1996,12 +2007,26 @@ namespace
         loopi(count) haloscenariotargetdamage(targets[i], damage(halofalloff(distances[i], inner, outer)));
     }
 
+    // A blast on the vehicles with a body vitality it reaches (halovehiclesnear: the Wraith, a
+    // ridden Ghost or Banshee): `damage` gives what it deals at a falloff, measured to the nearest
+    // point of the body box; the vehicle applies its material's modifier from `source`.
+    template<class F> void blastvehicles(const vec &centre, float inner, float outer, playerent *owner, const HaloDamage *source, F damage)
+    {
+        int vehicles[16];
+        float distances[16];
+        const int count = halovehiclesnear(centre, outer, vehicles, distances, 16);
+        loopi(count) halovehiclehit(vehicles[i], damage(halofalloff(distances[i], inner, outer)), source, true, owner);
+    }
+
     // Area damage (rockets, fuel rods, mortars, the Scorpion's shell): full inside the area's
     // inner radius, falling to the lower bound at the outer, none beyond.
     void areadamage(const HaloShot &shot, const HaloProjectileDef &p, const vec &centre)
     {
         const float scale = haloscenarioscale();
-        const float radius = p.radius * scale, inner = min(p.innerRadius * scale, radius);
+        // Inside the jpt! AOE core radius the blast is at full strength (the rocket's 0.6 reaches past
+        // its 0.5 inner radius).
+        const float radius = p.radius * scale, core = halo_aoecore ? min(p.damage.core * scale, radius) : 0;
+        const float inner = max(min(p.innerRadius * scale, radius), core);
         particle_fireball(PART_FIREBALL, centre);
         halofxblast(centre, radius);
         auto blast = [&](playerent *victim)
@@ -2017,7 +2042,64 @@ namespace
         loopv(players) blast(players[i]);
         blast(player1);
         if(shot.owner == player1) blasttargets(centre, inner, radius, [&](float falloff) { return shotdamage(shot, falloff); });
+        blastvehicles(centre, inner, radius, shot.owner, &p.damage, [&](float falloff) { return shotdamage(shot, falloff); });
         if(p.sideEffect == HALO_SIDE_EFFECT_EMP) halovehicleemp(centre, radius, -1, HALO_EMP_STUN_MILLIS);
+    }
+
+    // The needle's super detonation (Halo's supercombine): the player's needles stuck in one actor
+    // count while they are stuck (each detonates its own timer after it struck, 0.75 s for the
+    // needle); when halo_supercombine of them are stuck at once they detonate together with the
+    // projectile's super detonation, its effect's area damage at the body (weapons\needler\explosion:
+    // 0.5-1.0 world units, 60 down to 40, EMP: the shields it reaches are drained). The tags hold no
+    // count: 7 is an engine choice, about what the needler's full rate of fire (10 a second) lands
+    // inside one timer. The actors' needles on the player do not combine (not modelled).
+    // halo_damagetrace 1 logs `SUPERCOMBINE target=<name> needles=<n> damage=<roll>`.
+    struct StuckNeedles { const playerent *victim; int def; std::vector<int> struck; };
+    std::vector<StuckNeedles> stuckNeedles;
+    int superDetonations = 0;               // QA (haloqaneedles)
+
+    void supercombine(const HaloShot &shot, const HaloProjectileDef &p, playerent *victim)
+    {
+        const HaloProjectileDef::SuperDetonation &super = p.super;
+        // Any body but the player's (the needle that killed it still counts: the rounds were stuck).
+        if(!super.valid || shot.owner != player1 || !victim || victim == player1 || victim->type != ENT_BOT || halo_supercombine <= 0) return;
+        const int timer = max(1, int(super.timer * 1000));
+        StuckNeedles *entry = NULL;
+        for(size_t i = 0; i < stuckNeedles.size(); ++i)
+        {
+            StuckNeedles &e = stuckNeedles[i];
+            // The rounds whose timer has run out have detonated on their own.
+            e.struck.erase(std::remove_if(e.struck.begin(), e.struck.end(), [&](int at) { return lastmillis - at >= timer || lastmillis < at; }),
+                           e.struck.end());
+            if(e.struck.empty() && !(e.victim == victim && e.def == shot.def)) { stuckNeedles.erase(stuckNeedles.begin() + i--); continue; }
+            if(e.victim == victim && e.def == shot.def) entry = &e;
+        }
+        if(!entry)
+        {
+            stuckNeedles.push_back({victim, shot.def, {}});
+            entry = &stuckNeedles.back();
+        }
+        entry->struck.push_back(lastmillis);
+        if(int(entry->struck.size()) < halo_supercombine) return;
+        const int needles = int(entry->struck.size());
+        entry->struck.clear();
+        ++superDetonations;
+        HaloProjectileDef blast;
+        blast.valid = true;
+        blast.damage = super.damage;
+        blast.radius = super.radius;
+        blast.innerRadius = super.innerRadius;
+        blast.sideEffect = super.sideEffect;
+        blast.category = super.category;
+        HaloShot detonation = shot;
+        detonation.full = super.damage.roll();
+        detonation.lower = super.damage.lower;
+        detonation.modifier = 1;
+        const vec centre = victim->o;
+        if(halo_damagetrace) conoutf("SUPERCOMBINE target=%s needles=%d damage=%.2f", victim->name, needles, detonation.full);
+        const HaloWeaponDef *def = haloweapon(shot.def);
+        haloplaysound(def ? def->sound(HALO_SOUND_SUPERCOMBINE) : NULL, S_FEXPLODE, NULL, &centre);
+        areadamage(detonation, blast, centre);
     }
 
     // An EMP projectile stops on a vehicle's body (other shots pass through vehicles, as before).
@@ -2035,16 +2117,16 @@ namespace
 }
 
 void halohit(float damage, int sideEffect, playerent *victim, playerent *owner, const vec &dir, int gun, bool gib, int info,
-             const HaloDamage *source)
+             const HaloDamage *source, const vec *at)
 {
     if(!victim || !(damage > 0)) return;
-    halopendinghit(victim, damage, sideEffect, source);
+    halopendinghit(victim, damage, sideEffect, source, at);
     hit(max(1, int(damage + .5f)), victim, owner, dir, gun, gib, info);
     halopendinghit(NULL, 0, 0);
 }
 
 void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int index,
-                     const vec &from, const vec &to)
+                     const vec &from, const vec &to, float modifier)
 {
     const HaloTriggerDef *t = def.trigger(index);
     if(!t || !t->projectile.valid) return;
@@ -2077,7 +2159,7 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
         // Every shot rolls the jpt! upper bound; range falloff applies where it lands.
         HaloShot rolled = HaloShot();
         rolled.owner = owner;
-        rollshot(rolled, p, owner);
+        rollshot(rolled, p, owner, modifier);
         if(!instant)
         {
             HaloShot &shot = haloShots.add();
@@ -2111,9 +2193,15 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
             vec contact;
             if((victim = haloactorhit(owner, from, end, contact))) end = contact;
         }
+        // A vehicle body in the way (halovehicletrace: the Wraith, a ridden Ghost or Banshee) takes
+        // the shot, unless it reached a rider in an open seat.
+        float along;
+        const int vehicle = halovehicletrace(from, end, along, owner, victim);
+        if(vehicle >= 0) { end = vec(end).sub(from).mul(along).add(from); victim = NULL; target = -1; }
         if(victim) halohit(impactdamage(rolled, p, from.dist(end) / max(scale, 1e-3f)), p.sideEffect, victim, owner, dir,
-                           halodamagegun(p, fallbackGun), false, 0, &p.damage);
+                           halodamagegun(p, fallbackGun), false, 0, &p.damage, &end);
         else if(target >= 0) haloscenariotargetdamage(target, impactdamage(rolled, p, from.dist(end) / max(scale, 1e-3f)));
+        else if(vehicle >= 0) halovehiclehit(vehicle, impactdamage(rolled, p, from.dist(end) / max(scale, 1e-3f)), &p.damage, false, owner);
         else addbullethole(owner, from, end);
         addshotline(owner, from, end);
         particle_splash(PART_SPARK, 4, 220, end);
@@ -2121,9 +2209,43 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
     adddynlight(owner, from, 4, 100, 50, p.category == 10 ? 60 : 96, p.category == 10 ? 170 : 80, p.category == 10 ? 250 : 64);
 }
 
+int haloqaneedles(playerent *victim, int count)
+{
+    // The first weapon whose projectile super-detonates (the needler) and its first such trigger.
+    loopi(haloweaponcount())
+    {
+        const HaloWeaponDef *d = haloweapon(i);
+        loopj(int(d->triggers.size()))
+        {
+            const HaloProjectileDef &p = d->triggers[j].projectile;
+            if(!p.valid || !p.super.valid) continue;
+            int detonations = 0;
+            loopk(count)
+            {
+                if(!victim) break;
+                HaloShot shot = HaloShot();
+                shot.owner = player1;
+                shot.def = i;
+                shot.trigger = j;
+                rollshot(shot, p, player1, -1);
+                const vec at = victim->o;
+                // As a needle that struck: its hit, then the stuck count.
+                if(victim->state == CS_ALIVE)
+                    halohit(shotdamage(shot, 1), p.sideEffect, victim, player1, vec(0, 0, -1), GUN_SUBGUN, false, 0, &p.damage, &at);
+                const int before = superDetonations;
+                supercombine(shot, p, victim);
+                detonations += superDetonations - before;
+            }
+            return detonations;
+        }
+    }
+    return -1;
+}
+
 void haloclearbolts()
 {
     haloShots.setsize(0);
+    stuckNeedles.clear();
     haloActionEnd = 0;
 }
 
@@ -2188,19 +2310,29 @@ void haloupdatebolts(int elapsed)
             if((victim = intersectclosest(shot.position, end, player1, distance, zone))) { contact = end; shorten(shot.position, contact, distance); end = contact; target = -1; }
         }
         else if((victim = haloactorhit(shot.owner, shot.position, end, contact))) end = contact;
-        const int vehicle = victim ? -1 : empvehicle(*p, shot.position, end);
+        // A vehicle body in the way takes the shot (as for instant shots in halofiretrigger).
+        float along;
+        const int struck = halovehicletrace(shot.position, end, along, shot.owner, victim);
+        if(struck >= 0) { end = vec(end).sub(shot.position).mul(along).add(shot.position); victim = NULL; target = -1; }
+        const int vehicle = victim ? -1 : struck >= 0 && p->sideEffect == HALO_SIDE_EFFECT_EMP ? struck : empvehicle(*p, shot.position, end);
         if(p->radius > 0) particle_trail(PART_SMOKE, 300, shot.position, end);
         else if(p->category == 10 || p->guided > 0) particle_trail(PART_PLASMA_BOLT, 34, shot.position, end);
         else addshotline(shot.owner, shot.position, end);
         const bool spent = shot.travelled >= range;
-        if(victim || worldHit || spent || vehicle >= 0 || target >= 0)
+        if(victim || worldHit || spent || vehicle >= 0 || target >= 0 || struck >= 0)
         {
             if(p->radius > 0) areadamage(shot, *p, end);
             else
             {
-                if(victim) halohit(impactdamage(shot, *p, shot.travelled), p->sideEffect, victim, shot.owner, shot.direction,
-                                   halodamagegun(*p, GUN_SUBGUN), false, 0, &p->damage);
+                if(victim)
+                {
+                    halohit(impactdamage(shot, *p, shot.travelled), p->sideEffect, victim, shot.owner, shot.direction,
+                            halodamagegun(*p, GUN_SUBGUN), false, 0, &p->damage, &end);
+                    // The needles stuck in one body super-detonate together (supercombine).
+                    if(p->super.valid) supercombine(shot, *p, victim);
+                }
                 else if(target >= 0) haloscenariotargetdamage(target, impactdamage(shot, *p, shot.travelled));
+                else if(struck >= 0) halovehiclehit(struck, impactdamage(shot, *p, shot.travelled), &p->damage, false, shot.owner);
                 if(vehicle >= 0) halovehicleemp(end, 0, vehicle, HALO_EMP_STUN_MILLIS);
                 particle_splash(p->category == 10 || p->guided > 0 ? PART_PLASMA : PART_SPARK, 5, 165, end);
             }
@@ -2346,6 +2478,10 @@ namespace
         // the vehicles inside its outer radius and the one it is stuck to.
         const float scale = haloscenarioscale();
         const float inner = def->innerRadius * scale, outer = max(def->outerRadius * scale, inner + .1f);
+        // The jpt! AOE core radius (0.4 world units for both grenades): a body that close to the
+        // blast takes it whatever stands between (the centre is often a hair inside the floor or a
+        // wall it rests against, where the line of sight test fails).
+        const float core = halo_aoecore ? min(def->blast.core * scale, outer) : 0;
         const bool thrownByPlayer = owner == player1;
         auto blast = [&](playerent *victim)
         {
@@ -2353,7 +2489,7 @@ namespace
             const vec centre = vec(victim->o).sub(vec(0, 0, victim->eyeheight * .5f));
             const float distance = centre.dist(o);
             const bool stuck = victim == stuckTo;
-            if(!stuck && (distance >= outer || !raycubelos(o, centre, .3f))) return;
+            if(!stuck && (distance >= outer || (distance > core && !raycubelos(o, centre, .3f)))) return;
             const float falloff = stuck ? 1.0f : halofalloff(distance, inner, outer);
             const float full = thrownByPlayer ? def->blast.roll() : def->blast.rollFromLower();
             float damage = def->blast.scaled(full, falloff);
@@ -2366,6 +2502,23 @@ namespace
         blast(player1);
         loopv(players) blast(players[i]);
         if(thrownByPlayer) blasttargets(o, inner, outer, [&](float falloff) { return def->blast.scaled(def->blast.roll(), falloff); });
+        // Vehicles with a body vitality in reach (the line to the box's middle clear), the one a
+        // plasma grenade is stuck to at full strength with the attached damage on top.
+        {
+            int vehicles[16];
+            float distances[16];
+            const int count = halovehiclesnear(o, outer, vehicles, distances, 16);
+            loopi(count)
+            {
+                const bool stuck = vehicles[i] == stuckVehicle;
+                vec centre;
+                if(!stuck && distances[i] > core && halovehiclecentre(vehicles[i], centre) && !raycubelos(o, centre, .3f)) continue;
+                const float full = thrownByPlayer ? def->blast.roll() : def->blast.rollFromLower();
+                float damage = def->blast.scaled(full, stuck ? 1.0f : halofalloff(distances[i], inner, outer));
+                if(stuck) damage += thrownByPlayer ? def->attached.roll() : def->attached.rollFromLower();
+                halovehiclehit(vehicles[i], damage, &def->blast, true, owner);
+            }
+        }
         if(plasma) halovehicleemp(o, outer, stuckVehicle, HALO_EMP_STUN_MILLIS);
     }
 }
@@ -2519,9 +2672,14 @@ void halomelee()
         }
     }
     const HaloWeaponDef *def = haloweaponof(player1, player1->weaponsel->type);
-    // Through halohit so the melee jpt!'s material modifiers reach Hunters and Sentinels.
-    if(target) halohit(float(halomeleedamage()), HALO_SIDE_EFFECT_NONE, target, player1, direction, GUN_KNIFE, false, 0,
-                       def && def->melee.upperMax > 0 ? &def->melee : NULL);
+    // Through halohit so the melee jpt!'s material modifiers reach Hunters and Sentinels, and its
+    // side effect (2, lethal to the unsuspecting: halodamage kills an unaware actor from behind).
+    // A blow with no weapon tag behind it (empty hands, a table without the weapon) carries side
+    // effect 2 too, as every retail melee does.
+    // The blow lands where the aim meets the body's distance (a Hunter's head or belly).
+    const vec struck = target ? vec(direction).mul(from.dist(target->o)).add(from) : from;
+    if(target) halohit(float(halomeleedamage()), def && def->melee.upperMax > 0 ? def->meleeSideEffect : HALO_SIDE_EFFECT_UNSUSPECTING,
+                       target, player1, direction, GUN_KNIFE, false, 0, def && def->melee.upperMax > 0 ? &def->melee : NULL, &struck);
     // Each weapon's melee animation has its own sound; the MA5B's stands in without the tags.
     haloplaysound(def && def->sound(HALO_SOUND_MELEE) ? def->sound(HALO_SOUND_MELEE) : "melee", S_KNIFE);
     haloAction = ANIM_GUN_MELEE;

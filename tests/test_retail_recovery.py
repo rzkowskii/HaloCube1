@@ -31,23 +31,26 @@ require(root / 'packages/maps/halo_a10_01.hcol', 'run tools/import_halo_campaign
 
 profile = scratch('retail-recovery-')
 logfile = SCRATCH / 'retail-recovery.log'
-# Delays count from live gameplay, after the opening cinematic is skipped.
+# Delays count from live gameplay, after the opening cinematic is skipped, and start 4 s in: on
+# Heroic a10's fast_setup holds the player in the cryotube (the scripted seat) for about 2.5 s
+# before its unit_exit_vehicle (batch 9), and the drops below must start from the floor.
 script = ('halo_scripttrace 1; halo_difficulty 2; qa_campaign_play 1 1; qa_after_gameplay ['
-          'sleep 1500 [qa_retail_where; qa_retail_recover fall] 1; '
-          'sleep 4500 [qa_retail_where] 1; '
-          'sleep 5500 [qa_retail_recover void] 1; '
-          'sleep 10500 [qa_retail_where] 1; '
-          'sleep 11500 [qa_retail_recover wedge] 1; '
-          'sleep 14000 [qa_retail_where; qa_hs_state settled] 1; '
-          'sleep 14200 [qa_halo_moved; qa_hs_state moved; qa_retail_recover wedge] 1; '
-          'sleep 15300 [qa_retail_where; qa_hs_state grace] 1; '
-          'sleep 17500 [qa_retail_where; qa_hs_state after; quit] 1]')
+          'sleep 4000 [qa_cargo_state seat; qa_retail_where; qa_retail_recover fall] 1; '
+          'sleep 7000 [qa_retail_where] 1; '
+          'sleep 8000 [qa_retail_recover void] 1; '
+          'sleep 13000 [qa_retail_where] 1; '
+          'sleep 14000 [qa_retail_recover wedge] 1; '
+          'sleep 16500 [qa_retail_where; qa_hs_state settled] 1; '
+          'sleep 16700 [qa_halo_moved; qa_hs_state moved; qa_retail_recover wedge] 1; '
+          'sleep 17800 [qa_retail_where; qa_hs_state grace] 1; '
+          'sleep 20000 [qa_retail_where; qa_hs_state after; quit] 1]')
 with logfile.open('w') as output:
     subprocess.run([QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w640', '-h480', '-e' + script],
                    cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=120, check=True)
 log = logfile.read_text(errors='replace')
 
 assert re.search(r'loaded \d+ retail collision surfaces for halo_a10_01\b', log), 'retail collision not active: ' + str(logfile)
+assert re.search(r'CARGO_QA seat loaded=1 cargo=\d+ boarded=- ', log), ('the cryotube let the player out before the drops', str(logfile))
 starts = re.findall(r'RETAIL_QA recover-from (\w+) feet=(\S+),(\S+),(\S+)', log)
 assert [kind for kind, *_ in starts] == ['fall', 'void', 'wedge', 'wedge'], (starts, str(logfile))
 recoveries = re.findall(r'Halo recovery: ([^,]+), player put back at (\S+),(\S+),(\S+)', log)

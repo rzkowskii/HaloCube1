@@ -22,6 +22,15 @@ In the QA client:
    enc_swamp2_turret draws the table's effect.
 4. d40 section 3 (stock geometry): a spawned Warthog driven by the player plays its engine loop,
    which stops when the player gets out.
+5. d40 section 3: a spawned Covenant turret manned by the player: turning it at 50 degrees a second
+   plays its engine loop, still held 150 ms after the last turn, gone 600 ms after it; turning at 5
+   degrees a second (under the 15 degree threshold) plays nothing.
+6. a30 section 2: after a checkpoint, a running camera shake, cinematic screen effect and damage
+   arc are cleared by a revert (the player killed and respawned: halofxrevert), and a sound class
+   fade set before it is kept.
+7. a30 section 2: the blur's frame copy and the flashlight's spot are made again after resetgl (a
+   GL context rebuild, halofxcleanupgl) and the copy follows a window of a new size (screenres);
+   a power-of-two copy is only used without non-power-of-two textures.
 """
 import re
 import subprocess
@@ -224,3 +233,84 @@ s = states(text)
 assert s['driving']['engines'] == '1', ('the driven Warthog plays its engine loop', s.get('driving'), text[-3000:])
 assert s['parked']['engines'] == '0', ('the loop stops when the driver gets out', s.get('parked'))
 print('d40 section 3: the driven Warthog plays its engine loop and stops when left.')
+
+# ---- 5. A turret's engine loop: above 15 degrees a second it plays, held 250 ms after the turn
+text = run('turret', 'halo_section 10 3', [
+    (300, 'qa_combat_protect 1; qa_vehicle_spawn 1 8'), (600, 'qa_vehicle_enter 0 1'), (800, 'qa_fx_state manned')] +
+    [(1000 + 100 * i, 'qa_fx_yaw 5') for i in range(15)] +                 # 50 degrees a second for 1.5 s
+    [(2250, 'qa_fx_state turning'), (2550, 'qa_fx_state held'), (3100, 'qa_fx_state settled')] +
+    [(3300 + 100 * i, 'qa_fx_yaw 0.5') for i in range(15)] +               # 5 degrees a second
+    [(4850, 'qa_fx_state creeping'), (5000, 'quit')])
+assert re.search(r'VEHICLE_QA enter vehicle=0 role=1 ok=1', text), ('the player mans the spawned turret', text[-3000:])
+s = states(text)
+for label in ('manned', 'turning', 'held', 'settled', 'creeping'):
+    assert label in s, (label, text[-3000:])
+assert s['manned']['engines'] == '0', ('a still turret plays no loop', s['manned'])
+assert s['turning']['engines'] == '1', ('turning at 50 degrees a second plays the loop', s['turning'])
+assert s['held']['engines'] == '1', ('the loop is held for 250 ms after the last turn', s['held'])
+assert s['settled']['engines'] == '0', ('600 ms after the turn the loop has stopped', s['settled'])
+assert s['creeping']['engines'] == '0', ('under 15 degrees a second the turret is silent', s['creeping'])
+print('d40 section 3: the turret loop plays above 15 degrees a second, holds 250 ms, stays off below.')
+
+# ---- 6. A revert clears the shake, the screen effects and the arcs, and keeps the class gains
+text = run('revert', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0'),
+    (300, 'qa_checkpoint_save'),
+    (600, 'qa_hs_cmd sound_class_set_gain "s:music 0.25 0"; qa_hs_cmd player_effect_set_max_rotation "0 2 2"; '
+          'qa_hs_cmd player_effect_start "1 0.1"; qa_hs_cmd cinematic_screen_effect_start "true"; '
+          'qa_hs_cmd cinematic_screen_effect_set_convolution "1 2 10 10 0"'),
+    (1000, 'qa_fx_state before'),
+    (1100, 'qa_halo_damage 1000'),
+    (2600, 'qa_fx_hit 90 4; qa_fx_state dead; qa_halo_revert'),
+    (2700, 'qa_fx_state reverted'),
+    (3500, 'qa_fx_state later; quit'),
+])
+s = states(text)
+for label in ('before', 'dead', 'reverted'):
+    assert label in s, (label, text[-3000:])
+before, dead, reverted = s['before'], s['dead'], s['reverted']
+assert float(before['shake']) > .9 and before['screen'] == '1' and float(before['blur']) > 9, before
+assert dead['hits'] == '1', ('an arc just before the revert', dead)
+assert float(reverted['shake']) < .01 and reverted['screen'] == '0' and float(reverted['blur']) == 0, ('the revert clears them', reverted)
+assert reverted['hits'] == '0', ('the revert clears the damage arcs', reverted)
+assert abs(float(reverted['music']) - .25) < .02, ('the class fade outlives the revert', reverted)
+print('a30 section 2: a revert cleared the shake, the blur and the arc and kept the music fade.')
+
+# ---- 7. GL resources after a context rebuild and a new window size
+text = run('gl', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_hs_cmd cinematic_screen_effect_start "true"; qa_hs_cmd cinematic_screen_effect_set_convolution "1 2 10 10 0"; '
+          'halo_flashlight 1'),
+    (800, 'qa_fx_state drawn'),
+    (900, 'resetgl'),
+    (1800, 'qa_fx_state rebuilt'),
+    (1900, 'screenres 640 480'),
+    (2800, 'qa_fx_state resized; quit'),
+], timeout=180)
+s = states(text)
+for label in ('drawn', 'rebuilt', 'resized'):
+    assert label in s, (label, text[-3000:])
+
+
+def size(value):
+    w, h = value.split('x')
+    return int(w), int(h)
+
+
+drawn, rebuilt, resized = s['drawn'], s['rebuilt'], s['resized']
+assert size(drawn['copy']) == (800, 600) and drawn['screen_tex'] == '1', ('the blur copies the 800x600 frame', drawn)
+tw, th = size(drawn['copytex'])
+if drawn['npot'] == '1':
+    assert (tw, th) == (800, 600), ('with non-power-of-two textures the copy is the frame size', drawn)
+else:
+    assert (tw, th) == (1024, 1024), ('without them, the next powers of two', drawn)
+assert rebuilt['screen_tex'] == '1' and size(rebuilt['copy']) == (800, 600), ('the copy is made again after resetgl', rebuilt)
+assert rebuilt['flashlight'] == '1', rebuilt
+if 'spot_tex' in rebuilt and drawn['spot_tex'] == '1':
+    assert rebuilt['spot_tex'] == '1', ('the flashlight spot is made again after resetgl', rebuilt)
+assert 'resized' in s and resized['screen_tex'] == '1', resized
+if size(resized['copy']) != (800, 600):
+    assert size(resized['copy']) == (640, 480), ('the copy follows the new window size', resized)
+    print('a30 section 2: blur copy and flashlight spot made again after resetgl; the copy followed 640x480.')
+else:
+    print('a30 section 2: blur copy and flashlight spot made again after resetgl; screenres kept 800x600 (a fixed window?).')

@@ -67,11 +67,11 @@ if (( metrics )); then
 fi
 step import-complete bash -c 'cd "$0" && PYTHONPATH=tools python3 - <<"PYTHON"
 from pathlib import Path
-from import_halo_campaign import MISSIONS, STOCK_SECTIONS, VALIDATED_COLLISION
+from import_halo_campaign import CRASH_SITE, MISSIONS, STOCK_SECTIONS, VALIDATED_COLLISION
 packages = Path("packages")
 missing = [f"halo/{t}" for t in ("weapons.txt", "equipment.txt", "actors.txt", "vehicles.txt", "effects.txt", "hud.txt")
            if not (packages / "halo" / t).is_file()]
-for name in ("maps/halo_a30.cgz", "maps/halo_a30.cfg", "maps/halo_a30.mesh"):
+for name in ("maps/halo_a30.cgz", "maps/halo_a30.cfg", "maps/halo_a30.mesh") + (("maps/halo_a30.hcol",) if CRASH_SITE else ()):
     if not (packages / name).is_file():
         missing.append(name)
 for m in MISSIONS:

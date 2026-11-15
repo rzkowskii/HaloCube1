@@ -17,7 +17,9 @@ enum HaloSoundRole { HALO_SOUND_FIRE, HALO_SOUND_CHARGED, HALO_SOUND_EMPTY, HALO
                      HALO_SOUND_THROW, HALO_SOUND_EXPLODE, HALO_SOUND_ARMED,
                      // The weapon tag's zoom sounds and a looping sound held while firing (the
                      // flamethrower's fire, the plasma pistol's charge hum).
-                     HALO_SOUND_ZOOM_IN, HALO_SOUND_ZOOM_OUT, HALO_SOUND_LOOP, HALO_SOUND_ROLES };
+                     HALO_SOUND_ZOOM_IN, HALO_SOUND_ZOOM_OUT, HALO_SOUND_LOOP,
+                     // The needles' super detonation (weapons.txt `sound supercombine`).
+                     HALO_SOUND_SUPERCOMBINE, HALO_SOUND_ROLES };
 
 // The sample tools/import_halo_audio.py decodes a sound tag to, for haloplaysound():
 // "sound\sfx\weapons\needler\fire" is "tags/sfx-weapons-needler-fire".
@@ -41,6 +43,11 @@ enum { HALO_DAMAGE_MATERIALS = 33 };
 struct HaloDamage
 {
     float lower = 0, upperMin = 0, upperMax = 0;
+    // The jpt! AOE core radius (world units; a `core` line after the damage's line: the frag and
+    // plasma grenades' 0.4, the rocket's 0.6). A body within it of a blast's centre takes the blast
+    // at full strength and, for a grenade, even when the centre's line of sight to it is blocked
+    // (areadamage, halogrenade::explode; halo_aoecore 0 ignores it).
+    float core = 0;
     // The jpt! damage modifier per retail material type (the `materials` line after the damage's
     // line in weapons.txt or equipment.txt): 12 hunter armor, 13 hunter skin, 25 sentinel,
     // 26 monitor, 32 hunter shield and so on. Without the line every modifier is 1.
@@ -62,7 +69,8 @@ float halofalloff(float distance, float start, float end);
 // jpt! side effects. EMP (the plasma grenade, the charged plasma bolt): the shield a hit reaches
 // is drained after the hit, the overshield's layers too (halodamage), and the vehicles it reaches
 // are stunned for HALO_EMP_STUN_MILLIS (halovehicleemp). The tags' stun fields are all zero, so
-// the duration is the engine's. "Lethal to the unsuspecting" (every weapon's melee) is not modelled.
+// the duration is the engine's. "Lethal to the unsuspecting" (every campaign weapon's melee): the
+// player's melee on an actor from behind that is not fighting the player kills it (halodamage).
 enum { HALO_SIDE_EFFECT_NONE = 0, HALO_SIDE_EFFECT_HARMLESS = 1, HALO_SIDE_EFFECT_UNSUSPECTING = 2, HALO_SIDE_EFFECT_EMP = 3 };
 const int HALO_EMP_STUN_MILLIS = 2000;
 
@@ -75,6 +83,16 @@ struct HaloProjectileDef
     float rangeStart = 0, rangeEnd = 0;     // air damage range: impacts fall to the lower bound across it
     int category = -1, sideEffect = 0;      // side effect 3: EMP (the charged plasma bolt)
     std::string path;
+    // The needle's super detonation (a `supercombine` line): when enough of these rounds are stuck
+    // in one body within `timer` seconds of each other (halo_supercombine, an engine choice: the
+    // tags hold no count), they detonate together with this area damage at the body.
+    struct SuperDetonation
+    {
+        bool valid = false;
+        float timer = 0, innerRadius = 0, radius = 0;
+        HaloDamage damage;
+        int sideEffect = 0, category = 0;
+    } super;
 };
 
 struct HaloTriggerDef
@@ -104,6 +122,7 @@ struct HaloWeaponDef
     float zoomMin = 1, zoomMax = 1;
     float autoaimAngle = 0, autoaimRange = 0, magnetismAngle = 0, magnetismRange = 0;
     HaloDamage melee;
+    int meleeSideEffect = 0;                // the melee jpt!'s side effect: 2 lethal to the unsuspecting
     std::vector<HaloMagazineDef> magazines;
     std::vector<HaloTriggerDef> triggers;
     HaloSounds sounds;

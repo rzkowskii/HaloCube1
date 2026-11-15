@@ -22,6 +22,12 @@
 VARP(halo_scripttrace, 0, 0, 1);
 // 0 Easy, 1 Normal, 2 Hard, 3 Impossible. Read when a section starts or restarts.
 VARP(halo_difficulty, 0, 1, 3);
+// A seat the script holds the player in (Scenario::seatPlayer): 0 leaves unit_enter_vehicle of the
+// player into a vehicle the engine does not drive ignored, as before; halo_scriptseatmax is the
+// longest the hold lasts (seconds, 0 for as long as the script keeps it), a guard against a script
+// that never reaches its unit_exit_vehicle.
+VAR(halo_scriptseat, 0, 1, 1);
+VAR(halo_scriptseatmax, 0, 180, 3600);
 
 int halodifficulty() { return clamp(int(halo_difficulty), 0, 3); }
 // Enemy damage and vitality relative to Normal, and the player's incoming damage.
@@ -36,6 +42,10 @@ namespace
     // Actors and lists of actors are object values below these bases: an actor
     // is actorObject - its squadBots index, a list is actorList - its actorLists index.
     constexpr int actorObject = -1000, actorList = -100000;
+    // 343 Guilty Spark's body (halo.cpp ActorKind MONITOR, tools/halo_actors.py KINDS 10): the
+    // scripts cannot kill him (eraseSquads).
+    constexpr int monitorKind = 10;
+    bool monitorBody(const playerent *p) { return haloenemykind(p) == monitorKind; }
 
     struct Reader
     {
@@ -138,6 +148,9 @@ namespace
         int initial = 0, defaultState = 0, maneuver = -1;
         unsigned flags = 0, masks[7] = {};
         int counts[4] = {-1, -1, -1, -1};  // starts placed on Easy, Normal, Hard, Impossible; -1 = all (version 5 and 6)
+        // Version 9: the squad's default variant (an ACTORS kind, -1 when not one, and an
+        // actors.txt index, -1 unknown), what ai_attach turns a scripted biped into.
+        int defaultKind = -1, defaultVariant = -1;
     };
     struct Encounter
     {
@@ -147,6 +160,8 @@ namespace
         std::vector<FiringPosition> positions;
         std::vector<Platoon> platoons;
     };
+    // Version 9 object flags.
+    enum { OBJECT_STORY_FIGURE = 1 };
     struct CommandAtom { int type, modifier; float first, second; int point, otherPoint, animation, script, recording, command, object; };
     struct CommandList { std::string name; unsigned flags; std::vector<CommandAtom> atoms; std::vector<vec> points; };
     struct Projection { int bsp; vec origin; float xy, z, margin; };
@@ -191,6 +206,10 @@ namespace
         std::vector<BspSwitch> switches;
         std::vector<Encounter> encounters;
         std::vector<CommandList> commandLists;
+        std::vector<HaloStartingProfile> profiles;  // version 9: player starting profiles
+        // Per object (version 9): OBJECT_* flags; empty with an older file (storyFigure then
+        // falls back to the old name prefixes).
+        std::vector<unsigned char> objectFlags;
 
         const Node *node(uint32_t datum) const
         {
@@ -211,7 +230,7 @@ namespace
             Reader r(path);
             if(r.bytes(4) != "HSCB") return false;
             const uint32_t version = r.number<uint32_t>();
-            if(version < 5 || version > 8) return false;
+            if(version < 5 || version > 9) return false;
             auto u8 = [&] { return r.number<uint8_t>(); };
             auto u16 = [&] { return r.number<uint16_t>(); };
             auto i16 = [&] { return r.number<int16_t>(); };
@@ -366,6 +385,39 @@ namespace
                     return list;
                 });
             }
+            if(version >= 9)
+            {
+                profiles = r.rows<HaloStartingProfile>(64, [&]
+                {
+                    HaloStartingProfile profile;
+                    profile.name = r.text();
+                    profile.health = f32();
+                    profile.shield = f32();
+                    loopi(2)
+                    {
+                        profile.weapon[i] = r.text();
+                        profile.loaded[i] = max(0, int(i16()));
+                        profile.total[i] = max(0, int(i16()));
+                    }
+                    profile.frags = u8();
+                    profile.plasmas = u8();
+                    if(!std::isfinite(profile.health) || profile.health < 0) profile.health = 0;
+                    if(!std::isfinite(profile.shield) || profile.shield < 0) profile.shield = 0;
+                    return profile;
+                });
+                if(r.number<uint32_t>() != encounters.size()) return false;
+                for(Encounter &e : encounters)
+                {
+                    if(r.number<uint32_t>() != e.squads.size()) return false;
+                    for(Squad &squad : e.squads)
+                    {
+                        squad.defaultKind = i16();
+                        squad.defaultVariant = i16();
+                    }
+                }
+                objectFlags = r.rows<unsigned char>(4096, u8);
+                if(objectFlags.size() != objects.size()) return false;
+            }
             if(!r.valid || r.file->tell() != r.file->size() || nodes.empty() || scripts.empty()) return false;
             if(groupFlags.size() != deviceGroups.size()) return false;
             for(const Script &script : scripts) if(!node(script.root)) return false;
@@ -494,6 +546,12 @@ namespace
         int encounter, squad;
         bool suspended = false;
         int scriptFlags = 0;   // HALO_AI_* bits scripts set, reapplied when a revert respawns the actor
+        // ai_attach: the scripted object this actor stands for (-1 an encounter's own actor). Its
+        // start is Scenario::objectStarts[object]: where it took over, or stood at the checkpoint.
+        int object = -1;
+        // An attached object whose actor died before the checkpoint: kept, with no actor, so that
+        // a revert does not make the object an actor again (unit_get_health stays -1).
+        bool gone = false;
     };
 
     struct Playback
@@ -507,7 +565,7 @@ namespace
     };
 
     struct Voice { int id, location, until, scriptUntil; };
-    struct Music { int id; const Track *track; int location, until; float gain; bool repeat, ending, alternate; };
+    struct Music { int id; const Track *track; int location, until; float gain; bool repeat, ending, alternate; float loopGain; };
     struct Talking { int id, line, wake; };
 
     // Entry, Exit and Timeout scenes play at the route's boundaries, the Cartographer's at its
@@ -572,6 +630,22 @@ namespace
         std::vector<Thread> savedThreads;
         std::vector<Actor> savedActors;
         std::vector<SquadBot> squadBots, savedSquadBots;
+        // ai_attach (halo_script_ai.inc attachActors): per scripted object, the start its actor
+        // spawns from (the squad's default variant at the object's pose), the tick it was attached
+        // and the next tick a failed spawn is tried again. savedAttachedAt is attachedAt at the
+        // checkpoint: a revert puts it back (an attach after the checkpoint is undone with the
+        // script; one before it that is still waiting for its actor keeps waiting), and the state
+        // block's `s attaching` record carries the waiting ones through a Continue.
+        std::vector<SquadStart> objectStarts;
+        std::vector<int> attachedAt, attachRetry, savedAttachedAt;
+        // A Call scene's gameplay music (gap 12): the looping sounds playing when it started,
+        // restarted when it ends unless the scene stopped them.
+        struct CallMusic { int id; float gain; bool alternate; };
+        std::vector<CallMusic> callMusic;
+        // The player aboard a script vehicle at the checkpoint (a30's Pelicans): put back aboard by
+        // a revert or a Continue. vehicle noObject when not.
+        struct Boarded { int vehicle = -1, seat = -1; vec from; bool scripted = false; };
+        Boarded savedBoarded;
         // Encounter combat positions and command lists in this section's coordinates.
         std::vector<std::vector<HaloFiringPosition>> encounterPositions;
         std::vector<HaloCommandProgram> commandPrograms;
@@ -670,7 +744,7 @@ namespace
         bool cartographerMapped() const;
         void placeSquads(int reference, int limit, bool scaled = true);
         size_t livingBots() const;
-        void eraseSquads(int reference);
+        void eraseSquads(int reference, bool erase);
         int living(int reference) const;
         void restoreSquads();
         bool matchesSquad(int reference, int encounter, int squad) const;
@@ -691,10 +765,24 @@ namespace
         std::vector<Cargo> cargo;
         int boardedVehicle = noObject, boardedSeat = -1;
         vec boardedAt, boardedFrom;
+        // Seated by the script (seatPlayer) rather than boarded with E: held until
+        // unit_exit_vehicle; boardedStart is the seat where it began, boardedSince when.
+        bool boardedScripted = false;
+        int boardedSince = 0;
+        vec boardedStart;
+        // The seat's camera marker (the Pelican's "camera p-riderlf", the cryotube's "camera"):
+        // the eye of a scripted seat, or -1 for the seat marker and the usual seated eye height.
+        int boardedCamera = -1;
+        // Where updateCargo last put the player in a scripted seat (a move by anything else lets
+        // them out).
+        vec boardedPut;
+        bool boardedPutValid = false;
         // ai_vehicle_encounter: the squad a vehicle's driver belongs to, applied when one is loaded.
         std::unordered_map<int, int> vehicleSquads;
         bool scriptVehicle(int id) const;
         bool seatWorld(int vehicle, int seat, vec &point) const;
+        bool markerWorld(int vehicle, int marker, vec &point) const;
+        int cameraMarker(int vehicle, int seat) const;
         int freeSeat(int vehicle, const char *seat) const;
         bool loadCargo(int vehicle, const char *seat, playerent *unit, bool walking);
         int unloadCargo(int vehicle, const char *seat);
@@ -703,13 +791,20 @@ namespace
         int boardCandidate(int &seat) const;
         bool board();
         void unboard(bool keepPlace);
+        bool seatPlayer(int vehicle, const char *seat);
+        void unseatScripted(const char *why);
         void clearCargo();
         void configureActor(playerent *bot, int encounter, int squad, const SquadStart &start);
+        int attachedEntry(int object) const;
+        void attachActors();
+        void detachActor(int object);
+        void finishTalking();
         void updatePlatoons();
         int actorListFor(int reference);
         template<class F> void eachActor(int reference, F f);
         playerent *actorFromValue(int value) const;
         bool objectPosition(int value, vec &position) const;
+        bool objectMarkerPosition(int value, const char *marker, vec &position) const;
         Value literal(const Node &node) const;
         Value command(Thread &thread, const Node &node, const char *name, const std::vector<Value> &args, bool scene);
         bool pacingCommand(const char *name, const std::vector<Value> &args, bool scene, Value &out);
@@ -1892,7 +1987,7 @@ namespace
                 int channel = play(sample, gain * track.gain, directLoop);
                 if(halo_scripttrace) conoutf("Halo audio: loop %d / %d (audio %s)", id, sample, channel ? "playing" : "unavailable");
                 music.push_back({id, &track, channel, directLoop ? INT_MAX : tick + clip->duration,
-                                 gain * track.gain, repeat, false, false});
+                                 gain * track.gain, repeat, false, false, gain});
             }
             return;
         }
@@ -1984,6 +2079,11 @@ namespace
             actors[id] = {};
             actors[id].pose = program.objects[id].pose;
         }
+        // object_create of an object that does not exist yet makes it at its scenario placement, as
+        // in Halo; a section started without an opening scene used to leave it at the origin (a50's
+        // captain_keyes, which ai_attach now turns into an actor where the object stands).
+        else if(visible && !actors[id].visible && actors[id].parent < 0 && !actors[id].recording)
+            actors[id].pose = program.objects[id].pose;
         actors[id].visible = visible;
         if(cue && cue->trigger == SceneTrigger::Call) sceneObjects[id] = visible;
         // A dropship destroyed with actors aboard sets them down where they are; a destroyed
@@ -2000,6 +2100,8 @@ namespace
         halovehicleobject(id, visible, reset, bulk);
         // So is scenario equipment with this name (halo.cpp).
         haloequipmentobject(id, visible, reset);
+        // And the actor ai_attach made of it.
+        if(!visible || reset) detachActor(id);
     }
 
     Value Scenario::command(Thread &thread, const Node &node, const char *name, const std::vector<Value> &args, bool scene)
@@ -2074,7 +2176,7 @@ namespace
         }
         if(is("ai_kill") || is("ai_kill_silent") || is("ai_erase"))
         {
-            if(!scene) eraseSquads(index(0));
+            if(!scene) eraseSquads(index(0), is("ai_erase"));
             return {};
         }
         if(is("ai_erase_all"))
@@ -2082,7 +2184,12 @@ namespace
             if(!scene)
             {
                 HaloScriptDamage scripted;
-                for(SquadBot &bot : squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+                for(SquadBot &bot : squadBots)
+                {
+                    if(!bot.bot || bot.bot->state != CS_ALIVE) continue;
+                    if(monitorBody(bot.bot)) haloerasebot(bot.bot);
+                    else dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+                }
                 haloclearflood();
             }
             return {};
@@ -2180,6 +2287,12 @@ namespace
             // here: unhurt while it exists. Reporting -1 made a10 think the player shot Keyes.
             // Damage targets (d40's manifold detectors) report what the player's shots left.
             const int value = index(0);
+            // A vehicle the engine drives (halo_vehicle.cpp): its body health while it exists, -1
+            // once it blew up or was destroyed (b40's dialog_ext_a_c waits for crev_ent_wraith_a
+            // and _b to reach 0 or less).
+            if(value >= 0 && halovehiclebound(value)) return result(halovehiclehealth(value));
+            // An attached object whose actor died or is gone (ai_attach, attachActors).
+            if(attachedEntry(value) >= 0) return result(-1.0f);
             if(value < 0 || !at(actors, value) || !actors[value].visible) return result(-1.0f);
             const Object &unit = program.objects[value];
             return result(unit.vitality > 0 ? max(0.0f, 1 - actors[value].damage / unit.vitality) : 1.0f);
@@ -2272,6 +2385,19 @@ namespace
                 pendingCheckpoint = true;
             return {};
         }
+        if(is("player_add_equipment"))
+        {
+            // (player_add_equipment unit profile reset): a10's bridge0_profile (the pistol at the
+            // bridge), c20's easy_start (a shotgun on Easy). Only the player has a body here; a
+            // co-op player1 is no one.
+            if(index(0) == playerObject || index(0) == playerList)
+            {
+                HaloStartingProfile profile;
+                if(haloscenarioprofile(index(1), text(1), profile)) haloplayeraddequipment(profile, truth(2));
+                else if(halo_scripttrace) conoutf("Halo script: no starting profile %s (an .hscb older than version 9?)", text(1));
+            }
+            return {};
+        }
         if(is("game_won") || is("game_lost"))
         {
             // The mission scripts end the level here. The engine decides what that means (ending, or revert).
@@ -2351,8 +2477,21 @@ namespace
             return {};
         }
         if(is("sound_looping_start")) { startMusic(index(0), float(value(2, 1))); return {}; }
-        if(is("sound_looping_stop")) { stopMusic(index(0)); return {}; }
-        if(is("sound_looping_set_alternate")) { setAlternate(index(0), truth(1)); return {}; }
+        if(is("sound_looping_stop") || is("sound_looping_set_alternate"))
+        {
+            // A Call scene that stops or switches a gameplay loop it cut: so it stays after the scene.
+            const int id = index(0);
+            for(size_t i = 0; cue && cue->trigger == SceneTrigger::Call && i < callMusic.size(); ++i)
+            {
+                if(callMusic[i].id != id) continue;
+                if(is("sound_looping_stop")) callMusic.erase(callMusic.begin() + i);
+                else callMusic[i].alternate = truth(1);
+                break;
+            }
+            if(is("sound_looping_stop")) stopMusic(id);
+            else setAlternate(id, truth(1));
+            return {};
+        }
         if(is("ai_conversation")) { startConversation(index(0)); return result(1); }
         if(is("ai_conversation_stop")) { stopConversation(index(0)); return {}; }
         if(is("ai_conversation_status"))
@@ -2753,7 +2892,7 @@ namespace
                 const Flag *flag = at(program.flags, index(1));
                 if(flag && projection && !scene) { point = toWorld(*projection, flag->pose.position); found = true; }
             }
-            else if(!scene) found = objectPosition(object(1), point);
+            else if(!scene) found = objectMarkerPosition(object(1), text(2), point);
             if(found || scene) halofxeffect(text(0), point, found);
             return handled();
         }
@@ -3005,12 +3144,149 @@ namespace
         return true;
     }
 
+    // effect_new_on_object_marker's place: the named marker of the object's model (the .hscb's
+    // markers, in the model's bind pose and the object's frame, as the seats are placed: an
+    // animation does not move it), else the object's origin. The player and actors have no markers
+    // here (their origin). Every retail call is in a cinematic (the chip insertion at chief's and
+    // cortana's hands), where an effect only plays its sound; this places the gameplay ones.
+    bool Scenario::objectMarkerPosition(int value, const char *marker, vec &position) const
+    {
+        const Object *object = at(program.objects, value);
+        if(object && marker && *marker && projection && at(actors, value) && actors[value].visible && !actorFromValue(value))
+        {
+            int found = named(object->markers, marker);
+            for(size_t i = 0; i < object->markers.size() && found < 0; ++i)
+                if(!strcasecmp(object->markers[i].name.c_str(), marker)) found = int(i);
+            if(const Flag *flag = at(object->markers, found))
+            {
+                Pose pose = currentActor(value);
+                pose.position.add(poseOffset(vec(flag->pose.position).mul(actors[value].scale), pose));
+                const vec point = toWorld(*projection, pose.position);
+                if(std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z))
+                {
+                    position = point;
+                    if(halo_scripttrace) conoutf("Halo script: effect at %s's marker %s", object->name.c_str(), flag->name.c_str());
+                    return true;
+                }
+            }
+        }
+        return objectPosition(value, position);
+    }
+
     playerent *Scenario::actorFromValue(int value) const
     {
         if(value == playerObject) return player1;
+        // A scripted object ai_attach made an actor: the unit commands, volume tests,
+        // unit_get_health and object_teleport reach the actor.
+        if(value >= 0)
+        {
+            const SquadBot *bot = at(squadBots, attachedEntry(value));
+            return bot ? bot->bot : nullptr;
+        }
         if(value > actorObject || value <= actorList) return nullptr;
         const SquadBot *bot = at(squadBots, actorObject - value);
         return bot ? bot->bot : nullptr;
+    }
+
+    // The squad entry standing for a scripted object (ai_attach), or -1.
+    int Scenario::attachedEntry(int object) const
+    {
+        if(object < 0) return -1;
+        for(size_t i = 0; i < squadBots.size(); ++i) if(squadBots[i].object == object) return int(i);
+        return -1;
+    }
+
+    vec fromWorld(const Projection &p, const vec &point)
+    {
+        return vec(p.origin.x + (point.x - p.margin) / p.xy, p.origin.y - (point.y - p.margin) / p.xy, p.origin.z + point.z / p.z);
+    }
+
+    // ai_attach on a scripted biped in play: once nothing poses or carries it (no custom animation,
+    // recording or parent) and two ticks have passed since the attach (a50's cell block poses its
+    // marines and Keyes right after attaching them), an actor of the squad's default variant takes
+    // over at the object's pose, on the encounter's team, as a member of the squad: a50's freed
+    // captain_keyes and marines after ini_post_rescue, c10's marine_suicidal. The scripted model is
+    // no longer drawn; the actor's death or erasure is the unit's (unit_get_health -1). Attaching in
+    // a scene only records the squad, as before (the scene stage has no actors): a50's insertion
+    // marines and final Hunters stay figures of their scenes.
+    void Scenario::attachActors()
+    {
+        if(!projection || cue || player1->state != CS_ALIVE || intermission) return;
+        if(attachedAt.size() != actors.size()) attachedAt.assign(actors.size(), -1);
+        if(attachRetry.size() != actors.size()) attachRetry.assign(actors.size(), 0);
+        if(objectStarts.size() != actors.size()) return;
+        for(size_t i = 0; i < actors.size(); ++i)
+        {
+            const Actor &a = actors[i];
+            const Object &o = program.objects[i];
+            if(attachedAt[i] < 0 || a.squadReference < 0 || !a.visible || o.kind != -1 || o.vitality > 0) continue;
+            if(a.animation || a.recording || a.parent >= 0 || tick < attachedAt[i] + 2 || tick < attachRetry[i]) continue;
+            if(attachedEntry(int(i)) >= 0) continue;      // has its actor (alive or dead)
+            const int e = a.squadReference & 0xffff;
+            const unsigned kind = uint32_t(a.squadReference) >> 30;
+            const Encounter *encounter = at(program.encounters, e);
+            if(!encounter || encounter->squads.empty()) { attachedAt[i] = -1; continue; }
+            // The squad named, the first of the platoon named, or the encounter's first.
+            int squad = 0;
+            if(kind == 2) squad = (uint32_t(a.squadReference) >> 16) & 0xff;
+            else if(kind == 1)
+                for(size_t k = 0; k < encounter->squads.size(); ++k)
+                    if(encounter->squads[k].platoon == int((uint32_t(a.squadReference) >> 16) & 0xff)) { squad = int(k); break; }
+            const Squad *member = at(encounter->squads, squad);
+            if(!member) { attachedAt[i] = -1; continue; }
+            SquadStart &start = objectStarts[i];
+            start = SquadStart{};
+            start.actor = member->defaultKind;
+            start.variant = member->defaultVariant;
+            if(start.actor < 0 && !haloactordef(start.variant) && !member->starts.empty())
+            {
+                start.actor = member->starts.front().actor;
+                start.variant = member->starts.front().variant;
+            }
+            if(start.actor < 0 && !haloactordef(start.variant))
+            {
+                conoutf("HaloScript: %s attached to %s has no actor variant to become (an .hscb older than version 9?)",
+                        o.name.c_str(), encounter->name.c_str());
+                attachedAt[i] = -1;
+                continue;
+            }
+            const Pose pose = currentActor(int(i));
+            start.point = pose.position;
+            start.yaw = pose.yaw;
+            playerent *bot = haloscenariospawnenemy(start.actor, toWorld(*projection, start.point), 90 - start.yaw / RAD, start.variant,
+                                                    teamFor(*encounter, start));
+            if(!bot)
+            {
+                attachRetry[i] = tick + ticksPerSecond;   // no floor there yet: try again in a second
+                continue;
+            }
+            squadBots.push_back({&start, bot, e, squad});
+            squadBots.back().object = int(i);
+            configureActor(bot, e, squad, start);
+            conoutf("HaloScript: %s attached to %s/%s is an actor now", o.name.c_str(), encounter->name.c_str(), member->name.c_str());
+        }
+    }
+
+    // The scripted object is destroyed or created anew: its actor (ai_attach) goes with it, at
+    // once and without a death (object_destroy deletes the unit in Halo).
+    void Scenario::detachActor(int object)
+    {
+        if(at(attachedAt, object)) attachedAt[object] = -1;
+        for(SquadBot &entry : squadBots)
+        {
+            if(entry.object != object) continue;
+            playerent *bot = entry.bot;
+            entry.object = -1;
+            entry.bot = nullptr;
+            if(bot) haloerasebot(bot);
+        }
+    }
+
+    // A scene cuts the conversations being spoken: they count as finished (ai_conversation_status
+    // 5), so the scripts waiting for them move on instead of waiting at status 2 for good.
+    void Scenario::finishTalking()
+    {
+        for(const Talking &entry : talking) if(at(conversationStatus, entry.id)) conversationStatus[entry.id] = 5;
     }
 
     int Scenario::living(int reference) const
@@ -3021,12 +3297,24 @@ namespace
         return count;
     }
 
-    void Scenario::eraseSquads(int reference)
+    // ai_kill, ai_kill_silent and ai_erase: the squad's living actors die (the engine has no silent
+    // erase of a fighting actor; they fall where they stand, as before). 343 Guilty Spark cannot
+    // be killed in Halo: ai_kill of the Monitor does nothing, and ai_erase takes him away at once
+    // with no death, body or sound (c20 erases bsp0_monitor once the player moves on).
+    void Scenario::eraseSquads(int reference, bool erase)
     {
         HaloScriptDamage scripted;
         for(SquadBot &bot : squadBots)
-            if(bot.bot && bot.bot->state == CS_ALIVE && matchesSquad(reference, bot.encounter, bot.squad))
-                dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+        {
+            if(!bot.bot || bot.bot->state != CS_ALIVE || !matchesSquad(reference, bot.encounter, bot.squad)) continue;
+            if(monitorBody(bot.bot))
+            {
+                if(halo_scripttrace) conoutf("HaloScript: %s %s the Monitor", erase ? "ai_erase removes" : "ai_kill spares", bot.bot->name);
+                if(erase) haloerasebot(bot.bot);
+                continue;
+            }
+            dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+        }
     }
 
     void Scenario::restoreSquads()
@@ -3036,6 +3324,8 @@ namespace
         const Projection &p = *projection;
         for(SquadBot saved : savedSquadBots)
         {
+            // An attached object whose actor was dead at the checkpoint stays without one.
+            if(saved.gone) { saved.bot = nullptr; squadBots.push_back(saved); continue; }
             const SquadStart &start = *saved.start;
             vec point((start.point.x - p.origin.x) * p.xy + p.margin,
                       (p.origin.y - start.point.y) * p.xy + p.margin,
@@ -3176,6 +3466,12 @@ namespace
             savedActors.clear();
             savedSquadBots.clear();
             squadBots.clear();
+            // Actors are not carried into the next section (its map is another), attached ones
+            // neither: their objects stay as the scripts left them, with no actor again.
+            std::fill(attachedAt.begin(), attachedAt.end(), -1);
+            std::fill(savedAttachedAt.begin(), savedAttachedAt.end(), -1);
+            std::fill(attachRetry.begin(), attachRetry.end(), 0);
+            savedBoarded = {};
             std::fill(conversationStatus.begin(), conversationStatus.end(), 5);
             loaded = true;
             startCartographer();
@@ -3210,6 +3506,12 @@ namespace
         savedActors.clear();
         savedSquadBots.clear();
         squadBots.clear();
+        objectStarts.assign(program.objects.size(), SquadStart{});
+        attachedAt.assign(program.objects.size(), -1);
+        savedAttachedAt.assign(program.objects.size(), -1);
+        attachRetry.assign(program.objects.size(), 0);
+        callMusic.clear();
+        savedBoarded = {};
         savedGroups.clear();
         external.clear();
         groups.clear();
@@ -3382,6 +3684,16 @@ namespace
         }
         const int index = named(program.scripts, chosen->script);
         const int boardedPelican = pelicanReady() ? named(program.objects, "extraction_pelican") : -1;
+        // A scene a script calls mid-section cuts the gameplay music for its own; the loops come
+        // back when it ends (endCue). The conversations it cuts count as finished.
+        callMusic.clear();
+        if(trigger == SceneTrigger::Call)
+            for(const Music &item : music)
+            {
+                if(item.ending || std::any_of(callMusic.begin(), callMusic.end(), [&](const CallMusic &m) { return m.id == item.id; })) continue;
+                callMusic.push_back({item.id, item.loopGain, item.alternate});
+            }
+        finishTalking();
         stopSounds();
         cue = chosen;
         director = {};
@@ -3439,12 +3751,21 @@ namespace
         camera = {};
         fade = {};
         letterbox = cameraControl = false;
+        finishTalking();
         stopSounds();
         player1->attacking = false;
         player1->stopmoving();
         resetcamera();
         if(trigger == SceneTrigger::Call)
         {
+            // The gameplay music the scene cut, unless the scene stopped it (sound_looping_stop).
+            for(const CallMusic &item : callMusic)
+            {
+                startMusic(item.id, item.gain);
+                if(item.alternate) setAlternate(item.id, true);
+                if(halo_scripttrace) conoutf("Halo audio: loop %d restarted after %s", item.id, played);
+            }
+            callMusic.clear();
             // The scripted objects as gameplay left them, but for those the scene created or
             // destroyed. The calling thread carries on after the call on its next step.
             if(callActors.size() == actors.size())
@@ -3538,6 +3859,7 @@ namespace
                         conoutf("Halo checkpoint request: %s at tick %d", program.scripts[i].name.c_str(), tick);
                 }
             }
+            if(!cue) attachActors();
             if(!cue)
             {
                 armSwitches();
@@ -3613,19 +3935,28 @@ namespace
         glColor4ub(255, 255, 255, 255);
     }
 
-    // Named story figures the scripts create during play, outside any scene (a50's Keyes sitting
-    // in his cell, the Monitor or Cortana where a script places them): drawn with their scene
-    // model. A figure the script attached to a squad stands for an actor and is drawn only while
-    // a custom animation poses it (the engine does not turn scripted objects into actors).
-    bool storyFigure(const Object &object, const Actor &actor)
+    // Story figures the scripts show during play, outside any scene (a50's Keyes sitting in his
+    // cell, d40's Cortana left on the bridge after cinematic_bridge, d20's Flood-infested Keyes):
+    // drawn with their scene model. The .hscb (version 9) flags them (OBJECT_STORY_FIGURE,
+    // tools/import_halo_scripts.py story_figures: created by a gameplay script or left alive by a
+    // Call scene, not placed dead); an older one falls back to the keyes, cortana and monitor name
+    // prefixes. A figure attached to a squad stands for an actor: drawn only while a custom
+    // animation poses it and no actor has taken it over (attachActors).
+    bool storyFigure(const Program &program, size_t index, const Actor &actor, bool hasActor)
     {
-        static const char *const prefixes[] = {"keyes", "captain_keyes", "cortana", "monitor"};
-        const std::string &name = object.name;
-        bool named = false;
-        for(const char *prefix : prefixes) if(!name.compare(0, strlen(prefix), prefix)) { named = true; break; }
-        if(!named || name.find("chip") != std::string::npos || name.find("effect") != std::string::npos ||
-           name.find("teleport") != std::string::npos) return false;
-        return actor.squadReference < 0 || actor.animation != nullptr;
+        const Object &object = program.objects[index];
+        bool figure = false;
+        if(!program.objectFlags.empty()) figure = index < program.objectFlags.size() && (program.objectFlags[index] & OBJECT_STORY_FIGURE);
+        else
+        {
+            static const char *const prefixes[] = {"keyes", "captain_keyes", "cortana", "monitor"};
+            const std::string &name = object.name;
+            for(const char *prefix : prefixes) if(!name.compare(0, strlen(prefix), prefix)) { figure = true; break; }
+            if(name.find("chip") != std::string::npos || name.find("effect") != std::string::npos ||
+               name.find("teleport") != std::string::npos) figure = false;
+        }
+        if(!figure) return false;
+        return actor.squadReference < 0 || (actor.animation != nullptr && !hasActor);
     }
 
     void Scenario::render()
@@ -3645,7 +3976,7 @@ namespace
             const bool flown = object.kind >= 0 && !halovehiclebound(int(i)) &&
                                (actor.recording || actor.parent >= 0 || actor.recordingEnd > 0 || boardedVehicle == int(i) ||
                                 std::any_of(cargo.begin(), cargo.end(), [i](const Cargo &entry) { return entry.vehicle == int(i) && !entry.walking; }));
-            if(!cue && int(i) != landingPelican && !(actor.visible && (storyFigure(object, actor) || flown))) continue;
+            if(!cue && int(i) != landingPelican && !(actor.visible && (storyFigure(program, i, actor, actor.squadReference >= 0 && attachedEntry(int(i)) >= 0) || flown))) continue;
             // Damage targets are invisible in Halo (d40's manifold detectors).
             if(!actor.visible || object.model.empty() || objectDevices[i] >= 0 || object.vitality > 0) continue;
             Pose pose = currentActor(int(i));
@@ -3673,6 +4004,18 @@ void haloscenariostart(int mission, int section, bool preview, bool continuing)
 }
 
 void haloscenariostop() { scenario.stop(); }
+
+bool haloscenarioprofile(int index, const char *name, HaloStartingProfile &out)
+{
+    if(!scenario.loaded) return false;
+    const std::vector<HaloStartingProfile> &profiles = scenario.program.profiles;
+    const HaloStartingProfile *found = nullptr;
+    if(name && *name) for(const HaloStartingProfile &profile : profiles) if(profile.name == name) { found = &profile; break; }
+    if(!found) found = at(profiles, index);
+    if(!found) return false;
+    out = *found;
+    return true;
+}
 
 // For the QA client: adds `count` entries for actors that are gone, as a long fight leaves behind.
 void haloscenarioqapad(int count)
@@ -3757,6 +4100,7 @@ double haloscenarioobjectstate(const char *what, int id)
     if(!strcmp(what, "melee")) return item->meleeInhibited;
     if(!strcmp(what, "ranged")) return item->rangedInhibited;
     if(!strcmp(what, "squad")) return item->squadReference;
+    if(!strcmp(what, "boardable")) return item->boardable;
     if(!strcmp(what, "permutation")) return double(item->permutation.size());
     if(!strcmp(what, "door")) return at(scenario.objectDevices, id) && scenario.objectDevices[id] >= 0 ? scenario.devices[scenario.objectDevices[id]].visible : -1;
     return -1;
@@ -3769,6 +4113,18 @@ double haloscenarioqascript(const char *name, int action)
     const int index = named(scenario.program.scripts, name);
     if(index < 0 || size_t(index) >= scenario.threads.size()) return -1;
     if(action == 0) { scenario.wake(index, false); return 1; }
+    // 3: run a static script once as a thread of its own, as the script that calls it would (wake
+    // starts only startup, dormant and continuous scripts; tests/test_mission_exits.py item 3).
+    if(action == 3)
+    {
+        Thread &thread = scenario.threads[index];
+        if(scenario.program.scripts[index].kind <= 2 || (thread.started && !thread.done)) return 0;
+        thread = Thread();
+        thread.started = true;
+        thread.wake = scenario.tick;
+        thread.stack.emplace_back(scenario.program.scripts[index].root);
+        return 1;
+    }
     return action == 1 ? scenario.threads[index].started : scenario.threads[index].done;
 }
 
@@ -3821,6 +4177,9 @@ bool haloscenariobotsuspended(const playerent *bot)
 void haloscenarioremovebot(const playerent *bot)
 {
     for(SquadBot &member : scenario.squadBots) if(member.bot == bot) member.bot = nullptr;
+    // A rider or walker of a dropship that is removed (an attached actor erased) is no longer aboard.
+    scenario.cargo.erase(std::remove_if(scenario.cargo.begin(), scenario.cargo.end(),
+                                        [bot](const Scenario::Cargo &entry) { return entry.unit == bot; }), scenario.cargo.end());
 }
 
 void haloscenariotick(int elapsed)
@@ -3837,7 +4196,33 @@ void haloscenariocheckpoint()
     scenario.savedActors = scenario.actors;
     scenario.savedSquadBots.clear();
     for(const SquadBot &bot : scenario.squadBots)
-        if(bot.bot && bot.bot->state == CS_ALIVE) scenario.savedSquadBots.push_back(bot);
+    {
+        if(bot.bot && bot.bot->state == CS_ALIVE)
+        {
+            scenario.savedSquadBots.push_back(bot);
+            // An attached actor comes back where it stands now (its start is its own).
+            if(bot.object >= 0 && scenario.projection && at(scenario.objectStarts, bot.object))
+            {
+                SquadStart &start = scenario.objectStarts[bot.object];
+                start.point = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
+                start.yaw = (90 - bot.bot->yaw) * RAD;
+            }
+        }
+        else if(bot.object >= 0)
+        {
+            scenario.savedSquadBots.push_back(bot);
+            scenario.savedSquadBots.back().gone = true;
+        }
+    }
+    scenario.savedAttachedAt = scenario.attachedAt;
+    scenario.savedBoarded = {};
+    if(scenario.boardedVehicle != noObject)
+    {
+        scenario.savedBoarded.vehicle = scenario.boardedVehicle;
+        scenario.savedBoarded.seat = scenario.boardedSeat;
+        scenario.savedBoarded.from = scenario.boardedFrom;
+        scenario.savedBoarded.scripted = scenario.boardedScripted;
+    }
     scenario.savedGroups = scenario.groups;
     scenario.savedDevices = scenario.devices;
     scenario.savedExternal = scenario.external;
@@ -3890,7 +4275,31 @@ void haloscenariorevert()
         scenario.restoreSquads();
         scenario.tick = scenario.savedTick;
         scenario.accumulator = 0;
+        // The attaches as they stood at the checkpoint; a failed spawn's retry tick belonged to the
+        // time after it (left as it was, it could hold an attach back for as long as that lasted).
+        if(scenario.savedAttachedAt.size() == scenario.attachedAt.size()) scenario.attachedAt = scenario.savedAttachedAt;
+        std::fill(scenario.attachRetry.begin(), scenario.attachRetry.end(), 0);
         std::fill(scenario.conversationStatus.begin(), scenario.conversationStatus.end(), 5);
+        // Aboard a script vehicle at the checkpoint (a30's extraction Pelicans): aboard again.
+        const Scenario::Boarded &b = scenario.savedBoarded;
+        const Actor *vehicle = at(scenario.actors, b.vehicle);
+        vec seat;
+        if(vehicle && vehicle->visible && (vehicle->boardable || b.scripted) && scenario.scriptVehicle(b.vehicle) &&
+           player1->state == CS_ALIVE && scenario.seatWorld(b.vehicle, b.seat, seat))
+        {
+            scenario.boardedVehicle = b.vehicle;
+            scenario.boardedSeat = b.seat;
+            scenario.boardedFrom = b.from;
+            scenario.boardedAt = seat;
+            // A seat the script held the player in at the checkpoint holds them again; the reverted
+            // script lets them out (its hold timer starts over).
+            scenario.boardedScripted = b.scripted;
+            scenario.boardedSince = lastmillis;
+            scenario.boardedStart = seat;
+            scenario.boardedCamera = b.scripted ? scenario.cameraMarker(b.vehicle, b.seat) : -1;
+            scenario.boardedPutValid = false;
+            conoutf("Halo: player aboard %s again (the checkpoint's seat)", scenario.program.objects[b.vehicle].name.c_str());
+        }
     }
     else
     {
@@ -3927,6 +4336,10 @@ namespace
         bool showHelp;
         const std::vector<NavPoint> *navs;
         int hudHidden, hudBlinking, chapter, chapterStart, tick;
+        Scenario::Boarded boarded;
+        // Scripted objects attached in play whose actor does not exist yet (posed, carried or
+        // within the two ticks): the optional `s attaching` record.
+        std::vector<int> attaching;
     };
 
     void writeValue(std::string &out, const Value &v)
@@ -4083,6 +4496,29 @@ namespace
         {
             const Encounter *e = at(p.encounters, bot.encounter);
             const Squad *s = e ? at(e->squads, bot.squad) : nullptr;
+            // An actor ai_attach made of a scripted object (optional record, newer than the
+            // format: a save without it still loads): its object, squad and start.
+            if(bot.object >= 0)
+            {
+                const SquadStart *start = at(scenario.objectStarts, bot.object);
+                if(!s || !start || !at(p.objects, bot.object)) continue;
+                vec point = start->point;
+                float yaw = start->yaw;
+                if(bot.bot && bot.bot->state == CS_ALIVE && scenario.projection && v.threads == &scenario.threads)
+                {
+                    point = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
+                    yaw = (90 - bot.bot->yaw) * RAD;
+                }
+                halostatef(out, "s attached %d", bot.object);
+                halostateword(out, p.objects[bot.object].name);
+                halostatef(out, " %d", bot.encounter);
+                halostateword(out, e->name);
+                halostatef(out, " %d", bot.squad);
+                halostateword(out, s->name);
+                halostatef(out, " %d %d %d %d %d %.9g %.9g %.9g %.9g\n", bot.suspended, bot.scriptFlags, bot.gone, start->actor, start->variant,
+                           point.x, point.y, point.z, yaw);
+                continue;
+            }
             if(!s || s->starts.empty() || bot.start < s->starts.data() || bot.start >= s->starts.data() + s->starts.size()) continue;
             halostatef(out, "s squad %d", bot.encounter);
             halostateword(out, e->name);
@@ -4126,6 +4562,29 @@ namespace
         unsigned allied = 0, broken = 0;
         haloallegianceget(allied, broken, v.threads == &scenario.savedThreads);
         halostatef(out, "s allegiance %u %u\n", allied, broken);
+        // Optional records (a save without them loads with their defaults): the script vehicles
+        // the player may board (unit_set_enterable_by_player: a30's extraction Pelicans), the one
+        // they are aboard, and the sound class gains (sound_class_set_gain: c10's fades), as they
+        // stand when the save is written.
+        std::vector<int> boardable;
+        for(size_t i = 0; i < v.actors->size(); ++i) if((*v.actors)[i].boardable) boardable.push_back(int(i));
+        if(!boardable.empty()) writeInts(out, "board", boardable);
+        // A seat the script held the player in is not written (the record is the Pelican boarded
+        // with E; a Continue puts the player where the checkpoint had them, on foot).
+        if(at(p.objects, v.boarded.vehicle) && !v.boarded.scripted)
+        {
+            halostatef(out, "s boarded %d", v.boarded.vehicle);
+            halostateword(out, p.objects[v.boarded.vehicle].name);
+            halostatef(out, " %d %.9g %.9g %.9g\n", v.boarded.seat, v.boarded.from.x, v.boarded.from.y, v.boarded.from.z);
+        }
+        if(!v.attaching.empty()) writeInts(out, "attaching", v.attaching);
+        float gains[HALO_SOUND_CLASSES];
+        if(halofxgains(gains))
+        {
+            halostatef(out, "s gain %d", int(HALO_SOUND_CLASSES));
+            loopi(HALO_SOUND_CLASSES) halostatef(out, " %.6g", gains[i]);
+            out += '\n';
+        }
     }
 
     // Everything a state block restores, read in full before any of it is applied.
@@ -4148,6 +4607,13 @@ namespace
         HudTimer timer;
         bool allegiance = false;
         unsigned allied = 0, broken = 0;
+        // Optional records: attached actors (with their starts), boardable script vehicles, the
+        // vehicle the player is aboard, the sound class gains.
+        std::vector<std::pair<SquadBot, SquadStart>> attached;
+        std::vector<int> boardable, attaching;
+        Scenario::Boarded boarded;
+        bool gains = false;
+        float gain[HALO_SOUND_CLASSES] = {};
     };
 
     bool parseState(const std::vector<std::string> &records, ParsedState &s, std::string &why)
@@ -4314,6 +4780,65 @@ namespace
                 if(!r.ok) return fail("bad HUD timer", line);
                 timer = true;
             }
+            else if(r.key("attached"))
+            {
+                SquadBot bot{};
+                SquadStart start{};
+                bot.object = r.i();
+                const std::string object = r.word();
+                bot.encounter = r.i();
+                const std::string encounter = r.word();
+                bot.squad = r.i();
+                const std::string squad = r.word();
+                bot.suspended = r.b();
+                bot.scriptFlags = r.i();
+                bot.gone = r.b();
+                start.actor = r.i();
+                start.variant = r.i();
+                start.point.x = r.f(); start.point.y = r.f(); start.point.z = r.f();
+                start.yaw = r.f();
+                const Encounter *e = at(p.encounters, bot.encounter);
+                const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
+                if(!r.ok || !at(p.objects, bot.object) || p.objects[bot.object].name != object || !sq || e->name != encounter ||
+                   sq->name != squad || !std::isfinite(start.point.x) || !std::isfinite(start.point.y) || !std::isfinite(start.point.z) ||
+                   !std::isfinite(start.yaw))
+                    return fail("unknown attached actor", line);
+                bot.bot = nullptr;
+                s.attached.emplace_back(bot, start);
+            }
+            else if(r.key("board"))
+            {
+                if(!readInts(r, [&](int v) { s.boardable.push_back(v); })) return fail("bad boardable vehicles", line);
+                for(int v : s.boardable) if(!at(p.objects, v)) return fail("bad boardable vehicles", line);
+            }
+            else if(r.key("attaching"))
+            {
+                if(!readInts(r, [&](int v) { s.attaching.push_back(v); })) return fail("bad attaching objects", line);
+                for(int v : s.attaching) if(!at(p.objects, v)) return fail("bad attaching objects", line);
+            }
+            else if(r.key("boarded"))
+            {
+                s.boarded.vehicle = r.i();
+                const std::string name = r.word();
+                s.boarded.seat = r.i();
+                s.boarded.from.x = r.f(); s.boarded.from.y = r.f(); s.boarded.from.z = r.f();
+                const Object *o = at(p.objects, s.boarded.vehicle);
+                if(!r.ok || !o || o->name != name || !at(o->seats, s.boarded.seat) || !std::isfinite(s.boarded.from.x) ||
+                   !std::isfinite(s.boarded.from.y) || !std::isfinite(s.boarded.from.z))
+                    return fail("bad boarded vehicle", line);
+            }
+            else if(r.key("gain"))
+            {
+                const int count = r.i();
+                if(!r.ok || count != HALO_SOUND_CLASSES) return fail("bad sound class gains", line);
+                loopi(HALO_SOUND_CLASSES)
+                {
+                    s.gain[i] = r.f();
+                    if(!std::isfinite(s.gain[i])) r.ok = false;
+                }
+                if(!r.ok) return fail("bad sound class gains", line);
+                s.gains = true;
+            }
             else return fail("unknown record", line);
             if(!r.ok || r.more()) return fail("malformed record", line);
         }
@@ -4333,12 +4858,31 @@ bool haloscenariostatesave(std::string &out, bool live)
     if(live)
     {
         v = StateView{&s.globals, &s.threads, &s.actors, {}, &s.groups, &s.devices, &s.external, &s.objective, &s.help, s.showHelp,
-                      &s.navPoints, s.hudHidden, s.hudBlinking, s.chapter, s.chapterStart, s.tick};
-        for(const SquadBot &bot : s.squadBots) if(bot.bot && bot.bot->state == CS_ALIVE) v.squads.push_back(bot);
+                      &s.navPoints, s.hudHidden, s.hudBlinking, s.chapter, s.chapterStart, s.tick, {}};
+        for(const SquadBot &bot : s.squadBots)
+        {
+            if(bot.bot && bot.bot->state == CS_ALIVE) v.squads.push_back(bot);
+            else if(bot.object >= 0) { v.squads.push_back(bot); v.squads.back().gone = true; }
+        }
+        if(s.boardedVehicle != noObject)
+        {
+            v.boarded.vehicle = s.boardedVehicle;
+            v.boarded.seat = s.boardedSeat;
+            v.boarded.from = s.boardedFrom;
+            v.boarded.scripted = s.boardedScripted;
+        }
     }
     else v = StateView{&s.savedGlobals, &s.savedThreads, &s.savedActors, s.savedSquadBots, &s.savedGroups, &s.savedDevices,
                        &s.savedExternal, &s.savedObjective, &s.savedHelp, s.savedShowHelp, &s.savedNavPoints, s.savedHudHidden,
-                       s.savedHudBlinking, s.savedChapter, s.savedChapterStart, s.savedTick};
+                       s.savedHudBlinking, s.savedChapter, s.savedChapterStart, s.savedTick, s.savedBoarded, {}};
+    // The objects attached in play still waiting for their actor (a50's jailed marines, posed in
+    // their cells until the rescue): without them a Continue would leave them figures for good.
+    const std::vector<int> &attachedAt = live ? s.attachedAt : s.savedAttachedAt;
+    for(size_t i = 0; i < attachedAt.size() && i < v.actors->size(); ++i)
+    {
+        if(attachedAt[i] < 0 || (*v.actors)[i].squadReference < 0) continue;
+        if(std::none_of(v.squads.begin(), v.squads.end(), [i](const SquadBot &bot) { return bot.object == int(i); })) v.attaching.push_back(int(i));
+    }
     writeState(out, v);
     return true;
 }
@@ -4374,6 +4918,25 @@ bool haloscenariostaterestore(const std::vector<std::string> &records, bool comm
     s.maneuvered = std::move(parsed.maneuvered);
     s.flipped = std::move(parsed.flipped);
     s.hudTimer = parsed.timer;
+    if(s.objectStarts.size() != s.program.objects.size()) s.objectStarts.assign(s.program.objects.size(), SquadStart{});
+    for(auto &entry : parsed.attached)
+    {
+        s.objectStarts[entry.first.object] = entry.second;
+        entry.first.start = &s.objectStarts[entry.first.object];
+        s.savedSquadBots.push_back(entry.first);
+        // The scripted object is attached already: no second actor from attachActors.
+        if(at(s.attachedAt, entry.first.object)) s.attachedAt[entry.first.object] = 0;
+        if(at(s.savedAttachedAt, entry.first.object)) s.savedAttachedAt[entry.first.object] = 0;
+    }
+    // Attached in play, its actor still to come (the revert that follows copies savedAttachedAt).
+    for(int object : parsed.attaching)
+    {
+        if(at(s.attachedAt, object)) s.attachedAt[object] = 0;
+        if(at(s.savedAttachedAt, object)) s.savedAttachedAt[object] = 0;
+    }
+    for(int v : parsed.boardable) if(at(s.savedActors, v)) s.savedActors[v].boardable = true;
+    s.savedBoarded = parsed.boarded;
+    if(parsed.gains) halofxsetgains(parsed.gain);
     haloaisetgrenades(parsed.grenades);
     if(parsed.allegiance) haloallegianceput(parsed.allied, parsed.broken);
     else haloallegiancereset();
@@ -4536,7 +5099,8 @@ const char *haloscenarioblockingdevice(physent *entity)
 }
 float haloscenarioscale()
 {
-    // The standalone a30 map has no projection; tools/import_halo_a30.py uses HORIZONTAL_SCALE 2.75.
+    // Without a loaded program: 2.75, the authored Crash Site's horizontal scale (tools/import_halo_a30.py);
+    // the retail Crash Site's scale (4.1, CRASH_SITE in tools/import_halo_campaign.py) is in a30.hscb.
     return scenario.loaded && scenario.projection ? scenario.projection->xy : 2.75f;
 }
 
@@ -4666,6 +5230,13 @@ bool haloscenarioobjectvisible(int object)
     return actor && actor->visible;
 }
 
+void haloscenarioobjectdestroyed(int object)
+{
+    // As object_destroy: the object is gone for the scripts (unit_get_health -1, volume tests,
+    // object lists), its cargo set down; the vehicle itself already is.
+    if(scenario.loaded && at(scenario.actors, object) && scenario.actors[object].visible) scenario.setActor(object, false, false);
+}
+
 bool haloscenarioobjectcarried(int object, vec &feet, float &yaw, float *pitch)
 {
     if(!scenario.loaded || scenario.cue || !scenario.projection) return false;
@@ -4692,9 +5263,10 @@ void haloscenariocargodump(const char *label)
     fflush(stdout);
     if(!scenario.loaded) { conoutf("CARGO_QA %s loaded=0", label); fflush(stdout); return; }
     const Scenario &sc = scenario;
-    conoutf("CARGO_QA %s loaded=1 cargo=%d boarded=%s seat=%d player=%.2f,%.2f,%.2f", label, int(sc.cargo.size()),
+    conoutf("CARGO_QA %s loaded=1 cargo=%d boarded=%s seat=%d player=%.2f,%.2f,%.2f scripted=%d held=%d", label, int(sc.cargo.size()),
             at(sc.program.objects, sc.boardedVehicle) ? sc.program.objects[sc.boardedVehicle].name.c_str() : "-", sc.boardedSeat,
-            player1->o.x, player1->o.y, player1->o.z);
+            player1->o.x, player1->o.y, player1->o.z, int(sc.boardedVehicle != noObject && sc.boardedScripted),
+            sc.boardedVehicle != noObject && sc.boardedScripted ? lastmillis - sc.boardedSince : 0);
     for(const auto &entry : sc.cargo)
     {
         const Object &o = sc.program.objects[entry.vehicle];
@@ -4731,6 +5303,68 @@ bool haloscenarioqaboardpoint(const char *object, vec &feet)
     return false;
 }
 bool haloscenarioboarded() { return scenario.loaded && scenario.boardedVehicle != noObject; }
+bool haloscenarioscriptseated() { return haloscenarioboarded() && scenario.boardedScripted; }
+
+// QA (tests/test_ai_attach.py): an ATTACH_QA line per actor ai_attach made of a scripted object,
+// one per object attached in play that has none yet (posed, carried or waiting), and a count.
+void haloscenarioattachdump(const char *label)
+{
+    fflush(stdout);
+    const Scenario &sc = scenario;
+    int count = 0;
+    for(size_t i = 0; sc.loaded && i < sc.squadBots.size(); ++i)
+    {
+        const SquadBot &b = sc.squadBots[i];
+        if(b.object < 0) continue;
+        ++count;
+        const Encounter *e = at(sc.program.encounters, b.encounter);
+        const Squad *s = e ? at(e->squads, b.squad) : nullptr;
+        const bool alive = b.bot && b.bot->state == CS_ALIVE;
+        const vec where = b.bot ? b.bot->o : vec(0, 0, 0);
+        conoutf("ATTACH_QA %s object=%s squad=%s/%s alive=%d gone=%d health=%.2f pos=%.2f,%.2f,%.2f distance=%.2f variant=%d drawn=%d",
+                label, sc.program.objects[b.object].name.c_str(), e ? e->name.c_str() : "-", s ? s->name.c_str() : "-", alive, b.gone,
+                alive ? haloactorhealthfraction(b.bot) : -1.0f, where.x, where.y, where.z, b.bot ? where.dist(player1->o) : -1.0f,
+                b.start ? b.start->variant : -1,
+                storyFigure(sc.program, size_t(b.object), sc.actors[b.object], true) && sc.actors[b.object].visible);
+    }
+    for(size_t i = 0; sc.loaded && i < sc.actors.size() && i < sc.attachedAt.size(); ++i)
+    {
+        const Actor &a = sc.actors[i];
+        if(sc.attachedAt[i] < 0 || a.squadReference < 0 || sc.attachedEntry(int(i)) >= 0) continue;
+        conoutf("ATTACH_QA %s pending=%s visible=%d posed=%d recording=%d riding=%d drawn=%d", label, sc.program.objects[i].name.c_str(),
+                a.visible, a.animation != nullptr, a.recording != nullptr, a.parent >= 0,
+                a.visible && storyFigure(sc.program, i, a, false));
+    }
+    conoutf("ATTACH_QA %s count=%d figures=%d", label, count,
+            int(std::count_if(sc.program.objectFlags.begin(), sc.program.objectFlags.end(), [](unsigned char f) { return (f & OBJECT_STORY_FIGURE) != 0; })));
+    fflush(stdout);
+}
+
+// QA (tests/test_mission_exits.py): the looping sounds playing, the conversations being spoken and
+// those finished, and the gameplay loops a running Call scene will restart.
+void haloscenarioaudiodump(const char *label)
+{
+    fflush(stdout);
+    const Scenario &sc = scenario;
+    std::string loops, talking, restart;
+    for(const auto &item : sc.music) if(!item.ending) loops += (loops.empty() ? "" : ",") + std::to_string(item.id);
+    for(const auto &entry : sc.talking) talking += (talking.empty() ? "" : ",") + std::string(sc.program.conversations[entry.id].name);
+    for(const auto &item : sc.callMusic) restart += (restart.empty() ? "" : ",") + std::to_string(item.id);
+    int finished = 0, playing = 0;
+    for(int status : sc.conversationStatus) { finished += status == 5; playing += status == 2; }
+    conoutf("AUDIO_QA %s loaded=%d scene=%s loops=[%s] talking=[%s] playing=%d finished=%d restart=[%s]", label, sc.loaded,
+            sc.cue ? sc.cue->script : "-", loops.c_str(), talking.c_str(), playing, finished, restart.c_str());
+    fflush(stdout);
+}
+
+// QA: a conversation's status by name (ai_conversation_status), -1 when the mission has none by that name.
+int haloscenarioconversationstatus(const char *name)
+{
+    if(!scenario.loaded) return -1;
+    const int id = named(scenario.program.conversations, name);
+    const int *status = at(scenario.conversationStatus, id);
+    return status ? *status : -1;
+}
 
 const char *haloscenarioboardprompt()
 {

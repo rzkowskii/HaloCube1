@@ -9,6 +9,26 @@ int halodifficulty();
 float halodifficultydamage();
 float halodifficultyhealth();
 void haloscenariostart(int mission, int section, bool preview, bool continuing);
+// A player starting profile of the scenario (.hscb version 9, tools/import_halo_scripts.py
+// profile_rows): the health and shield modifiers (0 leaves them as they are), each weapon's retail
+// tag path ("" none) with its rounds loaded and total, and the grenade counts. Profile 0 is what
+// a mission starts the player with (a10's carries no weapon); scripts add others with
+// player_add_equipment.
+struct HaloStartingProfile
+{
+    std::string name;
+    float health = 0, shield = 0;
+    std::string weapon[2];
+    int loaded[2] = {}, total[2] = {};
+    int frags = 0, plasmas = 0;
+};
+// The loaded mission script's profile `index` (by name when `name` is given and found); false when
+// there is none (no script, or an .hscb older than version 9).
+bool haloscenarioprofile(int index, const char *name, HaloStartingProfile &out);
+// halo.cpp: puts a profile on the player. `reset` replaces what they carry (an empty slot of the
+// profile empties theirs); otherwise its weapons fill empty slots or top up a weapon carried (as
+// player_add_equipment with reset false), and its grenades are added up to the maximum.
+void haloplayeraddequipment(const HaloStartingProfile &profile, bool reset);
 void haloscenariostop();
 void haloscenariotick(int elapsed);
 void haloscenariorevert();
@@ -63,6 +83,9 @@ bool haloscenariotargetstate(const char *name, vec &centre, float &health, bool 
 // A scripted object's state, for the vehicles bound to it (halo_vehicle.cpp): created by the script,
 // and carried by another object or a recording (with its world position and AssaultCube yaw).
 bool haloscenarioobjectvisible(int object);
+// A vehicle the engine drives for `object` blew up (halo_vehicle.cpp halovehiclehit): the object
+// is destroyed for the scripts, as object_destroy does.
+void haloscenarioobjectdestroyed(int object);
 // `pitch`, when given, gets the carried pose's pitch in degrees (nose up positive): a Banshee on a
 // recorded flight climbs and dives with it.
 bool haloscenarioobjectcarried(int object, vec &feet, float &yaw, float *pitch = nullptr);
@@ -75,6 +98,10 @@ bool haloscenariocarried(const playerent *unit);
 bool haloscenarioboard();
 const char *haloscenarioboardprompt();
 bool haloscenarioboarded();
+// The player is held in a seat by the script (unit_enter_vehicle of the player into a vehicle the
+// engine does not drive: a10's cryotube, the insertion Pelicans when a script seats the player
+// outside a scene): E does not get out; unit_exit_vehicle (or halo_scriptseatmax) lets them out.
+bool haloscenarioscriptseated();
 // QA (tests/native/vehicle_qa.inc): one CARGO_QA line per rider or walker and per scripted vehicle
 // object that is visible (drawn, boardable, on a recording); and the feet beside the best rider
 // seat of `object` for a boarding test.
@@ -116,6 +143,11 @@ unsigned haloscenarioprogramhash();               // FNV-1a of the loaded .hscb 
 unsigned haloscenariofilehash(int mission);       // of packages/halo/<cache>.hscb on disk, 0 when missing
 const char *haloscenarioobjectname(int object);   // a script object's name, "" when none
 bool haloscenariobotsuspended(const playerent *bot);
+// QA probes (tests/native): the actors ai_attach made (ATTACH_QA lines), the script's audio
+// (AUDIO_QA: loops, conversations, the loops a Call scene restarts), and a conversation's status.
+void haloscenarioattachdump(const char *label);
+void haloscenarioaudiodump(const char *label);
+int haloscenarioconversationstatus(const char *name);
 void haloscenarioremovebot(const playerent *bot);
 
 #endif

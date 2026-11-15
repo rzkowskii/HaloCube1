@@ -282,3 +282,36 @@ COMMANDF(qa_vehicle_flown, "", ()
     conoutf("VEHICLE_QA flown mission=%d section=%d flown=%d", mission + 1, section + 1, flownSection());
     fflush(stdout);
 });
+
+// Vehicle damage (tests/test_vehicle_damage.py). qa_vehicle_damage deals AMOUNT points to vehicle N
+// as the player would (no jpt! material modifier; EXPLOSIVE 1 as a blast), logging what it took and
+// its VEHICLE_HEALTH row; qa_vehicle_aim turns the player to face vehicle N's body box (to fire the
+// player's own weapon at it); qa_vehicle_protect 1 keeps every vehicle from harm (halo_vehicledamage 0).
+COMMANDF(qa_vehicle_damage, "ifi", (int *vehicle, float *amount, int *explosive)
+{
+    const float taken = halovehicleqadamage(*vehicle, *amount, *explosive != 0);
+    conoutf("VEHICLE_QA damage vehicle=%d amount=%.2f explosive=%d taken=%.3f", *vehicle, *amount, *explosive, taken);
+    halovehicledump("damage");
+});
+COMMANDF(qa_vehicle_aim, "i", (int *vehicle)
+{
+    vec centre;
+    const bool ok = halovehiclecentre(*vehicle, centre);
+    if(ok)
+    {
+        const vec delta = vec(centre).sub(player1->o);
+        float yaw = atan2f(delta.x, -delta.y) / RAD;
+        if(yaw < 0) yaw += 360;
+        player1->yaw = yaw;
+        player1->pitch = clamp(atan2f(delta.z, max(.01f, delta.magnitudexy())) / RAD, -89.0f, 89.0f);
+    }
+    conoutf("VEHICLE_QA aim vehicle=%d ok=%d distance=%.2f", *vehicle, ok, ok ? centre.dist(player1->o) : -1.0f);
+    fflush(stdout);
+});
+COMMANDF(qa_vehicle_protect, "i", (int *on)
+{
+    extern int halo_vehicledamage;
+    halo_vehicledamage = *on ? 0 : 1;
+    conoutf("VEHICLE_QA protect=%d", halo_vehicledamage ? 0 : 1);
+    fflush(stdout);
+});

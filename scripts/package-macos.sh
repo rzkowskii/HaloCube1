@@ -20,12 +20,13 @@ PYTHONPATH="$root/tools" python3 - "$packages" "$partial" <<'PYTHON'
 from pathlib import Path
 import sys
 
-from import_halo_campaign import MISSIONS, STOCK_SECTIONS, VALIDATED_COLLISION
+from import_halo_campaign import CRASH_SITE, MISSIONS, STOCK_SECTIONS, VALIDATED_COLLISION
 
 packages = Path(sys.argv[1])
 partial = sys.argv[2] == '1'
 missing = []
-for asset in ('maps/halo_a30.cgz', 'maps/halo_a30.cfg', 'maps/halo_a30.mesh',
+# The Crash Site plays on retail collision when it is imported from the retail BSP (CRASH_SITE).
+for asset in ('maps/halo_a30.cgz', 'maps/halo_a30.cfg', 'maps/halo_a30.mesh') + (('maps/halo_a30.hcol',) if CRASH_SITE else ()) + (
               'textures/halo_a30/cliff.png', 'models/halo/ma5b/tris.md3', 'audio/halo/ma5b-fire.wav'):
     if not (packages / asset).is_file():
         missing.append(asset)

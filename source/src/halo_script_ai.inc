@@ -228,7 +228,12 @@
             {
                 if(!scene) eachUnit(index(0), [&](playerent *unit) { if(SquadBot *bot = squadBotOf(unit)) migrateBot(*bot, target); });
             }
-            else if(Actor *unit = scripted(object(0))) unit->squadReference = target;
+            else if(Actor *unit = scripted(object(0)))
+            {
+                unit->squadReference = target;
+                // In play, ai_attach turns the scripted biped into an actor of the squad (attachActors).
+                if(!scene && is("ai_attach") && at(attachedAt, object(0))) attachedAt[object(0)] = tick;
+            }
             return handled();
         }
         if(is("ai_attach_free") || is("ai_detach"))
@@ -449,10 +454,13 @@
             const int id = object(enter ? 1 : 0);
             if(!halovehiclebound(id))
             {
-                // A dropship or Pelican: the actors ride at its seats until vehicle_unload.
+                // A dropship or Pelican: the actors ride at its seats until vehicle_unload. The
+                // player (unit_enter_vehicle (player0) ...: a10's cryotube, an insertion Pelican
+                // outside a scene) is held in the seat until unit_exit_vehicle (seatPlayer).
                 if(scene || !scriptVehicle(id)) return false;
                 bool loaded = false;
-                for(playerent *unit : units(index(enter ? 0 : 2))) if(unit != player1) loaded |= loadCargo(id, text(enter ? 2 : 1), unit, false);
+                for(playerent *unit : units(index(enter ? 0 : 2)))
+                    loaded |= unit == player1 ? enter && seatPlayer(id, text(2)) : loadCargo(id, text(enter ? 2 : 1), unit, false);
                 return loaded ? answer(1) : false;
             }
             bool loaded = false;
@@ -469,6 +477,14 @@
             bool released = false;
             for(playerent *unit : units(index(0)))
             {
+                // Out of the seat the script held the player in (not in a scene: a scene's player
+                // is off stage, and the scene's end hands them back).
+                if(unit == player1 && !scene && boardedVehicle != noObject && boardedScripted)
+                {
+                    unseatScripted("unit_exit_vehicle");
+                    released = true;
+                    continue;
+                }
                 released |= halovehicleunseat(unit);
                 // Out of a dropship or Pelican too.
                 for(size_t i = 0; i < cargo.size(); ++i)
@@ -635,6 +651,39 @@
         return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
     }
 
+    // A marker of the object's model (its .hscb markers, bind pose) in the section's coordinates.
+    bool Scenario::markerWorld(int vehicle, int marker, vec &point) const
+    {
+        if(!projection || !at(actors, vehicle) || !at(program.objects, vehicle)) return false;
+        const Flag *flag = at(program.objects[vehicle].markers, marker);
+        if(!flag) return false;
+        Pose pose = currentActor(vehicle);
+        pose.position.add(poseOffset(vec(flag->pose.position).mul(actors[vehicle].scale), pose));
+        point = toWorld(*projection, pose.position);
+        return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+    }
+
+    // The seat's camera marker: "camera <seat marker>" (the Pelican's passenger seats), else the
+    // model's "camera" (the cryotube), when it is within a world unit and a half of the seat
+    // marker; -1 when there is none.
+    int Scenario::cameraMarker(int vehicle, int seat) const
+    {
+        const Object *o = at(program.objects, vehicle);
+        const Seat *s = o ? at(o->seats, seat) : nullptr;
+        if(!o || !s) return -1;
+        const Flag *seatFlag = at(o->markers, named(o->markers, s->marker.c_str()));
+        auto find = [&](const std::string &name)
+        {
+            for(size_t i = 0; i < o->markers.size(); ++i) if(!strcasecmp(o->markers[i].name.c_str(), name.c_str())) return int(i);
+            return -1;
+        };
+        int camera = find("camera " + s->marker);
+        if(camera < 0) camera = find("camera " + s->name);
+        if(camera < 0) camera = find("camera");
+        if(camera < 0 || (seatFlag && o->markers[camera].pose.position.dist(seatFlag->pose.position) > 1.5f)) return -1;
+        return camera;
+    }
+
     // The first seat of that name nobody rides in or walks to (or -1). A vehicle without seats
     // in the table takes one rider at its middle (seat -1) per call.
     int Scenario::freeSeat(int vehicle, const char *seat) const
@@ -742,8 +791,34 @@
             vec seat;
             const Actor *vehicle = at(actors, boardedVehicle);
             if(vehicle && vehicle->visible && seatWorld(boardedVehicle, boardedSeat, seat)) boardedAt = seat;
-            if(player1->state != CS_ALIVE) { boardedVehicle = noObject; boardedSeat = -1; return; }
-            player1->o = vec(boardedAt).add(vec(0, 0, player1->eyeheight * .45f));
+            if(player1->state != CS_ALIVE) { boardedVehicle = noObject; boardedSeat = -1; boardedScripted = false; boardedCamera = -1; return; }
+            // The guard against a script that never lets the player out of its seat.
+            if(boardedScripted && halo_scriptseatmax > 0 && lastmillis - boardedSince > halo_scriptseatmax * 1000)
+            {
+                unseatScripted("held too long (halo_scriptseatmax)");
+                return;
+            }
+            // Something else moved the player since the last frame put them in the scripted seat
+            // (a QA hook's teleport, a debugging command): the seat lets them go where they were put,
+            // rather than pulling them back every frame.
+            if(boardedScripted && boardedPutValid && projection && player1->o.dist(boardedPut) > 1.5f * projection->xy)
+            {
+                conoutf("Halo: the scripted seat lets the player out (moved elsewhere, after %.1f s)", (lastmillis - boardedSince) / 1000.0f);
+                boardedVehicle = noObject;
+                boardedSeat = -1;
+                boardedScripted = false;
+                boardedCamera = -1;
+                // No haloplayermoved: whatever moved them says what the move was (a QA teleport
+                // calls it; qa_retail_recover stands in for a fall and must leave the safe floors).
+                return;
+            }
+            // A scripted seat's eye is its camera marker (the view from the cryotube, the Pelican's bay).
+            vec eye;
+            if(boardedScripted && boardedCamera >= 0 && vehicle && vehicle->visible && markerWorld(boardedVehicle, boardedCamera, eye))
+                player1->o = eye;
+            else player1->o = vec(boardedAt).add(vec(0, 0, player1->eyeheight * .45f));
+            boardedPut = player1->o;
+            boardedPutValid = true;
             player1->vel = vec(0, 0, 0);
             player1->onfloor = true;
             player1->timeinair = 0;
@@ -786,6 +861,8 @@
 
     bool Scenario::board()
     {
+        // A seat the script holds the player in: E does nothing (Halo's cryotube and Pelican rides).
+        if(boardedVehicle != noObject && boardedScripted) return true;
         if(boardedVehicle != noObject) { unboard(false); return true; }
         int seat;
         const int id = boardCandidate(seat);
@@ -801,6 +878,60 @@
         return true;
     }
 
+    // unit_enter_vehicle of the player into a vehicle the engine does not drive, outside a scene
+    // (a10's cryotube, ct-driver; an insertion Pelican's p-riderlf): the player is held at the seat
+    // marker as a boarded rider is (updateCargo carries them with the vehicle, the view is the
+    // eye at the seat), E does not get out and the seat ends at unit_exit_vehicle (unseatScripted).
+    // halo_scriptseat 0 ignores it, as before.
+    bool Scenario::seatPlayer(int vehicle, const char *seatName)
+    {
+        const Object *o = at(program.objects, vehicle);
+        if(!halo_scriptseat || !o || !actors[vehicle].visible || player1->state != CS_ALIVE || halovehicleseated()) return false;
+        int seat = -1;
+        for(size_t i = 0; i < o->seats.size() && seat < 0; ++i) if(seatNamed(o->seats[i], seatName)) seat = int(i);
+        // A vehicle with no seats in the table takes the player at its middle (seat -1).
+        if(seat < 0 && !o->seats.empty()) return false;
+        vec seatPoint;
+        if(!seatWorld(vehicle, seat, seatPoint)) return false;
+        if(boardedVehicle != noObject) unboard(false);
+        boardedFrom = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        boardedAt = boardedStart = seatPoint;
+        boardedVehicle = vehicle;
+        boardedSeat = seat;
+        boardedScripted = true;
+        boardedSince = lastmillis;
+        boardedPutValid = false;
+        boardedCamera = cameraMarker(vehicle, seat);
+        // Facing the way the camera marker looks (the Pelican's riders look out of its side).
+        const Flag *camera = at(o->markers, boardedCamera);
+        vec eye, ahead;
+        if(camera && markerWorld(vehicle, boardedCamera, eye))
+        {
+            Pose pose = currentActor(vehicle);
+            Pose look = camera->pose;
+            const vec forward = poseOffset(poseOffset(vec(1, 0, 0), look), pose);
+            pose.position.add(poseOffset(vec(camera->pose.position).mul(actors[vehicle].scale), pose)).add(forward);
+            ahead = toWorld(*projection, pose.position).sub(eye);
+            if(ahead.magnitudexy() > 1e-3f) player1->yaw = fmodf(atan2f(ahead.y, ahead.x) / RAD + 90.0f + 360.0f, 360.0f);
+        }
+        player1->attacking = false;
+        player1->stopmoving();
+        haloplayermoved("into a scripted seat", &boardedFrom);
+        conoutf("Halo: the script seats the player in %s (%s)", o->name.c_str(), seat >= 0 ? o->seats[seat].name.c_str() : "-");
+        return true;
+    }
+
+    // Out of the scripted seat: where the seat is when the vehicle carried the player off (a
+    // Pelican ride), else back where they stood when seated (a10's cryotube: the start in front of
+    // it; the tutorial then teleports the player to tutorial_exit_cryotube_flag).
+    void Scenario::unseatScripted(const char *why)
+    {
+        if(boardedVehicle == noObject || !boardedScripted) return;
+        const bool carried = projection && boardedAt.dist(boardedStart) > 2.0f * projection->xy;
+        conoutf("Halo: the scripted seat lets the player out (%s, after %.1f s)", why, (lastmillis - boardedSince) / 1000.0f);
+        unboard(carried);
+    }
+
     // Out again: back where they got in (`keepPlace`: where the seat last was, the vehicle gone).
     void Scenario::unboard(bool keepPlace)
     {
@@ -808,6 +939,8 @@
         const vec feet = keepPlace ? boardedAt : boardedFrom;
         boardedVehicle = noObject;
         boardedSeat = -1;
+        boardedScripted = false;
+        boardedCamera = -1;
         if(player1->state != CS_ALIVE) return;
         player1->o = vec(feet).add(vec(0, 0, player1->eyeheight));
         player1->vel = vec(0, 0, 0);
@@ -822,5 +955,7 @@
         cargo.clear();
         boardedVehicle = noObject;
         boardedSeat = -1;
+        boardedScripted = false;
+        boardedCamera = -1;
     }
 

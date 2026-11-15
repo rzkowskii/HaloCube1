@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import math
 import mmap
 from pathlib import Path
+import re
 import struct
 import subprocess
 import unicodedata
@@ -16,7 +17,7 @@ from halo_cast import cast_metadata, damage_target
 from halo_devices import device_rows
 from halo_recordings import decode
 from import_halo_a30 import HaloMap, ORIGIN_X, ORIGIN_Y, SOURCE_FLOOR, HORIZONTAL_SCALE, VERTICAL_SCALE, MARGIN
-from import_halo_campaign import ACTORS, MISSIONS, section_layout
+from import_halo_campaign import ACTORS, CRASH_SITE, CRASH_SITE_KEY, CRASH_SITE_MISSION, MISSIONS, section_layout
 
 NIL = 0xffffffff
 OBJECT_BLOCKS = {
@@ -320,6 +321,166 @@ def squad_rows(halo, actors=None):
         yield name, team, bsp, squads, (positions, platoons, squad_ai)
 
 
+def profile_rows(halo):
+    """The scenario's player starting profiles (version 9): name, starting health and shield
+    modifiers, the primary and secondary weapon tags with their rounds loaded and total, and the
+    frag and plasma grenade counts. The weapons are written as tag paths, which the engine resolves
+    against weapons.txt when it applies a profile (haloweaponfind), so a regenerated weapons table
+    keeps them right. Profile 0 is the one the game gives the player at a mission's start; scripts
+    add the others with player_add_equipment (a10's bridge0_profile, c20's easy_start)."""
+    t, s = halo.tags, halo.scenario
+
+    def weapon(address):
+        tag = halo.reference(t, address)
+        return tag.name if tag and tag.group == 'weap' else ''
+
+    for p in t.block(s + 840, 104):
+        health, shield = (v if math.isfinite(v) else 0.0 for v in t.read('2f', p + 32))
+        frags, plasmas = (max(0, v) for v in t.read('2b', p + 80))
+        yield (t.name(p, 32), health, shield, weapon(p + 40), *t.read('2h', p + 56),
+               weapon(p + 60), *t.read('2h', p + 76), frags, plasmas)
+
+
+def squad_default_rows(halo, actors=None):
+    """Per encounter, per squad (squad_rows order): the squad's default actor variant as an ACTORS
+    kind (-1 when not one of those) and an actors.txt index (-1 when unknown). Version 9: what
+    ai_attach turns a scripted biped into (a squad attached to may have no starting locations)."""
+    t, s = halo.tags, halo.scenario
+    palette = t.block(s + 1056, 16)
+    actors = actors or {}
+    for encounter in t.block(s + 1068, 176):
+        rows = []
+        for squad in t.block(encounter + 128, 232):
+            default, = t.read('h', squad + 32)
+            actor = halo.reference(t, palette[default]) if 0 <= default < len(palette) else None
+            family = actor.name.split('\\')[1] if actor and '\\' in actor.name else ''
+            rows.append((ACTORS.get(family, -1), actors.get(actor.name, -1) if actor else -1))
+        yield rows
+
+
+def cue_scripts(mission_index):
+    """The scene scripts the engine plays on its scene stage for a mission (the cue table of
+    source/src/halo_script.cpp, read the way tests/test_campaign_tables.py reads it): script name
+    to trigger (Entry, Exit, Timeout, Cartographer, Call)."""
+    source = Path(__file__).resolve().parent.parent / 'source/src/halo_script.cpp'
+    rows = re.findall(r'\{(\d+), (-?\d+), (\d+), "(\w+)", SceneTrigger::(\w+)', source.read_text())
+    if not rows:
+        raise SystemExit(f'{source}: the scene cue table was not found (story figures need it)')
+    return {name: trigger for mission, _, _, name, trigger in rows if int(mission) == mission_index}
+
+
+def story_figures(program, cues):
+    """Version 9 object flag 1: the scripted figures the engine draws outside scenes. A biped (not
+    placed dead: corpses and bodies stay undrawn) or a character posed as scenery (a tag under
+    characters\\: d20's keyes_flood) that a gameplay script creates, or that a Call scene creates
+    and leaves alive for the play after it (d40's cortana, made by bridge_1 inside cinematic_bridge
+    and destroyed by chief_duck). Gameplay scripts are the startup and continuous scripts that are
+    not scene cues and what they reach through static calls and wake, without entering a cue script
+    (as the engine runs them: a cue script's calls play on the scene stage, and so do the scripts a
+    scene wakes). This replaces the engine's keyes, cortana and monitor name prefixes, which drew
+    figures only scenes use in bind poses and could duplicate the c20 Monitor actor."""
+    halo = program.halo
+    t, s = halo.tags, halo.scenario
+    nodes = program.nodes
+    names = [row[0] for row in program.scripts]
+    entries = t.block(s + 516, 36)
+    objects = [t.name(p, 32) for p in entries]
+    kinds = [t.read('h', p + 32)[0] for p in entries]
+
+    def node(datum):
+        return nodes[datum & 0xffff]
+
+    def children(datum):
+        out, it = [], node(datum)[6]
+        while it != NIL and len(out) < 4096:
+            out.append(it)
+            it = node(it)[4]
+        return out
+
+    def walk(datum, visit, depth=0):
+        n = node(datum)
+        if n[3] & 1 or depth > 64:
+            return
+        kids = children(datum)
+        if not kids:
+            return
+        if n[3] & 2:
+            visit('call', n[1], ())
+            return
+        name, args = program.text(node(kids[0])[5]), kids[1:]
+        visit(name, None, args)
+        for arg in args:
+            walk(arg, visit, depth + 1)
+
+    def targets(name, args):
+        if not args:
+            return []
+        literal = program.text(node(args[0])[5])
+        if name in ('object_create', 'object_create_anew', 'object_destroy'):
+            return [objects.index(literal)] if literal in objects else []
+        if name in ('object_create_containing', 'object_create_anew_containing', 'object_destroy_containing'):
+            return [i for i, o in enumerate(objects) if literal and literal in o]
+        return []
+
+    def creates(name):
+        return name.startswith('object_create')
+
+    created, seen = set(), set()
+    pending = [i for i, (name, kind, *_) in enumerate(program.scripts) if kind in (0, 2) and name not in cues]
+    while pending:
+        index = pending.pop()
+        if index in seen or index >= len(names):
+            continue
+        seen.add(index)
+
+        def gameplay(name, script, args):
+            if name == 'call':
+                if script < len(names) and names[script] not in cues and program.scripts[script][1] != 4:
+                    pending.append(script)
+            elif name == 'wake' and args:
+                woken = node(args[0])[6] & 0xffff
+                if woken < len(names) and names[woken] not in cues:
+                    pending.append(woken)
+            elif creates(name):
+                created.update(targets(name, args))
+        walk(program.scripts[index][3], gameplay)
+    # A Call scene's objects in the order its script (and the static scripts it calls) runs.
+    for name, kind, _, root in program.scripts:
+        if cues.get(name) != 'Call':
+            continue
+        alive = {}
+
+        def run(datum, depth):
+            def scene(command, script, args):
+                if command == 'call':
+                    if depth < 8 and script < len(names):
+                        run(program.scripts[script][3], depth + 1)
+                    return
+                for o in targets(command, args):
+                    alive[o] = creates(command)
+            walk(datum, scene)
+        run(root, 0)
+        created.update(o for o, live in alive.items() if live)
+    figures = set()
+    for index in created:
+        kind = kinds[index]
+        placements = OBJECT_BLOCKS.get(kind)
+        tag, dead = None, False
+        if placements and (entry := t.read('h', entries[index] + 34)[0]) >= 0:
+            points = t.block(s + placements[0], placements[1])
+            palette = t.block(s + placements[2], 48)
+            if entry < len(points) and t.read('h', points[entry] + 2)[0] == index:
+                variant, = t.read('h', points[entry])
+                tag = halo.reference(t, palette[variant]) if 0 <= variant < len(palette) else None
+                # Unit placement flags (after the object fields): bit 0 dead.
+                dead = kind == 0 and bool(t.read('I', points[entry] + 76)[0] & 1)
+        if kind == 0 and not dead:
+            figures.add(index)
+        elif kind == 6 and tag and tag.name.lower().startswith('characters\\'):
+            figures.add(index)
+    return figures
+
+
 def command_lists(halo):
     """Scenario command lists: name, flags, atoms and points (retail coordinates)."""
     t, s = halo.tags, halo.scenario
@@ -329,13 +490,13 @@ def command_lists(halo):
         yield t.name(entry, 32), t.read('I', entry + 32)[0], atoms, points
 
 
-def write_program(program, mission, output, objects, animations, sounds, conversations, loops, worlds, devices):
+def write_program(program, mission, output, objects, animations, sounds, conversations, loops, worlds, devices, figures=()):
     h = program.halo
     t, s = h.tags, h.scenario
     path = output / f'{mission.cache}.hscb'
     out = Writer(path.with_suffix('.tmp'))
     try:
-        out.write('4sI', b'HSCB', 8)
+        out.write('4sI', b'HSCB', 9)
         table(out, program.nodes, lambda *v: out.write('4H3I', *v))
         out.write('I', len(program.strings))
         out.file.write(program.strings)
@@ -386,14 +547,22 @@ def write_program(program, mission, output, objects, animations, sounds, convers
         projections = []
         for part, bsp in enumerate(mission.sections):
             if mission.cache == 'a30' and part == 0:
-                projections.append((bsp, ORIGIN_X, ORIGIN_Y, SOURCE_FLOOR, HORIZONTAL_SCALE, VERTICAL_SCALE, MARGIN))
+                # The engine's first a30 section is the Crash Site (halo_a30): imported from the retail
+                # BSP on its own uniform layout (import_halo_campaign.CRASH_SITE), or the authored map's
+                # non-uniform projection (tools/import_halo_a30.py).
+                if CRASH_SITE:
+                    crash = section_layout(h, CRASH_SITE_MISSION, 0, CRASH_SITE_KEY)[-1]
+                    projections.append((bsp, crash.x0, crash.y0, crash.z0, crash.scale, crash.scale, 9))
+                else:
+                    projections.append((bsp, ORIGIN_X, ORIGIN_Y, SOURCE_FLOOR, HORIZONTAL_SCALE, VERTICAL_SCALE, MARGIN))
             projection = section_layout(h, mission, part)[-1]
             projections.append((bsp, projection.x0, projection.y0, projection.z0, projection.scale, projection.scale, 9))
         table(out, projections, lambda *v: out.write('H6f', *v))
         table(out, [(i,) for i in worlds], lambda i: out.write('H', i))
         table(out, list(hud_rows(h)), lambda name, text: (out.text(name), out.text(text)))
         table(out, [t.read('f', p + 32) for p in t.block(s + 648, 52)], lambda value: out.write('f', value))
-        encounters = list(squad_rows(h, actors=actor_index(output.parent.parent)))
+        actors = actor_index(output.parent.parent)
+        encounters = list(squad_rows(h, actors=actors))
         table(out, encounters, lambda name, team, bsp, squads, ai:
               (out.text(name), out.write('2h', team, bsp), table(out, squads, lambda name, platoon, starts:
                (out.text(name), out.write('h', platoon), table(out, starts, lambda *v: out.write('h4f', *v))))))
@@ -424,6 +593,14 @@ def write_program(program, mission, output, objects, animations, sounds, convers
         table(out, list(command_lists(h)), lambda name, flags, atoms, points:
               (out.text(name), out.write('I', flags), table(out, atoms, lambda *v: out.write('2h2f7h', *v)),
                table(out, points, lambda *v: out.write('3f', *v))))
+        # Version 9: the player starting profiles, each squad's default variant (ai_attach), and a
+        # flags byte per object (1: a story figure drawn outside scenes, story_figures).
+        table(out, list(profile_rows(h)), lambda name, health, shield, primary, loaded, total,
+              secondary, loaded2, total2, frags, plasmas:
+              (out.text(name), out.write('2f', health, shield), out.text(primary), out.write('2h', loaded, total),
+               out.text(secondary), out.write('2h', loaded2, total2), out.write('2B', min(frags, 255), min(plasmas, 255))))
+        table(out, [(rows,) for rows in squad_default_rows(h, actors)], lambda squads: table(out, squads, lambda *v: out.write('2h', *v)))
+        table(out, [(1 if i in figures else 0,) for i in range(len(objects))], lambda flags: out.write('B', flags))
     finally:
         out.file.close()
     path.with_suffix('.tmp').replace(path)
@@ -583,9 +760,12 @@ def convert(job):
         worlds = export_worlds(halo, output, rebuild)
         objects, clips = export_cast(program, output, rebuild)
         devices = list(device_rows(halo, output, rebuild, model_pack_scale))
-        write_program(program, mission, out, objects, clips, sounds, conversations, loops, worlds, devices)
+        figures = story_figures(program, cue_scripts([m.cache for m in MISSIONS].index(mission.cache)))
+        write_program(program, mission, out, objects, clips, sounds, conversations, loops, worlds, devices, figures)
         print(f'{mission.cache}: {len(program.scripts)} scripts, {len(sounds)} sound tags, {len(conversations)} conversations, '
-              f'{len(worlds)} BSPs, {len(clips)} animation clips, {len(devices)} devices', flush=True)
+              f'{len(worlds)} BSPs, {len(clips)} animation clips, {len(devices)} devices, '
+              f'{len(list(profile_rows(halo)))} starting profiles, story figures: '
+              f'{", ".join(sorted(objects[i][0] for i in figures)) or "none"}', flush=True)
 
 
 def main():

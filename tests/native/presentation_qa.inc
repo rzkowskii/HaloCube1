@@ -80,3 +80,18 @@ COMMANDF(qa_fx_face_actor, "", ()
     conoutf("FX_QA face %s distance=%.2f", target->name, sqrtf(best));
     fflush(stdout);
 });
+
+// AUDIO_QA (tests/test_mission_exits.py): the script's loops and conversations; QA_CONVERSATION one status.
+COMMANDF(qa_audio_state, "s", (const char *label) { haloscenarioaudiodump(label); });
+COMMANDF(qa_conversation_state, "s", (const char *name)
+{
+    conoutf("QA_CONVERSATION %s %d", name, haloscenarioconversationstatus(name));
+    fflush(stdout);
+});
+
+// qa_fx_yaw DEGREES: turns the player (and so a turret they man) by that much at once; scheduled
+// every 100 ms it turns them at ten times that rate (the turret engine loop's 15 degrees a second).
+COMMANDF(qa_fx_yaw, "f", (float *degrees)
+{
+    player1->yaw = fmodf(player1->yaw + *degrees + 360.0f, 360.0f);
+});

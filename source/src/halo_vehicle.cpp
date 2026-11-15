@@ -38,6 +38,10 @@ VAR(halo_vehiclecollide, 0, 1, 1);
 VAR(halo_vehicletrace, 0, 0, 1);
 // Actors at the controls drive and fly their vehicles (0: they sit still, for checking).
 VAR(halo_vehicleai, 0, 1, 1);
+// Vehicles with a body vitality (the Wraith; the Ghost and the Banshee while someone rides them)
+// take damage and are destroyed (0: none is hurt; the QA vehicle walker sets it, as the foot
+// walker protects the player).
+VAR(halo_vehicledamage, 0, 1, 1);
 
 namespace
 {
@@ -57,6 +61,7 @@ namespace
         std::string name, marker;
         vec at, enter;                          // model frame, Halo units
         int role = HALO_SEAT_PASSENGER;
+        unsigned flags = 0;                     // retail unit seat flags (1 invisible: inside the hull)
     };
 
     struct VehicleDef
@@ -75,7 +80,17 @@ namespace
         // The tag's sounds (`sound` lines): the engine's loop while someone drives (a turret's
         // while its gunner turns it), the crash and the suspension's thump on a hard landing.
         std::string engineSound, crashSound, suspensionSound;
+        // The collision model (`vitality` line): body vitality (0 indestructible: the Warthog, the
+        // Scorpion, the turret), the coll flags (collOnlyExplosives, collOnlyOccupied,
+        // collTakesRiderDamage), the retail material type the jpt! modifiers are looked up by
+        // and its body multiplier; the body depleted effect (`destroyed`); the actor variant an
+        // actor at its gun fights as (`variant`: its damage modifier and firing error).
+        float vitality = 0, bodyMultiplier = 1;
+        unsigned collFlags = 0;
+        int material = -1;
+        std::string destroyedEffect, variantPath;
     };
+    constexpr unsigned collTakesRiderDamage = 2, collOnlyExplosives = 32, collOnlyOccupied = 64;
 
     struct Vehicle
     {
@@ -114,6 +129,10 @@ namespace
         float loopYaw = 0;                      // a turret's yaw when its turning loop last checked
         int loopYawAt = 0, loopTurnedAt = 0;    // when it last checked, and last turned fast enough
         float loopLevel = 0;                    // how fast it turned then (0.3..1)
+        // Body health, 1 whole to 0 (halovehiclehit; only vehicles with a body vitality lose it).
+        // `destroyed`: it blew up (it no longer exists; the scripts' object is gone too).
+        float health = 1;
+        bool destroyed = false;
     };
 
     std::vector<VehicleDef> defs;
@@ -208,6 +227,7 @@ namespace
     {
         if(!finiteValue(d.modelScale) || d.modelScale <= 0 || !finiteValue(d.radius) || d.radius < 0) return false;
         for(float f : {d.forward, d.reverse, d.acceleration, d.deceleration, d.turn, d.slide}) if(!finiteValue(f)) return false;
+        if(!finiteValue(d.vitality) || d.vitality < 0 || !finiteValue(d.bodyMultiplier)) return false;
         if(!finiteValue(d.low) || !finiteValue(d.high) || !finiteValue(d.camera)) return false;
         loopi(3) if(d.high[i] <= d.low[i] || d.high[i] - d.low[i] > 100) return false;
         for(const SeatDef &s : d.seats) if(!finiteValue(s.at) || !finiteValue(s.enter)) return false;
@@ -256,10 +276,17 @@ namespace
             {
                 SeatDef s;
                 ok = bool(in >> s.name >> s.marker >> s.at.x >> s.at.y >> s.at.z >> s.enter.x >> s.enter.y >> s.enter.z);
+                // The seat flags follow in newer tables.
+                unsigned flags = 0;
+                if(ok && in >> flags) s.flags = flags;
                 s.role = seatRole(s.name, s.marker);
                 if(ok && def->seats.size() < size_t(maxSeats)) def->seats.push_back(s);
             }
             else if(key == "camera") ok = bool(in >> def->camera.x >> def->camera.y >> def->camera.z);
+            else if(key == "vitality")
+                ok = bool(in >> def->vitality >> def->collFlags >> def->material >> def->bodyMultiplier) && def->vitality >= 0;
+            else if(key == "destroyed") std::getline(in >> std::ws, def->destroyedEffect);
+            else if(key == "variant") std::getline(in >> std::ws, def->variantPath);
             else if(key == "sound")
             {
                 // Unknown roles are skipped, so a newer table still loads.
@@ -521,11 +548,11 @@ namespace
             {
                 const vec feet = vec(pos).add(vec(f).mul(d.centre + along)).add(vec(0, 0, d.step));
                 HaloCollisionHit hit;
-                if(!delta.iszero() && halocollisionsweep(feet, delta, radius, height, hit) && hit.normal.z < .3f)
+                if(!delta.iszero() && halocollisionsweep(feet, delta, radius, height, hit, false) && hit.normal.z < .3f)
                 {
                     // Already embedded (a spawn on a seam): let it move out rather than stick.
                     HaloCollisionHit inside;
-                    if(hit.fraction <= 0 && halocollisionoverlap(feet, radius, height, inside) && inside.penetration > .05f) continue;
+                    if(hit.fraction <= 0 && halocollisionoverlap(feet, radius, height, inside, false) && inside.penetration > .05f) continue;
                     blocked = true;
                     if(hit.fraction < best) { best = hit.fraction; normal = hit.normal; }
                 }
@@ -912,11 +939,11 @@ namespace
             {
                 const vec feet = vec(pos).add(vec(f).mul(d.centre + along)).add(vec(0, 0, .05f));
                 HaloCollisionHit hit;
-                if(!delta.iszero() && halocollisionsweep(feet, delta, radius, height, hit))
+                if(!delta.iszero() && halocollisionsweep(feet, delta, radius, height, hit, false))
                 {
                     // Already embedded (spawned on a seam): let it move out rather than stick.
                     HaloCollisionHit inside;
-                    if(hit.fraction <= 0 && halocollisionoverlap(feet, radius, height, inside) && inside.penetration > .05f) continue;
+                    if(hit.fraction <= 0 && halocollisionoverlap(feet, radius, height, inside, false) && inside.penetration > .05f) continue;
                     blocked = true;
                     if(hit.fraction < best) { best = hit.fraction; normal = hit.normal; }
                 }
@@ -1049,7 +1076,7 @@ namespace
             {
                 HaloCollisionHit hit;
                 const vec feet = vec(pos).add(vec(f).mul(d.centre + along)).add(vec(0, 0, d.step));
-                if(halocollisionoverlap(feet, radius, height, hit) && hit.penetration > .05f) return false;
+                if(halocollisionoverlap(feet, radius, height, hit, false) && hit.penetration > .05f) return false;
             }
             return true;
         }
@@ -1338,6 +1365,8 @@ namespace
     {
         for(playerent *&p : v.riders) if(p && p != player1) p = nullptr;
         v.exists = exists;
+        v.health = 1;
+        v.destroyed = false;
         v.carried = false;
         v.gun = HaloWeaponState();
         settle(v, v.spawnFeet);
@@ -1414,7 +1443,7 @@ namespace
         {
             HaloCollisionHit hit;
             const vec feet = vec(v.pos).add(vec(f).mul(d.centre + along)).add(vec(0, 0, lift));
-            if(halocollisionoverlap(feet, radius, height, hit) && hit.penetration > .1f) return true;
+            if(halocollisionoverlap(feet, radius, height, hit, false) && hit.penetration > .1f) return true;
         }
         return false;
     }
@@ -1801,6 +1830,40 @@ namespace
         return haloweapon(v.gun.def);
     }
 
+    // The actor variant an actor seated at this vehicle's gun fights as (actors.txt: "vehicles\
+    // banshee\banshee pilot", "... c gun turret gunner"), or null. As in Halo, an actor that
+    // takes a vehicle's gun seat fires with the vehicle variant's damage modifier and error, not
+    // its own infantry variant's (an Elite's). Without a `variant` line (an older vehicles.txt)
+    // the variant named "<vehicle tag> pilot" or "gunner" is used if actors.txt has it.
+    const HaloActorDef *variantOf(const VehicleDef &d)
+    {
+        if(!d.variantPath.empty()) return haloactorfind(d.variantPath.c_str());
+        if(d.path.empty()) return nullptr;
+        for(const char *role : {" pilot", " gunner"})
+            if(const HaloActorDef *a = haloactorfind((d.path + role).c_str())) return a;
+        return nullptr;
+    }
+
+    // The vehicle variant when its fire block is authored (a damage modifier above 0), else null.
+    // The Warthog gunner's fire block is all zeros (no modifier, rate or error): it stands for
+    // nothing, so its gunner fights as the seated actor's own variant, error included (a marine
+    // at the gun would otherwise never miss).
+    const HaloActorDef *fightingVariant(const VehicleDef &d)
+    {
+        const HaloActorDef *a = variantOf(d);
+        return a && a->damageScale > 0 ? a : nullptr;
+    }
+
+    // The damage modifier an actor's shot from this vehicle's gun carries: the vehicle variant's,
+    // or -1 (rollshot then takes the seated actor's own; the player's shots carry 1). A variant
+    // with no modifier (0: the Warthog gunner's) falls back to the actor's too.
+    float gunModifier(const VehicleDef &d, const playerent *owner)
+    {
+        if(!owner || owner == player1) return -1;
+        const HaloActorDef *a = fightingVariant(d);
+        return a ? a->damageScale : -1;
+    }
+
     // One shot of trigger `trigger` (0 or 1) of the vehicle's gun by `owner` in `seat`, towards
     // `target`. A gun fixed in the hull fires within 25 degrees of the nose, else along it.
     bool shoot(Vehicle &v, playerent *owner, int seat, int trigger, const vec &target)
@@ -1833,7 +1896,7 @@ namespace
             }
         }
         const float reach = max(from.dist(target), 1.0f);
-        halofiretrigger(owner, *gun, state, trigger, from, vec(from).add(vec(aim).mul(reach)));
+        halofiretrigger(owner, *gun, state, trigger, from, vec(from).add(vec(aim).mul(reach)), gunModifier(d, owner));
         next = lastmillis + triggerDelay(state, *t);
         const char *sample = trigger && gun->sound(HALO_SOUND_CHARGED) ? gun->sound(HALO_SOUND_CHARGED) : gun->sound(HALO_SOUND_FIRE);
         haloplaysound(sample, d.vehicleClass == HALO_VEHICLE_TURRET || driverFires(d) ? S_SUBGUN : S_ASSAULT, owner);
@@ -1900,12 +1963,15 @@ namespace
             }
             if(lastmillis >= v.aiBurstUntil) return;
         }
-        // Lead the target by most of the shot's flight time, and miss by the variant's error.
+        // Lead the target by most of the shot's flight time, and miss by the vehicle variant's
+        // error (fightingVariant; the seated actor's own variant's without an authored one).
         const float speed = max(1.0f, t->projectile.speed * s);
         target.add(vec(in.target->vel).mul(.7f * distance / speed));
-        if(in.error > 0)
+        const HaloActorDef *variant = fightingVariant(d);
+        const float error = variant ? variant->error : in.error;
+        if(error > 0)
         {
-            const float spread = tanf(in.error) * distance;
+            const float spread = tanf(error) * distance;
             target.add(vec(rndscale(2 * spread) - spread, rndscale(2 * spread) - spread, (rndscale(2 * spread) - spread) * .5f));
         }
         vec to = target;
@@ -2215,6 +2281,109 @@ namespace
     }
 
     float playerSpeed(const Vehicle &v) { return v.vel.magnitude() / max(.01f, vehicleScale()); }
+
+    // Vehicle damage (halovehiclehit). Someone alive rides it: a vehicle "only damaged while
+    // occupied" (the Ghost, the Banshee) takes damage only then.
+    bool occupied(const Vehicle &v)
+    {
+        for(const playerent *p : v.riders) if(p && p->state == CS_ALIVE) return true;
+        return false;
+    }
+
+    // Vehicles with a body vitality: they stop shots and can be destroyed.
+    bool destructible(const Vehicle &v)
+    {
+        const VehicleDef *d = defOf(v);
+        return v.exists && d && d->vitality > 0;
+    }
+
+    bool rides(const Vehicle &v, const playerent *p)
+    {
+        if(!p) return false;
+        for(const playerent *r : v.riders) if(r == p) return true;
+        return false;
+    }
+
+    // Someone alive rides it whom `shooter` (an actor) is hostile to. An actor's shots pass through
+    // friendly bodies (haloactorhit); they pass through a vehicle of its own side, or an empty one,
+    // the same way (as before vehicle damage): Grunts firing at the player past their own Wraith
+    // do not wreck it.
+    bool hostileRider(const Vehicle &v, const playerent *shooter)
+    {
+        for(const playerent *p : v.riders) if(p && p->state == CS_ALIVE && haloactorhostile(shooter, p)) return true;
+        return false;
+    }
+
+    // The hull covers rider `p`: the collision model takes its children's body damage (the
+    // Banshee), or the rider's seat is an invisible one, inside the hull (the Wraith's driver).
+    bool coversRider(const Vehicle &v, const VehicleDef &d, const playerent *p)
+    {
+        if(d.collFlags & collTakesRiderDamage) return true;
+        loopi(min(maxSeats, int(d.seats.size()))) if(v.riders[i] == p) return (d.seats[i].flags & 1) != 0;
+        return false;
+    }
+
+    // The middle of the body box.
+    vec boxCentre(const Vehicle &v, const Dims &dm)
+    {
+        return vec(v.pos).add(vec(forwardOf(v.yaw)).mul(dm.centre)).add(vec(0, 0, (vehicleTop(v, dm) - v.pos.z) * .5f));
+    }
+
+    // Where the segment enters the body box (yaw only), as a fraction along it, or -1.
+    float boxEntry(const Vehicle &v, const Dims &dm, const vec &from, const vec &to)
+    {
+        const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
+        const vec centre = vec(v.pos).add(vec(f).mul(dm.centre));
+        const vec o = vec(from).sub(centre), dir = vec(to).sub(from);
+        const float bottom = v.pos.z - centre.z, top = vehicleTop(v, dm) - centre.z;
+        const float origin[3] = {o.dot(f), o.dot(r), o.z}, delta[3] = {dir.dot(f), dir.dot(r), dir.z};
+        const float low[3] = {-dm.halfL, -dm.halfW, bottom}, high[3] = {dm.halfL, dm.halfW, top};
+        float enter = 0, leave = 1;
+        loopi(3)
+        {
+            if(fabsf(delta[i]) < 1e-6f)
+            {
+                if(origin[i] < low[i] || origin[i] > high[i]) return -1;
+                continue;
+            }
+            float t0 = (low[i] - origin[i]) / delta[i], t1 = (high[i] - origin[i]) / delta[i];
+            if(t0 > t1) std::swap(t0, t1);
+            enter = max(enter, t0);
+            leave = min(leave, t1);
+            if(enter > leave) return -1;
+        }
+        return enter;
+    }
+
+    // Blown up: the body depleted effect where it stood, every rider killed (the player too,
+    // unless protected), and the vehicle and the scripts' object gone.
+    void destroyVehicle(Vehicle &v, int index, playerent *attacker)
+    {
+        const VehicleDef &d = *defOf(v);
+        const Dims dm = dims(v);
+        const vec centre = boxCentre(v, dm);
+        v.health = 0;
+        v.destroyed = true;
+        conoutf("Halo vehicle: the %s is destroyed", d.displayName.c_str());
+        halofxeffect(d.destroyedEffect.empty() ? "explosion" : d.destroyedEffect.c_str(), centre, !halocinematic());
+        playerent *riders[maxSeats];
+        loopi(maxSeats) riders[i] = v.riders[i];
+        ejectRiders(v, index);
+        v.exists = false;
+        v.sleeping = false;
+        // Nobody walks to a seat of it any more.
+        for(Boarding &b : boardings) if(b.vehicle == index) b.until = 0;
+        playerent *killer = attacker && (attacker == player1 || aliveBot(attacker)) ? attacker : player1;
+        loopi(maxSeats)
+        {
+            playerent *p = riders[i];
+            if(!p || p->state != CS_ALIVE || (p != player1 && !aliveBot(p))) continue;
+            // A large finite amount: halodamage still honours object_cannot_take_damage and the
+            // QA walker's protection.
+            dodamage(100000, p, killer, GUN_GRENADE, true);
+        }
+        if(v.object >= 0) haloscenarioobjectdestroyed(v.object);
+    }
 }
 
 void halovehiclesclear()
@@ -2338,6 +2507,9 @@ void halovehiclesstatesave(std::string &out)
         halostatef(out, " %.9g %.9g %.9g %.9g %d", v.stalledAt.x, v.stalledAt.y, v.stalledAt.z, v.stillZ, v.safeCount);
         loopi(clamp(v.safeCount, 0, safeSpotCount))
             halostatef(out, " %.9g %.9g %.9g %.9g", v.safePos[i].x, v.safePos[i].y, v.safePos[i].z, v.safeYaw[i]);
+        // Body health and whether it was destroyed (after the safe spots: a record without them,
+        // from before vehicle damage, still loads, whole).
+        halostatef(out, " %.9g %d", v.health, v.destroyed);
         out += '\n';
     }
 }
@@ -2372,7 +2544,11 @@ bool halovehiclesstaterestore(const std::vector<std::string> &records, std::stri
         v.safeCount = r.i();
         if(!r.ok || v.safeCount < 0 || v.safeCount > safeSpotCount) { why = "a vehicle record is damaged"; return false; }
         loopi(v.safeCount) { v.safePos[i].x = r.f(); v.safePos[i].y = r.f(); v.safePos[i].z = r.f(); v.safeYaw[i] = r.f(); }
-        if(!r.ok || r.more()) { why = "a vehicle record is damaged"; return false; }
+        if(r.ok && r.more()) { v.health = r.f(); v.destroyed = r.b(); }
+        if(!r.ok || r.more() || !std::isfinite(v.health)) { why = "a vehicle record is damaged"; return false; }
+        v.health = clamp(v.health, 0.0f, 1.0f);
+        // A destroyed vehicle is gone; it can only be created again by the script.
+        if(v.destroyed) v.exists = false;
         v.type = -1;
         for(const VehicleDef &d : defs) if(d.name == type) v.type = d.index;
         const VehicleDef *d = defOf(v);
@@ -2700,6 +2876,84 @@ int halovehicleemp(const vec &centre, float radius, int stuck, int millis)
         if(halo_vehicletrace) conoutf("Halo vehicle %d stunned by EMP for %d ms", i, millis);
     }
     return count;
+}
+
+int halovehicletrace(const vec &from, const vec &to, float &fraction, const playerent *shooter, const playerent *met)
+{
+    if(!haloactive() || !halo_vehicledamage) return -1;
+    int best = -1;
+    float nearest = 2;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        if(!destructible(v) || rides(v, shooter)) continue;
+        if(shooter && shooter != player1 && !hostileRider(v, shooter)) continue;
+        const Dims dm = dims(v);
+        const float t = boxEntry(v, dm, from, to);
+        if(t < 0 || t >= nearest) continue;
+        // A rider in an open seat is what the shot reached.
+        if(met && rides(v, met) && !coversRider(v, *defOf(v), met)) continue;
+        nearest = t;
+        best = i;
+    }
+    if(best >= 0) fraction = nearest;
+    return best;
+}
+
+int halovehiclesnear(const vec &centre, float radius, int *out, float *distances, int capacity)
+{
+    if(!haloactive() || !halo_vehicledamage || radius <= 0) return 0;
+    int count = 0;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        if(count >= capacity || !destructible(v)) continue;
+        // The nearest point of the body's box (yaw only), as halovehicleemp.
+        const Dims dm = dims(v);
+        const vec f = forwardOf(v.yaw), r = rightOf(v.yaw);
+        const vec rel = vec(centre).sub(vec(v.pos).add(vec(f).mul(dm.centre)));
+        const float along = max(0.0f, fabsf(rel.dot(f)) - dm.halfL), side = max(0.0f, fabsf(rel.dot(r)) - dm.halfW);
+        const float top = vehicleTop(v, dm);
+        const float up = centre.z > top ? centre.z - top : centre.z < v.pos.z ? v.pos.z - centre.z : 0;
+        const float distance = sqrtf(along * along + side * side + up * up);
+        if(distance >= radius) continue;
+        out[count] = i;
+        distances[count] = distance;
+        ++count;
+    }
+    return count;
+}
+
+float halovehiclehit(int index, float damage, const HaloDamage *source, bool explosive, playerent *attacker)
+{
+    if(!haloactive() || !halo_vehicledamage || !vehicles.inrange(index) || !(damage > 0) || halocinematic()) return 0;
+    Vehicle &v = vehicles[index];
+    const VehicleDef *d = defOf(v);
+    if(!destructible(v) || v.destroyed) return 0;
+    if((d->collFlags & collOnlyExplosives) && !explosive) return 0;
+    if((d->collFlags & collOnlyOccupied) && !occupied(v)) return 0;
+    float amount = damage * (source ? source->material(d->material) : 1.0f) * d->bodyMultiplier;
+    // The player's own vehicle takes enemy fire as the player does on this difficulty; any other
+    // vehicle has the difficulty's enemy toughness.
+    if(index == playerVehicle) { if(attacker != player1) amount *= halodifficultydamage(); }
+    else amount /= max(.1f, halodifficultyhealth());
+    if(!(amount > 0)) return 0;
+    v.health = max(0.0f, v.health - amount / d->vitality);
+    v.sleeping = false;
+    if(halo_vehicletrace)
+        conoutf("Halo vehicle %d (%s) takes %.2f%s from %s: health %.3f", index, d->displayName.c_str(), amount, explosive ? " (blast)" : "",
+                attacker ? (attacker == player1 ? "the player" : attacker->name) : "-", v.health);
+    if(v.health <= 0) destroyVehicle(v, index, attacker);
+    return amount;
+}
+
+float halovehiclehealth(int object)
+{
+    const int index = find(object);
+    if(index < 0 || !vehicles[index].exists) return -1;
+    const Vehicle &v = vehicles[index];
+    const VehicleDef *d = defOf(v);
+    return d && d->vitality > 0 ? clamp(v.health, 0.0f, 1.0f) : 1.0f;
 }
 
 bool halovehicleriderstunned(const playerent *unit)
@@ -3063,6 +3317,9 @@ bool halovehicleload(int object, const char *seat, playerent *unit)
     if(index < 0 || !unit || unit->state != CS_ALIVE) return false;
     Vehicle &v = vehicles[index];
     const VehicleDef &d = *defOf(v);
+    // A vehicle that blew up (halovehiclehit) takes nobody until the script creates it again
+    // (object_create respawns it whole, halovehicleobject); as in Halo, loading into it fails.
+    if(!v.exists && v.destroyed) return false;
     if(!v.exists) respawn(v, true);
     int s = seatByName(d, seat);
     if(s < 0) return false;
@@ -3277,8 +3534,54 @@ void halovehicledump(const char *label)
                 max(0, v.stunnedUntil - lastmillis), d ? d->vehicleClass : -1, pilot ? (pilot == player1 ? "player" : pilot->name) : "-",
                 v.aiPhase, pilot && pilot != player1 && haloactortarget(pilot) ? haloactortarget(pilot)->name : "-", v.carried,
                 v.gun.lastShot ? 1 : 0);
+        // A line of its own (conoutf cuts lines at 260 characters): body health, vitality and the
+        // variant its gun fires as (halovehiclehit, variantOf).
+        const HaloActorDef *variant = d ? variantOf(*d) : nullptr;
+        const char *object = haloscenarioobjectname(v.object);
+        conoutf("VEHICLE_HEALTH %s vehicle=%d name=%s health=%.3f destroyed=%d vitality=%g flags=%u material=%d occupied=%d "
+                "variant=%d modifier=%g error=%g", label, i, object && *object ? object : "-", v.health, v.destroyed,
+                d ? d->vitality : 0.0f, d ? d->collFlags : 0u, d ? d->material : -1, occupied(v), variant ? variant->index : -1,
+                variant ? variant->damageScale : 0.0f, variant ? variant->error : 0.0f);
     }
     fflush(stdout);
+}
+
+float halovehicleqadamage(int vehicle, float amount, bool explosive)
+{
+    return halovehiclehit(vehicle, amount, nullptr, explosive, player1);
+}
+
+bool halovehicleqapose(vec &pos, float &yaw)
+{
+    if(!halovehicleseated()) return false;
+    pos = vehicles[playerVehicle].pos;
+    yaw = vehicles[playerVehicle].yaw;
+    return true;
+}
+
+int halovehicleqafind(const char *name, const vec &near, vec &entry)
+{
+    int best = -1;
+    float distance = 1e9f;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        const VehicleDef *d = defOf(v);
+        if(!v.exists || !d || d->name != name || v.carried || !v.enterable) continue;
+        const int seat = seatByRole(*d, HALO_SEAT_DRIVER);
+        if(seat < 0 || v.riders[seat]) continue;
+        const vec at = modelPoint(v, d->seats[seat].enter, dims(v).s);
+        const float dd = at.dist(near);
+        if(dd < distance) { distance = dd; best = i; entry = vec(at.x, at.y, v.pos.z); }
+    }
+    return best;
+}
+
+bool halovehiclecentre(int vehicle, vec &centre)
+{
+    if(!vehicles.inrange(vehicle) || !vehicles[vehicle].exists || !defOf(vehicles[vehicle])) return false;
+    centre = boxCentre(vehicles[vehicle], dims(vehicles[vehicle]));
+    return true;
 }
 
 void halovehicleqainput(float throttle, float steer, int millis)

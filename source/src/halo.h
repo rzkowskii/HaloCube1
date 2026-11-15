@@ -14,9 +14,11 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun);
 // `source` is the jpt! damage dealt, whose material modifiers halodamage applies to the bodies
 // with retail collision materials (Hunters, Sentinels, the Monitor, Engineers); null for none.
 struct HaloDamage;
+// `at`, when given, is where the hit struck the body (shots and the player's melee): the Hunter's
+// head and belly and the general material model's head go by its height.
 void halohit(float damage, int sideEffect, playerent *victim, playerent *owner, const vec &dir, int gun, bool gib, int info,
-             const HaloDamage *source = NULL);
-void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source = NULL);
+             const HaloDamage *source = NULL, const vec *at = NULL);
+void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source = NULL, const vec *at = NULL);
 // Opacity a camouflaged actor is drawn with (rendermodel.cpp), or a negative value for a body
 // drawn as usual.
 float halomodelalpha(const playerent *p);
@@ -35,6 +37,10 @@ Texture *halocountertexture(const char *mesh, Texture *fallback);
 void haloremoveactor(const playerent *player);
 void halofrag();
 void halomelee();
+// QA (tests/native/damage_qa.inc): `count` of the player's needles strike `victim` at once, each
+// as a needle that hit it (its damage, then the stuck count of the supercombine); the number of
+// super detonations they set off, or -1 without a weapon whose projectile super-detonates.
+int haloqaneedles(playerent *victim, int count);
 // Retail grenades (weapon.cpp, from packages/halo/equipment.txt): thrown by the player and the
 // actors; plasma grenades stick to units and vehicles. False without the table.
 bool halothrowgrenade(playerent *owner, int type, const vec &velocity);
@@ -85,6 +91,9 @@ void haloenemysetshield(const playerent *p, float fraction);
 void haloenemyrenew(playerent *p, int health, int grenades);
 bool haloenemymove(playerent *p, const vec &point);
 void halorendervehicle();
+// Removes an actor from the world at once, with no death, body or drops (object_destroy of a
+// scripted biped that ai_attach turned into an actor, halo_script.cpp).
+void haloerasebot(playerent *p);
 // An actor's body kind (halo.cpp ActorKind) and team, or -1 for anything else.
 int haloenemykind(const playerent *p, int *team = NULL);
 
@@ -94,6 +103,9 @@ struct HaloWeaponState;
 // The retail weapon behind an AssaultCube gun slot for the player or an enemy.
 const HaloWeaponDef *haloweaponof(const playerent *p, int gun, HaloWeaponState **state = NULL);
 bool halocarriesgun(int gun);
+// The player holds no weapon (a slot left empty by a starting profile: a10 before the bridge): the
+// fire button does nothing and no viewmodel or fallback reticle is drawn; melee still strikes.
+bool haloplayerunarmed();
 void haloswitchweapon();
 void haloattackinput(bool down);
 float halozoom();
@@ -101,8 +113,10 @@ void halounzoom();
 int halomeleedamage();
 // The enemy the weapon's aim assist locks onto along a direction, if any.
 playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeaponDef &def);
+// `modifier`: the damage modifier an actor's shots carry instead of its own variant's (a vehicle
+// gun's variant, halo_vehicle.cpp); -1 for the shooter's own (1 for the player).
 void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int trigger,
-                     const vec &from, const vec &to);
+                     const vec &from, const vec &to, float modifier = -1);
 void halokilled(playerent *victim, playerent *killer);
 // The nearest marine or Elite body an infection form could reach within `range`.
 void haloclearflood();

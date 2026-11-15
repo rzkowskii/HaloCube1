@@ -5,7 +5,8 @@ packages/halo/effects.txt (git-ignored like the rest of packages/) is read by
 source/src/halo_fx.cpp:
 
 - every `effe` tag a mission script names (the effect constants of effect_new,
-  effect_new_on_object_marker and the d40 effect globals): its first sound, its first light
+  effect_new_on_object_marker and the d40 effect globals), and the vehicles' body depleted
+  effects (halo_vehicles.vehicle_health: the Wraith's, Ghost's and Banshee's death explosion): its first sound, its first light
   (radius in world units, colour, duration), the largest area radius of its `jpt!` parts and
   how many particle systems and particles it carries. The engine draws an effect with
   AssaultCube's own particles (fireballs, sparks, smoke) and a flash sprite sized from these;
@@ -74,6 +75,20 @@ def light_values(halo, tag):
     return max(0.0, radius), min(max(r, 0.0), 1.0), min(max(g, 0.0), 1.0), min(max(b, 0.0), 1.0), max(0.0, seconds)
 
 
+def vehicle_effects(halo):
+    """The body depleted effects of the vehicles the engine drives (tools/halo_vehicles.py
+    `destroyed` lines): halo_vehicle.cpp plays one where a vehicle is destroyed."""
+    from halo_vehicles import VEHICLES, vehicle_health
+    paths = {tag for _, tag, _, _, _ in VEHICLES}
+    found = set()
+    for tag in halo.directory:
+        if tag.group == 'vehi' and tag.name in paths:
+            effect = vehicle_health(halo, tag)[4]
+            if effect:
+                found.add(effect)
+    return found
+
+
 def effect_record(halo, tag):
     t = halo.tags
     light, blast, strongest, systems, particles, names = None, 0.0, None, 0, 0, [tag.name.lower()]
@@ -122,7 +137,7 @@ def main():
             raise SystemExit(f'missing {source}')
         with source.open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
-            wanted = script_effects(halo)
+            wanted = script_effects(halo) | vehicle_effects(halo)
             for tag in halo.directory:
                 if tag.group == 'effe' and tag.name in wanted and tag.name not in effects:
                     effects[tag.name] = effect_record(halo, tag)

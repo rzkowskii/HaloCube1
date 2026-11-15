@@ -563,7 +563,8 @@ COMMANDF(qa_hs_call, "sff", (const char *command, float *first, float *second)
     conoutf("HS_CALL %s %.4f", command, haloscenariocall(command, *first, *second));
     fflush(stdout);
 });
-// qa_hs_script endgame_cinematics 1 wakes (0), or reports started (1) or finished (2) for a script.
+// qa_hs_script endgame_cinematics 1 wakes (0), or reports started (1) or finished (2) for a script;
+// 3 runs a static script once as a thread of its own (wake starts only startup, dormant and continuous ones).
 COMMANDF(qa_hs_script, "si", (const char *name, int *action)
 {
     conoutf("HS_SCRIPT %s %d %.0f", name, *action, haloscenarioqascript(name, *action));

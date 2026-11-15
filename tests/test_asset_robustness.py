@@ -153,7 +153,7 @@ CASES = {
     'hscb-truncated': ((), {'halo/a30.hscb': truncated('halo/a30.hscb', .5)}, r'no retail scenario program for a30',
                        {'script': '0'}, 'section'),
     'hscb-version': ((), {'halo/a30.hscb': hscb_version(99)}, r'no retail scenario program for a30', {'script': '0'}, 'section'),
-    'hscb-garbage': ((), {'halo/a30.hscb': b'HSCB' + (8).to_bytes(4, 'little') + garbage(100000, 6)},
+    'hscb-garbage': ((), {'halo/a30.hscb': b'HSCB' + (9).to_bytes(4, 'little') + garbage(100000, 6)},
                      r'no retail scenario program for a30', {'script': '0'}, 'section'),
     'hscb-flip': ((), {'halo/a30.hscb': flipped('halo/a30.hscb', 7)}, r'QA_GAMEPLAY', {}, 'flip'),
     'route-garbage': ((), {f'maps/{SECTION}.route': garbage(2000, 8)}, r'RETAIL_QA FAIL invalid-route-file', None, 'route'),

@@ -7,7 +7,8 @@ Written while testing was on hold: not yet run.
 1. packages/halo/vehicles.txt format 2 (tools/halo_vehicles.py): the Ghost and the Wraith are
    hover craft, the Scorpion a tank, the Banshee a flyer; the player may drive all but the Wraith;
    weapons.txt gives the Banshee gun and the Scorpion cannon a second trigger (fuel rod, machine
-   gun). c40 sections 1 and 4 are flown: an .hcol and no .route.
+   gun). c40 sections 1 and 4 are flown: an .hcol, and the planned vehicle route (VEHICLE_ROUTES, gap 5)
+   as their .route.
 2. b40 section 3 (retail collision, ten parked Ghosts, two Banshees, a Wraith): the engine reads
    the classes (qa_vehicle_state class=3 hover, 5 flyer); E by a Ghost drives it (prompt
    `E  Drive the Ghost`), the throttle moves it, the trigger fires its bolts, E gets out; the
@@ -42,7 +43,7 @@ maps = root / 'packages/maps'
 table = root / 'packages/halo/vehicles.txt'
 require(table, 'run tools/halo_vehicles.py "$maps" (scripts/import-macos-assets.sh)')
 sys.path.insert(0, str(root / 'tools'))
-from import_halo_campaign import DRIVEN_SECTIONS, FLOWN_SECTIONS, STOCK_SECTIONS  # noqa: E402
+from import_halo_campaign import DRIVEN_SECTIONS, FLOWN_SECTIONS, STOCK_SECTIONS, VEHICLE_ROUTES  # noqa: E402
 
 HOVER, TANK, FLYER = '3', '4', '5'
 
@@ -71,8 +72,8 @@ assert len(triggers(r'vehicles\scorpion\scorpion cannon')) == 2, 'Scorpion canno
 assert FLOWN_SECTIONS <= DRIVEN_SECTIONS and not FLOWN_SECTIONS & STOCK_SECTIONS, FLOWN_SECTIONS
 for part in (0, 3):
     name = f'halo_c40_0{part + 1}'
-    assert (maps / f'{name}.hcol').is_file() and not (maps / f'{name}.route').exists(), \
-        f'{name}: flown, an .hcol and no .route (import_halo_campaign.py "$maps" --mission c40)'
+    assert (maps / f'{name}.hcol').is_file() and (maps / f'{name}.route').exists() == (('c40', part) in VEHICLE_ROUTES), \
+        f'{name}: flown, an .hcol and its planned vehicle route (import_halo_campaign.py "$maps" --mission c40)'
 print('tables: hover, tank and flyer classes, the Wraith enemy-only, two-trigger vehicle guns, c40 flown sections.')
 
 

@@ -30,6 +30,15 @@ EXPORT_SCALE = 4
 VEHICLE_SECTION = 380 + 372
 SUSPENSION_SOUND, CRASH_SOUND = VEHICLE_SECTION + 192, VEHICLE_SECTION + 208
 OBJECT_ATTACHMENTS, ATTACHMENT_STRIDE = 320, 72
+# The object's collision model (coll, object +112): flags u32 at 0 (bit 5 only damaged by
+# explosives, bit 6 only damaged while occupied, bit 1 takes body damage for its children), the
+# indirect (area) damage material index at 4, the maximum body vitality at 8 and the body depleted
+# effect at 168; its materials block at 564 (72 bytes: the material type at 36 and the body damage
+# multiplier at 60). A vitality of 0 is indestructible (the Warthog, the Scorpion, the turret).
+OBJECT_COLLISION = 112
+UNIT_SEATS, SEAT_STRIDE = 740, 284  # unit seats block: flags u32 at 0, label at 4, marker at 36
+COLL_FLAGS, COLL_INDIRECT, COLL_VITALITY, COLL_DEPLETED_EFFECT = 0, 4, 8, 168
+COLL_MATERIALS, MATERIAL_STRIDE, MATERIAL_TYPE, MATERIAL_BODY = 564, 72, 36, 60
 
 # name, tag, engine class, vehicle weapon, whether the player may take the driver's seat.
 # `car` drives on wheels (the Warthog), `turret` is a fixed gun with a gunner seat, `hover`
@@ -56,10 +65,20 @@ FIELDS = '''# vehicle <index> <name>
 # bounds <x0> <y0> <z0> <x1> <y1> <z1>   model frame, Halo units (x forward, y left, z up)
 # radius <r>
 # weapon <tag>|-
-# seat <name> <marker> <x> <y> <z> <enter x> <enter y> <enter z>   marker positions in the model frame
+# seat <name> <marker> <x> <y> <z> <enter x> <enter y> <enter z> [<flags>]   marker positions in the
+#                              model frame; the unit seat flags (1 invisible: the rider is inside the
+#                              hull, the Wraith's driver; 4 driver, 8 gunner)
 # camera <x> <y> <z>           first camera marker, or the bounds' top centre
 # sound <role> <snd! tag>      engine (looped while driven), crash, suspension (a hard landing);
 #                              older games skip these lines
+# vitality <body> <coll flags> <material type> <body multiplier>   the collision model's body
+#                              vitality (0: indestructible), its flags (32 only damaged by
+#                              explosives, 64 only damaged while occupied, 2 takes the riders'
+#                              damage), the retail material type of its indirect damage material
+#                              (the jpt! modifier column) and that material's body multiplier
+# destroyed <effe tag>         the body depleted effect, played where it is destroyed
+# variant <actv tag>           the actor variant an actor seated at its gun fights as (by name:
+#                              "<vehicle tag> pilot" or "gunner"; the retail tags reference none)
 '''
 
 
@@ -108,10 +127,11 @@ def record(halo, tag, index, name, kind, weapon, player, output):
             path = f'halo/vehicle/{name}'
     marker = {m[0]: m[1:4] for m in markers}
     rows = []
-    for seat, label in seats:
+    flags = [t.read('I', seat)[0] for seat in t.block(tag.address + UNIT_SEATS, SEAT_STRIDE)]
+    for index, (seat, label) in enumerate(seats):
         at = marker.get(label, ((low[0] + high[0]) / 2, 0., high[2] * .5))
         enter = marker.get(f'{label} enter', at)
-        rows.append((seat.replace(' ', '_'), label.replace(' ', '_'), *at, *enter))
+        rows.append((seat.replace(' ', '_'), label.replace(' ', '_'), *at, *enter, flags[index] if index < len(flags) else 0))
     camera = next((marker[n] for n in ('camera driver', 'camera', 'driver camera', 'camera gunner') if n in marker),
                   ((low[0] + high[0]) / 2, 0., high[2]))
     lines = [f'vehicle {index} {name}', f'path {tag.name}', f'class {kind}', f'player {int(player)}',
@@ -119,11 +139,44 @@ def record(halo, tag, index, name, kind, weapon, player, output):
              'motion %d %s' % (motion, ' '.join(f'{r:.6g}' for r in rates)),
              'bounds ' + ' '.join(f'{v:.4f}' for v in low + high),
              f'radius {radius:.4f}', f'weapon {weapon or "-"}']
-    lines += ['seat %s %s %.4f %.4f %.4f %.4f %.4f %.4f' % row for row in rows]
+    lines += ['seat %s %s %.4f %.4f %.4f %.4f %.4f %.4f %d' % row for row in rows]
     lines += ['camera %.4f %.4f %.4f' % tuple(camera)]
     lines += [f'sound {role} {sound}' for role, sound in vehicle_sounds(halo, tag)]
+    vitality, flags, material, multiplier, effect = vehicle_health(halo, tag)
+    lines.append(f'vitality {vitality:.6g} {flags} {material} {multiplier:.6g}')
+    if effect:
+        lines.append(f'destroyed {effect}')
+    variant = vehicle_variant(halo, tag.name)
+    if variant:
+        lines.append(f'variant {variant}')
     lines.append('end')
     return lines
+
+
+def vehicle_health(halo, tag):
+    """(body vitality, coll flags, material type, body multiplier, depleted effect tag or None)."""
+    t = halo.tags
+    coll = halo.reference(t, tag.address + OBJECT_COLLISION, 'coll')
+    if not coll:
+        return 0.0, 0, -1, 1.0, None
+    a = coll.address
+    flags, = t.read('I', a + COLL_FLAGS)
+    indirect, = t.read('h', a + COLL_INDIRECT)
+    vitality, = t.read('f', a + COLL_VITALITY)
+    materials = [(t.read('h', m + MATERIAL_TYPE)[0], t.read('f', m + MATERIAL_BODY)[0])
+                 for m in t.block(a + COLL_MATERIALS, MATERIAL_STRIDE)]
+    material, multiplier = (materials[indirect] if 0 <= indirect < len(materials) else
+                            materials[0] if materials else (-1, 1.0))
+    effect = halo.reference(t, a + COLL_DEPLETED_EFFECT)
+    if not (vitality > 0 and math.isfinite(vitality)):
+        vitality = 0.0
+    return vitality, flags, material, multiplier, effect.name if effect and effect.group == 'effe' else None
+
+
+def vehicle_variant(halo, path):
+    """The actv tag named after the vehicle (`<path> pilot`, `<path> gunner`), or None."""
+    names = sorted(tag.name for tag in halo.directory if tag.group == 'actv' and tag.name.lower().startswith(path.lower() + ' '))
+    return names[0] if names else None
 
 
 def vehicle_sounds(halo, tag):

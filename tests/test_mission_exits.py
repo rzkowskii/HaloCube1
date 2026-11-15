@@ -151,7 +151,9 @@ CALLS = [
 for mission, section, scene, flag, after in CALLS:
     schedule = [(300, f'qa_hs_cue {scene}'), (1200, 'qa_halo_where'), (1500, 'halo_next'), (2500, 'qa_halo_where')]
     if after:
-        schedule.append((2800, f'qa_hs_script {after} 0'))
+        # The script after the scene is static (called by the thread that called the scene, which a
+        # QA cue has none of): run it as a thread of its own (qa_hs_script action 3).
+        schedule.append((2800, f'qa_hs_script {after} 3'))
     schedule += [(4000, 'qa_halo_where; qa_halo_finale'), (5000, 'qa_halo_where; quit')]
     text, log = run(f'call-{scene}', f'qa_campaign_play {mission} {section}', schedule)
     assert f'QA_CUE {scene} 1' in text and f'Halo scene: {scene} start' in text, log
@@ -174,4 +176,30 @@ assert 'did not run to its end when skipped' not in text, log
 positions = [float(line.split()[-1]) for line in text.splitlines() if line.startswith('HS_CMD device_get_position')]
 assert positions and positions[-1] > 0.5, (positions, log)
 print('The Silent Cartographer: cutscene_shaftb_goal skipped at once still opened shafta_lock_door.')
+
+# 5. A Call scene gives back the gameplay music it cut and finishes the conversation it cut (gap 12,
+#    written while testing was on hold, not yet run): d40's bridge scene with one of d40's looping
+#    sounds started first, a50's rescue with a conversation being spoken.
+def audio(text, label):
+    found = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines() if line.startswith(f'AUDIO_QA {label} ')]
+    assert found, (label, text[-2000:])
+    return found[-1]
+
+
+loop = read_hscb(root / 'packages/halo/d40.hscb')['loops'][-1]
+text, log = run('call-music', 'qa_campaign_play 10 2', [
+    (300, f'qa_hs_cmd sound_looping_start "{loop} 0 1"; qa_audio_state before'), (500, 'qa_hs_cue cinematic_bridge'),
+    (800, 'qa_audio_state during'), (1000, 'halo_next'), (1600, 'qa_audio_state after; quit')])
+assert str(loop) in audio(text, 'before')['loops'], (loop, log)
+assert audio(text, 'during')['scene'] == 'cinematic_bridge' and str(loop) in audio(text, 'during')['restart'], (loop, log)
+# (If the bridge scene stops this loop itself, it is right that it stays stopped: pick another loop.)
+assert audio(text, 'after')['scene'] == '-' and str(loop) in audio(text, 'after')['loops'], (loop, log)
+conversations = read_hscb(root / 'packages/halo/a50.hscb')['conversations']
+talk = conversations[0]
+text, log = run('call-talk', 'qa_campaign_play 3 4', [
+    (300, f'qa_hs_cmd ai_conversation "{conversations.index(talk)}"; qa_conversation_state {talk}'),
+    (500, 'qa_hs_cue cutscene_rescue'), (800, 'halo_next'), (1400, f'qa_conversation_state {talk}; quit')])
+states = [line.split()[-1] for line in text.splitlines() if line.startswith(f'QA_CONVERSATION {talk} ')]
+assert states[:1] == ['2'] and states[-1] == '5', (talk, states, log)
+print(f'A Call scene restarted gameplay loop {loop} after it and finished the conversation {talk} it cut.')
 print('Mission exits, the finale and script-called scenes behave.')

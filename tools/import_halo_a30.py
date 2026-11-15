@@ -374,6 +374,18 @@ def encode_map(cubes, entries, factor=FACTOR, title=b'Halo | A30 - The Crash Sit
 
 
 def build(halo, output):
+    # The Crash Site imported from the retail BSP (import_halo_campaign.CRASH_SITE) writes its own map,
+    # mesh, .hcol, route and scenery models on a uniform projection; this importer then writes only
+    # the textures and sky its tracked halo_a30.cfg names. Imported lazily: import_halo_campaign
+    # imports this module.
+    from import_halo_campaign import CRASH_SITE
+    if CRASH_SITE:
+        output = output / 'packages'
+        write_materials(halo, output / 'textures' / 'halo_a30')
+        write_sky(halo, output / 'textures' / 'skymaps' / 'halo_a30')
+        print('Crash Site textures and sky written; its map, mesh, retail collision and route come from '
+              'tools/import_halo_campaign.py (CRASH_SITE: --mission a30 --part 0)')
+        return
     samples = sample_bsp(halo)
     floor = walkable_floor(samples, next(halo.player_starts()))
     print(f'Walkable floor: {len(floor):,} of {len(samples):,} sampled terrain vertices')
