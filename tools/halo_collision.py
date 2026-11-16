@@ -373,6 +373,35 @@ def _scenery_polygons(halo, tag, permutation):
     return result
 
 
+# Script functions that take an object name but leave the object where it is, as it is (the Halo CE
+# port in ../Halo3DS): objects_predict loads the definitions of the objects and their children
+# (object_predict, objects/objects.c); object_beautify sets a render flag for cutscenes;
+# objects_can_see_object, objects_can_see_flag and volume_test_object(s)(_all) only test; and
+# object_pvs_activate / object_pvs_set_object pick the object whose PVS the game activates
+# (object_pvs_set_object). Their arguments are only read, whatever their place.
+SCENERY_READ_ONLY = frozenset({'objects_predict', 'object_beautify', 'objects_can_see_object', 'objects_can_see_flag',
+                               'volume_test_object', 'volume_test_objects', 'volume_test_objects_all',
+                               'object_pvs_activate', 'object_pvs_set_object'})
+# Functions whose argument at the given place is only read: objects_attach (parent, parent marker,
+# child, child marker) and objects_detach (parent, child) move the child only
+# (objects_scripting_attach, objects_scripting_detach: object_attach_to_marker and object_detach act
+# on the child); the parent stays where it is.
+SCENERY_PARENT_ARGUMENT = {'objects_attach': 0, 'objects_detach': 0}
+
+
+def scenery_scripted(uses, at_end=()):
+    """Whether a named scenery placement's script uses (import_halo_scripts.object_uses' list for its
+    name) may create, destroy, move or otherwise change it while the section it stands in plays: any
+    use but a read-only one (SCENERY_READ_ONLY, SCENERY_PARENT_ARGUMENT) or one in an `at_end` script
+    (which runs only once the mission is over). A use in any other function, a special form (set, if)
+    or a global's initial value counts, so a function not listed keeps the placement out."""
+    for function, argument, script in uses:
+        if script in at_end or function in SCENERY_READ_ONLY or SCENERY_PARENT_ARGUMENT.get(function) == argument:
+            continue
+        return True
+    return False
+
+
 def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=(), extra_bsps=(), at_end=(), kept=()):
     """Collision polygons of BSP `bsp`'s scenery placements, in campaign coordinates.
 
@@ -381,10 +410,11 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=(), 
     in its SCN1 trailer (write_structure_collision). Returns (surfaces, placements, left out):
     `placements` is [(scenario scenery index, number of its surfaces)] in the order their polygons
     were appended, and `left out` a {reason: count}. Placements are left out when a script creates, destroys or moves
-    them (not-placed flag 1, or a name the scripts use: object_create, object_destroy, the c10
-    insertion's props; or a name holding the pattern of an object_*_containing call,
-    import_halo_scripts.containing_calls, unless the call is in one of the `at_end` scripts, which run
-    only once the mission is over) or when some difficulty does not place them (flags 2, 4, 8), since
+    them (not-placed flag 1; or a name a script passes to anything but a read-only use, scenery_scripted
+    over import_halo_scripts.object_uses: object_create, object_destroy, object_teleport, attached as a
+    child, scenery_animation_start; or a name holding the pattern of an object_*_containing call,
+    import_halo_scripts.containing_calls; either unless the use is in one of the `at_end` scripts, which
+    run only once the mission is over) or when some difficulty does not place them (flags 2, 4, 8), since
     the .hcol is fixed; when their origin is outside `window` (retail xmin, xmax, ymin, ymax: the
     section's map) or their name is in `skip`; and when their tag has no collision model. A name in
     `kept` (scenery a script handles only outside this section) is baked all the same, unless a not-placed
@@ -392,9 +422,10 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=(), 
     import_halo_campaign.EXTRA_BSPS) follow `bsp`'s, with the same filters; a placement in two of the BSPs
     counts once.
     """
-    from import_halo_scripts import named_objects, Program, containing_calls
+    from import_halo_scripts import named_objects, Program, containing_calls, object_uses
     program = program or Program(halo)
     names = {index: name for index, (name, _, _) in enumerate(named_objects(program))}
+    uses = object_uses(program)
     patterns = sorted({pattern for _, pattern, script in containing_calls(program) if pattern and script not in at_end})
     polygons, surfaces, baked, left_out = {}, [], [], {}
     def leave(reason):
@@ -414,8 +445,7 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=(), 
         if name and name in skip:
             leave('skipped')
             continue
-        if not_placed & 1 or (name and name not in kept and
-                              re.search(rb'\b' + re.escape(name.encode()) + rb'\b', program.strings)):
+        if not_placed & 1 or (name and name not in kept and scenery_scripted(uses.get(name, ()), at_end)):
             leave('scripted')
             continue
         if name and name not in kept and any(pattern in name for pattern in patterns):

@@ -107,14 +107,18 @@ def crash_site_cfg_problems(output):
 
 def crash_site_scenery(halo, projection):
     """The Crash Site's scenery models in campaign units: [(slot, (x, y, z), yaw, pitch, roll, scenario
-    scenery index)]."""
+    scenery index)]. A placement the mission does not place when it starts (not-placed flag 1, a
+    script's to create) is left out: a mapmodel draws from the map's start and no script can take it
+    away or bring it in. a30's only one is intro_tree (a tree_pine); no a30 script creates it (its one
+    use is cutscene_intro's object_destroy, and no *_containing call matches it), so Halo never shows
+    it in play (the use-aware rule's batch; before, it drew from the start)."""
     found = []
     tags = halo.tags
     palette = tags.block(halo.scenario + 540, 48)
     # halo.scenery()'s walk, keeping each placement's index in the scenario's scenery block.
     for index, placement in enumerate(tags.block(halo.scenario + 528, 72)):
-        variant, = tags.read('h', placement)
-        if not 0 <= variant < len(palette):
+        variant, _, not_placed = tags.read('2hH', placement)
+        if not 0 <= variant < len(palette) or not_placed & 1:
             continue
         tag = halo.reference(tags, palette[variant], 'scen')
         x, y, z, yaw, pitch, roll = tags.read('6f', placement + 8)
@@ -421,17 +425,22 @@ SCENERY_COLLISION = ({CRASH_SITE_KEY} | {(m.cache, part) for m in MISSIONS if m.
 # Scenery a script creates or destroys by name pattern (object_create_containing,
 # object_create_anew_containing, object_destroy_containing: Halo matches the pattern anywhere in the
 # object's name, strstr in hs_library_external.c of the Halo CE port in ../Halo3DS, as the engine's
-# interpreter does) is left out like scenery a script names in full (halo_collision.scenery_surfaces,
-# 'scripted by name pattern'). Except the calls of the scripts listed here, which run only once the
-# mission is over (judgement call: the .hcol is fixed, and a crate or a flame that goes in the last
-# seconds before the end changes nothing the player can do):
+# interpreter does) is left out like scenery a script creates, destroys or moves by its full name
+# (halo_collision.scenery_surfaces, 'scripted by name pattern'). Except the calls and uses of the
+# scripts listed here, which run only once the mission is over (judgement call: the .hcol is fixed,
+# and a crate or a flame that goes in the last seconds before the end changes nothing the player can
+# do); they count neither by pattern nor by full name (halo_collision.scenery_scripted):
 # - a50 extraction_cleanup ("box": box_1 to box_4, c_storage in the hangar, BSP 2, sections 3 and 5):
 #   game_win_script calls it after the hangar fight, behind a fade out, just before cutscene_extraction
 #   and game_won;
 # - d40 test_for_endgame and endgame_cleaner ("bsp_8_1", "_5", "_7", "_8" created, "bsp_8_" destroyed:
 #   the flames and oxygen tanks along the Warthog run, BSP 7, section 8): test_for_endgame waits for
 #   the player in grand_finale (the drive's end), then destroys every object, re-creates those and wakes
-#   endgame_cleaner, which destroys them all after a sleep, while the ending plays.
+#   endgame_cleaner, which destroys them all after a sleep, while the ending plays;
+# - b30 cutscene_extraction_exit (shaft_box_1 to _3: c_storage crates in BSP 0, sections 1 and 3, by
+#   full name; the use-aware rule's batch): obj_shafta_goal calls it once the player boards the
+#   extraction Pelican and calls game_won after it, so the crates go only in the mission's last scene.
+#   Its other uses (the dust, falling_box_ and extraction Pelican objects) are script-created.
 # The rule's one new left-out: d40's hangar_fire (x70_finale's hangar_3, the ending cinematic) matches
 # hangar_fire_2a to _2c, placed burning_flame emitters in the Longsword's hangar (section 8), which have
 # no collision model, so nothing changes. Every other *_containing pattern of the ten scenarios that
@@ -440,14 +449,20 @@ SCENERY_COLLISION = ({CRASH_SITE_KEY} | {(m.cache, part) for m in MISSIONS if m.
 # elite_corpse and shotgun, d40's banshee_fire, display, hangar_fire_1, hangar_tank and nipple (the
 # d40 section 3 batch's scan; b40's dump, d20's 0_, 1_, 2_ and 2x_ and c40's object_ patterns match
 # no scenery).
-SCENERY_SCRIPTS_AT_END = {'a50': ('extraction_cleanup',), 'd40': ('test_for_endgame', 'endgame_cleaner')}
+SCENERY_SCRIPTS_AT_END = {'a50': ('extraction_cleanup',), 'b30': ('cutscene_extraction_exit',),
+                          'd40': ('test_for_endgame', 'endgame_cleaner')}
 # Named scenery a script handles only outside the section where it stands, baked there all the same
 # (scenery_surfaces' `kept`): the .hcol of the section that plays while it stands holds it, as Halo does.
 # - c10 section 1: x50_rock (boulder_moss_large in the swamp, BSP 0, placed when the mission starts) is
 #   destroyed only by x50's door script (object_destroy_containing x50_rock), which plays in section 3
 #   (BSP 2, the control room); the player never comes back to BSP 0. Its full name is the pattern, so
 #   the whole-name rule used to leave it out of section 1, where it stands throughout the play.
-SCENERY_KEPT = {('c10', 0): ('x50_rock',)}
+#   crashed_dropship (pelican_crashed, BSP 0) likewise: the same ini_x50_preclean destroys it, called by
+#   mission_control once the player reaches control_lab_trigger in section 3 (the use-aware rule's batch).
+# - a10 section 7: field_x30 (c_field_generator, BSP 6) is destroyed only by mission_final after the
+#   player reaches end_trigger (the mission's exit), just before the x30 cinematic and game_won: the
+#   mission is over (the use-aware rule's batch; judgement call, as for SCENERY_SCRIPTS_AT_END).
+SCENERY_KEPT = {('c10', 0): ('x50_rock', 'crashed_dropship'), ('a10', 6): ('field_x30',)}
 # Sections played in a vehicle (source/src/halo_vehicle.cpp), not walked: d40's Warthog run and
 # c40's Banshee flights. They get an .hcol, which the vehicle drives or flies on (its body is the
 # retail vehicle's size at the section's scale, so it fits where the walking body does not), but
@@ -619,6 +634,13 @@ TRANSITIONS = {
 # Anchors near the navigable side of scripted lifts, dropship arrivals and
 # mission-specific entrances. Coordinates are in the retail BSP's space.
 SECTION_ANCHORS = {
+    # The Crash Site starts on the ground just outside the crashed lifepod's open rear end, 3 units from
+    # the scenario's player start (inside the pod, where Halo's player stands up after cutscene_intro),
+    # in the direction that player faces. Since the use-aware rule's batch the pod (pod_of_death) is in
+    # the .hcol, and its inside (about 1 unit high) has no room for the engine's 1.27-unit body, so the
+    # planner found no layer at the player start. Judgement call: the first steps Halo's player walks,
+    # no new link; mission_a30's wait for the player to leave lz_lifeboat then ends at once.
+    CRASH_SITE_KEY: ((31.35, -100.45, 58.7), None),
     # a30 section 2 (BSP 0, after the Crash Site's standalone map) starts on the floor in front of the
     # first structure: the centre of first_structure_front is 7.5 units above it, and the floor nearest
     # that point was a 133-cell fragment (a rock top) cut off from the valley, so the route stopped 22

@@ -143,7 +143,9 @@ PENDING_WALK = {
     # Route fixes of this batch (not KNOWN_BLOCKED: never walked).
     'halo_a30': 'the Crash Site on retail collision (CRASH_SITE, batch 6): from the lifepod up the valley, sliding down '
                 "two steep slopes (route flag 8) into the marines' basin, to first_marine_extraction; since the scenery "
-                'batch round and over the trees, boulders and lifepod as their real collision (SCENERY_COLLISION)',
+                'batch round and over the trees, boulders and lifepod as their real collision (SCENERY_COLLISION); since '
+                "the use-aware scenery rule the lifepod collides too and the walk starts on the ground just outside "
+                "its open rear end (SECTION_ANCHORS)",
     'halo_a30_01': 'starts on the valley floor in front of the first structure, ends on the ledge above the cave floor',
     'halo_b30_03': "walked return to the extraction Pelican's ledge; the walker presses E there until the Pelican hovers",
     'halo_b40_03': "ends in the b3 tower's bottom doorway (bsp 1,8), the section ending at its end marker",

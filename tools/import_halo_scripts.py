@@ -249,6 +249,58 @@ def containing_calls(program):
     return found
 
 
+# HaloScript value types an object name literal is parsed as (the node's constant type, field 1):
+# object_list (23), and object through scenery_name (37 to 48), as the Halo CE port's hs types in
+# ../Halo3DS (hs/hs.c) number them.
+OBJECT_LITERAL_TYPES = frozenset({23, *range(37, 49)})
+
+
+def object_uses(program):
+    """Each object name the scenario scripts pass as a literal argument: {name: [(function, argument
+    index, script name)]}, in script order. A literal is a node with flag 1 whose constant type is an
+    object type (OBJECT_LITERAL_TYPES); the function is the call's first child, so special forms
+    (set, if, begin) count as functions of their own. A global's initial value is listed as function
+    '(global)', argument 0, script 'global <name>'. Walked as containing_calls walks the scripts (a
+    static script call is walked as its own script). halo_collision.scenery_surfaces uses it to leave
+    out only the scenery a script creates, destroys, moves or attaches as a child, not every name some
+    script string holds."""
+    nodes = program.nodes
+    found = {}
+
+    def node(datum):
+        return nodes[datum & 0xffff]
+
+    def literal(datum):
+        n = node(datum)
+        return program.text(n[5]) if n[3] & 1 and n[1] in OBJECT_LITERAL_TYPES else None
+
+    def walk(datum, script, depth=0):
+        n = node(datum)
+        if n[3] & 3 or depth > 64:
+            return
+        kids, it = [], n[6]
+        while it != NIL and len(kids) < 4096:
+            kids.append(it)
+            it = node(it)[4]
+        if not kids:
+            return
+        function, args = program.text(node(kids[0])[5]), kids[1:]
+        for index, arg in enumerate(args):
+            name = literal(arg)
+            if name:
+                found.setdefault(name, []).append((function, index, script))
+            walk(arg, script, depth + 1)
+
+    for script, _, _, root in program.scripts:
+        walk(root, script)
+    for name, _, root in program.globals:
+        value = literal(root)
+        if value:
+            found.setdefault(value, []).append(('(global)', 0, f'global {name}'))
+        walk(root, f'global {name}')
+    return found
+
+
 def title_rows(halo):
     t, s = halo.tags, halo.scenario
     help_tag = halo.reference(t, s + 1412, 'ustr')
@@ -675,6 +727,36 @@ def export_worlds(halo, output, rebuild):
     return available
 
 
+def stale_scene_meshes(halo, output):
+    """The scene geometry on disk that differs from a fresh export_worlds (with rebuild): each
+    packages/maps/halo_scene_<map>_NN.mesh and packages/textures/halo_scene_<map>_NN/ file the
+    exporter would write differently, write but is missing, or no longer write. Exports into a
+    temporary directory and compares bytes (the export is deterministic); writes nothing under
+    `output`. export_worlds without rebuild keeps a mesh that exists, so one written by an older
+    exporter would otherwise go unnoticed (the use-aware rule's batch found 61 of the 68 campaign
+    scene meshes stale). The textures are PNGs compressed by the running Python's zlib, so after a
+    Python upgrade they may all differ once with nothing else changed."""
+    import tempfile
+    stale = []
+    with tempfile.TemporaryDirectory(prefix='halo-scene-') as scratch:
+        scratch = Path(scratch)
+        export_worlds(halo, scratch, True)
+        prefix = f'halo_scene_{halo.name}_'
+        for tree, pattern in (('maps', f'{prefix}*.mesh'), ('textures', f'{prefix}*/**/*')):
+            fresh = {p.relative_to(scratch) for p in (scratch / 'packages' / tree).glob(pattern) if p.is_file()}
+            disk = {p.relative_to(output) for p in (output / 'packages' / tree).glob(pattern) if p.is_file()}
+            for path in sorted(fresh | disk):
+                if path not in disk or path not in fresh or (scratch / path).read_bytes() != (output / path).read_bytes():
+                    stale.append(str(path))
+    return stale
+
+
+def check_scenes(job):
+    source, output, mission = job
+    with (source / f'{mission.cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        return mission.cache, stale_scene_meshes(HaloMap(data), output)
+
+
 def model_pack_scale(model, animated=False):
     extent = max((abs(c) for mesh in model.meshes for point, *_ in mesh.vertices for c in point), default=1)
     return max(100, math.ceil(extent * (48 if animated else 18)))
@@ -812,7 +894,22 @@ def main():
     parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--mission', choices=[m.cache for m in MISSIONS])
     parser.add_argument('--rebuild', action='store_true', help='regenerate BSP meshes and cinematic models')
+    parser.add_argument('--check-scenes', action='store_true',
+                        help='write nothing; list the halo_scene_*.mesh files and their textures that differ from a '
+                             'fresh export (stale_scene_meshes) and exit 1 if any do (about a minute for all ten)')
     args = parser.parse_args()
+    if args.check_scenes:
+        jobs = [(args.maps, args.output, mission) for mission in MISSIONS if not args.mission or args.mission == mission.cache]
+        with ProcessPoolExecutor(max_workers=min(len(jobs), 6)) as pool:
+            results = list(pool.map(check_scenes, jobs))
+        stale = [path for _, paths in results for path in paths]
+        for cache, paths in results:
+            print(f'{cache}: ' + (f'{len(paths)} stale scene files: ' + ', '.join(paths) if paths else 'scene meshes current'),
+                  flush=True)
+        if stale:
+            print('Regenerate them with tools/import_halo_scripts.py "$maps" --mission <cache> --rebuild', flush=True)
+            raise SystemExit(1)
+        return
     jobs = [(args.maps, args.output, mission, args.rebuild)
             for mission in MISSIONS if not args.mission or args.mission == mission.cache]
     with ProcessPoolExecutor(max_workers=min(len(jobs), 4)) as pool:
