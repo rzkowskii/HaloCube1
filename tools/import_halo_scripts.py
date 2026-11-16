@@ -11,7 +11,7 @@ import struct
 import subprocess
 import unicodedata
 
-from halo_map_art import write_world_mesh
+from halo_map_art import png_content, write_world_mesh
 from halo_actors import actor_index
 from halo_cast import cast_metadata, damage_target
 from halo_devices import device_rows
@@ -365,14 +365,17 @@ def looping_rows(program):
         yield index, not bool(flags & 2), tracks
 
 
-def difficulty_counts(normal, insane):
-    """Squad sizes on Easy, Normal, Hard and Impossible from the tag's two counts. The tag
-    stores only the Normal and the 'insane' size; Easy is three quarters of Normal (never
-    empty while Normal is not) and Hard sits halfway to the larger of the two."""
-    normal = max(0, normal)
-    top = max(normal, insane)
-    easy = (normal * 3 + 2) // 4
-    return easy, normal, normal + (top - normal + 1) // 2, top
+def difficulty_counts(min_count, max_count):
+    """Squad sizes on Easy, Normal, Hard and Impossible from the squad's two tag counts
+    (squad+124 min_count, squad+126 max_count; ../Halo3DS source/ai/ai_scenario_definitions.h:296),
+    as Halo's encounter placement picks them (source/ai/encounters.c:2191-2201): Easy and Normal
+    place min_count, Hard (max_count + min_count) / 2 in C integer division, Impossible max_count,
+    even where the tag's max_count is below its min_count (132 of the 2,988 campaign squads; on
+    Legendary Halo places fewer of those than on Normal). Each is clamped to at least 0 (Halo's
+    placement loop places nothing for a count of 0 or less, encounters.c:2256). Python's floor
+    division equals C's truncation here because both operands are clamped non-negative first."""
+    low, high = max(0, min_count), max(0, max_count)
+    return low, low, (low + high) // 2, high
 
 
 def squad_rows(halo, actors=None):
@@ -446,6 +449,18 @@ def squad_default_rows(halo, actors=None):
             family = actor.name.split('\\')[1] if actor and '\\' in actor.name else ''
             rows.append((ACTORS.get(family, -1), actors.get(actor.name, -1) if actor else -1))
         yield rows
+
+
+def squad_upgrade_rows(halo):
+    """Per encounter, per squad (squad_rows order): the squad's major_upgrade enum, the short at
+    squad+128 (../Halo3DS source/ai/ai_scenario_definitions.h:298, enum actor_major_upgrade at :37:
+    0 normal, 1 few, 2 many, 3 none, 4 all). Version 10. The engine places an actor whose variant
+    has a major upgrade (actors.txt `major`) as that major by Halo's chance and error diffusion
+    (encounters.c:3040, ai.c:615 and 1875). Values outside 0..4 are written as they are; the engine
+    treats them as normal, as ai_get_major_upgrade_chance's default case does (ai.c:645)."""
+    t, s = halo.tags, halo.scenario
+    for encounter in t.block(s + 1068, 176):
+        yield [t.read('h', squad + 128)[0] for squad in t.block(encounter + 128, 232)]
 
 
 def cue_scripts(mission_index):
@@ -586,7 +601,7 @@ def write_program(program, mission, output, objects, animations, sounds, convers
     path = output / f'{mission.cache}.hscb'
     out = Writer(path.with_suffix('.tmp'))
     try:
-        out.write('4sI', b'HSCB', 9)
+        out.write('4sI', b'HSCB', 10)
         table(out, program.nodes, lambda *v: out.write('4H3I', *v))
         out.write('I', len(program.strings))
         out.file.write(program.strings)
@@ -691,6 +706,9 @@ def write_program(program, mission, output, objects, animations, sounds, convers
                out.text(secondary), out.write('2h', loaded2, total2), out.write('2B', min(frags, 255), min(plasmas, 255))))
         table(out, [(rows,) for rows in squad_default_rows(h, actors)], lambda squads: table(out, squads, lambda *v: out.write('2h', *v)))
         table(out, [(1 if i in figures else 0,) for i in range(len(objects))], lambda flags: out.write('B', flags))
+        # Version 10: per encounter, per squad (squad_rows order), the squad's major_upgrade enum
+        # (squad_upgrade_rows), which sets the chance its actors are placed as their variant's major.
+        table(out, [(rows,) for rows in squad_upgrade_rows(h)], lambda squads: table(out, [(v,) for v in squads], lambda v: out.write('h', v)))
     finally:
         out.file.close()
     path.with_suffix('.tmp').replace(path)
@@ -731,13 +749,25 @@ def stale_scene_meshes(halo, output):
     """The scene geometry on disk that differs from a fresh export_worlds (with rebuild): each
     packages/maps/halo_scene_<map>_NN.mesh and packages/textures/halo_scene_<map>_NN/ file the
     exporter would write differently, write but is missing, or no longer write. Exports into a
-    temporary directory and compares bytes (the export is deterministic); writes nothing under
-    `output`. export_worlds without rebuild keeps a mesh that exists, so one written by an older
-    exporter would otherwise go unnoticed (the use-aware rule's batch found 61 of the 68 campaign
-    scene meshes stale). The textures are PNGs compressed by the running Python's zlib, so after a
-    Python upgrade they may all differ once with nothing else changed."""
+    temporary directory and compares (the export is deterministic); writes nothing under `output`.
+    export_worlds without rebuild keeps a mesh that exists, so one written by an older exporter
+    would otherwise go unnoticed (the use-aware rule's batch found 61 of the 68 campaign scene
+    meshes stale). Meshes and other files compare by bytes; the textures are PNGs whose deflate
+    stream comes from the running Python's zlib, so they compare by content (png_content: the
+    decoded IHDR and the inflated IDAT data), and a Python or zlib upgrade does not make them all
+    stale. A PNG that does not decode (truncated, bad CRC, damaged stream) is stale."""
     import tempfile
     stale = []
+
+    def same(fresh_path, disk_path):
+        fresh_bytes, disk_bytes = fresh_path.read_bytes(), disk_path.read_bytes()
+        if fresh_bytes == disk_bytes:
+            return True
+        if fresh_path.suffix.lower() != '.png':
+            return False
+        content = png_content(disk_bytes)
+        return content is not None and content == png_content(fresh_bytes)
+
     with tempfile.TemporaryDirectory(prefix='halo-scene-') as scratch:
         scratch = Path(scratch)
         export_worlds(halo, scratch, True)
@@ -746,7 +776,7 @@ def stale_scene_meshes(halo, output):
             fresh = {p.relative_to(scratch) for p in (scratch / 'packages' / tree).glob(pattern) if p.is_file()}
             disk = {p.relative_to(output) for p in (output / 'packages' / tree).glob(pattern) if p.is_file()}
             for path in sorted(fresh | disk):
-                if path not in disk or path not in fresh or (scratch / path).read_bytes() != (output / path).read_bytes():
+                if path not in disk or path not in fresh or not same(scratch / path, output / path):
                     stale.append(str(path))
     return stale
 

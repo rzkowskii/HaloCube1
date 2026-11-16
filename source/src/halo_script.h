@@ -4,10 +4,9 @@
 #include <string>
 #include <vector>
 
-// Selected difficulty (0 Easy to 3 Impossible) and its enemy damage and health multipliers.
+// Selected difficulty (0 Easy to 3 Impossible). Its damage, vitality and recharge scaling by team
+// is in halo_ai.h (halodifficultyteamvalue, halodifficultydamagefactor).
 int halodifficulty();
-float halodifficultydamage();
-float halodifficultyhealth();
 void haloscenariostart(int mission, int section, bool preview, bool continuing);
 // A player starting profile of the scenario (.hscb version 9, tools/import_halo_scripts.py
 // profile_rows): the health and shield modifiers (0 leaves them as they are), each weapon's retail
@@ -48,6 +47,12 @@ float haloscenarioscale();
 int haloscenarioplace(const char *encounter);
 void haloscenarioqapad(int count);
 int haloscenarioencountercount();
+// QA (tests/test_major_upgrades.py): the living squad members' major upgrades and the diffusion state.
+void haloscenarioqamajors();
+// QA (tests/test_frontend_progress.py item 16): the living squad members where they stand with
+// their vitality (SQUAD_STOOD), and a way to hurt them all (not the attached actors).
+void haloscenarioqasquads(const char *label);
+void haloscenarioqasquadhurt(float health, float shield);
 const char *haloscenarioencountername(int index);
 int haloscenarioencounterstarts(int index);
 // QA probes: an encounter's script reference ("encounter/squad" a squad's, negative; -1 when not found),
@@ -136,6 +141,9 @@ void haloscenariocheckpoint();
 void haloscenarioplayersave();
 // team: an engine team (halo_ai.h HALO_TEAM_*), or -1 (HALO_TEAM_DEFAULT) for the variant's own.
 playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int actorIndex = -1, int team = -1);
+// Where haloscenariospawnenemy would put that body's feet for `feet` on retail collision, without
+// spawning it (a revert's check of where a squad member stood); false with no floor, or off retail collision.
+bool haloscenariospawnfloor(int kind, int actorIndex, vec &feet);
 // Saved games (halo.cpp, config/halo-progress.txt version 3). haloscenariostatesave appends the
 // mission script's state as "s ..." records: what the last checkpoint keeps for a revert, or with
 // `live` the state now (a section's start, the script carried in from the section before); false

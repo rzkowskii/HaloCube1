@@ -8,8 +8,9 @@ halo_scene_<map>_NN.mesh, packages/textures/halo_scene_<map>_NN/) only when it i
 --rebuild is given, so a mesh written by an older exporter stays on disk unseen; the use-aware rule's
 batch found 61 of the 68 campaign scene meshes stale that way and regenerated them. This runs
 `import_halo_scripts.py "$HALO_SOURCE" --check-scenes` (stale_scene_meshes: a fresh export of every
-scene BSP of the ten missions into a temporary directory, compared byte for byte; it writes nothing
-under packages/; about a minute) and fails on any stale, missing or leftover file. Fix with
+scene BSP of the ten missions into a temporary directory, meshes compared byte for byte and PNG
+textures by content, their decoded header and inflated IDAT data, so a Python or zlib upgrade does not
+make them stale; it writes nothing under packages/; about a minute) and fails on any stale, missing or leftover file. Fix with
 `tools/import_halo_scripts.py "$maps" --mission <cache> --rebuild`. Written while testing was on hold:
 not yet run.
 """

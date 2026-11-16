@@ -12,7 +12,9 @@ NOT YET RUN: written while testing was on hold.
 3. QA client on d40 section 5 (The Maw, the engine room): a detector exists from the start at full
    health (`unit_get_health` 1, not -1 as before, which destroyed every manifold at once);
    `object_cannot_take_damage` stops damage and `object_can_take_damage` lets it in again; 50
-   points leave 0.6; a trace from the player through a detector meets it; once enc5_1_manager runs,
+   points leave 1 - 50 / (125 x Heroic's enemy_vitality) (0.667 with the retail 1.2: the detectors'
+   biped is on the Covenant team, so its maximum vitality takes enemy_vitality, ../Halo3DS
+   objects/damage.c:441; 0.6 before the difficulty-table work, not yet run); a trace from the player through a detector meets it; once enc5_1_manager runs,
    a b detector shot down to 0 destroys its manifold (`manifold_s1_destroyed` 1) and the s1
    detector stops taking damage with its piston closed (enc5_1_damage_detector_control). Then a
    real shot: the player stands on the route's first use row, uses the control (the piston opens),
@@ -29,8 +31,8 @@ from qa_common import *  # noqa: E402,F403
 halo = root / 'packages/halo'
 require(halo / 'd40.hscb', 'run tools/import_halo_scripts.py')
 for path in sorted(halo.glob('*.hscb')):
-    assert int.from_bytes(path.read_bytes()[4:8], 'little') in (8, 9), f'{path.name} is older than HSCB version 8; rerun tools/import_halo_scripts.py'
-print('Every .hscb is version 8 or 9.')
+    assert int.from_bytes(path.read_bytes()[4:8], 'little') in (8, 9, 10), f'{path.name} is older than HSCB version 8; rerun tools/import_halo_scripts.py'
+print('Every .hscb is version 8 or later (8 to 10).')
 
 if os.environ.get('HALO_SOURCE') or (HALO_SOURCE / 'd40.map').is_file():
     import mmap
@@ -61,6 +63,11 @@ print('halo_d40_05.route uses the four manifold controls and shoots three detect
 require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
 # The real shot: the second manifold's use row (n1, not touched before), then its shoot row.
 use, shot = uses[1], shots[1]
+# Heroic's enemy_vitality from actors.txt's globals table (1.25, the engine's fallback, without it).
+heroic_vitality = 1.25
+for entry in (halo / 'actors.txt').read_text().splitlines() if (halo / 'actors.txt').is_file() else ():
+    if entry.startswith('difficulty 1 enemy_vitality '):
+        heroic_vitality = float(entry.split()[5])
 target = shot[4].split('@')[0]
 profile = scratch('damage-targets-')
 steps = [
@@ -70,7 +77,7 @@ steps = [
           'qa_target_state enc5_1_detector_s1 half'),
     (400, 'qa_target_trace enc5_1_detector_s3'),
     (500, 'qa_hs_script enc5_1_manager 0'),
-    (900, 'qa_target_damage enc5_1_detector_s1b 125'),
+    (900, 'qa_target_damage enc5_1_detector_s1b 200'),   # past 125 x Heroic's enemy_vitality
     (2000, 'qa_hs_global manifold_s1_destroyed ""; qa_target_state enc5_1_detector_s1 managed'),
     (2200, f'qa_halo_feet {use[0]} {use[1]} {use[2]}'),
     (2700, 'halo_use'),
@@ -104,7 +111,8 @@ assert 'found=1 health=1.000 damageable=1' in state('start'), state('start')
 assert line('HS_CMD unit_get_health ')[0].endswith('1.0000'), line('HS_CMD unit_get_health ')
 damage = line('TARGET_QA damage name=enc5_1_detector_s1 ')
 assert 'dealt=0' in damage[0] and 'dealt=1' in damage[1], damage
-assert 'health=0.600' in state('half'), state('half')
+half = float(state('half').split('health=')[1].split()[0])
+assert abs(half - (1 - 50 / (125 * heroic_vitality))) < .002, (state('half'), heroic_vitality)
 assert line('TARGET_QA trace name=enc5_1_detector_s3 ')[0].split('hit=')[1].split()[0] in \
     ('enc5_1_detector_s3', 'enc5_1_detector_s3b'), line('TARGET_QA trace')
 assert line('QA_HS_GLOBAL manifold_s1_destroyed ')[0].endswith('1.0000'), line('QA_HS_GLOBAL manifold_s1_destroyed')

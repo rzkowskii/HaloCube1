@@ -2291,7 +2291,11 @@ void haloupdatebolts(int elapsed)
         if(p->guided > 0 && shot.target && shot.target->state == CS_ALIVE)
         {
             vec want = vec(shot.target->o).sub(shot.position).normalize();
-            const float turn = min(1.0f, p->guided * seconds);
+            // A projectile homing on the player turns at guidance_vs_player of its rate, whoever
+            // fired it (../Halo3DS items/projectiles.c:798-803, game_difficulty_get_value: 0.5 on
+            // Easy and Normal, 0.75 Heroic, 1 Legendary; 1 without the globals table).
+            const float guidance = shot.target == player1 ? haloguidancevsplayer() : 1.0f;
+            const float turn = min(1.0f, p->guided * guidance * seconds);
             shot.direction.mul(1 - turn).add(want.mul(turn)).normalize();
         }
         vec velocity = vec(shot.direction).mul(max(speed, 0.5f));

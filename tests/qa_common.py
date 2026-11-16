@@ -108,12 +108,14 @@ def read_progress(profile):
 
 def read_hscb(path):
     """A compiled mission script (packages/halo/<cache>.hscb, tools/import_halo_scripts.py), read as
-    source/src/halo_script.cpp Program::load reads it, versions 5 to 9. Returns a dict: version,
+    source/src/halo_script.cpp Program::load reads it, versions 5 to 10. Returns a dict: version,
     scripts and globals (names), objects (names), conversations (names), loops (looping sound tag
     ids, as sound_looping_start takes them), encounters ([(name, [squad names])]) and, from
     version 9, profiles (player starting profiles as dicts), squad_defaults (per encounter, per squad:
     (ACTORS kind, actors.txt index)) and object_flags (a byte per object; 1: a story figure drawn
-    outside scenes). Fails unless the file is read to its last byte."""
+    outside scenes); from version 7 squad_counts (per encounter, per squad: the Easy, Normal, Hard and
+    Impossible start counts) and from version 10 squad_upgrades (per encounter, per squad: the
+    major_upgrade enum). Fails unless the file is read to its last byte."""
     import struct as _struct
     data = Path(path).read_bytes()
     offset = 0
@@ -139,7 +141,7 @@ def read_hscb(path):
     assert data[:4] == b'HSCB', path
     offset = 4
     version = one('I')
-    assert 5 <= version <= 9, (path, version)
+    assert 5 <= version <= 10, (path, version)
     out = {'version': version}
     rows(lambda: take('4H3I'))                                       # nodes
     size = one('I')                                                  # strings
@@ -183,10 +185,12 @@ def read_hscb(path):
         rows(lambda: (take('H'), rows(lambda: take('6f'))))
     rows(device)
     if version >= 6:
+        out['squad_counts'] = []
         for _ in out['encounters']:
             rows(lambda: take('3f2h'))                               # firing positions
             rows(lambda: take('I4h'))                                # platoons
-            rows(lambda: (take('2hIh7I'), take('4h') if version >= 7 else (), rows(lambda: take('4h'))))
+            squads = rows(lambda: (take('2hIh7I'), take('4h') if version >= 7 else (), rows(lambda: take('4h'))))
+            out['squad_counts'].append([squad[1] for squad in squads])
         rows(lambda: (text(), take('I'), rows(lambda: take('2h2f7h')), rows(lambda: take('3f'))))   # command lists
     if version >= 9:
         def profile():
@@ -203,5 +207,8 @@ def read_hscb(path):
         assert len(out['squad_defaults']) == len(out['encounters']), path
         assert all(len(d) == len(e[1]) for d, e in zip(out['squad_defaults'], out['encounters'])), path
         assert len(out['object_flags']) == len(out['objects']), path
+    if version >= 10:
+        out['squad_upgrades'] = rows(lambda: rows(lambda: one('h')))
+        assert [len(u) for u in out['squad_upgrades']] == [len(e[1]) for e in out['encounters']], path
     assert offset == len(data), (path, offset, len(data))
     return out

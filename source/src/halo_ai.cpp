@@ -20,9 +20,13 @@ extern int halo_damagetrace;
 namespace
 {
     // Format 2 adds the team, unitmelee and material lines; format 1 tables still load (their
-    // variants take the team of their family and have no materials).
-    constexpr int formatVersion = 2;
+    // variants take the team of their family and have no materials). Format 3 adds the `major`
+    // line per variant and the globals' `difficulty` lines before the variants; format 1 and 2
+    // tables still load (no major upgrades, and halodifficultyvalue answers its fallback).
+    constexpr int formatVersion = 3;
     std::vector<HaloActorDef> definitions;
+    float difficultyValues[HALO_DIFFICULTY_VALUES][4];
+    bool difficultySeen[HALO_DIFFICULTY_VALUES] = {};
     bool attempted = false, loaded = false;
 
     enum Awareness { UNAWARE, ALERT, COMBAT };
@@ -59,6 +63,10 @@ namespace
         bool hasDestination = false;
         int positionUntil = 0, nextWander = 0;
         int burstUntil = 0, nextBurst = 0, nextGrenade = 0;
+        // The attack delay its weapon slot was given at spawn (spawnEnemy's campaignWeapon, just
+        // before haloactorattach): a melee-only actor's swing cadence, which fire() scales by the
+        // melee delay values on each swing (the slot's delay is rewritten there, so it is read once).
+        int baseDelay = 0;
         bool hiding = false, berserkTried = false;
         int startHealth = 0;
         const HaloCommandProgram *program = nullptr;
@@ -136,7 +144,21 @@ namespace
             std::string key;
             in >> key;
             bool ok = true;
-            if(key == "format") { int v = 0; in >> v; ok = versioned = v == formatVersion || v == 1; }
+            if(key == "format") { int v = 0; in >> v; ok = versioned = v >= 1 && v <= formatVersion; }
+            else if(key == "difficulty" && !d)
+            {
+                // difficulty <value index> <name> <easy> <normal> <hard> <impossible>
+                int index = -1;
+                std::string name;
+                float v[4];
+                ok = bool(in >> index >> name >> v[0] >> v[1] >> v[2] >> v[3]) && index >= 0 && index < HALO_DIFFICULTY_VALUES;
+                loopi(4) if(ok && !std::isfinite(v[i])) ok = false;
+                if(ok)
+                {
+                    loopi(4) difficultyValues[index][i] = v[i];
+                    difficultySeen[index] = true;
+                }
+            }
             else if(key == "actor") { definitions.emplace_back(); d = &definitions.back(); in >> d->index; ok = d->index == int(definitions.size()) - 1; }
             else if(!d) ok = false;
             else if(key == "path") std::getline(in >> std::ws, d->path);
@@ -159,11 +181,29 @@ namespace
                 ok = bool(in >> m.type >> m.flags >> m.body >> m.shield);
                 if(ok) d->materials.push_back(m);
             }
+            else if(key == "major") std::getline(in >> std::ws, d->majorPath);
+            // Optional format 3 lines (tools/halo_actors.py; older engines skip them).
+            else if(key == "unit") ok = bool(in >> d->unitFlags >> d->bipedFlags);
+            else if(key == "spawn")
+            {
+                // spawn <actor index> <lower> <upper> <throw velocity>: the index is checked once
+                // the table is read; bounds Halo could not draw from (negative, or upper below lower:
+                // seed_random_range's unsigned span, random_math.c:203-209) leave no spawn.
+                ok = bool(in >> d->spawnVariant >> d->spawnLower >> d->spawnUpper >> d->spawnVelocity) &&
+                     std::isfinite(d->spawnVelocity);
+                if(ok && (d->spawnLower < 0 || d->spawnUpper < d->spawnLower)) d->spawnVariant = -1;
+            }
+            else if(key == "pop")
+            {
+                ok = bool(in >> d->popInner >> d->popOuter >> d->popLower >> d->popUpperMin >> d->popUpperMax >> d->popFlags);
+                for(float v : {d->popInner, d->popOuter, d->popLower, d->popUpperMin, d->popUpperMax}) if(ok && !std::isfinite(v)) ok = false;
+            }
             else if(key == "end") d = nullptr;
             if(!ok)
             {
                 conoutf("\f3Halo actors: invalid line in packages/halo/actors.txt: %s", line.c_str());
                 definitions.clear();
+                loopi(HALO_DIFFICULTY_VALUES) difficultySeen[i] = false;
                 return false;
             }
         }
@@ -171,9 +211,25 @@ namespace
         {
             conoutf("\f3Halo actors: packages/halo/actors.txt ends inside variant %d; re-run tools/halo_actors.py", d->index);
             definitions.clear();
+            loopi(HALO_DIFFICULTY_VALUES) difficultySeen[i] = false;
             return false;
         }
         if(!versioned) definitions.clear();
+        if(definitions.empty()) loopi(HALO_DIFFICULTY_VALUES) difficultySeen[i] = false;
+        // The major upgrade references, by path (one level, as actor_place takes it: actors.c:2687).
+        // A path not in the table, or naming the variant itself, gives no upgrade.
+        for(HaloActorDef &def : definitions)
+        {
+            def.major = -1;
+            if(def.majorPath.empty()) continue;
+            for(const HaloActorDef &other : definitions)
+                if(!strcasecmp(other.path.c_str(), def.majorPath.c_str())) { def.major = other.index; break; }
+            if(def.major == def.index) def.major = -1;
+        }
+        // A spawned variant outside the table, or the variant itself (a unit releasing its own kind
+        // would recurse), gives no spawn.
+        for(HaloActorDef &def : definitions)
+            if(def.spawnVariant < 0 || def.spawnVariant >= int(definitions.size()) || def.spawnVariant == def.index) def.spawnVariant = -1;
         return versioned && !definitions.empty();
     }
 
@@ -479,6 +535,49 @@ namespace
         }
     }
 
+    // --- difficulty -------------------------------------------------------
+    //
+    // An actor's combat numbers on the selected difficulty: halocombatscaling on its current team
+    // (a team hostile to the player takes the level's values, the player's side Normal's), applied
+    // to the variant's actv values at use as Halo does; actors.txt keeps the tag values. Shared by
+    // the brain and the QA probe (haloactorcombatdump), so the probe prints what the brain uses.
+    struct CombatValues
+    {
+        HaloCombatScaling scale;
+        float error = 0;        // aim error (radians), before the camouflage term
+        bool leads = false;     // the lead gate (actor_combat.c:2194-2199)
+        int fireDelay = 0;      // ms between trigger pulls in a burst; 0: the weapon's own cadence
+        int meleeDelay = 0;     // ms between a melee-only actor's swings; 0: not melee-only
+    };
+
+    CombatValues combatValues(const Actor &a)
+    {
+        CombatValues v;
+        v.scale = halocombatscaling(a.team);
+        const HaloActorDef &d = *a.def;
+        // actor_combat.c:1268-1272: burst_error = projectile_error_angle * projectile_error (the
+        // error every projectile of the burst takes).
+        v.error = d.error * v.scale.projectileError;
+        // actor_combat.c:2194-2210: target_leading is added to the variant's lead fraction only
+        // for the test MIN(1, sum) > 0; the lead itself (point_from_line3d) is the variant's own
+        // fraction. Followed as written (the conservative reading): no difficulty leads harder,
+        // and since every exported lead is 0 or more the gate never closes on a lead that exists.
+        v.leads = min(1.0f, d.lead + v.scale.targetLeading) > 0;
+        const weapon *w = a.bot ? a.bot->weaponsel : nullptr;
+        const bool melee = w && w->type == GUN_KNIFE;
+        // actor_combat.c:2380-2404: a variant rate of 0 holds the trigger (the weapon's own
+        // cadence, unscaled); otherwise a pull every TICKS_PER_SECOND / (rate * rate_of_fire)
+        // ticks, at least 2. The engine's slot delay (spawnEnemy) is 1000 / rate ms; the same
+        // formula with the factor, floored at two ticks (66 ms: no exported rate reaches it on Normal).
+        // Both delays are kept within the slot's short attackdelay (guninfo, weapon.h).
+        if(!melee && d.rate > 0) v.fireDelay = clamp(int(1000 / max(d.rate * v.scale.rateOfFire, 1e-3f)), 66, 32767);
+        // actions.c:2563-2568: the wait between melee charges is melee_delay_scale times the
+        // actr's melee_attack_delay_timer plus melee_delay_base seconds. The actr timer is not
+        // exported; the engine's own swing cadence (the slot delay, at least 1.2 s) stands for it.
+        if(melee && a.baseDelay > 0) v.meleeDelay = min(halomeleedelay(a.baseDelay), 32767);
+        return v;
+    }
+
     // --- firing -----------------------------------------------------------
 
     void fire(Actor &a, CBot *body)
@@ -496,24 +595,28 @@ namespace
         const float distance = e->o.dist(t->o);
         const bool melee = e->weaponsel->type == GUN_KNIFE;
         if(!melee && d.maxRange > 0 && distance > d.maxRange * s * 1.25f) return;
+        // Difficulty (combatValues): error, lead gate, trigger and swing delays, burst separation.
+        const CombatValues combat = combatValues(a);
         // Lead moving targets by the variant's lead fraction of the travel time.
         const HaloWeaponDef *w = haloweapon(d.weapon);
         const HaloTriggerDef *trigger = w ? w->trigger() : nullptr;
         const float speed = trigger && trigger->projectile.valid ? max(1.0f, trigger->projectile.speed * s) : 1000.0f;
         vec aim = centreOf(t);
-        aim.add(vec(t->vel).mul(d.lead * distance / speed));
-        // A camouflaged player is hard to hit: the shots spread wider.
+        if(combat.leads) aim.add(vec(t->vel).mul(d.lead * distance / speed));
+        // A camouflaged player is hard to hit: the shots spread wider (the engine's own term,
+        // not scaled by difficulty).
         const float camoError = (t == player1 ? haloplayercamo() : haloactorcloak(t)) * 0.12f;
-        if(d.error > 0 || camoError > 0)
+        if(combat.error > 0 || camoError > 0)
         {
-            const float spread = tanf(d.error + camoError) * distance;
+            const float spread = tanf(combat.error + camoError) * distance;
             aim.add(vec(frand(-spread, spread), frand(-spread, spread), frand(-spread, spread) * 0.5f));
         }
         body->AimToVec(aim);
         if(lastmillis >= a.nextBurst && lastmillis >= a.burstUntil)
         {
             a.burstUntil = lastmillis + millisFor(frand(d.burstMin, d.burstMax));
-            a.nextBurst = a.burstUntil + millisFor(frand(d.separationMin, d.separationMax));
+            // actor_combat.c:599-605: the separation times burst_separation.
+            a.nextBurst = a.burstUntil + millisFor(frand(d.separationMin, d.separationMax) * combat.scale.burstSeparation);
         }
         if(lastmillis >= a.burstUntil && !melee) return;
         // Fire only once roughly facing the target.
@@ -524,6 +627,10 @@ namespace
         // Warthog's gunner) the vehicle fires instead (halo_vehicle.cpp); the aim above still
         // turns a turret with its gunner.
         if(halovehiclearmedseat(e)) return;
+        // The cadence the weapon code waits between pulls (weapon.cpp reads the slot's
+        // attackdelay for a bot): the variant's rate times rate_of_fire, or the swing delay.
+        if(combat.fireDelay > 0) e->weaponsel->info.attackdelay = combat.fireDelay;
+        else if(combat.meleeDelay > 0) e->weaponsel->info.attackdelay = combat.meleeDelay;
         e->attacking = true;
         shoot(e, aim);
     }
@@ -535,10 +642,18 @@ namespace
         if(!grenadesAllowed || !BotManager.BotsShoot() || !a.target || passive(a) || lastmillis < a.nextGrenade || e->mag[GUN_GRENADE] <= 0 || d.grenadeChance <= 0) return;
         // Nobody throws from a vehicle seat (or a dropship's hold).
         if(halovehicleinside(e) || haloscenariocarried(e)) return;
-        a.nextGrenade = lastmillis + 4000 + rnd(4000);
+        const int wait = 4000 + rnd(4000);
+        a.nextGrenade = lastmillis + wait;
         const float distance = e->o.dist(a.target->o), s = scale();
         if(distance < max(d.grenadeRangeMin, 2.0f) * s || distance > max(d.grenadeRangeMax, 8.0f) * s) return;
-        if(rndscale(1.0f) > d.grenadeChance) return;
+        // Difficulty on the actor's current team: the throw chance times grenade_chance_scale
+        // (actions.c:3642-3647), and the wait after a throw times grenade_timer_scale. Halo scales
+        // the encounter's timeout after any member's throw (actions.c:2350-2368, the actv's
+        // encounter_grenade_timeout, not exported); the engine's per-actor wait after its own
+        // throw stands for it, and the wait after a check that does not throw stays as it was.
+        const HaloCombatScaling scaling = halocombatscaling(a.team);
+        if(rndscale(1.0f) > d.grenadeChance * scaling.grenadeChance) return;
+        a.nextGrenade = lastmillis + max(1, int(wait * scaling.grenadeTimer + .5f));
         vec direction = vec(a.target->o).sub(e->o);
         const float flight = clamp(direction.magnitude() / 60.0f, 0.4f, 1.6f);
         direction.normalize().mul(1.6f);
@@ -686,7 +801,10 @@ namespace
         if(vec(t->o).sub(e->o).magnitudexy() > reach || fabsf(t->o.z - e->o.z) > max(e->eyeheight, t->eyeheight)) return;
         const float yawError = fabsf(e->targetyaw - e->yaw);
         if(min(yawError, 360 - yawError) > 40) return;
-        a.nextSmash = lastmillis + 1600 + rnd(600);
+        // The wait between smashes on the selected difficulty, for every team alike (actions.c:
+        // 2563-2568, game_difficulty_get_value): melee_delay_scale times the engine's 1.6 to 2.2 s
+        // (standing for the actr's melee_attack_delay_timer, not exported) plus melee_delay_base.
+        a.nextSmash = lastmillis + halomeleedelay(1600 + rnd(600));
         const float *m = a.def->unitMelee;
         const float full = m[2] > 0 ? frand(m[1], m[2]) : 40.0f;
         vec dir = vec(t->o).sub(e->o);
@@ -906,6 +1024,166 @@ bool haloactorsload()
 
 int haloactordefcount() { haloactorsload(); return int(definitions.size()); }
 
+float halodifficultyvalue(int type, int level, float fallback)
+{
+    haloactorsload();
+    if(type < 0 || type >= HALO_DIFFICULTY_VALUES || !difficultySeen[type]) return fallback;
+    return difficultyValues[type][clamp(level, 0, 3)];
+}
+
+bool halodifficultytable()
+{
+    haloactorsload();
+    loopi(HALO_DIFFICULTY_VALUES) if(difficultySeen[i]) return true;
+    return false;
+}
+
+namespace
+{
+    // ../Halo3DS game/game_globals.c:167-196 game_difficulty_get_value_by_difficulty: the table's
+    // value (the level clamped to 0..3). Without the table (actors.txt format 1 or 2) the engine's
+    // constants from before it, where it had one, else Halo's own 1.0 for a missing table (:171),
+    // except for the three values Halo adds rather than multiplies (target_tracking and
+    // target_leading, actor_combat.c:2175 and 2196; melee_delay_base, actions.c:2567): 0, so an
+    // older actors.txt leaves the engine's combat exactly as it was before the combat scaling.
+    float difficultyAt(int type, int level)
+    {
+        static const float damage[4] = {0.6f, 1.0f, 1.3f, 1.7f}, vitality[4] = {0.75f, 1.0f, 1.25f, 1.5f};
+        level = clamp(level, 0, 3);
+        const bool additive = type == HALO_DIFFICULTY_TARGET_TRACKING || type == HALO_DIFFICULTY_TARGET_LEADING ||
+                              type == HALO_DIFFICULTY_MELEE_DELAY_BASE;
+        // infection_forms has no engine constant and its neutral value is 0 (Normal's: no speed
+        // stagger, no pop toughness), where Halo's missing-table answer would be 1.0; an older
+        // actors.txt has no pop or stagger data anyway.
+        const float fallback = type == HALO_DIFFICULTY_ENEMY_DAMAGE ? damage[level] :
+                               type == HALO_DIFFICULTY_ENEMY_VITALITY || type == HALO_DIFFICULTY_ENEMY_SHIELD ? vitality[level] :
+                               additive || type == HALO_DIFFICULTY_INFECTION_FORMS ? 0.0f : 1.0f;
+        return halodifficultyvalue(type, level, fallback);
+    }
+}
+
+float halodifficultyget(int type) { return difficultyAt(type, halodifficulty()); }
+
+float halodifficultyteamvalue(int type, int team)
+{
+    // game_globals.c:204-225. game_team_is_enemy(_game_team_player, team) is true for an invalid
+    // team (game_allegiance.c:192-206), so no team takes the enemy value; the player's own team is
+    // friendly to itself (every team is, game_allegiance.c:171-180), so the player takes the
+    // friend value. global_difficulty_friend_settings (game_globals.c:138-148) maps types 0 to 3 to
+    // 4 to 7; any other type on the player's side is read at Normal. (game_engine_running, the
+    // multiplayer engines' Normal, does not arise in the single-player campaign.)
+    if(team >= 0 && !haloteamhostile(HALO_TEAM_PLAYER, team))
+    {
+        if(type >= HALO_DIFFICULTY_ENEMY_DAMAGE && type <= HALO_DIFFICULTY_ENEMY_RECHARGE)
+            return difficultyAt(type + HALO_DIFFICULTY_FRIEND_DAMAGE, halodifficulty());
+        return difficultyAt(type, 1);
+    }
+    return difficultyAt(type, halodifficulty());
+}
+
+float halodifficultydamagefactor(int ownerTeam, int targetTeam, float *divisor)
+{
+    if(divisor) *divisor = 1;
+    // damage.c:1415-1419: only damage with an owner team hostile to the player is multiplied.
+    if(ownerTeam < 0 || !haloteamhostile(ownerTeam, HALO_TEAM_PLAYER)) return 1;
+    const float scale = halodifficultyget(HALO_DIFFICULTY_ENEMY_DAMAGE);
+    // damage.c:1603-1612: the target's team is not the owner's enemy (its own team or an ally):
+    // the shield (881-887) and the body (1159-1165) divide the multiplier back out, when positive.
+    if(scale > 0 && !haloteamhostile(targetTeam, ownerTeam))
+    {
+        if(divisor) *divisor = scale;
+        return 1;
+    }
+    return scale;
+}
+
+HaloCombatScaling halocombatscaling(int team)
+{
+    HaloCombatScaling c;
+    c.team = team;
+    c.level = halodifficulty();
+    // game_difficulty_get_team_value with the actor's team (actor->meta.team_index in
+    // actor_combat.c; the encounter's team for the grenade timer, actions.c:2356-2358, which the
+    // engine's actors share with their encounter): Normal's value on the player's side.
+    auto teamValue = [team](int type) { return halodifficultyteamvalue(type, team); };
+    c.rateOfFire = teamValue(HALO_DIFFICULTY_RATE_OF_FIRE);              // actor_combat.c:2394-2396
+    c.projectileError = teamValue(HALO_DIFFICULTY_PROJECTILE_ERROR);     // :1268-1272
+    c.burstError = teamValue(HALO_DIFFICULTY_BURST_ERROR);               // :1400-1408
+    c.newTargetDelay = teamValue(HALO_DIFFICULTY_NEW_TARGET_DELAY);      // :1230-1235
+    c.burstSeparation = teamValue(HALO_DIFFICULTY_BURST_SEPARATION);     // :599-605
+    c.targetTracking = teamValue(HALO_DIFFICULTY_TARGET_TRACKING);       // :2174-2178
+    c.targetLeading = teamValue(HALO_DIFFICULTY_TARGET_LEADING);         // :2195-2199
+    c.overchargeChance = teamValue(HALO_DIFFICULTY_OVERCHARGE_CHANCE);   // :1785-1787 (never read after)
+    c.specialFireDelay = teamValue(HALO_DIFFICULTY_SPECIAL_FIRE_DELAY);  // :1776-1778 (never read after)
+    c.grenadeChance = teamValue(HALO_DIFFICULTY_GRENADE_CHANCE_SCALE);   // actions.c:3644-3647
+    c.grenadeTimer = teamValue(HALO_DIFFICULTY_GRENADE_TIMER_SCALE);     // actions.c:2356-2358
+    // game_difficulty_get_value: the selected level whatever the team (actions.c:2565-2568,
+    // projectiles.c:802).
+    c.meleeDelayScale = halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_SCALE);
+    c.meleeDelayBase = halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_BASE);
+    c.guidanceVsPlayer = halodifficultyget(HALO_DIFFICULTY_GUIDANCE_VS_PLAYER);
+    return c;
+}
+
+int halomeleedelay(int millis)
+{
+    // actions.c:2565-2568: charge_delay = melee_delay_scale * delay + melee_delay_base.
+    const float scaled = halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_SCALE) * millis +
+                         halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_BASE) * 1000.0f;
+    return max(1, int(scaled + .5f));
+}
+
+float haloguidancevsplayer() { return halodifficultyget(HALO_DIFFICULTY_GUIDANCE_VS_PLAYER); }
+
+int halodamageteam(const playerent *attacker)
+{
+    if(!attacker) return -1;
+    if(attacker == player1 || find(attacker)) return haloactorteam(attacker);
+    // A dead actor's record is gone (haloactordeath), but the grenades and projectiles it fired
+    // still carry the team they were fired with (Halo's damage keeps its owner_team_index,
+    // ../Halo3DS objects/damage.c:1415): the team it spawned on (halo.cpp's HaloEnemy), not
+    // haloactorteam's Covenant default, so a dead marine's frag is not taken for Covenant fire.
+    int team = -1;
+    if(haloenemykind(attacker, &team) >= 0 && team >= 0 && team < HALO_TEAM_COUNT) return team;
+    return haloactorteam(attacker);
+}
+
+void halomajorupgradechance(int majorUpgrade, int level, bool &force, bool &random, float &chance)
+{
+    // ../Halo3DS ai/ai.c:615-650. Without the globals table (an actors.txt older than format 3)
+    // the chances are the retail globals' (the same in all ten caches; checked by
+    // tests/test_major_upgrades.py against the tags).
+    static const float normal[4] = {0.15f, 0.25f, 0.5f, 0.75f}, few[4] = {0.05f, 0.1f, 0.3f, 0.5f},
+                       many[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    level = clamp(level, 0, 3);
+    force = false;
+    random = false;
+    chance = 0;
+    switch(majorUpgrade)
+    {
+        case 3: break;                                   // _actor_major_upgrade_none
+        case 4: force = true; break;                     // _actor_major_upgrade_all
+        case 1: random = true; chance = halodifficultyvalue(HALO_DIFFICULTY_MAJOR_UPGRADE_1, level, few[level]); break;
+        case 2: random = true; chance = halodifficultyvalue(HALO_DIFFICULTY_MAJOR_UPGRADE_2, level, many[level]); break;
+        default: random = true; chance = halodifficultyvalue(HALO_DIFFICULTY_MAJOR_UPGRADE, level, normal[level]); break;
+    }
+}
+
+bool haloconsidermajorupgrade(float &globalError, float &squadError, uint32_t &seed, float chance)
+{
+    // ../Halo3DS ai/ai.c:1875-1893, with real_seed_random (math/random_math.c:211-216) on its own
+    // seed: seed = seed * 1664525 + 1013904223 (RANDOM_A, RANDOM_C, :69-70), (seed >> 16) / 65535.
+    const float global = globalError * -(1.0f / 3.0f), squad = -squadError;
+    const float error = fabsf(global) > fabsf(squad) ? global : squad;
+    seed = seed * 1664525u + 1013904223u;
+    const float draw = float(seed >> 16) / 65535.0f;
+    const bool upgrade = draw < error + chance;
+    const float delta = (upgrade ? 1.0f : 0.0f) - chance;
+    squadError += delta;
+    globalError += delta;
+    return upgrade;
+}
+
 const HaloActorDef *haloactordef(int index)
 {
     haloactorsload();
@@ -949,6 +1227,7 @@ void haloactorattach(botent *bot, const HaloActorDef *def, int team)
     a.lastKnown = bot->o;
     a.startHealth = bot->health;
     a.homeYaw = bot->yaw;
+    a.baseDelay = bot->weaponsel ? bot->weaponsel->info.attackdelay : 0;
     bot->mag[GUN_GRENADE] = def->grenadeMax > 0 ? def->grenadeMin + rnd(def->grenadeMax - def->grenadeMin + 1) : 0;
     actors.push_back(a);
 }
@@ -1090,6 +1369,25 @@ bool halohovering(const playerent *p)
     return a && a->def->flying();
 }
 
+float halomovementscale(const playerent *p)
+{
+    // ../Halo3DS units/bipeds.c:3580-3590: movement_scale = infection_forms * (biped_index % 137) *
+    // 0.00729927 + 1 when the biped definition has _biped_random_speed_increase_bit and the unit's
+    // aiming speed is alert (0); the infection swarm sets alert only while it closes on or backs off
+    // a combat target (ai/actor_type_infection.c:470-474), casual otherwise (:334). The retail tags
+    // set the flag on characters\flood_infection\flood_infection nopop alone (c10). The engine's
+    // ordinal is the bot's client number (Halo's is the object datum index). physics.cpp scales
+    // the bot's whole horizontal step by it, so a leap or a throw in flight is scaled too, where
+    // Halo scales only the movement the biped asks for (judgement call: a bot's velocity in the
+    // engine does not keep its own movement apart from momentum). Vertical motion is untouched.
+    if(!p || p->type != ENT_BOT || p->state != CS_ALIVE || !haloactive()) return 1;
+    const Actor *a = find(p);
+    if(!a || !a->def->randomSpeedIncrease() || a->awareness != COMBAT || !alive(a->target)) return 1;
+    const float value = halodifficultyget(HALO_DIFFICULTY_INFECTION_FORMS);
+    const unsigned ordinal = unsigned(max(0, p->clientnum)) % 137;
+    return max(0.05f, value * float(ordinal) * 0.00729927f + 1.0f);
+}
+
 bool haloactorpassive(const playerent *p) { const Actor *a = find(p); return a && passive(*a); }
 void haloactorscriptdamage(bool on, bool ownerless)
 {
@@ -1198,7 +1496,14 @@ bool haloactorintent(const playerent *bot, HaloActorIntent &intent)
     const Actor *a = find(bot);
     if(!a || !alive(a->bot)) return false;
     intent.active = !(a->flags & HALO_AI_BRAINDEAD);
-    intent.error = a->def->error;
+    // Difficulty on the seated actor's current team (halocombatscaling): Halo scales a vehicle
+    // gunner's firing variant the same way as an infantry one's (actor_combat.c reads the firing
+    // variant and the actor's team alike).
+    const HaloCombatScaling scaling = halocombatscaling(a->team);
+    intent.errorScale = scaling.projectileError;
+    intent.separationScale = scaling.burstSeparation;
+    intent.rateScale = max(scaling.rateOfFire, 1e-3f);
+    intent.error = a->def->error * intent.errorScale;
     if(!intent.active) return true;
     if(a->awareness == COMBAT && alive(a->target) && haloactorhostile(a->bot, a->target)) intent.target = a->target;
     intent.mayFire = intent.target && BotManager.BotsShoot() && lastmillis >= a->reactUntil && a->morale != PANICKED && !passive(*a);
@@ -1398,6 +1703,43 @@ void haloactordump(const char *label)
         const float angle = acosf(clamp(vec(delta.x, delta.y, 0).normalize().dot(vec(sinf(yaw), -cosf(yaw), 0)), -1.0f, 1.0f)) / RAD;
         conoutf("ACTOR_VIEW %s cn=%d name=%s yaw=%.0f angle=%.0f distance=%.1f range=%.1f visible=%d thinks=%d", label, e->clientnum, e->name, e->yaw,
                 angle, delta.magnitude(), a.def->visionDistance * scale(), ::IsVisible(e->o, centreOf(player1), NULL), a.thinks);
+    }
+    fflush(stdout);
+}
+
+void haloactorcombatdump(const char *label)
+{
+    // Two lines per team (conoutf cuts a line at 260 characters), from halocombatscaling:
+    // COMBAT_DIFFICULTY <label> level= table= team=<name> rof= perror= burst_error= new_target=
+    //   separation= tracking= leading=
+    // COMBAT_DIFFICULTY_MORE <label> team=<name> overcharge= special= grenade_chance=
+    //   grenade_timer= melee_scale= melee_base= guidance=
+    static const int teams[] = {HALO_TEAM_COVENANT, HALO_TEAM_FLOOD, HALO_TEAM_SENTINEL, HALO_TEAM_HUMAN, HALO_TEAM_PLAYER, -1};
+    for(int team : teams)
+    {
+        const HaloCombatScaling c = halocombatscaling(team);
+        const char *name = haloteamname(team);
+        conoutf("COMBAT_DIFFICULTY %s level=%d table=%d team=%s rof=%.3f perror=%.3f burst_error=%.3f new_target=%.3f separation=%.3f "
+                "tracking=%.3f leading=%.3f", label, c.level, halodifficultytable() ? 1 : 0, name, c.rateOfFire, c.projectileError,
+                c.burstError, c.newTargetDelay, c.burstSeparation, c.targetTracking, c.targetLeading);
+        conoutf("COMBAT_DIFFICULTY_MORE %s team=%s overcharge=%.3f special=%.3f grenade_chance=%.3f grenade_timer=%.3f melee_scale=%.3f "
+                "melee_base=%.3f guidance=%.3f", label, name, c.overchargeChance, c.specialFireDelay, c.grenadeChance, c.grenadeTimer,
+                c.meleeDelayScale, c.meleeDelayBase, c.guidanceVsPlayer);
+    }
+    // ACTOR_COMBAT <label> cn= variant= team= rate=<actv> delay=<ms, 0 weapon's own> slot=<ms now>
+    //   error=<actv> scaled_error= lead=<actv> leads=<0|1> separation=<min>,<max> (scaled s)
+    //   grenade=<actv chance> grenade_scaled= melee=<ms, 0 not melee-only> smash=<min>,<max> (ms)
+    for(const Actor &a : actors)
+    {
+        const botent *e = a.bot;
+        if(!alive(e)) continue;
+        const CombatValues v = combatValues(a);
+        const HaloActorDef &d = *a.def;
+        conoutf("ACTOR_COMBAT %s cn=%d variant=%d team=%s rate=%.3f delay=%d slot=%d error=%.4f scaled_error=%.4f lead=%.3f leads=%d "
+                "separation=%.3f,%.3f grenade=%.3f grenade_scaled=%.3f melee=%d smash=%d,%d", label, e->clientnum, d.index,
+                haloteamname(a.team), d.rate, v.fireDelay, e->weaponsel ? int(e->weaponsel->info.attackdelay) : -1, d.error, v.error,
+                d.lead, v.leads, d.separationMin * v.scale.burstSeparation, d.separationMax * v.scale.burstSeparation, d.grenadeChance,
+                d.grenadeChance * v.scale.grenadeChance, v.meleeDelay, halomeleedelay(1600), halomeleedelay(2199));
     }
     fflush(stdout);
 }

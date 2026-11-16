@@ -45,6 +45,15 @@ QA client, throwaway profiles. NOT YET RUN: written while testing was on hold.
    tutorial holds the player in cryotube_1; a checkpoint taken then writes `s boarded` with the trailing
    scripted flag (1), and Continue puts the player back in the tube ("player aboard cryotube_1 again",
    CARGO_QA boarded=cryotube_1 scripted=1) instead of on foot inside it.
+16. Squad members where they stood (the stood-members change, not yet run): on a30 section 2 at Normal
+   with lz_search placed and not shooting, every living member is hurt to health 0.5 and shield 0.25
+   (qa_squad_hurt) and a checkpoint is taken. Its `s squad` records end with the major flag, the two
+   fractions and the stood point (15 fields). The player's death and a revert bring the members back
+   within 1.5 units of where they stood with those fractions (SQUAD_STOOD, the revert's log line,
+   SQUAD_STOOD_STATE stood=); members whose spot failed the floor or wall check (fallback=) may come
+   back at their starts, but most must not. A Continue from the save does the same. The same save with
+   each `s squad` record cut back to its major flag (the format before the change, its block hash
+   rebuilt) still continues with the script where it was, the members at their starts at full health.
 """
 import shutil
 import struct
@@ -392,3 +401,80 @@ assert 'Halo: player aboard cryotube_1 again' in text, text[-2000:]
 cont = [line for line in rows(text, 'CARGO_QA continued ') if ' loaded=1 ' in line]
 assert cont and 'boarded=cryotube_1' in cont[0] and 'scripted=1' in cont[0], cont
 print('A save in the cryotube kept the scripted seat; Continue put the player back in it.')
+
+# 16. Squad members come back where they stood, as hurt as they were (the stood-members change).
+if not (root / 'packages/maps/halo_a30_02.cgz').exists():
+    print('SKIP stood members: a30 section 2 is not imported.')
+else:
+    def stood_rows(text, label):
+        found = {}
+        for line in rows(text, f'SQUAD_STOOD {label} '):
+            parts = line.split()
+            values = dict(re.findall(r'(\w+)=(\S+)', line))
+            if values['object'] != '-1':
+                continue
+            found[(parts[2], values['start'])] = (tuple(float(v) for v in values['pos'].split(',')), float(values['health']),
+                                                  float(values['shield']), values['riding'] == '1')
+        state = rows(text, f'SQUAD_STOOD_STATE {label} ')
+        assert state, (label, text[-2000:])
+        return found, dict(re.findall(r'(\w+)=(\S+)', state[-1]))
+
+    def compare(before, after, counts, label):
+        assert after, (label, 'no living members after', counts)
+        far = []
+        kept = [key for key in after if key in before]
+        assert kept, (label, 'no member of the checkpoint came back', after, before)
+        for key in kept:   # (others are squads the restored scripts placed since)
+            pos, health, shield, riding = after[key]
+            was, was_health, was_shield, was_riding = before[key]
+            assert abs(health - was_health) < .05, (label, 'health kept', key, was_health, health)
+            assert abs(shield - was_shield) < .05, (label, 'shield kept', key, was_shield, shield)
+            if not was_riding and sum((a - b) ** 2 for a, b in zip(was, pos)) ** .5 > 1.5:
+                far.append(key)
+        assert int(counts['stood']) >= 1 and len(far) <= int(counts['fallback']), (label, far, counts)
+        assert int(counts['stood']) > int(counts['fallback']), ('most members come back where they stood', label, counts)
+
+    text, profile = run('stood-save', 'halo_difficulty 1; halo_scripttrace 1; qa_campaign_play 2 2; qa_after_gameplay [botsshoot 0; '
+                        'qa_actor_place lz_search; sleep 3000 [qa_squad_hurt 0.5 0.25; qa_squad_stood saved; qa_checkpoint_save] 1; '
+                        'sleep 3300 [qa_halo_damage 100000] 1; sleep 5000 [qa_halo_revert] 1; sleep 5100 [qa_squad_stood reverted] 1; '
+                        'sleep 5400 [quit] 1]', timeout=200)
+    before, _ = stood_rows(text, 'saved')
+    assert before and all(abs(h - .5) < .05 for _, h, _, _ in before.values()), ('every member hurt to 0.5', before)
+    after, counts = stood_rows(text, 'reverted')
+    assert 'squad members back where they stood' in text, text[-2000:]
+    compare(before, after, counts, 'revert')
+    saved = read_progress(profile)
+    squads = [r.split() for r in saved['records']['s'] if r.startswith('squad ')]
+    # squad <e> =<encounter> <s> =<squad> <start> <suspended> <flags> <major> <health> <shield> [<x> <y> <z> <yaw>]
+    assert squads and all(len(r) in (11, 15) for r in squads), squads[:5]
+    lz = [r for r in squads if r[2] == '=lz_search']
+    assert lz and all(abs(float(r[9]) - .5) < .05 for r in lz), ('the records hold the health', lz[:5])
+    assert sum(1 for r in lz if len(r) == 15) >= len(lz) - sum(1 for v in before.values() if v[3]), ('the stood point on foot', lz[:5])
+    stood_profile = scratch('frontend-stood-copy-')
+    shutil.copytree(profile / 'config', stood_profile / 'config')
+    text, profile = run('stood-continue', 'halo_scripttrace 1; halo_title; sleep 300 [halo_continue] 1; '
+                        'qa_after_gameplay [botsshoot 0; qa_squad_stood continued; sleep 300 [quit] 1]', profile, timeout=200)
+    assert 'with the mission script where it was' in text and 'could not be restored' not in text, text[-2000:]
+    after, counts = stood_rows(text, 'continued')
+    compare(before, after, counts, 'Continue')
+
+    # The same save in the format before the change: each squad record cut back to its major flag.
+    def cut(lines):
+        start = next(i for i, l in enumerate(lines) if l.startswith('state '))
+        end = start + 1
+        while end < len(lines) and len(lines[end].split(' ', 1)[0]) == 1 and lines[end][0] in STATE_KINDS:
+            end += 1
+        records = [' '.join(l.split()[:10]) if l.startswith('s squad ') else l for l in lines[start + 1:end]]
+        return lines[:start] + state_block(lines[start].split()[1:7], records) + lines[end:]
+
+    profile = scratch('frontend-stood-old-')
+    shutil.copytree(stood_profile / 'config', profile / 'config')
+    rewrite_progress(profile, cut)
+    assert all(len(r.split()) == 9 for r in read_progress(profile)['records']['s'] if r.startswith('squad ')), 'cut to the major flag'
+    text, profile = run('stood-old', 'halo_scripttrace 1; halo_title; sleep 300 [halo_continue] 1; '
+                        'qa_after_gameplay [botsshoot 0; qa_squad_stood old; sleep 300 [quit] 1]', profile, timeout=200)
+    assert 'with the mission script where it was' in text and 'could not be restored' not in text, text[-2000:]
+    after, counts = stood_rows(text, 'old')
+    assert after and counts['stood'] == '0' and all(abs(h - 1) < .02 for _, h, _, _ in after.values()), (counts, after)
+    print(f'Squad members came back where they stood with their health and shield after a revert and a Continue '
+          f'({len(before)} lz_search and other members); a save without the new fields still loads, at the starts.')

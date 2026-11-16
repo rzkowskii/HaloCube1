@@ -8,12 +8,61 @@ import tempfile
 import zlib
 
 
+PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+
+
+def png_content(data):
+    """A PNG's image content independent of how it was compressed: its IHDR chunk's data and its
+    IDAT chunks' data concatenated and inflated, or None when `data` is not a whole, intact PNG
+    (bad signature, a truncated chunk, a CRC mismatch, no IHDR, IDAT or IEND, or a damaged deflate
+    stream). Two PNGs with equal content decode to the same pixels; their bytes may differ when
+    another zlib wrote them (write_png's stream comes from the running Python's zlib.compress).
+    Ancillary chunks are ignored (write_png writes none)."""
+    if not data.startswith(PNG_SIGNATURE):
+        return None
+    position, header, idat, ended = len(PNG_SIGNATURE), None, [], False
+    while position + 12 <= len(data):
+        length, name = struct.unpack_from('>I4s', data, position)
+        end = position + 12 + length
+        if end > len(data):
+            return None
+        body = data[position + 8:end - 4]
+        if struct.unpack_from('>I', data, end - 4)[0] != zlib.crc32(name + body):
+            return None
+        if name == b'IHDR':
+            header = body
+        elif name == b'IDAT':
+            idat.append(body)
+        elif name == b'IEND':
+            ended = True
+            break
+        position = end
+    if header is None or not idat or not ended:
+        return None
+    try:
+        inflater = zlib.decompressobj()
+        pixels = inflater.decompress(b''.join(idat)) + inflater.flush()
+    except zlib.error:
+        return None
+    return (header, pixels) if inflater.eof else None
+
+
 def write_png(path, width, height, pixels):
+    """Write an 8-bit RGBA PNG, unless `path` already holds one with the same content (png_content:
+    the same header and inflated scanlines, whatever zlib compressed it), which is left untouched.
+    Re-imports then rewrite only the textures that changed, and a Python or zlib upgrade does not
+    rewrite every texture with a different but equivalent deflate stream."""
     def chunk(name, data):
         return struct.pack('>I', len(data)) + name + data + struct.pack('>I', zlib.crc32(name + data))
     scanlines = b''.join(b'\0' + pixels[i:i + width * 4] for i in range(0, len(pixels), width * 4))
+    header = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
+    try:
+        if path.is_file() and png_content(path.read_bytes()) == (header, scanlines):
+            return
+    except OSError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0))
+    path.write_bytes(PNG_SIGNATURE + chunk(b'IHDR', header)
                      + chunk(b'IDAT', zlib.compress(scanlines)) + chunk(b'IEND', b''))
 
 

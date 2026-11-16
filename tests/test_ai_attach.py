@@ -69,7 +69,8 @@ require(root / 'packages/halo/a50.hscb', 'run tools/import_halo_scripts.py')
 
 # ---- Static: the flags and the squads' default variants.
 programs = {p.stem: read_hscb(p) for p in sorted((root / 'packages/halo').glob('*.hscb'))}
-assert all(h['version'] == 9 for h in programs.values()), {k: h['version'] for k, h in programs.items()}
+# Version 10 (major upgrades) keeps version 9's tables.
+assert all(h['version'] in (9, 10) for h in programs.values()), {k: h['version'] for k, h in programs.items()}
 
 
 def figures(cache):

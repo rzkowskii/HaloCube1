@@ -10,6 +10,10 @@ The unit and object-state commands (berserk, grenades, flags, impervious and
 damage immunity, vitality, damage, follow, migration, attach, renew, teleport,
 suspend; object hover, collision, open, doors) change what the actors and
 objects do; the player's vitality and protection follow the same commands.
+Combat by difficulty (item 6, the combat-scaling work, not yet run): on each
+level the Covenant fire with the globals table's rate_of_fire, projectile_error,
+burst_separation, grenade_chance_scale and the lead gate, the marines with
+Normal's, and the melee delays and guidance_vs_player follow the level for all.
 """
 import re
 import subprocess
@@ -288,3 +292,96 @@ text, log = run('doors', 'qa_campaign_resume 3 1', [
 doors = [float(v) for w, n, v in probes(text, 'HS_OBJECT')]
 assert len(doors) == 2 and doors[0] == 1 and doors[1] == 0, ('a door set to door_off stops drawing and blocking', doors, log)
 print('Doors: object_set_permutation door_off removes the cell door.')
+
+
+# 6. Combat by difficulty (the combat-scaling work; written while testing was on hold, NOT YET RUN).
+#    Halo scales hostile actors' firing by the globals' (matg) difficulty table on their team
+#    (game_difficulty_get_team_value, ../Halo3DS game/game_globals.c:204-225: the player's side
+#    reads Normal): rate_of_fire divides the trigger delay (ai/actor_combat.c:2394), projectile_error
+#    multiplies the aim error (:1270), burst_separation the pause between bursts (:603),
+#    target_leading only gates the lead (:2196), grenade_chance_scale the throw chance
+#    (ai/actions.c:3645) and grenade_timer_scale the wait after a throw (:2356); melee_delay_scale
+#    and _base (:2565) and guidance_vs_player (items/projectiles.c:802) are read for every team.
+#    qa_actor_combat prints the team factors (COMBAT_DIFFICULTY and _MORE) and, per living actor, the values
+#    its brain fires with (ACTOR_COMBAT); they must follow actors.txt's `difficulty` lines and the
+#    variant's own `fire`, `burst` and `grenade` lines.
+table, variants, current = {}, {}, None
+for entry in (root / 'packages/halo/actors.txt').read_text().splitlines():
+    key, _, rest = entry.partition(' ')
+    if key == 'difficulty':
+        index, name, *values = rest.split()
+        table[name] = [float(v) for v in values]
+    elif key == 'actor':
+        current = variants.setdefault(int(rest), {})
+    elif current is not None and key in ('fire', 'burst', 'grenade'):
+        current[key] = [float(v) for v in rest.split()]
+for name in ('rate_of_fire', 'projectile_error', 'burst_separation', 'target_leading', 'grenade_chance_scale',
+             'grenade_timer_scale', 'melee_delay_scale', 'melee_delay_base', 'guidance_vs_player'):
+    assert name in table, ('actors.txt has no difficulty table (format 3); rerun tools/halo_actors.py', name)
+# The retail values (the same in the ten caches; tests/test_difficulty.py checks the export).
+assert [round(v, 2) for v in table['rate_of_fire']] == [0.8, 1, 1.2, 1.5], table['rate_of_fire']
+assert [round(v, 2) for v in table['guidance_vs_player']] == [0.5, 0.5, 0.75, 1], table['guidance_vs_player']
+FACTORS = {'rof': 'rate_of_fire', 'perror': 'projectile_error', 'burst_error': 'burst_error', 'new_target': 'new_target_delay',
+           'separation': 'burst_separation', 'tracking': 'target_tracking', 'leading': 'target_leading',
+           'overcharge': 'overcharge_chance', 'special': 'special_fire_delay', 'grenade_chance': 'grenade_chance_scale',
+           'grenade_timer': 'grenade_timer_scale'}
+GLOBAL = {'melee_scale': 'melee_delay_scale', 'melee_base': 'melee_delay_base', 'guidance': 'guidance_vs_player'}
+
+
+def near(a, b, tolerance=.0015):
+    return abs(a - b) <= tolerance   # printed with three decimals
+
+
+summary = []
+for d in range(4):
+    text, log = run(f'combat-{d}', f'halo_difficulty {d}; qa_campaign_resume 2 2', [
+        (0, 'qa_actor_place lz_search; qa_actor_place first_marine'),
+        (300, 'qa_hs_ai ai_magically_see_players lz_search 0'),
+        (5000, 'qa_actor_state combat; qa_actor_combat combat'),
+        (5300, 'quit'),
+    ], timeout=150)
+    teams = {}
+    for line in text.splitlines():
+        # Two lines per team (the console cuts lines at 260 characters), merged by team.
+        if line.startswith('COMBAT_DIFFICULTY combat ') or line.startswith('COMBAT_DIFFICULTY_MORE combat '):
+            fields = dict(re.findall(r'(\w+)=(\S+)', line))
+            teams.setdefault(fields['team'], {}).update(fields)
+    assert sorted(teams) == ['covenant', 'flood', 'human', 'none', 'player', 'sentinel'], (sorted(teams), log)
+    for team, fields in teams.items():
+        assert int(fields['level']) == d and fields['table'] == '1', ('the level and the table', d, fields, log)
+        # Hostile teams (and no team) the level's value; the player and the marines Normal's.
+        level = 1 if team in ('human', 'player') else d
+        for field, name in FACTORS.items():
+            assert near(float(fields[field]), table[name][level]), ('team value', d, team, field, fields[field], table[name][level])
+        for field, name in GLOBAL.items():
+            assert near(float(fields[field]), table[name][d]), ('every team reads the level', d, team, field, fields[field])
+    shots = {a['cn']: int(a['shots']) for a in actors(text, 'combat')}
+    rows = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines() if line.startswith('ACTOR_COMBAT combat ')]
+    covenant = [r for r in rows if r['team'] == 'covenant']
+    marines = [r for r in rows if r['team'] == 'human']
+    assert covenant and marines, ('lz_search and first_marine are placed and alive', len(covenant), len(marines), log)
+    written = 0
+    for r in rows:
+        v = variants[int(r['variant'])]
+        level = 1 if r['team'] in ('human', 'player') else d
+        rate, error, lead = v['fire'][1], v['fire'][2], v['fire'][7]
+        assert near(float(r['scaled_error']), error * table['projectile_error'][level], .0002), ('projectile_error', d, r)
+        assert r['leads'] == ('1' if min(1.0, lead + table['target_leading'][level]) > 0 else '0'), ('lead gate', d, r)
+        separation = [s * table['burst_separation'][level] for s in v['burst'][2:4]]
+        assert all(near(float(a), b) for a, b in zip(r['separation'].split(','), separation)), ('burst_separation', d, r)
+        assert near(float(r['grenade_scaled']), v['grenade'][1] * table['grenade_chance_scale'][level]), ('grenade_chance_scale', d, r)
+        if int(r['melee']) == 0 and rate > 0:
+            want = max(66, int(1000 / (rate * table['rate_of_fire'][level])))
+            assert abs(int(r['delay']) - want) <= 1, ('rate_of_fire on the trigger delay', d, r, want)
+            # The brain writes the delay into the slot on each shot (an actor whose only noise
+            # was a grenade still has its spawn delay, so only count the matches; on Normal the
+            # two are the same). Only the hostile actors count: a marine reads Normal, so its slot
+            # matches from spawn whether or not fire() wrote it.
+            if r['team'] not in ('human', 'player') and shots.get(r['cn'], 0) > 0 and int(r['slot']) == int(r['delay']):
+                written += 1
+        smash = [int(x) for x in r['smash'].split(',')]
+        for base, got in zip((1600, 2199), smash):
+            assert abs(got - round(base * table['melee_delay_scale'][d] + table['melee_delay_base'][d] * 1000)) <= 1, ('melee delay', d, r)
+    assert written, ('at least one Covenant actor fired at its scaled delay', d, shots, log)
+    summary.append((d, round(float(covenant[0]['scaled_error']), 4), covenant[0]['delay'], marines[0]['scaled_error']))
+print(f'Combat scaling: per level (level, a Covenant actor\'s error and delay, a marine\'s error) {summary}.')

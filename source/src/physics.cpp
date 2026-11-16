@@ -727,6 +727,14 @@ void moveplayer(physent *pl, int moveres, bool local, int curtime)
         pl->vel.div(fpsfric);
         d = pl->vel;
         d.mul(speed);
+        // Halo's random speed increase on an actor's ground movement (halomovementscale; 1 for every
+        // other bot). Bots only: the player's movement is not touched.
+        if(pl->type==ENT_BOT && !hover)
+        {
+            const float stagger = halomovementscale((const playerent *)pl);
+            d.x *= stagger;
+            d.y *= stagger;
+        }
 
         if(editfly)                // just apply velocity
         {

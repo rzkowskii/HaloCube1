@@ -145,6 +145,12 @@ COMMANDF(qa_nav_state, "s", (const char *name)
     fflush(stdout);
 });
 
+// The stood-members change (tests/test_frontend_progress.py item 16, not yet run): SQUAD_STOOD per
+// living squad member (where it stands, health, shield, riding) and SQUAD_STOOD_STATE with the
+// last revert's counts; qa_squad_hurt HEALTH SHIELD sets every living non-attached member's fractions.
+COMMANDF(qa_squad_stood, "s", (const char *label) { haloscenarioqasquads(label); });
+COMMANDF(qa_squad_hurt, "ff", (float *health, float *shield) { haloscenarioqasquadhurt(*health, *shield); });
+
 // Takes a scripted checkpoint where the player stands, as game_save does once it is safe (and
 // saves it to the progress file).
 COMMANDF(qa_checkpoint_save, "", () { if(haloactive() && player1->state == CS_ALIVE) saveCheckpoint(true); });

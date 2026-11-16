@@ -43,7 +43,7 @@ HUNTER, ELITE, SENTINEL_KIND, MARINE, MONITOR_KIND, ENGINEER_KIND = 3, 1, 8, 9, 
 def actor_table():
     actors, current = {}, None
     text = ACTORS.read_text()
-    assert text.startswith('format 2'), 'actors.txt is format 2 (re-run tools/halo_actors.py)'
+    assert text.startswith(('format 2\n', 'format 3\n')), 'actors.txt is format 2 or 3 (re-run tools/halo_actors.py)'
     for line in text.splitlines():
         key, _, rest = line.partition(' ')
         if key == 'actor':

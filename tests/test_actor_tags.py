@@ -23,8 +23,8 @@ def records():
             actors.append(current)
         elif current is None or key.startswith('#') or key in ('format', 'end'):
             continue
-        elif key == 'path':
-            current['path'] = rest
+        elif key in ('path', 'major'):
+            current[key] = rest     # format 3: `major <actv path>`, the variant's major upgrade
         elif key == 'family':
             family, kind, kind_type, *_ = rest.split()
             current.update(family=family, kind=int(kind), type=int(kind_type))

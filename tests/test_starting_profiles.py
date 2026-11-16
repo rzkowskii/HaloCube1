@@ -3,7 +3,7 @@
 Written while testing was on hold: not yet run (see docs/macos-build.md, "Not yet verified in the
 game", and the starting profiles under Retail weapons).
 
-Static (assets, no game): every packages/halo/<cache>.hscb is version 9 and reads to its last byte
+Static (assets, no game): every packages/halo/<cache>.hscb is version 9 or 10 and reads to its last byte
 (qa_common.read_hscb); each mission's profile 0 is the player's start: a10 carries no weapon and no
 grenades (it starts unarmed), a10 has bridge0_profile (a pistol, 6 loaded, 48 more) for Keyes's
 bridge, a30 the assault rifle 60/120 and the pistol 12/64 with no grenades, a50 the sniper rifle 4/64
@@ -54,8 +54,9 @@ require(root / 'packages/halo/a10.hscb', 'run tools/import_halo_scripts.py')
 
 # ---- Static: the profile tables.
 programs = {p.stem: read_hscb(p) for p in sorted((root / 'packages/halo').glob('*.hscb'))}
-old = [name for name, h in programs.items() if h['version'] != 9]
-assert not old, (old, 'rerun tools/import_halo_scripts.py (HSCB version 9)')
+# Version 10 (major upgrades, the squad-count batch) keeps version 9's profile tables.
+old = [name for name, h in programs.items() if h['version'] not in (9, 10)]
+assert not old, (old, 'rerun tools/import_halo_scripts.py (HSCB version 9 or later)')
 
 
 def weapons(profile):
@@ -82,7 +83,7 @@ if (HALO_SOURCE / 'a10.map').exists():
             rows_ = list(profile_rows(HaloMap(data)))
         assert [r[0] for r in rows_] == [p['name'] for p in program['profiles']], cache
         assert [(r[3], r[4], r[5]) for r in rows_] == [p['weapons'][0] for p in program['profiles']], cache
-print(f'{len(programs)} .hscb files are version 9; the starting profiles hold a10 unarmed, its bridge pistol, a30, a50, c20 easy_start.')
+print(f'{len(programs)} .hscb files are version 9 or 10; the starting profiles hold a10 unarmed, its bridge pistol, a30, a50, c20 easy_start.')
 
 require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
 require(root / 'packages/halo/weapons.txt', 'run tools/halo_weapons.py')

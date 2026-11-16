@@ -400,6 +400,9 @@ COMMANDF(qa_enemy_weapons, "", ()
 
 // ---- Actor AI (tests/test_actor_ai.py)
 COMMANDF(qa_actor_state, "s", (const char *label) { haloactordump(label); });
+// Combat by difficulty (the combat-scaling work): COMBAT_DIFFICULTY per team and ACTOR_COMBAT per
+// living actor, the effective values the brain fires with (halo_ai.cpp haloactorcombatdump).
+COMMANDF(qa_actor_combat, "s", (const char *label) { haloactorcombatdump(label); });
 COMMANDF(qa_actor_place, "s", (const char *encounter)
 {
     conoutf("ACTOR_PLACE %s %d", encounter, haloscenarioplace(encounter));
@@ -421,6 +424,22 @@ COMMANDF(qa_actor_count, "s", (const char *label)
     conoutf("FLOOD_QA %s grunt=%d elite=%d jackal=%d hunter=%d flood_elite=%d flood_human=%d infection=%d carrier=%d sentinel=%d marine=%d",
             label, counts[GRUNT], counts[ELITE], counts[JACKAL], counts[HUNTER], counts[FLOOD_ELITE], counts[FLOOD_HUMAN],
             counts[INFECTION], counts[CARRIER], counts[SENTINEL], counts[MARINE]);
+    fflush(stdout);
+});
+// Halo's random speed increase (tests/test_flood.py, written while testing was on hold, NOT YET
+// RUN): FLOOD_STAGGER <label> <name> cn=<client number> flag=<0|1> combat=<0|1> scale=<factor>
+// value=<infection_forms> for every living actor (halomovementscale; combat: it fights a target).
+COMMANDF(qa_flood_stagger, "s", (const char *label)
+{
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot->state != CS_ALIVE) continue;
+        const HaloActorDef *def = haloactorvariant(bot);
+        conoutf("FLOOD_STAGGER %s %s cn=%d flag=%d combat=%d scale=%.4f value=%.2f", label, bot->name, bot->clientnum,
+                def && def->randomSpeedIncrease() ? 1 : 0, haloactorstatus(bot) == 6 && haloactortarget(bot) ? 1 : 0,
+                halomovementscale(bot), halodifficultyget(HALO_DIFFICULTY_INFECTION_FORMS));
+    }
     fflush(stdout);
 });
 // Leaves `count` dead entries in the squad list, as a long fight does.
@@ -645,10 +664,60 @@ COMMANDF(qa_campaign_play, "ii", (int *m, int *s)
     queueSection(*m - 1, *s - 1);
 });
 
-// Difficulty (tests/test_difficulty.py): the selected level, the script's view of it and the damage multiplier.
-COMMANDF(qa_difficulty, "", ()
+// Difficulty (tests/test_difficulty.py): the selected level, the script's view of it, enemy_damage
+// and the Covenant's (enemy) vitality, then the team values (halodifficultyteamvalue) for the
+// Covenant, the marines and the player, whether actors.txt carried the globals table, and one
+// DIFFICULTY_DAMAGE line of halodifficultydamagefactor per owner>target team pair ("none": -1).
+static void qaDifficulty()
 {
-    conoutf("DIFFICULTY %d script=%d damage=%.2f health=%.2f", halodifficulty(),
-            int(haloscenariocall("game_difficulty_get", 0, 0)), halodifficultydamage(), halodifficultyhealth());
+    auto team = [](int type, int t) { return halodifficultyteamvalue(type, t); };
+    conoutf("DIFFICULTY %d script=%d damage=%.2f health=%.2f shield=%.2f recharge=%.2f human=%.2f,%.2f,%.2f player=%.2f,%.2f,%.2f "
+            "none=%.2f table=%d", halodifficulty(), int(haloscenariocall("game_difficulty_get", 0, 0)),
+            halodifficultyget(HALO_DIFFICULTY_ENEMY_DAMAGE), team(HALO_DIFFICULTY_ENEMY_VITALITY, HALO_TEAM_COVENANT),
+            team(HALO_DIFFICULTY_ENEMY_SHIELD, HALO_TEAM_COVENANT), team(HALO_DIFFICULTY_ENEMY_RECHARGE, HALO_TEAM_COVENANT),
+            team(HALO_DIFFICULTY_ENEMY_VITALITY, HALO_TEAM_HUMAN), team(HALO_DIFFICULTY_ENEMY_SHIELD, HALO_TEAM_HUMAN),
+            team(HALO_DIFFICULTY_ENEMY_RECHARGE, HALO_TEAM_HUMAN), team(HALO_DIFFICULTY_ENEMY_VITALITY, HALO_TEAM_PLAYER),
+            team(HALO_DIFFICULTY_ENEMY_SHIELD, HALO_TEAM_PLAYER), team(HALO_DIFFICULTY_ENEMY_RECHARGE, HALO_TEAM_PLAYER),
+            team(HALO_DIFFICULTY_ENEMY_VITALITY, -1), halodifficultytable() ? 1 : 0);
+    static const int pairs[][2] = {{HALO_TEAM_COVENANT, HALO_TEAM_PLAYER}, {HALO_TEAM_COVENANT, HALO_TEAM_HUMAN},
+                                   {HALO_TEAM_COVENANT, HALO_TEAM_COVENANT}, {HALO_TEAM_COVENANT, HALO_TEAM_FLOOD},
+                                   {HALO_TEAM_FLOOD, HALO_TEAM_COVENANT}, {HALO_TEAM_HUMAN, HALO_TEAM_PLAYER},
+                                   {HALO_TEAM_HUMAN, HALO_TEAM_COVENANT}, {HALO_TEAM_PLAYER, HALO_TEAM_COVENANT},
+                                   {HALO_TEAM_PLAYER, HALO_TEAM_PLAYER}, {-1, HALO_TEAM_PLAYER}, {HALO_TEAM_COVENANT, -1}};
+    for(const auto &p : pairs)
+    {
+        float divisor = 1;
+        const float factor = halodifficultydamagefactor(p[0], p[1], &divisor);
+        conoutf("DIFFICULTY_DAMAGE %s>%s factor=%.2f divisor=%.2f", haloteamname(p[0]), haloteamname(p[1]), factor, divisor);
+    }
     fflush(stdout);
-});
+}
+COMMANDF(qa_difficulty, "", () { qaDifficulty(); });
+// Major upgrades (tests/test_major_upgrades.py): the placed squad members' variants and the error
+// diffusion state of the loaded section.
+COMMANDF(qa_major_upgrades, "", () { haloscenarioqamajors(); fflush(stdout); });
+// The engine's diffusion on its own, off any scenario: `squads` squads of `per` actors each,
+// placed squad after squad from fresh errors and `seed` (hex), with the squad major_upgrade enum
+// `kind` on the chosen difficulty. MAJOR_SIM kind level force random chance squads per seed, then
+// the majors per squad and the final map-wide error.
+static void qaMajorUpgradeSim(int kind, int squads, int per, const char *seedText)
+{
+    bool force = false, random = false;
+    float chance = 0;
+    halomajorupgradechance(kind, halodifficulty(), force, random, chance);
+    uint32_t seed = uint32_t(strtoul(seedText && *seedText ? seedText : "deadbeef", nullptr, 16));
+    float global = 0;
+    std::string counts;
+    for(int s = 0; s < clamp(squads, 0, 1000); ++s)
+    {
+        float squadError = 0;
+        int majors = 0;
+        for(int k = 0; k < clamp(per, 0, 1000); ++k)
+            majors += random ? haloconsidermajorupgrade(global, squadError, seed, chance) : force;
+        counts += " " + std::to_string(majors);
+    }
+    conoutf("MAJOR_SIM kind=%d level=%d force=%d random=%d chance=%.4f squads=%d per=%d majors=%s global=%.6f table=%d", kind,
+            halodifficulty(), force, random, chance, squads, per, counts.c_str(), global, halodifficultytable() ? 1 : 0);
+    fflush(stdout);
+}
+COMMANDF(qa_major_upgrade_sim, "iiis", (int *kind, int *squads, int *per, const char *seedText) { qaMajorUpgradeSim(*kind, *squads, *per, seedText); });

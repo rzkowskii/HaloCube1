@@ -40,9 +40,9 @@ VAR(halo_effectdamage, 0, 0, 1);
 VAR(halo_carriedhold, 0, 0, 1);
 
 int halodifficulty() { return clamp(int(halo_difficulty), 0, 3); }
-// Enemy damage and vitality relative to Normal, and the player's incoming damage.
-float halodifficultydamage() { static const float scale[4] = {0.6f, 1.0f, 1.3f, 1.7f}; return scale[halodifficulty()]; }
-float halodifficultyhealth() { static const float scale[4] = {0.75f, 1.0f, 1.25f, 1.5f}; return scale[halodifficulty()]; }
+// The damage and vitality scaling is the globals' difficulty table by team (halo_ai.cpp
+// halodifficultyteamvalue and halodifficultydamagefactor); the constants this file had before
+// are its fallback.
 
 namespace
 {
@@ -161,6 +161,10 @@ namespace
         // Version 9: the squad's default variant (an ACTORS kind, -1 when not one, and an
         // actors.txt index, -1 unknown), what ai_attach turns a scripted biped into.
         int defaultKind = -1, defaultVariant = -1;
+        // Version 10: the squad's major_upgrade enum (0 normal, 1 few, 2 many, 3 none, 4 all;
+        // tools/import_halo_scripts.py squad_upgrade_rows). -1 with an older file: its actors are
+        // never upgraded, as before (the engine cannot tell a normal squad from a none one).
+        int majorUpgrade = -1;
     };
     struct Encounter
     {
@@ -240,7 +244,7 @@ namespace
             Reader r(path);
             if(r.bytes(4) != "HSCB") return false;
             const uint32_t version = r.number<uint32_t>();
-            if(version < 5 || version > 9) return false;
+            if(version < 5 || version > 10) return false;
             auto u8 = [&] { return r.number<uint8_t>(); };
             auto u16 = [&] { return r.number<uint16_t>(); };
             auto i16 = [&] { return r.number<int16_t>(); };
@@ -428,6 +432,15 @@ namespace
                 objectFlags = r.rows<unsigned char>(4096, u8);
                 if(objectFlags.size() != objects.size()) return false;
             }
+            if(version >= 10)
+            {
+                if(r.number<uint32_t>() != encounters.size()) return false;
+                for(Encounter &e : encounters)
+                {
+                    if(r.number<uint32_t>() != e.squads.size()) return false;
+                    for(Squad &squad : e.squads) squad.majorUpgrade = i16();
+                }
+            }
             if(!r.valid || r.file->tell() != r.file->size() || nodes.empty() || scripts.empty()) return false;
             if(groupFlags.size() != deviceGroups.size()) return false;
             for(const Script &script : scripts) if(!node(script.root)) return false;
@@ -560,18 +573,24 @@ namespace
         // start is Scenario::objectStarts[object]: where it took over (its spawn, which
         // ai_teleport_to_starting_location goes back to).
         int object = -1;
-        // An attached actor's checkpoint copy (savedSquadBots): where it stood when the checkpoint
-        // was taken (scenario units, as SquadStart), which a revert or Continue brings it back to;
-        // its start stays its spawn.
+        // A living squad member's checkpoint copy (savedSquadBots; attached actors since gap 4,
+        // every member since the stood-members change): where it stood when the checkpoint was
+        // taken (scenario units, as SquadStart), which a revert or Continue brings it back to when
+        // the spot passes Scenario::stoodSpot; its start stays where it was placed or took over.
+        // Not set for a member riding a vehicle (Scenario::riding): that one comes back at its start.
         bool stood = false;
         vec stoodPoint = vec(0, 0, 0);
         float stoodYaw = 0;
         // An attached object whose actor died before the checkpoint: kept, with no actor, so that
         // a revert does not make the object an actor again (unit_get_health stays -1).
         bool gone = false;
-        // An attached actor's health and shield (fractions) when the checkpoint was taken: a revert
-        // or a Continue brings it back with them (a50's game_lost_script reads Keyes's health).
+        // A living member's health and shield (fractions) when the checkpoint was taken: a revert
+        // or a Continue brings it back with them (a50's game_lost_script reads Keyes's health),
+        // wherever it comes back.
         float health = 1, shield = 1;
+        // Placed as its start variant's major upgrade (Scenario::chooseMajor): a revert or a
+        // Continue respawns it as the same variant instead of choosing again.
+        bool major = false;
     };
 
     // An actor ai_attach made of a scripted object, alive when the player walked on into the next
@@ -667,6 +686,14 @@ namespace
         std::vector<Thread> savedThreads;
         std::vector<Actor> savedActors;
         std::vector<SquadBot> squadBots, savedSquadBots;
+        // Halo's major upgrade error diffusion (../Halo3DS ai/ai.c:1875 ai_consider_major_upgrade):
+        // the map-wide error (ai_globals major_upgrade_error, ai.c:349), each squad's (squad_datum,
+        // encounters.h:94) and the seed its draws come from. Halo zeroes the errors when a map
+        // starts (ai.c:1929, encounters.c:1767) and keeps them in its game state, so a revert puts
+        // them back: here `savedUpgrade` is the checkpoint's copy and the state block's optional
+        // `s upgrade` record carries it through a Continue.
+        struct UpgradeState { uint32_t seed = 0; float global = 0; std::vector<std::vector<float>> squads; };
+        UpgradeState upgrade, savedUpgrade;
         // ai_attach (halo_script_ai.inc attachActors): per scripted object, the start its actor
         // spawns from (the squad's default variant at the object's pose), the tick it was attached
         // and the next tick a failed spawn is tried again. savedAttachedAt is attachedAt at the
@@ -808,11 +835,20 @@ namespace
         bool cartographerInterior() const;
         bool cartographerMapped() const;
         void placeSquads(int reference, int limit, bool scaled = true);
+        void resetUpgrade();
+        bool chooseMajor(int encounter, int squad, const SquadStart &start);
         size_t livingBots() const;
         void eraseSquads(int reference, bool erase);
         int living(int reference, bool carried = false) const;
         void migrateCarried(CarriedAttach &c, int newGroup);
         void restoreSquads();
+        // Where a living squad member stands and its vitality, onto its checkpoint copy (noteStood),
+        // and the revert's check of that spot (stoodSpot); restoreCounts are the last revert's
+        // members put back where they stood and those that fell back to their starts (QA).
+        bool riding(const playerent *bot) const;
+        void noteStood(SquadBot &copy, const playerent *bot) const;
+        bool stoodSpot(const SquadBot &saved, int kind, int variant, vec &point) const;
+        int restoreCounts[2] = {0, 0};
         bool matchesSquad(int reference, int encounter, int squad) const;
         void prepareAI();
         void updateLinks();
@@ -1965,6 +2001,12 @@ namespace
         const Object &object = program.objects[target];
         Actor &actor = actors[target];
         if(object.vitality <= 0 || !actor.visible || actor.cannotTakeDamage) return false;
+        // Difficulty: a unit's maximum body vitality times its team's value (../Halo3DS
+        // objects/damage.c:441). The only damage targets, d40's `invisible damage detector`
+        // bipeds, have the default team 3 (covenant), hostile to the player: enemy_vitality. The
+        // damage counts out of the Normal vitality, so the hit is divided by it. (Only the player's
+        // shots and blasts reach a target, so enemy_damage never applies: damage.c:1415-1419.)
+        amount /= max(.1f, halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, HALO_TEAM_COVENANT));
         actor.damage = min(object.vitality, actor.damage + amount);
         if(halo_scripttrace) conoutf("Halo target: %s took %.1f, health %.2f", object.name.c_str(), amount,
                                      max(0.0f, 1 - actor.damage / object.vitality));
@@ -3133,6 +3175,19 @@ namespace
             haloactorcommand(bot, &commandPrograms[start.commandList]);
     }
 
+    // The actors.txt variant a start is placed as: its own, or with `major` its major upgrade
+    // (actor_place, ../Halo3DS ai/actors.c:2687-2696), and in `kind` the body (the major's family's
+    // when it has one: the marine shotgun upgrades to a marine_armored major, the same body).
+    int startVariant(const SquadStart &start, bool major, int &kind)
+    {
+        kind = start.actor;
+        const HaloActorDef *def = haloactordef(start.variant);
+        const HaloActorDef *upgraded = major && def ? haloactordef(def->major) : nullptr;
+        if(!upgraded) return start.variant;
+        if(upgraded->kind >= 0) kind = upgraded->kind;
+        return upgraded->index;
+    }
+
     // The encounter's team (retail numbering: 1 player, 2 human, 3 covenant, 4 flood, 5 sentinel,
     // 6-9 unused); on the default team (0) the actors take their unit's default team from
     // actors.txt (marines and crew human, the Flood flood, Sentinels and the Monitor sentinel).
@@ -3159,7 +3214,7 @@ namespace
         const Encounter *encounter = at(program.encounters, id);
         if(!encounter || !projection || (encounter->bsp >= 0 && encounter->bsp != projection->bsp)) return;
         const Projection &p = *projection;
-        int count = 0, selected = 0;
+        int count = 0, selected = 0, majors = 0;
         for(size_t i = 0; i < encounter->squads.size(); ++i)
         {
             if(!matchesSquad(reference, id, int(i))) continue;
@@ -3179,15 +3234,64 @@ namespace
                           (p.origin.y - start.point.y) * p.xy + p.margin,
                           (start.point.z - p.origin.z) * p.z);
                 if(!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
-                if(playerent *bot = haloscenariospawnenemy(start.actor, point, 90 - start.yaw / RAD, start.variant, teamFor(*encounter, start)))
+                // The major upgrade is chosen before the actor is placed, as encounter_place_actor
+                // does (encounters.c:3040-3051): a placement that then fails has still moved the errors.
+                const bool major = chooseMajor(id, int(i), start);
+                int kind = start.actor;
+                const int variant = startVariant(start, major, kind);
+                if(playerent *bot = haloscenariospawnenemy(kind, point, 90 - start.yaw / RAD, variant, teamFor(*encounter, start)))
                 {
                     squadBots.push_back({&start, bot, id, int(i)});
+                    squadBots.back().major = major;
                     configureActor(bot, id, int(i), start);
                     ++count;
+                    if(major) ++majors;
                 }
             }
         }
-        if(count) conoutf("HaloScript: placed %d actors from %s (%d starts on difficulty %d)", count, encounter->name.c_str(), selected, halodifficulty());
+        // ", N major" after the parenthesis keeps the line tests/test_difficulty.py matches.
+        if(count) conoutf("HaloScript: placed %d actors from %s (%d starts on difficulty %d), %d major", count, encounter->name.c_str(),
+                          selected, halodifficulty(), majors);
+    }
+
+    // A fresh section: no errors yet (Halo zeroes them per map, ai.c:1929 and encounters.c:1767)
+    // and the seed Halo's game options start with (0xDEADBEEF, game/game.c:541), moved on by the
+    // section so that each section's draws differ. Judgement call: Halo draws from its one global
+    // seed, shared with everything else random, so its sequence cannot be reproduced; a seed of
+    // the upgrades' own keeps a section's placements the same from one fresh start to the next.
+    void Scenario::resetUpgrade()
+    {
+        upgrade = UpgradeState();
+        upgrade.seed = 0xDEADBEEFu + uint32_t(max(section, 0)) * 1013904223u;
+        upgrade.squads.assign(program.encounters.size(), {});
+        for(size_t e = 0; e < program.encounters.size(); ++e) upgrade.squads[e].assign(program.encounters[e].squads.size(), 0.0f);
+        savedUpgrade = upgrade;
+    }
+
+    // Whether a squad's actor at `start` is placed as its variant's major upgrade: Halo's
+    // encounter_place_actor (../Halo3DS ai/encounters.c:3040-3051) with ai_get_major_upgrade_chance
+    // (ai.c:615) and ai_consider_major_upgrade (ai.c:1875; halomajorupgradechance and
+    // haloconsidermajorupgrade, halo_ai.cpp). Only a variant with a major (actors.txt `major`)
+    // is considered, so the others leave the errors alone; a squad from an .hscb older than
+    // version 10 (majorUpgrade -1) is never upgraded.
+    bool Scenario::chooseMajor(int e, int s, const SquadStart &start)
+    {
+        const Encounter *encounter = at(program.encounters, e);
+        const Squad *squad = encounter ? at(encounter->squads, s) : nullptr;
+        const HaloActorDef *def = haloactordef(start.variant);
+        if(!squad || squad->majorUpgrade < 0 || !def || !haloactordef(def->major)) return false;
+        bool force = false, random = false;
+        float chance = 0;
+        halomajorupgradechance(squad->majorUpgrade, halodifficulty(), force, random, chance);
+        if(!random) return force;
+        if(upgrade.squads.size() != program.encounters.size()) upgrade.squads.resize(program.encounters.size());
+        std::vector<float> &errors = upgrade.squads[e];
+        if(errors.size() != encounter->squads.size()) errors.resize(encounter->squads.size(), 0.0f);
+        const bool major = haloconsidermajorupgrade(upgrade.global, errors[s], upgrade.seed, chance);
+        if(halo_scripttrace)
+            conoutf("HaloScript: %s/%s major upgrade chance %.3f, errors %.3f %.3f: %s", encounter->name.c_str(), squad->name.c_str(),
+                    chance, upgrade.global, errors[s], major ? "major" : "not upgraded");
+        return major;
     }
 
     // Platoon rules switch squads between attacking and defending, and send
@@ -3621,9 +3725,63 @@ namespace
         }
     }
 
+    // Whether a squad member rides a vehicle: a seat of an engine vehicle (halovehicleinside) or a
+    // script vehicle's cargo, seated or walking to or from its seat (a dropship's riders). Where it
+    // stands then is the seat's, not a spot to come back to on foot.
+    bool Scenario::riding(const playerent *bot) const
+    {
+        if(!bot) return false;
+        if(halovehicleinside(bot)) return true;
+        return std::any_of(cargo.begin(), cargo.end(), [bot](const Cargo &entry) { return entry.unit == bot; });
+    }
+
+    // A living squad member's checkpoint copy (haloscenariocheckpoint, and a live save's records):
+    // its health and shield fractions, and where it stands unless it rides a vehicle. Halo's
+    // checkpoint is the whole game state (../Halo3DS source/saved games/game_state.c:289-294
+    // writes the state heap, :312-324 a revert reads it back), so every living actor comes back
+    // where it was, as hurt as it was.
+    void Scenario::noteStood(SquadBot &copy, const playerent *bot) const
+    {
+        copy.stood = false;
+        if(!bot || bot->state != CS_ALIVE || !projection) return;
+        // A bot with no actor record reads health 0, which a revert would turn into 1 hit point:
+        // keep it at full instead, as the restore always did before.
+        copy.health = haloactorstarthealth(bot) > 0 ? haloactorhealthfraction(bot) : 1.0f;
+        copy.shield = haloenemyshieldfraction(bot);
+        if(riding(bot)) return;
+        const vec feet = fromWorld(*projection, vec(bot->o).sub(vec(0, 0, bot->eyeheight)));
+        const float yaw = (90 - bot->yaw) * RAD;
+        if(!std::isfinite(feet.x) || !std::isfinite(feet.y) || !std::isfinite(feet.z) || !std::isfinite(yaw)) return;
+        copy.stood = true;
+        copy.stoodPoint = feet;
+        copy.stoodYaw = yaw;
+    }
+
+    // Whether a reverted member may come back where it stood (`point`, world units, set either
+    // way): spawnCarried's two checks on that spot. On retail collision the body needs floor there
+    // (the spawn helper's ring, haloscenariospawnfloor) and nothing solid between where it stood
+    // and where that floor puts it (the ring moves the body up to 1.2 units: not through a wall or
+    // a closed door's lip). Off retail collision the spawn's own open-cube test is the check.
+    // Judgement call: spawnCarried's line is from the player, since a carried actor is placed
+    // near them; a reverted actor stood where it stood, so its own spot is the line's start.
+    bool Scenario::stoodSpot(const SquadBot &saved, int kind, int variant, vec &point) const
+    {
+        if(!saved.stood || !projection) return false;
+        const vec &stand = saved.stoodPoint;
+        if(!std::isfinite(stand.x) || !std::isfinite(stand.y) || !std::isfinite(stand.z) || !std::isfinite(saved.stoodYaw)) return false;
+        point = toWorld(*projection, stand);
+        if(!halocollisionactive()) return true;
+        vec feet = point;
+        if(!haloscenariospawnfloor(kind, variant, feet)) return false;
+        const vec chest(0, 0, player1->eyeheight * .6f);
+        HaloCollisionHit hit;
+        return !haloscenariotrace(vec(point).add(chest), vec(feet).add(chest), hit);
+    }
+
     void Scenario::restoreSquads()
     {
         squadBots.clear();
+        restoreCounts[0] = restoreCounts[1] = 0;
         if(!projection) return;
         const Projection &p = *projection;
         for(SquadBot saved : savedSquadBots)
@@ -3631,29 +3789,42 @@ namespace
             // An attached object whose actor was dead at the checkpoint stays without one.
             if(saved.gone) { saved.bot = nullptr; squadBots.push_back(saved); continue; }
             const SquadStart &start = *saved.start;
-            // An attached actor comes back where it stood at the checkpoint; the rest at their start.
-            const vec stand = saved.stood ? saved.stoodPoint : start.point;
-            const float yaw = saved.stood ? saved.stoodYaw : start.yaw;
-            vec point((stand.x - p.origin.x) * p.xy + p.margin,
-                      (p.origin.y - stand.y) * p.xy + p.margin,
-                      (stand.z - p.origin.z) * p.z);
             const Encounter *encounter = at(program.encounters, saved.encounter);
             const int team = encounter ? teamFor(*encounter, start) : HALO_TEAM_DEFAULT;
-            saved.bot = haloscenariospawnenemy(start.actor, point, 90 - yaw / RAD, start.variant, team);
+            // As the variant it was placed as (a major stays a major; no new choice).
+            int kind = start.actor;
+            const int variant = startVariant(start, saved.major, kind);
+            // Where it stood at the checkpoint when that spot passes the checks; otherwise, or for
+            // a member that rode a vehicle or a record without the spot, at its start as before.
+            vec point;
+            const bool stood = stoodSpot(saved, kind, variant, point);
+            if(stood) saved.bot = haloscenariospawnenemy(kind, point, 90 - saved.stoodYaw / RAD, variant, team);
+            else saved.bot = nullptr;
+            if(!saved.bot)
+            {
+                if(saved.stood) ++restoreCounts[1];
+                point = vec((start.point.x - p.origin.x) * p.xy + p.margin,
+                            (p.origin.y - start.point.y) * p.xy + p.margin,
+                            (start.point.z - p.origin.z) * p.z);
+                saved.bot = haloscenariospawnenemy(kind, point, 90 - start.yaw / RAD, variant, team);
+            }
+            else ++restoreCounts[0];
             if(saved.bot)
             {
                 squadBots.push_back(saved);
                 configureActor(saved.bot, saved.encounter, saved.squad, start);
                 for(int bit = 1; bit <= HALO_AI_NO_MANEUVER; bit <<= 1)
                     if(saved.scriptFlags & bit) haloactorsetflag(saved.bot, bit, true);
-                // An attached actor (a50's Keyes) comes back as hurt as it was at the checkpoint.
-                if(saved.object >= 0)
-                {
-                    if(saved.health < 1) haloactorsethealthfraction(saved.bot, saved.health);
-                    if(saved.shield < 1) haloenemysetshield(saved.bot, saved.shield);
-                }
+                // As hurt as it was at the checkpoint (a50's Keyes; every member since the
+                // stood-members change), wherever it came back. A record without the fractions
+                // leaves them at 1: full vitality, as before.
+                if(saved.health < 1) haloactorsethealthfraction(saved.bot, saved.health);
+                if(saved.shield < 1) haloenemysetshield(saved.bot, saved.shield);
             }
         }
+        if(restoreCounts[0] || restoreCounts[1])
+            conoutf("HaloScript: the revert put %d squad members back where they stood (%d at their starts instead: no floor or a wall there)",
+                    restoreCounts[0], restoreCounts[1]);
     }
 
     void Scenario::stop()
@@ -3792,6 +3963,10 @@ namespace
                 conoutf("HaloScript: %s (%s) comes along into section %d, health %.2f", program.objects[c.object].name.c_str(),
                         program.encounters[c.encounter].name.c_str(), s + 1, c.health);
             squadBots.clear();
+            // The upgrade errors and seed go on: in Halo the mission is one map, its BSP switches
+            // do not reset them (only a new map does, ai.c:1929).
+            if(upgrade.squads.size() != program.encounters.size()) resetUpgrade();
+            savedUpgrade = upgrade;
             std::fill(attachedAt.begin(), attachedAt.end(), -1);
             std::fill(savedAttachedAt.begin(), savedAttachedAt.end(), -1);
             std::fill(attachRetry.begin(), attachRetry.end(), 0);
@@ -3833,6 +4008,7 @@ namespace
         savedActors.clear();
         savedSquadBots.clear();
         squadBots.clear();
+        resetUpgrade();
         objectStarts.assign(program.objects.size(), SquadStart{});
         attachedAt.assign(program.objects.size(), -1);
         savedAttachedAt.assign(program.objects.size(), -1);
@@ -4602,6 +4778,68 @@ void haloscenarioqapad(int count)
 
 int haloscenarioencountercount() { return scenario.loaded ? int(scenario.program.encounters.size()) : 0; }
 
+// QA (tests/test_major_upgrades.py): one MAJOR_UPGRADE line per living squad member (its squad,
+// start index, whether it was placed as a major, the variant it is, its start's variant and that
+// variant's major, "-" for none), then MAJOR_STATE with the
+// seed, the map-wide error and the checkpoint's copy of both.
+void haloscenarioqamajors()
+{
+    if(!scenario.loaded) { conoutf("MAJOR_STATE none"); return; }
+    const Program &p = scenario.program;
+    for(const SquadBot &bot : scenario.squadBots)
+    {
+        if(!bot.bot || bot.bot->state != CS_ALIVE || bot.object >= 0) continue;
+        const Encounter *e = at(p.encounters, bot.encounter);
+        const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
+        if(!sq || !bot.start || bot.start < sq->starts.data() || bot.start >= sq->starts.data() + sq->starts.size()) continue;
+        const HaloActorDef *variant = haloactorvariant(bot.bot), *base = haloactordef(bot.start->variant);
+        conoutf("MAJOR_UPGRADE %s/%s start=%d enum=%d major=%d variant=%s | base=%s | base_major=%s", e->name.c_str(), sq->name.c_str(),
+                int(bot.start - sq->starts.data()), sq->majorUpgrade, bot.major ? 1 : 0, variant ? variant->path.c_str() : "-",
+                base ? base->path.c_str() : "-", base && haloactordef(base->major) ? haloactordef(base->major)->path.c_str() : "-");
+    }
+    conoutf("MAJOR_STATE seed=%08x global=%.6f saved_seed=%08x saved_global=%.6f table=%d", scenario.upgrade.seed, scenario.upgrade.global,
+            scenario.savedUpgrade.seed, scenario.savedUpgrade.global, halodifficultytable() ? 1 : 0);
+}
+
+// QA (tests/test_frontend_progress.py item 16, the stood-members change): one SQUAD_STOOD line per
+// living squad member (its squad, start index, attached object or -1, major flag, feet in world
+// units, health and shield fractions, whether it rides a vehicle), then SQUAD_STOOD_STATE with
+// the living count and the last revert's members put back where they stood and at their starts.
+void haloscenarioqasquads(const char *label)
+{
+    if(!scenario.loaded) { conoutf("SQUAD_STOOD_STATE %s none", label); fflush(stdout); return; }
+    const Program &p = scenario.program;
+    int living = 0;
+    for(const SquadBot &bot : scenario.squadBots)
+    {
+        if(!bot.bot || bot.bot->state != CS_ALIVE || !bot.start) continue;
+        const Encounter *e = at(p.encounters, bot.encounter);
+        const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
+        if(!sq) continue;
+        const bool own = bot.start >= sq->starts.data() && bot.start < sq->starts.data() + sq->starts.size();
+        const vec feet = vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight));
+        conoutf("SQUAD_STOOD %s %s/%s start=%d object=%d major=%d pos=%.2f,%.2f,%.2f health=%.3f shield=%.3f riding=%d", label,
+                e->name.c_str(), sq->name.c_str(), own ? int(bot.start - sq->starts.data()) : -1, bot.object, bot.major ? 1 : 0,
+                feet.x, feet.y, feet.z, haloactorhealthfraction(bot.bot), haloenemyshieldfraction(bot.bot), scenario.riding(bot.bot) ? 1 : 0);
+        ++living;
+    }
+    conoutf("SQUAD_STOOD_STATE %s living=%d stood=%d fallback=%d", label, living, scenario.restoreCounts[0], scenario.restoreCounts[1]);
+    fflush(stdout);
+}
+
+// QA: sets every living squad member that is not an attached actor to these health and shield
+// fractions, so that a revert or a Continue can be seen to keep them.
+void haloscenarioqasquadhurt(float health, float shield)
+{
+    if(!scenario.loaded) return;
+    for(const SquadBot &bot : scenario.squadBots)
+    {
+        if(!bot.bot || bot.bot->state != CS_ALIVE || bot.object >= 0) continue;
+        haloactorsethealthfraction(bot.bot, health);
+        haloenemysetshield(bot.bot, shield);
+    }
+}
+
 const char *haloscenarioencountername(int index)
 {
     return scenario.loaded && index >= 0 && index < int(scenario.program.encounters.size()) ? scenario.program.encounters[index].name.c_str() : "";
@@ -4827,17 +5065,11 @@ void haloscenariocheckpoint()
         if(bot.bot && bot.bot->state == CS_ALIVE)
         {
             scenario.savedSquadBots.push_back(bot);
-            // An attached actor comes back where it stands now, with the health and shield it has
-            // now; its start stays where it took over (ai_teleport_to_starting_location).
-            if(bot.object >= 0 && scenario.projection)
-            {
-                SquadBot &copy = scenario.savedSquadBots.back();
-                copy.stood = true;
-                copy.stoodPoint = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
-                copy.stoodYaw = (90 - bot.bot->yaw) * RAD;
-                copy.health = haloactorhealthfraction(bot.bot);
-                copy.shield = haloenemyshieldfraction(bot.bot);
-            }
+            // Every living member (an attached actor since gap 4, the rest since the stood-members
+            // change) comes back where it stands now unless it rides a vehicle, with the health and
+            // shield it has now; its start stays where it was placed or took over
+            // (ai_teleport_to_starting_location).
+            scenario.noteStood(scenario.savedSquadBots.back(), bot.bot);
         }
         else if(bot.object >= 0)
         {
@@ -4846,6 +5078,7 @@ void haloscenariocheckpoint()
         }
     }
     scenario.savedAttachedAt = scenario.attachedAt;
+    scenario.savedUpgrade = scenario.upgrade;
     scenario.savedCarried = scenario.carriedAttached;
     scenario.savedAttachVitality = scenario.attachVitality;
     scenario.savedBoarded = {};
@@ -4908,6 +5141,9 @@ void haloscenariorevert()
         scenario.chapter = scenario.savedChapter;
         scenario.chapterStart = scenario.savedChapterStart;
         haloallegiancerevert();
+        // The upgrade errors and seed as at the checkpoint, so the squads placed after it are
+        // placed as they were (Halo's revert restores its game state, the errors with it).
+        scenario.upgrade = scenario.savedUpgrade;
         scenario.restoreSquads();
         scenario.tick = scenario.savedTick;
         scenario.accumulator = 0;
@@ -4954,7 +5190,8 @@ void haloscenariorevert()
 // ---- Saved games: the mission script's state in config/halo-progress.txt (halo.cpp, version 3)
 //
 // The records hold what haloscenariocheckpoint() keeps for a revert (globals, threads with their
-// whole call stacks, scripted objects, the living squad members, device groups and devices,
+// whole call stacks, scripted objects, the living squad members (where they stood and how hurt
+// they were, since the stood-members change), device groups and devices,
 // external globals, objective and help text, nav points, the HUD parts hidden or blinking, the
 // chapter and the tick), plus what the scripts set on the AI for the rest of the section and a
 // revert leaves as it is (actor lists, activation links, migration targets, platoon rules that
@@ -4984,6 +5221,8 @@ namespace
         std::vector<int> attaching;
         // Attached actors carried in from the section before, not spawned yet (gap 4).
         const std::vector<CarriedAttach> *carried = nullptr;
+        // The major upgrade errors and seed (the optional `s upgrade` record).
+        const Scenario::UpgradeState *upgrade = nullptr;
     };
 
     // The optional `s attached` record: an actor ai_attach made of a scripted object, its squad,
@@ -5166,19 +5405,13 @@ namespace
             {
                 const SquadStart *start = at(scenario.objectStarts, bot.object);
                 if(!s || !start || !at(p.objects, bot.object)) continue;
-                // Where it stood at the checkpoint (its start when it had not moved: a record read
-                // from a save written before the stood point was kept).
-                vec point = bot.stood ? bot.stoodPoint : start->point;
-                float yaw = bot.stood ? bot.stoodYaw : start->yaw, health = bot.health, shield = bot.shield;
-                if(bot.bot && bot.bot->state == CS_ALIVE && scenario.projection && v.threads == &scenario.threads)
-                {
-                    point = fromWorld(*scenario.projection, vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight)));
-                    yaw = (90 - bot.bot->yaw) * RAD;
-                    health = haloactorhealthfraction(bot.bot);
-                    shield = haloenemyshieldfraction(bot.bot);
-                }
+                // Where it stood at the checkpoint (its start when it had not moved, rode a vehicle,
+                // or came from a save written before the stood point was kept). A live save's
+                // members were noted as they stand now (haloscenariostatesave).
+                const vec point = bot.stood ? bot.stoodPoint : start->point;
+                const float yaw = bot.stood ? bot.stoodYaw : start->yaw;
                 writeAttached(out, bot.object, bot.encounter, bot.squad, bot.suspended, bot.scriptFlags, bot.gone, *start, point, yaw,
-                              health, shield, false);
+                              bot.health, bot.shield, false);
                 continue;
             }
             if(!s || s->starts.empty() || bot.start < s->starts.data() || bot.start >= s->starts.data() + s->starts.size()) continue;
@@ -5186,7 +5419,15 @@ namespace
             halostateword(out, e->name);
             halostatef(out, " %d", bot.squad);
             halostateword(out, s->name);
-            halostatef(out, " %d %d %d\n", int(bot.start - s->starts.data()), bot.suspended, bot.scriptFlags);
+            halostatef(out, " %d %d %d", int(bot.start - s->starts.data()), bot.suspended, bot.scriptFlags);
+            // Optional trailing fields, each group needing the one before it: placed as its
+            // variant's major upgrade (a save without it brings every squad member back as its
+            // start's variant); then (the stood-members change) its health and shield fractions,
+            // then where it stood (x, y, z and yaw in scenario units; left out for a member riding
+            // a vehicle). A save without them brings the member back at its start at full vitality.
+            halostatef(out, " %d %.6g %.6g", bot.major ? 1 : 0, clamp(bot.health, 0.0f, 1.0f), clamp(bot.shield, 0.0f, 1.0f));
+            if(bot.stood) halostatef(out, " %.9g %.9g %.9g %.9g", bot.stoodPoint.x, bot.stoodPoint.y, bot.stoodPoint.z, bot.stoodYaw);
+            out += '\n';
         }
         // Attached actors carried in from the section before that have not spawned yet (gap 4):
         // the same record, flagged to spawn behind the player again.
@@ -5253,6 +5494,25 @@ namespace
             out += '\n';
         }
         if(!v.attaching.empty()) writeInts(out, "attaching", v.attaching);
+        // Optional: the major upgrade seed, the map-wide error and the squads' errors that are not
+        // zero (encounter, squad, error). A save without it starts them afresh for the section.
+        if(v.upgrade)
+        {
+            std::string entries;
+            int count = 0;
+            for(size_t e = 0; e < v.upgrade->squads.size() && e < p.encounters.size(); ++e)
+                for(size_t k = 0; k < v.upgrade->squads[e].size() && k < p.encounters[e].squads.size(); ++k)
+                {
+                    const float error = v.upgrade->squads[e][k];
+                    if(error == 0 || !std::isfinite(error)) continue;
+                    halostatef(entries, " %zu %zu %.9g", e, k, error);
+                    ++count;
+                }
+            const float global = std::isfinite(v.upgrade->global) ? v.upgrade->global : 0.0f;
+            halostatef(out, "s upgrade %08x %.9g %d", v.upgrade->seed, global, count);
+            out += entries;
+            out += '\n';
+        }
         float gains[HALO_SOUND_CLASSES];
         if(halofxgains(gains))
         {
@@ -5290,6 +5550,8 @@ namespace
         Scenario::Boarded boarded;
         bool gains = false;
         float gain[HALO_SOUND_CLASSES] = {};
+        bool upgraded = false;
+        Scenario::UpgradeState upgrade;
     };
 
     bool parseState(const std::vector<std::string> &records, ParsedState &s, std::string &why)
@@ -5397,6 +5659,27 @@ namespace
                 const int start = r.i();
                 bot.suspended = r.b();
                 bot.scriptFlags = r.i();
+                // Optional: placed as its variant's major upgrade.
+                if(r.ok && r.more()) bot.major = r.b();
+                // Optional (the stood-members change): its health and shield fractions, then where
+                // it stood. Without them it comes back at its start at full vitality, as before.
+                if(r.ok && r.more())
+                {
+                    bot.health = r.f();
+                    bot.shield = r.f();
+                    if(r.ok && (!std::isfinite(bot.health) || !std::isfinite(bot.shield))) r.ok = false;
+                    bot.health = r.ok ? clamp(bot.health, 0.0f, 1.0f) : 1.0f;
+                    bot.shield = r.ok ? clamp(bot.shield, 0.0f, 1.0f) : 1.0f;
+                }
+                if(r.ok && r.more())
+                {
+                    bot.stoodPoint.x = r.f(); bot.stoodPoint.y = r.f(); bot.stoodPoint.z = r.f();
+                    bot.stoodYaw = r.f();
+                    if(r.ok && (!std::isfinite(bot.stoodPoint.x) || !std::isfinite(bot.stoodPoint.y) || !std::isfinite(bot.stoodPoint.z) ||
+                                !std::isfinite(bot.stoodYaw)))
+                        r.ok = false;
+                    bot.stood = r.ok;
+                }
                 const Encounter *e = at(p.encounters, bot.encounter);
                 const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
                 if(!r.ok || !sq || e->name != encounter || sq->name != squad || !at(sq->starts, start)) return fail("unknown squad", line);
@@ -5548,6 +5831,24 @@ namespace
                    !std::isfinite(s.boarded.from.y) || !std::isfinite(s.boarded.from.z))
                     return fail("bad boarded vehicle", line);
             }
+            else if(r.key("upgrade"))
+            {
+                s.upgrade.seed = r.x();
+                s.upgrade.global = r.f();
+                const int count = r.i();
+                if(!r.ok || !std::isfinite(s.upgrade.global) || count < 0 || count > 100000) return fail("bad major upgrade state", line);
+                s.upgrade.squads.assign(p.encounters.size(), {});
+                for(size_t e = 0; e < p.encounters.size(); ++e) s.upgrade.squads[e].assign(p.encounters[e].squads.size(), 0.0f);
+                for(int k = 0; k < count && r.ok; ++k)
+                {
+                    const int e = r.i(), squad = r.i();
+                    const float error = r.f();
+                    if(!r.ok || !at(p.encounters, e) || !at(p.encounters[e].squads, squad) || !std::isfinite(error))
+                        return fail("bad major upgrade state", line);
+                    s.upgrade.squads[e][squad] = error;
+                }
+                s.upgraded = true;
+            }
             else if(r.key("gain"))
             {
                 const int count = r.i();
@@ -5582,7 +5883,8 @@ bool haloscenariostatesave(std::string &out, bool live)
                       &s.navPoints, s.hudHidden, s.hudBlinking, s.chapter, s.chapterStart, s.tick, {}};
         for(const SquadBot &bot : s.squadBots)
         {
-            if(bot.bot && bot.bot->state == CS_ALIVE) v.squads.push_back(bot);
+            // A living member as it stands now: where, unless it rides a vehicle, and how hurt.
+            if(bot.bot && bot.bot->state == CS_ALIVE) { v.squads.push_back(bot); s.noteStood(v.squads.back(), bot.bot); }
             else if(bot.object >= 0) { v.squads.push_back(bot); v.squads.back().gone = true; }
         }
         if(s.boardedVehicle != noObject)
@@ -5597,6 +5899,7 @@ bool haloscenariostatesave(std::string &out, bool live)
                        &s.savedExternal, &s.savedObjective, &s.savedHelp, s.savedShowHelp, &s.savedNavPoints, s.savedHudHidden,
                        s.savedHudBlinking, s.savedChapter, s.savedChapterStart, s.savedTick, s.savedBoarded, {}};
     v.carried = live ? &s.carriedAttached : &s.savedCarried;
+    v.upgrade = live ? &s.upgrade : &s.savedUpgrade;
     // The objects attached in play still waiting for their actor (a50's jailed marines, posed in
     // their cells until the rescue): without them a Continue would leave them figures for good.
     const std::vector<int> &attachedAt = live ? s.attachedAt : s.savedAttachedAt;
@@ -5640,6 +5943,16 @@ bool haloscenariostaterestore(const std::vector<std::string> &records, bool comm
     s.maneuvered = std::move(parsed.maneuvered);
     s.flipped = std::move(parsed.flipped);
     s.hudTimer = parsed.timer;
+    // Into the checkpoint's copy (the revert that follows puts it in play); a save without the
+    // record starts the section's errors and seed afresh.
+    if(parsed.upgraded) s.savedUpgrade = std::move(parsed.upgrade);
+    else
+    {
+        const Scenario::UpgradeState live = s.upgrade;
+        s.resetUpgrade();
+        s.savedUpgrade = s.upgrade;
+        s.upgrade = live;
+    }
     if(s.objectStarts.size() != s.program.objects.size()) s.objectStarts.assign(s.program.objects.size(), SquadStart{});
     for(auto &entry : parsed.attached)
     {

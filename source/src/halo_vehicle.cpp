@@ -157,6 +157,9 @@ namespace
         // `destroyed`: it blew up (it no longer exists; the scripts' object is gone too).
         float health = 1;
         bool destroyed = false;
+        // The owner team (teamOf): the last driver's (else gunner's) engine team, -1 until anyone
+        // has sat there. Kept through a checkpoint copy, not in saved games.
+        int team = -1;
         // A destroyed vehicle left as a wreck (halo_vehiclewreck): it does not exist (no seats, no
         // shots stopped, no scripts' object), but bodies collide with its box and it is drawn
         // where it blew up. `wreckSmoke`: when it last gave off smoke.
@@ -1267,6 +1270,21 @@ namespace
     // Someone flies or drives it: a Banshee with a pilot stays up.
     bool piloted(const Vehicle &v) { return driverOf(v) != nullptr; }
 
+    // The vehicle's owner team, the team its difficulty scaling follows: Halo gives a vehicle its
+    // driver's team, else its gunner's, every tick while it is not destroyed, and it keeps the
+    // last one when they get out (../Halo3DS units/units.c:5327-5359). Before anyone has sat in
+    // it, the unit tag's default team (units.c:2643-2648): 0 (_game_team_default) in every vehi
+    // tag of the ten caches, a team hostile to the player and to every actor team
+    // (game_allegiance.c:171-180, 192-206), which the engine's no team (-1) stands for.
+    int teamOf(const Vehicle &v)
+    {
+        if(const playerent *p = driverOf(v)) return haloactorteam(p);
+        const VehicleDef *d = defOf(v);
+        if(d) for(int i = 0; i < int(d->seats.size()) && i < maxSeats; ++i)
+            if(d->seats[i].role == HALO_SEAT_GUNNER && v.riders[i] && v.riders[i]->state == CS_ALIVE) return haloactorteam(v.riders[i]);
+        return v.team;
+    }
+
     // Engine loops: one per vehicle somebody drives, from the driver (or a turret's gunner while
     // it turns), its pitch rising with the speed, at the vehicle_engine class's gain. The ones
     // playing last frame that nobody drives now stop.
@@ -1493,6 +1511,7 @@ namespace
         for(playerent *&p : v.riders) if(p && p != player1) p = nullptr;
         v.exists = exists;
         v.health = 1;
+        v.team = -1;
         v.destroyed = v.wreck = false;
         v.carried = false;
         v.gun = HaloWeaponState();
@@ -2087,16 +2106,19 @@ namespace
             if(lastmillis >= v.aiNextBurst && lastmillis >= v.aiBurstUntil)
             {
                 v.aiBurstUntil = lastmillis + 900 + rnd(900);
-                v.aiNextBurst = v.aiBurstUntil + 700 + rnd(800);
+                // The pause between bursts times the seated actor's burst_separation
+                // (../Halo3DS ai/actor_combat.c:599-605; halocombatscaling).
+                v.aiNextBurst = v.aiBurstUntil + int((700 + rnd(800)) * in.separationScale + .5f);
             }
             if(lastmillis >= v.aiBurstUntil) return;
         }
         // Lead the target by most of the shot's flight time, and miss by the vehicle variant's
-        // error (fightingVariant; the seated actor's own variant's without an authored one).
+        // error (fightingVariant; the seated actor's own variant's without an authored one), times
+        // the seated actor's projectile_error (actor_combat.c:1268-1272; in.error already has it).
         const float speed = max(1.0f, t->projectile.speed * s);
         target.add(vec(in.target->vel).mul(.7f * distance / speed));
         const HaloActorDef *variant = fightingVariant(d);
-        const float error = variant ? variant->error : in.error;
+        const float error = variant ? variant->error * in.errorScale : in.error;
         if(error > 0)
         {
             const float spread = tanf(error) * distance;
@@ -2119,8 +2141,10 @@ namespace
             across.normalize();
             to = vec(v.pos).add(vec(across).mul(cosf(angle) * 100)).add(vec(0, 0, sinf(angle) * 100 + dm.height));
         }
-        // A semi-automatic gun (the mortar, the cannon) waits a little longer between rounds.
-        if(shoot(v, unit, seat, 0, to) && !automatic) v.nextShot += 400 + rnd(900);
+        // A semi-automatic gun (the mortar, the cannon) waits a little longer between rounds: the
+        // engine's stand-in for the firing variant's trigger pulls, divided by the seated actor's
+        // rate_of_fire (actor_combat.c:2394-2403; the gun's own cadence, triggerDelay, is not).
+        if(shoot(v, unit, seat, 0, to) && !automatic) v.nextShot += int((400 + rnd(900)) / in.rateScale + .5f);
         if(d.vehicleClass == HALO_VEHICLE_FLYER && gun->trigger(1) && lastmillis >= v.aiNextSecondary && distance < 35 * s)
         {
             if(shoot(v, unit, seat, 1, target)) v.aiNextSecondary = lastmillis + 5000 + rnd(4000);
@@ -2982,6 +3006,7 @@ void halovehiclesupdate(int elapsed)
             particle_splash(PART_SMOKE, 3, 1800, boxCentre(v, dims(v)).add(vec(0, 0, dims(v).height * .5f)));
         }
         if(!v.exists || !d) continue;
+        if(!v.destroyed) v.team = teamOf(v);
         // Carried by a scripted object (a Pelican's cargo hook) or moved by a recording.
         vec carriedAt;
         float carriedYaw, carriedPitch = 0;
@@ -3187,16 +3212,21 @@ float halovehiclehit(int index, float damage, const HaloDamage *source, bool exp
     if((d->collFlags & collOnlyExplosives) && !explosive) return 0;
     if((d->collFlags & collOnlyOccupied) && !occupied(v)) return 0;
     float amount = damage * (source ? source->material(d->material) : 1.0f) * d->bodyMultiplier;
-    // The player's own vehicle takes enemy fire as the player does on this difficulty; any other
-    // vehicle has the difficulty's enemy toughness.
-    if(index == playerVehicle) { if(attacker != player1) amount *= halodifficultydamage(); }
-    else amount /= max(.1f, halodifficultyhealth());
+    // Difficulty by the vehicle's owner team (teamOf), as for any unit (../Halo3DS
+    // objects/damage.c): damage owned by a team hostile to the player times enemy_damage, divided
+    // back out when the vehicle is on the owner's side (1415-1419, 1603-1612, 1159-1165), and the
+    // maximum body vitality times enemy_vitality for a team hostile to the player (an enemy's
+    // Ghost, a vehicle nobody has sat in) or friend_vitality for the player's side (the player's
+    // own vehicle, a marine's) (441). Vehicles have no shields.
+    const int team = teamOf(v);
+    amount *= halodifficultydamagefactor(halodamageteam(attacker), team);
+    amount /= max(.1f, halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, team));
     if(!(amount > 0)) return 0;
     v.health = max(0.0f, v.health - amount / d->vitality);
     v.sleeping = false;
     if(halo_vehicletrace)
-        conoutf("Halo vehicle %d (%s) takes %.2f%s from %s: health %.3f", index, d->displayName.c_str(), amount, explosive ? " (blast)" : "",
-                attacker ? (attacker == player1 ? "the player" : attacker->name) : "-", v.health);
+        conoutf("Halo vehicle %d (%s) takes %.2f%s from %s: health %.3f (team %s)", index, d->displayName.c_str(), amount, explosive ? " (blast)" : "",
+                attacker ? (attacker == player1 ? "the player" : attacker->name) : "-", v.health, haloteamname(team));
     if(v.health <= 0) destroyVehicle(v, index, attacker);
     return amount;
 }

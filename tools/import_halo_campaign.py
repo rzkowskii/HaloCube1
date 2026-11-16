@@ -7,11 +7,13 @@ from dataclasses import dataclass
 import math
 import mmap
 from pathlib import Path
+import gzip
 import hashlib
 import heapq
 import json
 import re
 import time
+import zlib
 
 from import_halo_a30 import HaloMap, ac_yaw, encode_map, entity, LIGHT, PLAYERSTART, AMMO, GRENADE, HEALTH, MAPMODEL
 from halo_collision import (CollisionTree, DoorBlocks, FlightSpace, GrenadeArcs, LightBridges, PolygonClearance, SightLines,
@@ -1949,7 +1951,22 @@ def section_layout(halo, mission, part, key=None):
 # by `--metrics-only`, which plans the section as an import would but writes nothing else.
 # Format 2 (the ownerless-kill batch): every metrics file carries `cfg_current` (format 1 files
 # from before the jump governors lack it, and a stale .cfg would pass unseen).
+# Format 2 also covers `cgz_raw_sha1` (the currency fix: the uncompressed map's SHA-1, beside the
+# informational `cgz_sha1` of its gzip bytes). It is an added key, not a changed one, and
+# `cgz_current` still means "the map on disk is what this importer writes"; only how that is
+# decided changed (by content, cgz_disk_map), so no format bump: format 2 files without the key
+# stay valid and gain it on the next --metrics-only.
 METRICS_FORMAT = 2
+
+
+def cgz_disk_map(path):
+    """The uncompressed map in the .cgz at `path`, or None when it cannot be read or gunzipped
+    (empty, truncated, a damaged deflate stream or CRC, not gzip): a damaged file is never current."""
+    try:
+        data = path.read_bytes()
+        return gzip.decompress(data) if data else None
+    except (OSError, EOFError, zlib.error):
+        return None
 # A route is a stub (definition of done, roadmap item 3) when it has fewer steps than this, its
 # reachable floor is under this share of the section's floor columns, or it ends more than this
 # many source units from the section's exit point; and a walked route (retail collision) that
@@ -2960,7 +2977,12 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
     opened = {cube for cube in opened if cube in floor and cube not in raster_solid}
     cgz = encode_map(native_cubes(floor, ceilings, size, raster_solid, opened, raster_capped), entries, factor, title.encode())
     cgz_path = maps / f'{name}.cgz'
-    cgz_current = cgz_path.is_file() and cgz_path.read_bytes() == cgz
+    # The map as the engine reads it, gunzipped: the gzip bytes depend on the Python and zlib that
+    # compressed them (3.13's and 3.15's deflate streams differ for the same map), so the files on
+    # disk are compared by content and a Python upgrade does not mark every map stale. A file that
+    # does not gunzip (truncated, damaged, not gzip) is stale.
+    cgz_raw = gzip.decompress(cgz)
+    cgz_current = cgz_path.is_file() and cgz_disk_map(cgz_path) == cgz_raw
     # The section's map .cfg (git-ignored; halo_a30.cfg, the Crash Site's, is tracked and not written
     # here): the fog, and a driven section's jump governors (GOVERNOR_SECONDS).
     cfg_path, cfg_text = maps / f'{name}.cfg', None
@@ -3192,6 +3214,10 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         'throws': planned_throws,
         # DOOR_PREREQUISITES: for each door, the route step of its door row and the volumes passed before it.
         'door_order': door_order if walked else [],
+        # SHA-1s of the map: of its uncompressed bytes (cgz_raw_sha1, what cgz_current compares),
+        # and, for information only, of the gzip bytes this run's Python writes (cgz_sha1, the file's
+        # own after a real import; it can change with the Python or zlib while the map does not).
+        'cgz_raw_sha1': hashlib.sha1(cgz_raw).hexdigest(),
         'cgz_sha1': hashlib.sha1(cgz).hexdigest(),
         'route_sha1': hashlib.sha1(route_text.encode()).hexdigest() if route_text is not None else None,
         # Whether the files on disk are what this importer writes (always, after a real import;

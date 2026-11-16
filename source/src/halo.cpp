@@ -10,6 +10,7 @@
 #include "halo_fx.h"
 #include "halo_vehicle.h"
 #include "halo_state.h"
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <utility>
@@ -17,6 +18,7 @@
 
 extern void startgame(const char *name, int mode, int minutes, bool notify);
 extern int halo_scripttrace;     // halo_script.cpp: trace logging
+extern int halo_damagetrace;     // below: damage trace logging (the Flood pops and throws use it too)
 
 namespace
 {
@@ -188,13 +190,21 @@ namespace
     // Flood life cycle: carriers burst into infection forms, infection forms
     // reaching a marine or Elite body turn it into a combat form after a delay.
     struct Corpse { vec o; float yaw; ActorKind kind; int expires; };
-    struct FloodSpawn { vec o; float yaw; ActorKind kind; int count; int at; };
+    // A burst or a rising body: `actor` is the variant (actors.txt index, -1 the kind's default),
+    // `throwSpeed` the spawn throw in Halo world units a tick (0: none).
+    struct FloodSpawn { vec o; float yaw; ActorKind kind; int count; int at; int actor = -1; int team = HALO_TEAM_FLOOD; float throwSpeed = 0; };
+    // An infection form's pop (its body destroyed effect's jpt!, actors.txt `pop`): where it went
+    // off and the variant whose jpt! it is.
+    struct FloodPop { vec centre; const HaloActorDef *def; };
     vector<Corpse> corpses;
     vector<FloodSpawn> floodSpawns;
+    vector<FloodPop> floodPops;
     const int corpseLife = 90000, infectionDelay = 2500;
     const float infectionReach = 4.0f;
+    // An infection form spent on a body (updateFlood) is removed, not destroyed: no pop.
+    bool floodSpending = false;
 
-    void clearFlood() { corpses.setsize(0); floodSpawns.setsize(0); }
+    void clearFlood() { corpses.setsize(0); floodSpawns.setsize(0); floodPops.setsize(0); }
     // The player carries two retail weapons, each bound to an AssaultCube slot.
     HaloWeaponState carried[2], checkpointCarried[2];
     int carriedGun[2] = {GUN_ASSAULT, GUN_PISTOL}, currentCarried = 0, checkpointCurrent = 0;
@@ -560,10 +570,16 @@ namespace
         const bool human = team == HALO_TEAM_HUMAN || team == HALO_TEAM_PLAYER;
         botent *bot = BotManager.CreateBot(human ? "RVSF" : "CLA", kind == ELITE ? "worse" : "bad", name);
         if(!bot) return nullptr;
-        // The variant's vitality overrides the body defaults when it sets one.
-        // Difficulty toughens or softens the Covenant and the Flood; allies are unchanged.
-        const float vitality = human ? 1.0f : halodifficultyhealth();
-        const float shieldMax = (actor && actor->shield > 0 ? actor->shield : float(profile.shield)) * vitality;
+        // The variant's vitality overrides the body defaults when it sets one. Difficulty scales the
+        // maximum body and shield vitality by team (../Halo3DS objects/damage.c:433-456 with
+        // game/game_globals.c:204-225): enemy_vitality and enemy_shield for a team hostile to the
+        // player, friend_vitality and friend_shield for the player's allies (the marines). Halo
+        // reads it at every hit from the current team; it is taken here at spawn, from the team
+        // the actor spawns on (with the retail table the two differ only on Easy, 0.6 against 0.8,
+        // for an actor whose side changes later).
+        const float vitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, team),
+                    shieldVitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_SHIELD, team);
+        const float shieldMax = (actor && actor->shield > 0 ? actor->shield : float(profile.shield)) * shieldVitality;
         enemies.add(HaloEnemy{bot, kind, shieldMax, lastmillis, HaloWeaponState(), team, shieldMax});
         enemies.last().weapon.reset(def);
         bot->health = max(1, int((actor && actor->body > 0 ? int(actor->body + .5f) : profile.health) * vitality + .5f));
@@ -731,25 +747,124 @@ namespace
 
     // A new actor beside a body: on retail collision it must find floor, otherwise
     // it only needs open space, as entinmap settles it.
-    bool spawnNear(ActorKind kind, const vec &feet, float yaw, int team)
+    playerent *spawnNear(ActorKind kind, const vec &feet, float yaw, int team, int actor = -1)
     {
-        if(halocollisionactive()) return haloscenariospawnenemy(kind, feet, yaw, -1, team) != nullptr;
+        if(halocollisionactive()) return haloscenariospawnenemy(kind, feet, yaw, actor, team);
         const int x = int(feet.x), y = int(feet.y);
-        if(halocinematic() || editmode || OUTBORD(x, y) || SOLID(S(x, y))) return false;
-        return spawnEnemy(kind, vec(feet).add(vec(0, 0, profiles[kind].eyeheight)), yaw, -1, -1, team) != nullptr;
+        if(halocinematic() || editmode || OUTBORD(x, y) || SOLID(S(x, y))) return nullptr;
+        return spawnEnemy(kind, vec(feet).add(vec(0, 0, profiles[kind].eyeheight)), yaw, -1, actor, team);
     }
 
-    // Spawns `count` actors of a kind in a ring around a point, as many as fit.
-    int spawnRing(ActorKind kind, const vec &feet, float yaw, int count, int team)
+    // Halo's spawn throw (../Halo3DS ai/actors.c:2944-2958): along the spawn's heading at
+    // throw * [0.5, 1] and upwards at throw * [0.8, 1.5], halved for a living biped
+    // (units/bipeds.c:1639-1644); `throwSpeed` is the tag's velocity / 30, world units a tick
+    // (units.c:1688). The horizontal part becomes the bot's velocity, in the engine's units of the
+    // bots' 16 cubes a second (physics.cpp: a bot's maxspeed is held to 16) at the section's scale.
+    // The engine's jump is fixed (movement constants), so the upward part, 0.6 to 1.1 times the
+    // cyborg biped's 0.07 jump velocity (bipd +948) at the retail carrier's 3.0, is the bot's
+    // ordinary jump (the infection forms' leap uses the same).
+    void throwSpawned(playerent *bot, float angle, float throwSpeed)
+    {
+        if(!bot || !(throwSpeed > 0)) return;
+        const float living = 0.5f, horizontal = throwSpeed * living * (0.5f + rndscale(0.5f));
+        const float cubesPerSecond = horizontal * 30 * haloscenarioscale();
+        bot->vel.x = cosf(angle) * cubesPerSecond / 16.0f;
+        bot->vel.y = sinf(angle) * cubesPerSecond / 16.0f;
+        bot->jumpnext = true;
+        // FLOOD_THROW <name> speed=<world units a second, horizontal> vel=<x>,<y>
+        if(halo_damagetrace) conoutf("FLOOD_THROW %s speed=%.3f vel=%.3f,%.3f", bot->name, horizontal * 30, bot->vel.x, bot->vel.y);
+    }
+
+    // Spawns `count` actors of a kind (variant `actor`, -1 its default) in a ring around a point,
+    // as many as fit, each thrown outwards along its ring angle when `throwSpeed` is set.
+    int spawnRing(ActorKind kind, const vec &feet, float yaw, int count, int team, int actor = -1, float throwSpeed = 0)
     {
         int placed = 0;
         for(int attempt = 0; attempt < count * 4 && placed < count; ++attempt)
         {
             const float angle = (attempt * 360.0f / max(count, 1) + rnd(30)) * RAD, r = count > 1 ? 1.0f + rndscale(1.8f) : 0.0f;
             const vec at = vec(feet).add(vec(cosf(angle) * r, sinf(angle) * r, 0));
-            if(spawnNear(kind, at, yaw + rnd(360), team)) ++placed;
+            if(playerent *bot = spawnNear(kind, at, yaw + rnd(360), team, actor))
+            {
+                ++placed;
+                throwSpawned(bot, angle, throwSpeed);
+            }
         }
         return placed;
+    }
+
+    // ../Halo3DS objects/damage.c:2343-2421, the area damage of a jpt! with the infection-form pop
+    // flag (characters\flood_infection\body destroyed: falloff 0.5, cutoff 0.75 world units,
+    // damage 1): only units whose tag is inconsequential (the infection forms) and not its owner
+    // (the form that popped) take it. With infection_forms above 0 (Hard 0.5, Impossible 1) or the
+    // jpt!'s does-not-hurt-infection-forms flag (c10's nopop forms), a pop hurts one object at most,
+    // and each form resists it with chance infection_forms * 0.25. The scale falls from 1 at the
+    // falloff radius to 0 at the cutoff (:2389-2402) and the damage from the upper bound to the lower
+    // (the engine's area-damage reading, as for grenades); against the variant's body vitality (the
+    // infection forms' actv 0.01) the retail pop is lethal anywhere inside the cutoff. Engine
+    // choices: candidates go nearest first (Halo's order is its object iteration) and need a clear
+    // line from the centre (the collision test at :2309-2323), which with a 0.75 unit cutoff rarely
+    // matters; the pop goes off a frame after the death that set it, so a cluster pops in a ripple.
+    void popInfectionForms(const FloodPop &pop)
+    {
+        const HaloActorDef &d = *pop.def;
+        const float s = haloscenarioscale(), outer = d.popOuter * s, inner = min(d.popInner, d.popOuter) * s;
+        const float toughness = halodifficultyget(HALO_DIFFICULTY_INFECTION_FORMS);
+        const bool one = toughness > 0 || d.popHitsOne();
+        struct Candidate { botent *bot; float distance; };
+        std::vector<Candidate> candidates;
+        loopv(enemies)
+        {
+            botent *bot = enemies[i].bot;
+            if(!bot || bot->state != CS_ALIVE) continue;
+            const HaloActorDef *v = haloactorvariant(bot);
+            if(!v || !v->inconsequential()) continue;
+            const vec middle = vec(bot->o).sub(vec(0, 0, bot->eyeheight * 0.5f));
+            const float distance = middle.dist(pop.centre);
+            if(distance >= outer) continue;
+            candidates.push_back(Candidate{bot, distance});
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) { return a.distance < b.distance; });
+        int hit = 0, resisted = 0;
+        for(size_t i = 0; i < candidates.size(); ++i)
+        {
+            botent *bot = candidates[i].bot;
+            if(bot->state != CS_ALIVE) continue;
+            // A blocked line leaves the form out without spending the pop (the collision test
+            // clears can_damage before the pop block, so infection_form stays FALSE, :2322-2323).
+            const vec middle = vec(bot->o).sub(vec(0, 0, bot->eyeheight * 0.5f));
+            if(!IsVisible(pop.centre, middle)) continue;
+            // A form that resists still spends a one-object pop: Halo sets
+            // _damage_damaged_one_object_bit for an infection form that was either hurt or refused
+            // (:2447-2450), so on Heroic and Legendary a resist ends the pop.
+            if(toughness > 0 && rndscale(1.0f) < toughness * 0.25f)
+            {
+                ++resisted;
+                if(one) break;
+                continue;
+            }
+            const float scale = outer > inner ? clamp(1 - (candidates[i].distance - inner) / (outer - inner), 0.0f, 1.0f) : 1.0f;
+            if(!(scale > 0)) continue;
+            const float upper = d.popUpperMax > d.popUpperMin ? d.popUpperMin + rndscale(d.popUpperMax - d.popUpperMin) : d.popUpperMin;
+            const float amount = d.popLower + (upper - d.popLower) * scale;
+            if(!(amount > 0)) continue;
+            const HaloActorDef *v = haloactorvariant(bot);
+            if(v && v->body > 0 && amount >= v->body) dodamage(INT_MAX, bot, bot, GUN_GRENADE);
+            else
+            {
+                vec dir = vec(middle).sub(pop.centre);
+                dir.z = 0;
+                if(dir.iszero()) dir = vec(0, 1, 0);
+                dir.normalize();
+                halohit(amount, HALO_SIDE_EFFECT_NONE, bot, bot, dir, GUN_GRENADE, false, 0);
+            }
+            ++hit;
+            if(one) break;
+        }
+        // FLOOD_POP variant=<actv> candidates=<forms inside the cutoff> hit=<n> resisted=<n> one=<0|1> toughness=<value>
+        if(halo_damagetrace)
+            conoutf("FLOOD_POP variant=%s candidates=%d hit=%d resisted=%d one=%d toughness=%.2f", d.path.c_str(),
+                    int(candidates.size()), hit, resisted, int(one), toughness);
     }
 
     void updateFlood()
@@ -766,7 +881,9 @@ namespace
                 floodSpawns.add(FloodSpawn{c.o, c.yaw, c.kind == ELITE ? FLOOD_ELITE : FLOOD_HUMAN, 1, lastmillis + infectionDelay});
                 conoutf("Halo: infection form takes a %s body", profiles[c.kind].name);
                 corpses.remove(j);
+                floodSpending = true;
                 dodamage(INT_MAX, bot, bot, GUN_KNIFE);
+                floodSpending = false;
                 break;
             }
         }
@@ -775,9 +892,17 @@ namespace
         {
             if(lastmillis < floodSpawns[i].at) continue;
             const FloodSpawn spawn = floodSpawns.remove(i);
-            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, HALO_TEAM_FLOOD);
+            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, spawn.team, spawn.actor, spawn.throwSpeed);
             if(placed) conoutf("Halo: flood %s rises", profiles[spawn.kind].name);
         }
+        // The pops queued last frame; the deaths they cause queue the next ring.
+        const int pops = floodPops.length();
+        for(int i = 0; i < pops && i < floodPops.length(); ++i)
+        {
+            const FloodPop pop = floodPops[i];
+            popInfectionForms(pop);
+        }
+        floodPops.remove(0, min(pops, floodPops.length()));
     }
 
     void showPickup(const char *text)
@@ -1743,8 +1868,19 @@ namespace
         return true;
     }
 
+    // The full-recharge time `base` on this difficulty for `team`: Halo multiplies the shield's
+    // recharge velocity by enemy_recharge for a team hostile to the player and friend_recharge for
+    // the player and the player's allies (../Halo3DS objects/damage.c:1926-1932); the stun delay
+    // before it is not scaled. 0: the shield does not recharge (a value of 0).
+    int rechargeTime(int base, int team)
+    {
+        const float scale = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_RECHARGE, team);
+        return scale > 0 ? max(1, int(base / scale + .5f)) : 0;
+    }
+
     void shieldTick(float &value, float capacity, int hit, int delay, int recharge, int elapsed)
     {
+        if(recharge <= 0) return;
         int regenTime = min(elapsed, lastmillis - hit - delay);
         if(value < capacity && regenTime > 0) value = min(capacity, value + capacity * regenTime / recharge);
     }
@@ -2070,6 +2206,16 @@ playerent *haloscenariospawnenemy(int kind, const vec &point, float yaw, int act
     const int x = int(point.x), y = int(point.y);
     if(OUTBORD(x, y) || SOLID(S(x, y)) || fabsf(S(x, y)->floor - point.z) > 5.0f) return nullptr;
     return spawnEnemy(ActorKind(kind), point, yaw, -1, actorIndex, team);
+}
+
+// The feet haloscenariospawnenemy would stand that body on for `point` on retail collision (the
+// same ring of spots), without spawning it: false with no floor there, or off retail collision.
+bool haloscenariospawnfloor(int kind, int actorIndex, vec &feet)
+{
+    if(const HaloActorDef *actor = haloactordef(actorIndex)) if(kind < 0) kind = actor->kind;
+    if(kind < 0 || kind >= ACTOR_COUNT || !halocollisionactive()) return false;
+    const ActorProfile &profile = profiles[kind];
+    return retailfloorspot(feet, profile.radius, profile.eyeheight + .7f);
 }
 
 // Milliseconds left on the escape countdown, or -1 outside the escape run.
@@ -2693,7 +2839,7 @@ void haloupdate(int elapsed)
         haloplaysound("shield-charge", S_NULL);
         shieldRecharging = true;
     }
-    shieldTick(shield, shieldCap, shieldHit, shieldDelay, shieldRecharge, elapsed);
+    shieldTick(shield, shieldCap, shieldHit, shieldDelay, rechargeTime(shieldRecharge, HALO_TEAM_PLAYER), elapsed);
     updateWeapons(elapsed);
     updateItems(elapsed);
     updateFlood();
@@ -2701,7 +2847,7 @@ void haloupdate(int elapsed)
     {
         HaloEnemy &enemy = enemies[i];
         if(enemy.shieldMax > 0 && enemy.bot && enemy.bot->state == CS_ALIVE)
-            shieldTick(enemy.shield, enemy.shieldMax, enemy.hitTime, eliteDelay, eliteRecharge, elapsed);
+            shieldTick(enemy.shield, enemy.shieldMax, enemy.hitTime, eliteDelay, rechargeTime(eliteRecharge, haloactorteam(enemy.bot)), elapsed);
     }
     if(retailCartographer()) return;
     switch(stage)
@@ -2923,15 +3069,36 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     if(haloactorflags(attacker) & HALO_AI_PLAYFIGHT) { damage = 0; trace(-1, 0); return; }
     // object_cannot_take_damage and unit_impervious (traced with shield -1).
     if((target == player1 && playerProtected) || (haloactorflags(target) & (HALO_AI_NO_DAMAGE | HALO_AI_IMPERVIOUS))) { damage = 0; trace(-1, 0); return; }
+    // Difficulty (../Halo3DS objects/damage.c:1415-1419): damage owned by a team hostile to the
+    // player is multiplied by enemy_damage whoever it hits; the player's own, the allies' and
+    // ownerless damage are not. On a target the owner's team is friendly to (its own side) the
+    // multiplier is divided back out (1603-1612 with 881-887 and 1159-1165), so a grunt's stray
+    // plasma on an Elite is Normal's while it hits the marines and the player harder.
+    float difficultyDivisor = 1;
+    const int ownerTeam = halodamageteam(attacker), targetTeam = haloactorteam(target);
+    const float difficultyFactor = halodifficultydamagefactor(ownerTeam, targetTeam, &difficultyDivisor);
+    amount *= difficultyFactor;
+    if(halo_damagetrace && (difficultyFactor != 1 || difficultyDivisor != 1))
+        conoutf("DAMAGE_DIFFICULTY owner=%s target=%s level=%d factor=%.3f divisor=%.3f", haloteamname(ownerTeam), haloteamname(targetTeam),
+                halodifficulty(), difficultyFactor, difficultyDivisor);
     if(target == player1)
     {
-        // Enemy fire hurts more on the higher difficulties.
-        if(attacker != player1) amount *= halodifficultydamage();
+        // The player's maximum shield and body vitality are scaled by friend_shield and
+        // friend_vitality (damage.c:441, 454: the player's unit is on the player team, players.c:1140
+        // and 1321, which is friendly to itself, game_allegiance.c:171-180, so
+        // game_difficulty_get_team_value answers the friend values, game_globals.c:213-221; no path
+        // excludes a player's unit except falling damage, damage.c:820-825 and 1142-1147, which the
+        // engine does not deal). The shield and health here count out of the Normal maximum (75),
+        // so the hit is divided by the scale instead: the same fraction Halo takes off.
+        float shieldVitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_SHIELD, HALO_TEAM_PLAYER),
+              bodyVitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, HALO_TEAM_PLAYER);
+        if(!(shieldVitality > 0)) shieldVitality = 1;
+        if(!(bodyVitality > 0)) bodyVitality = 1;
         // In a Warthog the body takes some of the fire.
         if(halodriving()) amount = halovehicledamage(amount);
         shieldHit = lastmillis;
         shieldRecharging = false;
-        const float factor = attacker != player1 && gun == GUN_SUBGUN ? 2 : 1;
+        const float factor = (attacker != player1 && gun == GUN_SUBGUN ? 2 : 1) / shieldVitality;
         // The overshield's extra layers take the hit first.
         if(overshield > 0)
         {
@@ -2955,7 +3122,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         amount = max(0.0f, amount - absorbed / factor);
         if(emp) { shield = 0; overshield = overshieldTarget = 0; }
         if(hadShield) haloplaysound(shield > 0 ? "shield-hit" : "shield-depleted", S_NULL);
-        damage = wholeDamage(amount, playerHealthCarry);
+        damage = wholeDamage(amount / bodyVitality, playerHealthCarry);
         // The damage-direction arc points at the attacker, for a hit the shield took too.
         if(attacker && attacker != player1) halofxdamage(attacker->o, given, damage <= 0);
         trace(shield, playerHealthCarry);
@@ -2964,6 +3131,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     HaloEnemy *enemy = enemyState(target);
     if(!enemy) { trace(0, 0); return; }
     enemy->hurtAt = lastmillis;
+    // (The actor's maximum vitality took its team's difficulty scale at spawn, spawnEnemy.)
     int region = -1;
     float shieldScale = 1;
     const float material = materialScale(*enemy, target, attacker, gun, exact ? pendingSource : NULL, region,
@@ -3038,6 +3206,10 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
             amount = modifier > 0 ? max(0.0f, amount - absorbed / modifier) : 0;
             if(emp) enemy->shield = 0;
             particle_splash(PART_PLASMA, emp ? 12 : 6, 220, target->o);
+            // What passes a shield is divided once more on the owner's own side: Halo's shield
+            // step divides by enemy_damage (damage.c:881-887) and passes the excess on to the
+            // body step, which divides it again (1159-1165).
+            if(difficultyDivisor != 1 && absorbed > 0 && amount > 0) amount /= difficultyDivisor;
         }
     }
     amount *= bodyScale;
@@ -3943,11 +4115,36 @@ void halokilled(playerent *victim, playerent *killer)
     if(!haloactive() || !victim || victim == player1) return;
     const bool keepsItems = !(haloactorflags(victim) & HALO_AI_NO_DROPS);
     const int grenadeKind = haloactorgrenadetype(victim);
+    // The variant, read before haloactordeath detaches the actor.
+    const HaloActorDef *variant = haloactorvariant(victim);
     haloactordeath(victim, killer);
     HaloEnemy *enemy = enemyState(victim);
     if(!enemy) return;
     const vec feet = feetOf(victim);
-    if(enemy->kind == CARRIER) floodSpawns.add(FloodSpawn{feet, victim->yaw, INFECTION, 4 + rnd(5), lastmillis});
+    // An infection form's body destroyed effect pops its neighbours (popInfectionForms), unless it
+    // was spent on a body (Halo deletes that form rather than destroying it).
+    if(variant && variant->pops() && !floodSpending && floodPops.length() < 64)
+        floodPops.add(FloodPop{vec(victim->o).sub(vec(0, 0, victim->eyeheight * 0.5f)), variant});
+    // A unit with a spawned actor variant releases random_range(lower, upper + 1) of it when it is
+    // destroyed, thrown at the tag's velocity / 30 (../Halo3DS units/units.c:1666-1693, called from
+    // unit_destroy, :2712-2716), in the dead unit's encounter and squad, so on its side
+    // (actors.c:2844-2931; the engine uses the team the carrier fought on). The retail carrier
+    // (characters\floodcarrier\floodcarrier, bipd +588/+604/+606/+608) releases 3 to 6 infection
+    // forms at 3.0. Without actors.txt's spawn line (an older table) a carrier keeps the engine's
+    // earlier burst: 4 to 8 infection forms of the kind's default variant, unthrown.
+    const HaloActorDef *spawned = variant && variant->spawnVariant >= 0 ? haloactordef(variant->spawnVariant) : nullptr;
+    if(spawned && spawned->kind >= 0 && spawned->kind < ACTOR_COUNT)
+    {
+        const int count = variant->spawnLower + rnd(variant->spawnUpper - variant->spawnLower + 1);
+        if(count > 0)
+            floodSpawns.add(FloodSpawn{feet, victim->yaw, ActorKind(spawned->kind), count, lastmillis, spawned->index,
+                                       enemy->team, max(0.0f, variant->spawnVelocity) / 30.0f});
+        // FLOOD_SPAWN <dead unit> variant=<index> lower=<n> upper=<n> count=<n> velocity=<world units a second>
+        if(halo_damagetrace)
+            conoutf("FLOOD_SPAWN %s variant=%d lower=%d upper=%d count=%d velocity=%.3f", victim->name, spawned->index,
+                    variant->spawnLower, variant->spawnUpper, count, variant->spawnVelocity);
+    }
+    else if(enemy->kind == CARRIER) floodSpawns.add(FloodSpawn{feet, victim->yaw, INFECTION, 4 + rnd(5), lastmillis});
     else if((enemy->kind == MARINE || enemy->kind == ELITE) && corpses.length() < 32)
         corpses.add(Corpse{feet, victim->yaw, enemy->kind, lastmillis + corpseLife});
     // unit_doesnt_drop_items leaves nothing behind. Actors drop the grenades they still
