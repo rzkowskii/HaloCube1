@@ -42,4 +42,17 @@ inline bool haloparsemap(const char *name, int &mission, int &section)
     return false;
 }
 
+// The section maps stamp their baked scenery into the cube raster (scenery_raster in
+// tools/halo_collision.py, the cube-raster stamp) as solid cubes with this vdelta, which no solid
+// cube of theirs had before (the importer wrote 0), for the actors' flood waypoints and the stock
+// fallback only: light passes them (worldlight.cpp), so models are lit as before the stamp. Keep in
+// sync with RASTER_SCENERY_VDELTA in tools/import_halo_campaign.py.
+constexpr int haloSceneryVdelta = 83;
+// Set by load_world for a campaign section map (haloparsemap), before its light is calculated.
+extern bool haloscenerycubes;
+// One of a section map's scenery cubes: solid for the flood waypoints and the stock fallback, but not
+// a full-height wall, so neither light (worldlight.cpp) nor the 2D occlusion map that culls models
+// (worldocull.cpp) stops at it.
+inline bool haloscenerycube(const sqr *s) { return haloscenerycubes && SOLID(s) && s->vdelta == haloSceneryVdelta; }
+
 #endif

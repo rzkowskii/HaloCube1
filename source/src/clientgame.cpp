@@ -1146,6 +1146,9 @@ COMMAND(gamemodedesc, "is");
 
 void resetmap(bool mrproper)
 {
+    // Halo: every map load resets here before its map .cfg runs; jump governors a .cfg left
+    // unclaimed (halo_vehicle.cpp) must not reach this map.
+    halovehiclegovernorsreset();
     resetsleep();
     resetzones();
     clearminimap();
@@ -1175,6 +1178,9 @@ void startmap(const char *name, bool reset, bool norespawn)   // called just aft
     extern bool canceldownloads;
     canceldownloads = false;
     copystring(clientmap, name);
+    // Halo: the jump governors the map .cfg just gave become the map's, on every load path
+    // (the edit-mode xmap restore too, which starts the map without respawning).
+    halovehiclegovernorsadopt();
 
     if(norespawn) return;
 

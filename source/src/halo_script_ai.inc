@@ -393,8 +393,10 @@
             const std::string effect = text(0);
             auto lethal = [&](const char *word) { return effect.find(word) != std::string::npos; };
             const int damage = lethal("guaranteed") || lethal("doom") || lethal("plummet") || lethal("death") ? INT_MAX : 40;
-            HaloScriptDamage scripted;
-            auto hurt = [&](playerent *unit) { if(unit && unit->state == CS_ALIVE) dodamage(damage, unit, unit == player1 ? unit : player1, GUN_GRENADE); };
+            // Nobody's damage (an ownerless scope): Halo's hs_damage_object and hs_damage_new
+            // deal it with owner NONE (../Halo3DS hs/hs_library_external.c), so a kill is no one's.
+            HaloScriptDamage scripted(true);
+            auto hurt =[&](playerent *unit) { if(unit && unit->state == CS_ALIVE) dodamage(damage, unit, unit == player1 ? unit : player1, GUN_GRENADE); };
             if(is("damage_object")) eachUnit(index(1), hurt);
             else
             {

@@ -1,6 +1,12 @@
 // worldocull.cpp: occlusion map and occlusion test
 
 #include "cube.h"
+#include "halo_campaign.h"
+
+// A Halo section's scenery cubes (the cube-raster stamp, halo_campaign.h) are crates, rocks and trunks
+// the eye sees over and round, not walls: the occlusion map passes them, so models behind them (or
+// round a camera standing on one) are not culled. Any other solid cube occludes, as always.
+static inline bool occludes(const sqr *s) { return SOLID(s) && !haloscenerycube(s); }
 
 #define NUMRAYBITS 9
 #define NUMRAYS (1 << NUMRAYBITS)
@@ -34,7 +40,7 @@ void computeraytable(float vx, float vy, float fov)
     float af = fov/2+max(apitch/1.5f,4.2f);
     float byaw = (camera1->yaw-90+af)/360*PI2;
     float syaw = (camera1->yaw-90-af)/360*PI2;
-    const bool vinside = !OUTBORD(vx, vy) && !SOLID(S(int(vx), int(vy)));
+    const bool vinside = !OUTBORD(vx, vy) && !occludes(S(int(vx), int(vy)));
 
     loopj(NUMRAYS4)
     {
@@ -68,7 +74,7 @@ void computeraytable(float vx, float vy, float fov)
             {
                 sx += dx;
                 sy += dy;
-                if(SOLID(S(int(sx), int(sy))))    // 90% of time spend in this function is on this line
+                if(occludes(S(int(sx), int(sy))))    // 90% of time spend in this function is on this line
                 {
                     float dist = (float)(fabs(sx-vx)+fabs(sy-vy));
                     if(firstquarter || dist > rdist[k]) rdist[k] = dist;

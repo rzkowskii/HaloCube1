@@ -2303,7 +2303,9 @@ namespace
         {
             if(!scene)
             {
-                HaloScriptDamage scripted;
+                // Nobody's kills (an ownerless scope): Halo's ai_erase_all deletes the actors
+                // (ai_erase, ../Halo3DS ai/ai.c) with no player owning anything.
+                HaloScriptDamage scripted(true);
                 for(SquadBot &bot : squadBots)
                 {
                     if(!bot.bot || bot.bot->state != CS_ALIVE) continue;
@@ -3589,7 +3591,11 @@ namespace
     // with no death, body or sound (c20 erases bsp0_monitor once the player moves on).
     void Scenario::eraseSquads(int reference, bool erase)
     {
-        HaloScriptDamage scripted;
+        // An ownerless scope: in Halo ai_kill is an act of god (actor_kill sets the unit's
+        // act-of-god death flags, ../Halo3DS ai/actors.c) and ai_erase deletes the actor, so no
+        // player owns the kill: no betrayal, and no hostile neighbour is alerted to the player
+        // (haloactordeath gets no killer; the final integration review of the ownerless-kill batch).
+        HaloScriptDamage scripted(true);
         // Attached actors carried in that have not spawned yet (spawnCarried) die too: their object
         // keeps an entry with no actor, so unit_get_health answers -1 as for one killed here.
         for(size_t k = 0; k < carriedAttached.size();)

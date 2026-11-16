@@ -44,6 +44,15 @@ Batch 7, the critic's worry 3 of batch 6 (written while testing was on hold, not
    put beside the Wraith as in item 6 takes the explosion when the player destroys the Wraith (a
    DAMAGE_TRACE naming it), and no kill counts towards a betrayal (FACTION_BETRAYALS ... human=0 after
    it, no "the human turn on the player"), whether or not the marine survives it.
+   The ownerless-kill batch (written while testing was on hold, not yet run): a kill by the explosion
+   is nobody's to haloactordeath, so it alerts no hostile neighbour to the player. If the marine
+   dies, its DEATH_TRACE (halo_damagetrace) reads killer=- ownerless=1 alerted=0. Then a Covenant run:
+   Grunt B, braindead and facing away (qa_actor_turn), stands 2.5 half-lengths along from the
+   Wraith's middle, outside the blast and within 15 world units of Grunt A, which stands beside the
+   Wraith as in item 6, with an Elite at the controls. The Elite killed with the Wraith is still the
+   destroyer's kill (DEATH_TRACE killer=player, alerted>=1, which is what makes Grunt B a candidate
+   neighbour). Grunt A, killed by the explosion (55 to 65 against 25 points), has killer=- ownerless=1
+   alerted=0, with no "turn on the player" line, and Grunt B is alive afterwards.
 """
 import re
 import subprocess
@@ -283,3 +292,36 @@ counted = [l for l in text.splitlines() if l.startswith('FACTION_BETRAYALS after
 assert counted == ['FACTION_BETRAYALS after human=0'], ('the explosion is nobody\'s: no betrayal', counted)
 assert 'Halo: the human turn on the player' not in text, text[-3000:]
 print(f'death explosion: the marine {placed.group(1)} beside the Wraith took {float(hits[0]["amount"]):.1f}; no betrayal counted.')
+deaths = [fields(l) for l in text.splitlines() if l.startswith('DEATH_TRACE ') and f' victim={placed.group(1)} ' in l + ' ']
+for death in deaths:
+    assert death['killer'] == '-' and death['ownerless'] == '1' and death['alerted'] == '0', ('the marine\'s death is nobody\'s', death)
+
+# 9, continued: a Covenant kill by the explosion alerts no hostile neighbour to the player (the
+# ownerless-kill batch).
+# Grunt B is made braindead the moment it spawns: it faces the player 3 units off, and one think
+# would put it in COMBAT, which haloactordeath does not alert (the Elite's alerted>=1 needs it
+# UNAWARE or ALERT; the Elite's own shout at the player makes it ALERT).
+text = run('explosion-hostile', [
+    (300, 'qa_combat_protect 1'), (400, f'qa_vehicle_approach {wraith} 0'),
+    (500, 'qa_actor_spawn 0 0 3 0; qa_actor_turn 0 180'), (600, f'qa_vehicle_place_actor {wraith} 2.5 0'),
+    (700, 'qa_actor_spawn 0 0 1 0'), (800, f'qa_vehicle_place_actor {wraith} 0 1.3'),
+    (900, 'qa_actor_turn 0 180'), (1000, f'qa_vehicle_pilot {wraith} 1 0 driver'), (1100, 'qa_actor_state before'),
+    (1200, f'qa_vehicle_damage {wraith} 2000 1'), (1500, 'qa_actor_state after'), (1600, 'quit')])
+placements = re.findall(r'VEHICLE_QA place actor vehicle=\d+ ok=1 name=(\S+) inside=-1', text)
+assert len(placements) == 2 and placements[0] != placements[1], ('Grunt B along the Wraith, then Grunt A beside it', placements, text[-3000:])
+neighbour, victim = placements
+assert re.search(r"Halo vehicle: the Wraith's death explosion deals its damage", text), text[-3000:]
+deaths = [fields(l) for l in text.splitlines() if l.startswith('DEATH_TRACE ')]
+killed = [d for d in deaths if d['victim'] == victim]
+assert killed, ('Grunt A dies in the explosion (55 to 65 against its 25 points)', deaths, text[-3000:])
+assert killed[0]['killer'] == '-' and killed[0]['ownerless'] == '1' and killed[0]['alerted'] == '0', \
+    ('the explosion\'s kill is nobody\'s: no killer, no neighbour alerted to the player', killed[0])
+pilot = re.search(r'VEHICLE_QA pilot vehicle=\d+ ok=1 name=(\S+)', text)
+assert pilot, ('an Elite at the Wraith\'s controls', text[-3000:])
+driver = [d for d in deaths if d['victim'] == pilot.group(1)]
+assert driver and driver[0]['killer'] == 'player' and int(driver[0]['alerted']) >= 1, \
+    ('the Elite killed with the Wraith is the destroyer\'s kill, and alerts Grunt B (so B was a candidate)', driver)
+after = [fields(l) for l in text.splitlines() if l.startswith('ACTOR_QA after ') and f' name={neighbour} ' in l + ' ']
+assert after and after[0]['alive'] == '1', ('Grunt B stands outside the blast and lives', after, text[-3000:])
+assert 'turn on the player' not in text, text[-3000:]
+print(f'death explosion: {victim} killed by nobody (no neighbour alerted); {neighbour} lives; the driver is the player\'s kill.')

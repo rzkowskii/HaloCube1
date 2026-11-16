@@ -20,6 +20,8 @@ constexpr unsigned haloCollisionAssist = 16;
 constexpr unsigned haloCollisionScenery = 32;
 
 void halocollisionmap(const char *name);
+// QA only (qa_stock_geometry, tests/native/retail_qa.inc): load no .hcol, play stock geometry.
+extern bool halocollisionstockonly;
 bool halocollisionactive();
 // A scenario machine whose real polygons are in the loaded .hcol (its box collision is skipped).
 bool halocollisionbaked(int device);

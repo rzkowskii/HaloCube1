@@ -1431,6 +1431,11 @@ namespace
 }
 
 COMMANDF(qa_retail_step, "", () { qaRetailStep(); });
+// The sections loaded after `qa_stock_geometry 1` play on stock AssaultCube geometry even where their
+// .hcol exists (halocollisionmap logs "retail collision off for <map>"): the stock-geometry checks of
+// test_vehicles.py, test_presentation.py and test_damage_model.py, since no campaign section is stock
+// any more (the d40 section 3 batch). Not saved; the game has no such switch.
+VARF(qa_stock_geometry, 0, 0, 1, halocollisionstockonly = qa_stock_geometry != 0);
 COMMANDF(qa_retail_start, "ii", (int *m, int *s)
 {
     // HALOQA_RETAIL_ROUTE: the route file; HALOQA_RETAIL_CHAIN: newline-separated route files
@@ -1547,6 +1552,49 @@ COMMANDF(qa_retail_scenery, "", ()
         conoutf("RETAIL_QA scenery %d placement=%d low=%.2f,%.2f,%.2f high=%.2f,%.2f,%.2f ray_hits=%d bounce_hits=%d body_hits=%d",
                 i, placement, low.x, low.y, low.z, high.x, high.y, high.z, rayHits, bounceHits, bodyHits);
     }
+    fflush(stdout);
+});
+// qa_raster_waypoints: AssaultCube's flood waypoints against the section's scenery (the cube-raster
+// stamp: tools/halo_collision.py scenery_raster puts the baked scenery into the cube raster the flood
+// reads). For each flood waypoint, its cube (the flood puts one at a cube's corner, 2 units over the
+// cube's floor): `solid` counts waypoints in a solid cube (the flood never places one there), and
+// `scenery` those whose cube has scenery in the body's column at its centre: a ray down from 5.2 over
+// the cube's floor to 2 over it stops on a scenery top, or a ray up between the same heights on a
+// scenery underside (2, not the step, as the cube's floor is the whole unit under the real one). The
+// first 12 such waypoints are listed. `marked` counts the map's scenery cubes and `lightpass` says
+// whether the engine lets light through them (worldlight.cpp). For tests/test_scenery_raster.py.
+COMMANDF(qa_raster_waypoints, "", ()
+{
+    int total = 0;
+    int solid = 0;
+    int scenery = 0;
+    int listed = 0;
+    loopi(MAX_MAP_GRIDS) loopj(MAX_MAP_GRIDS)
+    {
+        for(TLinkedList<node_s *>::node_s *p = WaypointClass.m_Waypoints[i][j].GetFirst(); p; p = p->next)
+        {
+            const vec &o = p->Entry->v_origin;
+            const int x = int(floorf(o.x));
+            const int y = int(floorf(o.y));
+            ++total;
+            if(OUTBORD(x, y) || SOLID(S(x, y))) { ++solid; continue; }
+            const float floorZ = S(x, y)->floor;
+            const vec low(x + .5f, y + .5f, floorZ + 2.0f);
+            const vec high(x + .5f, y + .5f, floorZ + 5.2f);
+            HaloCollisionHit down;
+            HaloCollisionHit up;
+            const bool top = halocollisiontrace(high, low, down) && (down.flags & haloCollisionScenery) && down.normal.z > 0;
+            const bool under = halocollisiontrace(low, high, up) && (up.flags & haloCollisionScenery) && up.normal.z < 0;
+            if(!top && !under) continue;
+            ++scenery;
+            if(listed++ < 12) conoutf("RETAIL_QA raster waypoint at=%.1f,%.1f,%.1f top=%d under=%d", o.x, o.y, o.z, top, under);
+        }
+    }
+    // The scenery cubes the map holds (halo_campaign.h haloSceneryVdelta) and whether light passes them.
+    int marked = 0;
+    loopi(ssize) loopj(ssize) if(SOLID(S(j, i)) && S(j, i)->vdelta == haloSceneryVdelta) ++marked;
+    conoutf("RETAIL_QA raster map=%s collision=%d waypoints=%d solid=%d scenery=%d marked=%d lightpass=%d", getclientmap(),
+            halocollisionactive(), total, solid, scenery, marked, haloscenerycubes);
     fflush(stdout);
 });
 // qa_retail_where: the player's feet and state, for tests/test_retail_recovery.py.

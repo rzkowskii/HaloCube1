@@ -185,9 +185,12 @@ namespace
         for(const QaCruise &c : qaCruise) if(c.map == "*" || (map && c.map == map)) return c.speed;
         return 0;
     }
-    // Jump governors (halo_vehiclegovern, from the section's map .cfg): the cfg runs inside
-    // load_world, before startmap's halomapstart, so its commands fill `governorsLoading` and
-    // halovehiclesclear (halomapstart) makes them the section's `governors`.
+    // Jump governors (halo_vehiclegovern, from the section's map .cfg): every map load path calls
+    // resetmap (halovehiclegovernorsreset empties `governorsLoading`), runs the map's .cfg (its
+    // commands fill `governorsLoading`), then startmap (halovehiclegovernorsadopt makes them the
+    // map's `governors`). The edit-mode xmap restore starts the map without respawning, so it never
+    // reaches halomapstart: before the ownerless-kill batch its pending governors leaked into the
+    // next map loaded.
     struct Governor { vec at; float radius, speed; };
     std::vector<Governor> governors, governorsLoading;
     int governedAt = -100000;                   // when a governor last held the player's car
@@ -2557,11 +2560,11 @@ namespace
         // The death explosion's own damage. The vehicle no longer exists, so it takes none of it;
         // the tag's modifier for metal is 0, so other vehicles take none either (no chain of
         // explosions, as in Halo); bodies near it do. The blast has no owner (haloeffectblast's null
-        // owner), so it is dealt as the scripts' blasts are: haloareablast hits in the player's name
-        // inside a script-damage scope, so no ally's death counts as a betrayal and the player's own
-        // hurt is not scaled by difficulty, whoever destroyed the vehicle (a kill is still the
-        // player's to haloactordeath, which alerts the dead actor's hostile neighbours to the
-        // player; Halo credits nobody). Halo's object_deplete_body creates the body depleted effect with the vehicle
+        // owner): haloareablast hits in the player's name (the stock engine needs an attacker)
+        // inside an ownerless script-damage scope, so whoever destroyed the vehicle no ally's death
+        // counts as a betrayal, the player's own hurt is not scaled by difficulty, and a kill is
+        // nobody's to haloactordeath (no killer: the dead actor's hostile neighbours are not alerted
+        // to the player; the ownerless-kill batch). Halo's object_deplete_body creates the body depleted effect with the vehicle
         // itself as its damage owner (damage_effect_new_on_object), and a scenario vehicle's
         // owner_player_index is NONE (only the player's biped gets one, players.c), so its damage
         // carries no player either (read from the Halo CE source port, ../Halo3DS damage.c and
@@ -2590,8 +2593,15 @@ void halovehiclesclear()
     struck.clear();
     boardings.clear();
     thrownVehicle = thrownSeat = -1;
-    // The section's jump governors: what its map .cfg just gave (halo_vehiclegovern); none for a
-    // map without them.
+    // The section's jump governors were adopted by startmap just before (halovehiclegovernorsadopt).
+    governedAt = -100000;
+}
+
+void halovehiclegovernorsreset() { governorsLoading.clear(); }
+
+void halovehiclegovernorsadopt()
+{
+    // What the map .cfg just gave (halo_vehiclegovern); none for a map without them.
     governors.swap(governorsLoading);
     governorsLoading.clear();
     governedAt = -100000;

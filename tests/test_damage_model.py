@@ -14,7 +14,8 @@ bound to the lower across a projectile's damage range and a grenade's radius bou
 grenade rolls cover [lower, upper max] while the player's stay at the retail roll; exact hits
 carry their fraction to the next hit; EMP drains the shield and the overshield.
 
-d40 section 3 (stock geometry): an EMP stuns a Warthog the player drives (the throttle does
+d40 section 3 (stock geometry: qa_stock_geometry 1, as no campaign section is stock since the d40
+section 3 batch): an EMP stuns a Warthog the player drives (the throttle does
 nothing until it wears off).
 
 b40 section 3: an EMP on a Ghost and on a Scorpion an Elite drives (qa_vehicle_pilot, then
@@ -211,8 +212,8 @@ assert float(vitals[6]['overshield']) == 0 and float(vitals[6]['shield']) == 0 a
     ('EMP drains the overshield and the shield', vitals[6])
 print('a30 section 2: range and blast falloff to the lower bound, actor grenade rolls, exact hits, EMP on the player.')
 
-# ---- d40 section 3 (stock): EMP stuns the Warthog the player drives
-text, log = run('vehicle', 'halo_section 10 3', [
+# ---- d40 section 3 (stock geometry, qa_stock_geometry 1): EMP stuns the Warthog the player drives
+text, log = run('vehicle', 'qa_stock_geometry 1; halo_section 10 3', [
     (100, 'botsshoot 0; qa_combat_protect 1'),
     (300, 'qa_vehicle_spawn 0 8'), (600, 'qa_vehicle_enter 0 0'), (700, 'qa_vehicle_state before'),
     (800, 'qa_damage_emp_vehicle 0 3000; qa_vehicle_state stunned'),

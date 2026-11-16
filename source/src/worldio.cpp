@@ -1,6 +1,7 @@
 // worldio.cpp: loading & saving of maps and savegames
 
 #include "cube.h"
+#include "halo_campaign.h"
 
 #define DEBUGCOND (worldiodebug==1)
 VARP(worldiodebug, 0, 0, 1);
@@ -1088,6 +1089,11 @@ int load_world(char *mname)        // still supports all map formats that have e
         s++;
     }
     c2skeepalive();
+    // A Halo section map's scenery cubes let light through (worldlight.cpp, halo_campaign.h).
+    {
+        int mission, section;
+        haloscenerycubes = haloparsemap(behindpath(mname), mission, section);
+    }
     calclight();
     conoutf("read map %s rev %d (%d milliseconds)", cgzname, hdr.maprevision, watch.elapsed());
     conoutf("%s", hdr.maptitle);

@@ -14,7 +14,8 @@ Written while testing was on hold: not yet run.
 4. a50 section 1: a placed turret; E mans it, the trigger fires the turret gun, E gets out.
 5. b30's script commands on its jeep: object_create makes it, vehicle_load_magic seats the
    player, vehicle_test_seat_list and unit_in_vehicle see it, unit_exit_vehicle lets them out.
-6. A Warthog spawned on stock geometry (d40 section 3) drives and stops at a wall.
+6. A Warthog spawned on stock geometry (d40 section 3 with qa_stock_geometry 1: no campaign section is
+   stock since the d40 section 3 batch) drives and stops at a wall.
 7. Bodies inside vehicles (b30 section 1, a50 section 1): the player put part way into the
    beach Warthog, or into its middle, is pushed out within a frame (`player pushed out of the
    Warthog`) and stands beside it; a Warthog rolling into the player never has the body inside
@@ -196,11 +197,13 @@ assert head['seated'] == '0', head
 print('b30: object_create, vehicle_load_magic, vehicle_test_seat_list, unit_in_vehicle and unit_exit_vehicle act on the jeep.')
 
 # 6. Stock geometry: a Warthog spawned ahead of the player in d40 section 3 (no placements there,
-#    so it is vehicle 0).
-text = run('stock-drive', 'halo_section 10 3', [
+#    so it is vehicle 0). The section is on retail collision since the d40 section 3 batch;
+#    qa_stock_geometry 1 (QA only) keeps its .hcol unloaded, so the drive is on the cube map.
+text = run('stock-drive', 'qa_stock_geometry 1; halo_section 10 3', [
     (300, 'qa_vehicle_spawn 0 8'), (600, 'qa_vehicle_enter 0 0'), (800, 'qa_vehicle_state before'),
     (900, 'qa_vehicle_input 1 0 6000'), (7200, 'qa_vehicle_state after'), (7400, 'quit')])
-assert 'retail collision surfaces for halo_d40_03' not in text, 'd40 section 3 plays on stock geometry'
+assert 'retail collision surfaces for halo_d40_03' not in text and 'retail collision off for halo_d40_03' in text, \
+    'd40 section 3 plays on stock geometry (qa_stock_geometry 1)'
 assert 'VEHICLE_QA spawn type=0 vehicle=0' in text and 'enter vehicle=0 role=0 ok=1' in text, text[-3000:]
 _, before = state(text, 'before')
 _, after = state(text, 'after')

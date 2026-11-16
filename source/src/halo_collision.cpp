@@ -375,14 +375,27 @@ namespace
     }
 }
 
+// Set only by the QA client's `qa_stock_geometry 1` (tests/native/retail_qa.inc): the sections loaded
+// after it play on stock AssaultCube geometry even where their .hcol exists. No campaign section is on
+// stock geometry since the d40 section 3 batch, so the stock-geometry checks (tests/test_vehicles.py
+// item 6, test_presentation.py items 4 and 5, test_damage_model.py's Warthog EMP) set it before
+// loading d40 section 3. The game never sets it.
+bool halocollisionstockonly = false;
+
 // Any section with a valid packages/maps/<section>.hcol uses the original structure
-// collision. A missing file is the normal case (stock AssaultCube geometry); a file that
-// fails validation is reported and also falls back to stock geometry.
+// collision. A missing file was the normal case before every campaign section had one (stock
+// AssaultCube geometry, as for any other map); a file that fails validation is reported and also
+// falls back to stock geometry.
 void halocollisionmap(const char *name)
 {
     mesh = {};
     if(!name) return;
     name = behindpath(name);
+    if(halocollisionstockonly)
+    {
+        conoutf("Halo: retail collision off for %s (qa_stock_geometry 1)", name);
+        return;
+    }
     defformatstring(path)("packages/maps/%s.hcol", name);
     std::unique_ptr<stream> file(openfile(path, "rb"));
     if(!file) return;

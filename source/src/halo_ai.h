@@ -162,12 +162,17 @@ int haloactorstarthealth(const playerent *bot);
 void haloactorrenew(playerent *bot);
 
 // Damage the scripts deal in the player's name (ai_erase, ai_kill, damage_object) while one of
-// these lives: it does not count as the player betraying allies.
-void haloactorscriptdamage(bool on);
+// these lives: it does not count as the player betraying allies. An ownerless scope (haloareablast
+// with no owner: a vehicle's death explosion, effect_new's jpt! damage; and since the final
+// integration review of the ownerless-kill batch ai_kill, ai_kill_silent, ai_erase, ai_erase_all,
+// damage_object and damage_new, which Halo deals with no owner) also makes its kills nobody's:
+// haloactordeath gets no killer, so no hostile neighbour is alerted to the player.
+void haloactorscriptdamage(bool on, bool ownerless = false);
 struct HaloScriptDamage
 {
-    HaloScriptDamage() { haloactorscriptdamage(true); }
-    ~HaloScriptDamage() { haloactorscriptdamage(false); }
+    explicit HaloScriptDamage(bool ownerless = false) : ownerless(ownerless) { haloactorscriptdamage(true, ownerless); }
+    ~HaloScriptDamage() { haloactorscriptdamage(false, ownerless); }
+    const bool ownerless;
     HaloScriptDamage(const HaloScriptDamage &) = delete;
     HaloScriptDamage &operator=(const HaloScriptDamage &) = delete;
 };

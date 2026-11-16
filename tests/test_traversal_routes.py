@@ -47,6 +47,9 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
     section 5 is a walked route (written while testing was on hold, not yet run): only crouch, jump and
     ledge-drop rows, two drops (off the landing at the bottom of lift_b, and by the lower BSP 3/4
     doorway), at least one jump (the hop from the crate onto the rubble), ending in its exit (its metrics),
+  * d40 section 3 (the d40 section 3 batch, written while testing was on hold, not yet run) has an .hcol
+    and a walked route of plain rows on the upper level only (the lower floor round bsp 2,1 stays
+    unreachable, as on stock geometry), starting on its anchor and ending in bsp 2,3 (its metrics),
   * walking assists (ASSISTS in tools/import_halo_campaign.py, written while testing was on hold, not
     yet run): a section's .hcol has an AST1 trailer exactly when ASSISTS lists the section, naming
     its last len(ASSISTS[section]) surfaces, each two-sided (flag 1) and walkable (normal z 0.65 or
@@ -322,6 +325,30 @@ if ('c10', 4) not in STOCK_SECTIONS and (maps / f'{name}.route').is_file():
     if m.get('mode') != 'walked' or not m.get('ends_in_exit'):
         problems.append(f'{name}: mode {m.get("mode")}, ends in its exit {m.get("ends_in_exit")} '
                         '(expected a walked route ending in bsp 3,4 #0; re-import c10 part 5)')
+
+
+# d40 section 3 (the d40 section 3 batch, not yet run): a walked route on retail collision from the upper
+# level where its stock route started (SECTION_ANCHORS, the projection's origin) to bsp 2,3: plain rows
+# only, each within 8 cube units of the start's height (the lower floor round bsp 2,1 is 2.02 retail
+# units, 16 cube units, below it and stays unreachable, as on stock geometry), starting on the anchor
+# (entry offset under 1 unit) and ending in its exit (its metrics).
+name = 'halo_d40_03'
+if ('d40', 2) not in STOCK_SECTIONS:
+    m = json.loads((maps / f'{name}.metrics.json').read_text()) if (maps / f'{name}.metrics.json').is_file() else {}
+    if not (maps / f'{name}.route').is_file() or not (maps / f'{name}.hcol').is_file():
+        problems.append(f'{name}: no hcol or route (re-run import_halo_campaign.py --mission d40 --part 3)')
+    else:
+        table = rows(maps / f'{name}.route')
+        checked += 1
+        odd = sorted({flags for _, flags, _, _ in table if flags})
+        if odd:
+            problems.append(f'{name}: route flags {odd} (only plain rows expected)')
+        low = [point for point, _, _, _ in table if abs(point[2]) > 8]
+        if low:
+            problems.append(f'{name}: {len(low)} rows off the upper level, the first at {low[0]} (the lower floor is unreachable)')
+    if m.get('mode') != 'walked' or not m.get('ends_in_exit') or m.get('entry_offset', 99) >= 1:
+        problems.append(f'{name}: mode {m.get("mode")}, ends in its exit {m.get("ends_in_exit")}, entry offset '
+                        f'{m.get("entry_offset")} (expected a walked route from the anchor to bsp 2,3; re-import d40 part 3)')
 
 
 # The Crash Site (CRASH_SITE: imported from the retail BSP, the engine's first a30 section): an .hcol and

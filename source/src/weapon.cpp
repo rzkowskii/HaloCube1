@@ -2535,14 +2535,18 @@ void haloareablast(const vec &centre, const HaloDamage &damage, float innerRadiu
     const float scale = haloscenarioscale();
     const float outer = outerRadius * scale, inner = clamp(innerRadius * scale, 0.0f, outer);
     const float core = halo_aoecore ? min(damage.core * scale, outer) : 0;
-    // The scripts' blasts are dealt in the player's name (as damage_new is), without counting as
-    // the player betraying allies; the player's own hurt is self-inflicted (no difficulty scale).
+    // A blast with no owner (a vehicle's death explosion, effect_new's jpt! damage) is dealt in the
+    // player's name, because the stock engine's hit and kill paths need an attacker, inside an
+    // ownerless script-damage scope: no ally's death counts as a betrayal, and haloactordeath gets
+    // no killer, so the dead actor's hostile neighbours are not alerted to the player (in Halo the
+    // effect's damage owner is the vehicle, or NONE for effect_new, and carries no player). The
+    // player's own hurt is self-inflicted (halodamage: no difficulty scale, no damage arc).
     playerent *attacker = owner ? owner : player1;
     struct ScriptScope
     {
         bool on;
-        explicit ScriptScope(bool scripted) : on(scripted) { if(on) haloactorscriptdamage(true); }
-        ~ScriptScope() { if(on) haloactorscriptdamage(false); }
+        explicit ScriptScope(bool ownerless) : on(ownerless) { if(on) haloactorscriptdamage(true, true); }
+        ~ScriptScope() { if(on) haloactorscriptdamage(false, true); }
     } scripted(!owner);
     auto blast = [&](playerent *victim)
     {

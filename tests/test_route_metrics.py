@@ -21,8 +21,9 @@ low share only means a big map window). The test fails when
     flown, stock) that the importer's tables (VALIDATED_COLLISION, STOCK_SECTIONS,
     DRIVEN_SECTIONS, FLOWN_SECTIONS) do not give it;
   * the maps on disk are not what the importer writes (`cgz_current`, `route_current` or
-    `cfg_current` false after --metrics-only: re-import the section; `cfg_current`, the map .cfg with
-    a driven section's jump governors, is missing from metrics written before it and then not held);
+    `cfg_current` false after --metrics-only: re-import the section; `cfg_current` is the map .cfg
+    with a driven section's jump governors; metrics without it count as stale, and the format
+    bump to 2 in the ownerless-kill batch makes older metrics fail the format check first);
   * a stub is not in KNOWN_STUBS below (the table must not grow), or a KNOWN_STUBS section is no
     longer a stub (remove it, so the table stays current).
 
@@ -111,7 +112,8 @@ for name, cache, part in sections:
         problems.append(f'{name}: {name}.cgz on disk is not what the importer writes now (re-import the section)')
     if not m['route_current']:
         problems.append(f'{name}: {name}.route on disk is not what the importer writes now (re-import the section)')
-    if m.get('cfg_current') is False:
+    # A missing `cfg_current` (metrics written before the jump governors) counts as stale.
+    if not m.get('cfg_current'):
         problems.append(f'{name}: {name}.cfg on disk is not what the importer writes now (its jump governors; re-import the section)')
     reasons = stub_reasons(m, (cache, part) in EXIT_FALLS)
     if reasons:

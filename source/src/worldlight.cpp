@@ -1,8 +1,15 @@
 // worldlight.cpp
 
 #include "cube.h"
+#include "halo_campaign.h"
 
 VAR(lightscale,1,4,100);
+
+// A Halo section's scenery cubes (halo_campaign.h haloSceneryVdelta) are solid for the waypoints and the
+// stock fallback, not for light: rays go on through them, so the cube light models are tinted by is
+// what it was before the cube-raster stamp. Any other solid cube stops a ray, as always.
+bool haloscenerycubes = false;
+static inline bool stopslight(const sqr *s) { return SOLID(s) && !haloscenerycube(s); }
 
 void lightray(float bx, float by, const persistent_entity &light, float fade = 1, bool flicker = false)     // done in realtime, needs to be fast
 {
@@ -54,7 +61,7 @@ void lightray(float bx, float by, const persistent_entity &light, float fade = 1
                 s->r = min((l>>PRECBITS)+s->r, 255);
                 s->g = min((g>>PRECBITS)+s->g, 255);
                 s->b = min((b>>PRECBITS)+s->b, 255);
-                if(SOLID(s)) return;
+                if(stopslight(s)) return;
                 x += stepx;
                 y += stepy;
                 l -= stepl;
@@ -82,7 +89,7 @@ void lightray(float bx, float by, const persistent_entity &light, float fade = 1
                 s->r = min((l>>PRECBITS)+s->r, 255);
                 s->g = min((l>>PRECBITS)+s->g, 255);
                 s->b = min((l>>PRECBITS)+s->b, 255);
-                if(SOLID(s)) return;
+                if(stopslight(s)) return;
                 x += stepx;
                 y += stepy;
                 l -= stepl;
@@ -92,7 +99,7 @@ void lightray(float bx, float by, const persistent_entity &light, float fade = 1
             {
                 sqr *s = S(x>>PRECBITS, y>>PRECBITS);
                 s->r = s->g = s->b = min((l>>PRECBITS)+s->r, 255);
-                if(SOLID(s)) return;
+                if(stopslight(s)) return;
                 x += stepx;
                 y += stepy;
                 l -= stepl;
@@ -107,7 +114,7 @@ void lightray(float bx, float by, const persistent_entity &light, float fade = 1
             sqr *s = S(x>>PRECBITS, y>>PRECBITS);
             int light = l>>PRECBITS;
             if(light>s->r) s->r = s->g = s->b = (uchar)light;
-            if(SOLID(s)) return;
+            if(stopslight(s)) return;
             x += stepx;
             y += stepy;
             l -= stepl;

@@ -373,7 +373,7 @@ def _scenery_polygons(halo, tag, permutation):
     return result
 
 
-def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=()):
+def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=(), extra_bsps=(), at_end=(), kept=()):
     """Collision polygons of BSP `bsp`'s scenery placements, in campaign coordinates.
 
     Halo collides everything with scenery (rocks, trees, crates, the fallen computer banks); the
@@ -382,17 +382,30 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=()):
     `placements` is [(scenario scenery index, number of its surfaces)] in the order their polygons
     were appended, and `left out` a {reason: count}. Placements are left out when a script creates, destroys or moves
     them (not-placed flag 1, or a name the scripts use: object_create, object_destroy, the c10
-    insertion's props) or when some difficulty does not place them (flags 2, 4, 8), since the .hcol
-    is fixed; when their origin is outside `window` (retail xmin, xmax, ymin, ymax: the section's
-    map) or their name is in `skip`; and when their tag has no collision model.
+    insertion's props; or a name holding the pattern of an object_*_containing call,
+    import_halo_scripts.containing_calls, unless the call is in one of the `at_end` scripts, which run
+    only once the mission is over) or when some difficulty does not place them (flags 2, 4, 8), since
+    the .hcol is fixed; when their origin is outside `window` (retail xmin, xmax, ymin, ymax: the
+    section's map) or their name is in `skip`; and when their tag has no collision model. A name in
+    `kept` (scenery a script handles only outside this section) is baked all the same, unless a not-placed
+    flag leaves it out. The placements of the `extra_bsps` (the other BSPs the section holds,
+    import_halo_campaign.EXTRA_BSPS) follow `bsp`'s, with the same filters; a placement in two of the BSPs
+    counts once.
     """
-    from import_halo_scripts import named_objects, Program
+    from import_halo_scripts import named_objects, Program, containing_calls
     program = program or Program(halo)
     names = {index: name for index, (name, _, _) in enumerate(named_objects(program))}
+    patterns = sorted({pattern for _, pattern, script in containing_calls(program) if pattern and script not in at_end})
     polygons, surfaces, baked, left_out = {}, [], [], {}
     def leave(reason):
         left_out[reason] = left_out.get(reason, 0) + 1
-    for index, tag, name_index, not_placed, permutation, pose in scenery_placements(halo, bsp):
+    placements, seen = [], set()
+    for number in (bsp, *extra_bsps):
+        for placement in scenery_placements(halo, number):
+            if placement[0] not in seen:
+                seen.add(placement[0])
+                placements.append(placement)
+    for index, tag, name_index, not_placed, permutation, pose in placements:
         x, y, z, yaw, pitch, roll = pose
         name = names.get(name_index, '') if name_index >= 0 else ''
         if window is not None and not (window[0] <= x <= window[1] and window[2] <= y <= window[3]):
@@ -401,8 +414,12 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=()):
         if name and name in skip:
             leave('skipped')
             continue
-        if not_placed & 1 or (name and re.search(rb'\b' + re.escape(name.encode()) + rb'\b', program.strings)):
+        if not_placed & 1 or (name and name not in kept and
+                              re.search(rb'\b' + re.escape(name.encode()) + rb'\b', program.strings)):
             leave('scripted')
+            continue
+        if name and name not in kept and any(pattern in name for pattern in patterns):
+            leave('scripted by name pattern')
             continue
         if not_placed & 14:
             leave('not on every difficulty')
@@ -441,6 +458,122 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=()):
             continue
         baked.append((index, len(surfaces) - before))
     return surfaces, baked, left_out
+
+
+def _clipped_heights(points, x0, y0, x1, y1):
+    """The lowest and highest z of the part of a polygon whose (x, y) lies in [x0, x1] x [y0, y1]
+    (Sutherland-Hodgman against the four sides; a wall, whose footprint is a segment, clips too),
+    or None when no part of it does."""
+    polygon = points
+    for axis, bound, above in ((0, x0, True), (0, x1, False), (1, y0, True), (1, y1, False)):
+        if not polygon:
+            return None
+        clipped = []
+        for i, a in enumerate(polygon):
+            b = polygon[i - 1]
+            a_in = a[axis] >= bound if above else a[axis] <= bound
+            b_in = b[axis] >= bound if above else b[axis] <= bound
+            if a_in != b_in:
+                t = (bound - b[axis]) / (a[axis] - b[axis])
+                clipped.append(tuple(b[k] + (a[k] - b[k]) * t for k in range(3)))
+            if a_in:
+                clipped.append(a)
+        polygon = clipped
+    if not polygon:
+        return None
+    heights = [p[2] for p in polygon]
+    return min(heights), max(heights)
+
+
+# The native cube raster's view of the baked scenery (scenery_raster): a scenery top up to the engine's
+# step above a cube's floor (retailStep in source/src/physics.cpp) raises the floor onto it; anything
+# else between the floor and the body's top (PolygonClearance.HEIGHT) makes the cube solid; a top
+# within this much of the floor is the floor itself.
+RASTER_STEP, RASTER_HEIGHT, RASTER_FLOOR = 1.26, 5.2, .3
+# A top steeper than this (the planner's and retail Halo's walkable limit) is no floor to raise onto.
+RASTER_WALKABLE = .65
+
+
+def scenery_raster(surfaces, placements, floor, keep=(), inset=.02):
+    """Stamp baked scenery into the native cube raster (the cube-raster stamp): the cubes the engine's
+    flood waypoints, AssaultCube's sight checks on stock geometry and the stock fallback read. The
+    .hcol, the planner's CollisionTree and the routes are not touched.
+
+    `surfaces` and `placements` are scenery_surfaces' polygons (campaign coordinates) and its
+    (scenario index, surface count) pairs, in order; `floor` is the native floor, {(x, y): height in
+    quarter units} for cube (x, y), whose floor AssaultCube samples at the grid point (x, y) and whose
+    square is [x, x+1] x [y, y+1]; cubes in `keep` (the route's, the vehicles' and the mapmodels') are
+    left as they are. Each placement is taken as solid between the lowest and highest point of its
+    polygons inside a cube's square (inset by `inset` so a face on the boundary does not count), so a
+    rock's or a crate's side makes every cube it crosses solid, and an invisible wall plane does too.
+    Per cube, from the floor up: a placement whose highest point is within RASTER_FLOOR of the floor
+    (or below it) is passed over; one wholly RASTER_HEIGHT or more above it (a tree's crown, an arch)
+    too; a low one (at most RASTER_STEP high) whose walkable top covers the grid point raises the floor
+    onto that top, and the search goes on from there; a low one that does not cover the grid point is
+    stepped over; anything else makes the cube solid.
+
+    Returns (solid, raised, kept): the cubes made solid, {cube: new floor in quarter units} for the
+    raised ones, and {cube: None (solid) or the new floor (raised)} for the cubes in `keep` the stamp
+    would have changed, which it left as they were.
+    """
+    keep = set(keep)
+    spans = {}
+    start = 0
+    for number, (_, count) in enumerate(placements):
+        for normal, _, _, _, points in surfaces[start:start + count]:
+            low_x, high_x = min(p[0] for p in points), max(p[0] for p in points)
+            low_y, high_y = min(p[1] for p in points), max(p[1] for p in points)
+            # A walkable top's height at the grid points it covers (convex polygons, as floor_samples).
+            nx, ny, nz = normal
+            edges = None
+            if nz >= RASTER_WALKABLE:
+                edges = [(b[1] - a[1], a[0] - b[0], b[0]*a[1] - a[0]*b[1]) for a, b in zip(points, points[1:] + points[:1])]
+                cx, cy = sum(p[0] for p in points) / len(points), sum(p[1] for p in points) / len(points)
+                flip = -1 if sum(e[0]*cx + e[1]*cy + e[2] for e in edges) < 0 else 1
+            for x in range(math.floor(low_x - inset), math.floor(high_x - inset) + 1):
+                for y in range(math.floor(low_y - inset), math.floor(high_y - inset) + 1):
+                    if (x, y) not in floor:
+                        continue
+                    inside = low_x >= x + inset and high_x <= x + 1 - inset and low_y >= y + inset and high_y <= y + 1 - inset
+                    heights = (min(p[2] for p in points), max(p[2] for p in points)) if inside else \
+                        _clipped_heights(points, x + inset, y + inset, x + 1 - inset, y + 1 - inset)
+                    if heights is None:
+                        continue
+                    span = spans.setdefault((x, y), {}).setdefault(number, [heights[0], heights[1], None])
+                    span[0], span[1] = min(span[0], heights[0]), max(span[1], heights[1])
+                    if edges is not None and not any(flip*(e[0]*x + e[1]*y + e[2]) < -1e-6 for e in edges):
+                        x0, y0, z0 = points[0]
+                        top = z0 - ((x - x0)*nx + (y - y0)*ny) / nz
+                        if span[2] is None or top > span[2]:
+                            span[2] = top
+        start += count
+    solid, raised, kept = set(), {}, {}
+    for cube, found in spans.items():
+        level = base = floor[cube] / 4
+        blocked = False
+        for low, high, top in sorted(found.values(), key=lambda span: (span[0], span[1])):
+            if high <= level + RASTER_FLOOR:
+                continue
+            if low >= level + RASTER_HEIGHT:
+                continue
+            if high <= level + RASTER_STEP:
+                if top is not None and level < top <= high + 1e-6:
+                    level = top
+                continue
+            blocked = True
+            break
+        # A cube raised onto a top with something over it within the body's height is solid as well.
+        if not blocked and level != base:
+            blocked = any(high > level + RASTER_FLOOR and low < level + RASTER_HEIGHT and high > level + RASTER_STEP
+                          for low, high, _ in found.values())
+        if blocked or round(level * 4) != floor[cube]:
+            if cube in keep:
+                kept[cube] = None if blocked else round(level * 4)
+            elif blocked:
+                solid.add(cube)
+            else:
+                raised[cube] = round(level * 4)
+    return solid, raised, kept
 
 
 def assist_surfaces(assists, projection):

@@ -211,6 +211,44 @@ def object_not_placed(program):
         yield flags
 
 
+CONTAINING_CALLS = ('object_create_containing', 'object_create_anew_containing', 'object_destroy_containing')
+
+
+def containing_calls(program):
+    """The scenario scripts' object_create_containing, object_create_anew_containing and
+    object_destroy_containing calls: [(function, pattern, script name)], in script order. Halo applies
+    such a call to every scenario object whose name holds the pattern anywhere (strstr over the object
+    names: hs_library_external.c of the Halo CE port in ../Halo3DS; the engine's interpreter does the
+    same, halo_script.cpp). halo_collision.scenery_surfaces leaves the scenery they match out of the
+    .hcol, as it does the scenery a script names in full."""
+    nodes = program.nodes
+    found = []
+
+    def node(datum):
+        return nodes[datum & 0xffff]
+
+    def walk(datum, script, depth=0):
+        n = node(datum)
+        # A literal, a static script call (walked as its own script) or a runaway tree.
+        if n[3] & 3 or depth > 64:
+            return
+        kids, it = [], n[6]
+        while it != NIL and len(kids) < 4096:
+            kids.append(it)
+            it = node(it)[4]
+        if not kids:
+            return
+        name, args = program.text(node(kids[0])[5]), kids[1:]
+        if name in CONTAINING_CALLS and args and node(args[0])[3] & 1:
+            found.append((name, program.text(node(args[0])[5]), script))
+        for arg in args:
+            walk(arg, script, depth + 1)
+
+    for script, _, _, root in program.scripts:
+        walk(root, script)
+    return found
+
+
 def title_rows(halo):
     t, s = halo.tags, halo.scenario
     help_tag = halo.reference(t, s + 1412, 'ustr')

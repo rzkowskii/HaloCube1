@@ -20,9 +20,10 @@ In the QA client:
    onto it (MELEE_QA lunge), and its hit on the player raises the indicator through halodamage.
 3. c10 section 1: effect_new through the script interpreter at the cutscene flag
    enc_swamp2_turret draws the table's effect.
-4. d40 section 3 (stock geometry): a spawned Warthog driven by the player plays its engine loop,
+4. d40 section 3 (stock geometry: qa_stock_geometry 1, as no campaign section is stock since the d40
+   section 3 batch): a spawned Warthog driven by the player plays its engine loop,
    which stops when the player gets out.
-5. d40 section 3: a spawned Covenant turret manned by the player: turning it at 50 degrees a second
+5. d40 section 3 (stock geometry likewise): a spawned Covenant turret manned by the player: turning it at 50 degrees a second
    plays its engine loop, still held 150 ms after the last turn, gone 600 ms after it; turning at 5
    degrees a second (under the 15 degree threshold) plays nothing.
 6. a30 section 2: after a checkpoint, a running camera shake, cinematic screen effect and damage
@@ -230,8 +231,8 @@ assert int(scripted['effects']) >= 1 and scripted['unknown'] == '0', scripted
 assert 'large_explosion_no_objects' in scripted['last'] or int(scripted['effects']) > 1, scripted
 print('c10: effect_new at a cutscene flag draws the table effect.')
 
-# ---- 4. A Warthog's engine loop (d40 section 3, stock geometry)
-text = run('engine', 'halo_section 10 3', [
+# ---- 4. A Warthog's engine loop (d40 section 3, stock geometry: qa_stock_geometry keeps its .hcol unloaded)
+text = run('engine', 'qa_stock_geometry 1; halo_section 10 3', [
     (300, 'qa_vehicle_spawn 0 8'), (600, 'qa_vehicle_enter 0 0'),
     (700, 'qa_vehicle_input 1 0 1500'), (1500, 'qa_fx_state driving'),
     (2400, 'qa_vehicle_use'), (2800, 'qa_fx_state parked; quit'),
@@ -242,7 +243,7 @@ assert s['parked']['engines'] == '0', ('the loop stops when the driver gets out'
 print('d40 section 3: the driven Warthog plays its engine loop and stops when left.')
 
 # ---- 5. A turret's engine loop: above 15 degrees a second it plays, held 250 ms after the turn
-text = run('turret', 'halo_section 10 3', [
+text = run('turret', 'qa_stock_geometry 1; halo_section 10 3', [
     (300, 'qa_combat_protect 1; qa_vehicle_spawn 1 8'), (600, 'qa_vehicle_enter 0 1'), (800, 'qa_fx_state manned')] +
     [(1000 + 100 * i, 'qa_fx_yaw 5') for i in range(15)] +                 # 50 degrees a second for 1.5 s
     [(2250, 'qa_fx_state turning'), (2550, 'qa_fx_state held'), (3100, 'qa_fx_state settled')] +

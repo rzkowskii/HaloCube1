@@ -16,7 +16,8 @@ import time
 from import_halo_a30 import HaloMap, ac_yaw, encode_map, entity, LIGHT, PLAYERSTART, AMMO, GRENADE, HEALTH, MAPMODEL
 from halo_collision import (CollisionTree, DoorBlocks, FlightSpace, GrenadeArcs, LightBridges, PolygonClearance, SightLines,
                             VehicleGround, assist_surfaces, euler_rows, floor_samples, lift_ride, machine_boxes, overlap_seals,
-                            scenery_surfaces, static_device_surfaces, structure_surfaces, write_structure_collision)
+                            scenery_raster, scenery_surfaces, static_device_surfaces, structure_surfaces,
+                            write_structure_collision)
 from halo_map_art import SCENERY_MODELS, write_scenery, write_world_mesh
 from halo_weapons import actor_weapon, equipment_index, weapon_index
 from halo_vehicles import vehicle_type
@@ -269,7 +270,10 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   (the a1 tower) and lift_b down from its z 48 walkway. tun_garage_2 and tun_garage_3, on the
 #   way, open only from their control panels, which the planner does not model (sealed).
 # d40 (The Maw):
-# - section 3 (BSP 2): the lower floor, entered from BSP 1 at bsp 2,1 (z 0), and the upper level
+# - section 3 (BSP 2) is no longer stock (the d40 section 3 batch; not walked in the game; to put it
+#   back add ('d40', 2) here and re-run `import_halo_campaign.py "$maps" --mission d40 --part 3` and
+#   `import_halo_scripts.py "$maps" --mission d40`). Why it was: the lower floor, entered from BSP 1 at
+#   bsp 2,1 (z 0), and the upper level
 #   (the grate deck at z 1.49 round enc3_3b and enc3_4, the walkway at x -49 rising to z 2, and
 #   the room with enc3_5b, enc3_6, section4 and bsp 2,3 at z 2) have no walkable connection in the
 #   structure collision (nor in the render geometry). The only floor in between is a fallen beam
@@ -287,7 +291,10 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   to itself. The one climb in Halo's envelope left is from the 45-degree chamfers at the foot of the
 #   ribbed walls beside the grate deck (top 0.8, 0.3-wide ribs) up 0.81 onto the deck's edge, 1.0
 #   across; whether Halo's biped stands on those chamfers is not settled statically, so no assist
-#   (a link Halo may not have). BSP 2 has no lift or other device between the floors;
+#   (a link Halo may not have). BSP 2 has no lift or other device between the floors. Since the d40
+#   section 3 batch the section is on retail collision all the same (it was the last section on stock
+#   geometry): it starts on the upper level where its stock route started (SECTION_ANCHORS), so the
+#   lower floor stays out of the route, as it was on stock geometry;
 # - sections 6 to 8 (BSPs 5 to 7) are the Warthog run, 1,200 units driven in the original. The
 #   run starts with a 45 to 65 degree ramp up from the elevator (BSP 5, x -94 to -82 past
 #   no_jeep_test, z 107.6 to 119.4) and drops down ramps as steep in BSP 6 (x 358 to 366) and
@@ -296,7 +303,9 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   scales (1.98, 3.23, 2.24) make the body 1.6 to 2.6 units tall, more than the Maw's corridors
 #   and the elevator landing hold (from section6 only 3 cells of BSP 5 are reachable at its
 #   scale). They are DRIVEN_SECTIONS instead: the player drives them in a Warthog.
-STOCK_SECTIONS = {('d40', 2)}
+# The table is empty since the d40 section 3 batch: every section of a validated mission plays on
+# retail collision. To put a section back on stock geometry, add its key and re-run its import.
+STOCK_SECTIONS = set()
 
 
 @dataclass(frozen=True)
@@ -383,9 +392,10 @@ ASSISTS = {
         ramp_x(39.70, 40.10, -44.85, -39.994, -45.72, -39.536,
                'c10 BSP 3 west bay: lower floor up onto the lying c_storage crate at the foot of the debris pile (Halo standing jump, 0.46)'),
     ),
-    # No assist for d40 section 3 (STOCK_SECTIONS, above): none of its missing links is one Halo's jump
-    # makes that an assist may stand in for (docs/macos-build.md, the notes on d40; batch 5 looked again
-    # with its scenery's collision).
+    # No assist for d40 section 3 (STOCK_SECTIONS' notes, above): none of its missing links is one Halo's
+    # jump makes that an assist may stand in for (docs/macos-build.md, the notes on d40; batch 5 looked
+    # again with its scenery's collision). On retail collision since the d40 section 3 batch, it starts on
+    # the upper level (SECTION_ANCHORS) and needs none.
 }
 # Sections whose .hcol carries their scenery's collision (halo_collision.scenery_surfaces, the SCN1
 # trailer): the scenario's scenery placements in the section's BSP and map window, each its coll tag's
@@ -399,13 +409,45 @@ ASSISTS = {
 # .mesh (write_world_mesh's `scenery`). The scenery batch started with the Crash Site and c10 sections
 # 3 and 6; the batch after the c10 section 5 batch added every other section on retail collision,
 # mission by mission, walked, driven and flown (each route still ends in its exit; the per-section
-# figures are in docs/macos-build.md, Scenery collision). A section on stock geometry (d40 section 3)
-# gets no .hcol, so its entry only matters should it leave STOCK_SECTIONS. Not seen in the game. To take
-# a section's scenery out, add its key to SCENERY_LEFT_OUT with the reason and re-run its import (for
-# the Crash Site also put halo_a30.cfg's mapmodel lines back to CRASH_SITE_MAPMODELS' sizes).
+# figures are in docs/macos-build.md, Scenery collision); the d40 section 3 batch added d40 section 3
+# (it left STOCK_SECTIONS) and the scenery of the EXTRA_BSPS a section holds (c40 section 1's BSP 12),
+# scanned with the same filters and map window. A section on stock geometry gets no .hcol, so its entry
+# only matters should it leave STOCK_SECTIONS. Not seen in the game. To take a section's scenery out,
+# add its key to SCENERY_LEFT_OUT with the reason and re-run its import (for the Crash Site also put
+# halo_a30.cfg's mapmodel lines back to CRASH_SITE_MAPMODELS' sizes).
 SCENERY_LEFT_OUT = set()
 SCENERY_COLLISION = ({CRASH_SITE_KEY} | {(m.cache, part) for m in MISSIONS if m.cache in VALIDATED_COLLISION
                                          for part in range(len(m.sections))}) - SCENERY_LEFT_OUT
+# Scenery a script creates or destroys by name pattern (object_create_containing,
+# object_create_anew_containing, object_destroy_containing: Halo matches the pattern anywhere in the
+# object's name, strstr in hs_library_external.c of the Halo CE port in ../Halo3DS, as the engine's
+# interpreter does) is left out like scenery a script names in full (halo_collision.scenery_surfaces,
+# 'scripted by name pattern'). Except the calls of the scripts listed here, which run only once the
+# mission is over (judgement call: the .hcol is fixed, and a crate or a flame that goes in the last
+# seconds before the end changes nothing the player can do):
+# - a50 extraction_cleanup ("box": box_1 to box_4, c_storage in the hangar, BSP 2, sections 3 and 5):
+#   game_win_script calls it after the hangar fight, behind a fade out, just before cutscene_extraction
+#   and game_won;
+# - d40 test_for_endgame and endgame_cleaner ("bsp_8_1", "_5", "_7", "_8" created, "bsp_8_" destroyed:
+#   the flames and oxygen tanks along the Warthog run, BSP 7, section 8): test_for_endgame waits for
+#   the player in grand_finale (the drive's end), then destroys every object, re-creates those and wakes
+#   endgame_cleaner, which destroys them all after a sleep, while the ending plays.
+# The rule's one new left-out: d40's hangar_fire (x70_finale's hangar_3, the ending cinematic) matches
+# hangar_fire_2a to _2c, placed burning_flame emitters in the Longsword's hangar (section 8), which have
+# no collision model, so nothing changes. Every other *_containing pattern of the ten scenarios that
+# matches a scenery name matches only scenery a script creates (not-placed flag 1, left out already)
+# or whose full name a script uses: a10's x10_ dressing, b30's downed_smolder and dust, c10's blood,
+# elite_corpse and shotgun, d40's banshee_fire, display, hangar_fire_1, hangar_tank and nipple (the
+# d40 section 3 batch's scan; b40's dump, d20's 0_, 1_, 2_ and 2x_ and c40's object_ patterns match
+# no scenery).
+SCENERY_SCRIPTS_AT_END = {'a50': ('extraction_cleanup',), 'd40': ('test_for_endgame', 'endgame_cleaner')}
+# Named scenery a script handles only outside the section where it stands, baked there all the same
+# (scenery_surfaces' `kept`): the .hcol of the section that plays while it stands holds it, as Halo does.
+# - c10 section 1: x50_rock (boulder_moss_large in the swamp, BSP 0, placed when the mission starts) is
+#   destroyed only by x50's door script (object_destroy_containing x50_rock), which plays in section 3
+#   (BSP 2, the control room); the player never comes back to BSP 0. Its full name is the pattern, so
+#   the whole-name rule used to leave it out of section 1, where it stands throughout the play.
+SCENERY_KEPT = {('c10', 0): ('x50_rock',)}
 # Sections played in a vehicle (source/src/halo_vehicle.cpp), not walked: d40's Warthog run and
 # c40's Banshee flights. They get an .hcol, which the vehicle drives or flies on (its body is the
 # retail vehicle's size at the section's scale, so it fits where the walking body does not), but
@@ -627,6 +669,15 @@ SECTION_ANCHORS = {
     # there skipped the swamp (enc3_1 to enc3_8) and made a 117-step route.
     ('d20', 1): ((42.5, -34.4, -27.6), None),
     ('d40', 7): ((744.0, -8.0, 66.0), 'grand_finale'),
+    # d40 section 3 (BSP 2) starts on the upper level, on the walkway's floor at z 2.02 (the d40
+    # section 3 batch: retail collision since then; STOCK_SECTIONS' notes on its floors). That is the
+    # first row of the route it had on stock geometry (the render raster's route started there too,
+    # 9.75 units from bsp 2,1, which is on the lower floor): the start a player already got, so no new
+    # link. The lower floor, where bsp 2,1 lies, stays unreachable from the route, as on stock
+    # geometry (judgement call: no walkable link joins it to the upper level, and none is invented).
+    # The window does not change (the BSP's bounds clip it either way); the projection's origin is
+    # the start's height, so d40.hscb is regenerated with it.
+    ('d40', 2): ((-45.97, -16.31, 2.02), 'bsp2,3'),
     # The Library climbs four floors (-4.6, 11.4, 27.4, 43.4) on platform1 to platform3, which
     # the platforms script raises while the player stands on them. Each BSP switch volume is
     # half way up a shaft, where no floor is; a section starts on the landing where the player
@@ -1762,21 +1813,41 @@ def routes(points, start, floor):
     return parents
 
 
-def native_cubes(floor, ceilings, size):
+# The vdelta of the solid cubes the cube-raster stamp writes (native_cubes' `scenery`): the engine lets
+# light through them on a campaign section map (haloSceneryVdelta in source/src/halo_campaign.h, keep in
+# sync), so models are tinted as before the stamp. Every other solid cube has 0.
+RASTER_SCENERY_VDELTA = 83
+
+
+def native_cube_open(floor, x, y, scenery=(), opened=()):
+    """Whether native_cubes writes cube (x, y) as open space: a floor at (x, y) and at the three grid
+    points of its square's other corners, or a cube in `opened` with a floor of its own, and not one
+    of the `scenery` cubes (scenery_raster's solid ones)."""
+    if (x, y) not in floor or (x, y) in scenery:
+        return False
+    return (x, y) in opened or all((x+dx, y+dy) in floor for dx, dy in ((1,0),(0,1),(1,1)))
+
+
+def native_cubes(floor, ceilings, size, scenery=(), opened=(), capped=()):
+    """The native cube raster. `scenery`: the cubes the cube-raster stamp made solid (scenery_raster),
+    written with RASTER_SCENERY_VDELTA so the engine's light passes them. `opened`: cubes kept open
+    space even where a corner of their square has no floor (the route's and the placed entities'
+    cubes since the cube-raster stamp: they had stood in solid cubes beside walls and on other storeys).
+    `capped`: open cubes whose ceiling is one unit over the floor (a mapmodel's cube inside its own
+    scenery: the engine draws the mapmodel at the floor, and neither a waypoint nor a body fits)."""
     for y in range(size):
         for x in range(size):
             z = floor.get((x,y))
-            if z is None:
-                yield b'\x00\x02\x00'
+            if (x, y) in scenery:
+                yield bytes((0, 2, RASTER_SCENERY_VDELTA))
                 continue
-            corners = [floor.get((x+dx,y+dy)) for dx,dy in ((1,0),(0,1),(1,1))]
-            if any(v is None for v in corners):
+            if z is None or not native_cube_open(floor, x, y, opened=opened):
                 yield b'\x00\x02\x00'
                 continue
             base = z // 4
             # Keep overhangs above the selected layer as native ceilings.
             roof = min((c//4 for c in ceilings.get((x,y), ()) if c >= z+22), default=125)
-            roof = min(125, max(base+6, roof))
+            roof = min(127, base + 1) if (x, y) in capped else min(125, max(base+6, roof))
             # Native SPACE cells keep consistent elevations across steep or
             # overlapping rooms. Exact render surfaces are drawn separately.
             yield bytes((4, (z//4)&255, roof&255, 2, 2, 0, 0, 2, 0))
@@ -1854,7 +1925,9 @@ def section_layout(halo, mission, part, key=None):
 # Route metrics (`packages/maps/<section>.metrics.json`, git-ignored with the maps): what the
 # stub-route gate (tests/test_route_metrics.py) reads. Written by every import of a section, and
 # by `--metrics-only`, which plans the section as an import would but writes nothing else.
-METRICS_FORMAT = 1
+# Format 2 (the ownerless-kill batch): every metrics file carries `cfg_current` (format 1 files
+# from before the jump governors lack it, and a stale .cfg would pass unseen).
+METRICS_FORMAT = 2
 # A route is a stub (definition of done, roadmap item 3) when it has fewer steps than this, its
 # reachable floor is under this share of the section's floor columns, or it ends more than this
 # many source units from the section's exit point; and a walked route (retail collision) that
@@ -2360,10 +2433,15 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         machines, baked = static_device_surfaces(halo, bsp, projection, output,
                                                  CINEMATIC_STILL.get(mission.cache, ()))
         # Scenery collision (SCENERY_COLLISION): its polygons are walked, seen and thrown at like the
-        # static machines' (`fixed`), and written to the .hcol's SCN1 trailer.
+        # static machines' (`fixed`), and written to the .hcol's SCN1 trailer. With the scenery of the
+        # EXTRA_BSPS the section holds (c40 section 1's BSP 12, the d40 section 3 batch), in the same
+        # map window; less what a script creates or destroys during play by name or name pattern
+        # (SCENERY_SCRIPTS_AT_END, SCENERY_KEPT).
         if key in SCENERY_COLLISION:
             scenery_polygons, scenery_baked, scenery_left = scenery_surfaces(
-                halo, bsp, projection, window=(xmin - 8, xmax + 8, ymin - 8, ymax + 8))
+                halo, bsp, projection, window=(xmin - 8, xmax + 8, ymin - 8, ymax + 8),
+                extra_bsps=EXTRA_BSPS.get(key, ()), at_end=SCENERY_SCRIPTS_AT_END.get(mission.cache, ()),
+                kept=SCENERY_KEPT.get(key, ()))
             print(f'{mission.cache} section {part+1}: {len(scenery_baked)} scenery placements baked '
                   f'({len(scenery_polygons)} surfaces)' + (', left out: ' + ', '.join(
                       f'{count} {why}' for why, count in sorted(scenery_left.items())) if scenery_left else ''), flush=True)
@@ -2643,6 +2721,27 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
             say(f'{mission.cache} section {part+1}: WARNING no vehicle route (run tools/halo_vehicles.py first)', flush=True)
         elif len(vehicle_plan[1]) >= 2:
             path = vehicle_plan[1]
+    # The cube-raster stamp (scenery_raster): the baked scenery goes into the native cube raster too,
+    # which the engine's flood waypoints, AssaultCube's sight checks on stock geometry and the stock
+    # fallback read (the .hcol, the planner and the route are as they were). Tall scenery makes its
+    # cubes solid, a low walkable top raises the floor onto it. The cubes the route walks, the vehicles
+    # stand in and the Crash Site's mapmodels are drawn on keep their floor (the engine draws a mapmodel
+    # at its cube's floor); actors, weapons and equipment are placed off the solid cubes below. A
+    # mapmodel's cube the stamp would make solid (a tree's trunk) is capped instead: open space one unit
+    # high over its floor, so the mapmodel stands where it did and no waypoint goes in it (the flood
+    # needs the body's radius between floor and ceiling) and bodies on stock geometry do not fit.
+    raster_solid, raster_raised, raster_kept, raster_capped = set(), {}, {}, set()
+    if scenery_polygons:
+        walked_cubes = {(p[0], p[1]) for p in path}
+        if retail:
+            walked_cubes |= {(round(projection.point(point)[0]), round(projection.point(point)[1]))
+                             for _, _, _, point, _ in section_placements}
+        modelled_cubes = {(round(x), round(y)) for _, (x, y, _), *_ in scenery} if crash_site else set()
+        raster_solid, raster_raised, raster_kept = scenery_raster(scenery_polygons, scenery_baked, floor,
+                                                                  walked_cubes | modelled_cubes)
+        raster_capped = {cube for cube, level in raster_kept.items()
+                         if level is None and cube in modelled_cubes and cube not in walked_cubes}
+        floor = {**floor, **raster_raised}
     body = None
     if walked:
         # Spawns, markers and items need room for a body, not only floor: a shelf at chest
@@ -2675,6 +2774,10 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         phase = 1 if i < len(path)//4 else 2 if i < halfway-3 else 3
         entries.append(entity(xyz(path[i]), PLAYERSTART,0,100,phase))
     used = []
+    def off_scenery(cells):
+        # The cube-raster stamp: off its solid cubes, unless every cell in reach is one (the placement's
+        # cube is then opened again below, as the route's are).
+        return [p for p in cells if p not in raster_solid] or cells
     # Native actor spawns: two encounters, each the actors (at most four) whose retail position is
     # within 55 units (2D) of an anchor on the route, placed on the nearest reachable raster cell
     # within 35 of it; the anchors stand a quarter and three quarters along the route.
@@ -2685,6 +2788,7 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         close = [(x,y) for x in range(round(point[0])-6,round(point[0])+7)
                        for y in range(round(point[1])-6,round(point[1])+7)
                  if (x,y) in parents and not parked_at(x, y, floor[x,y])]
+        close = off_scenery(close)
         if not close:
             continue
         place = closest(close,floor,point)
@@ -2730,6 +2834,7 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         close = [(x,y) for x in range(round(projected_point[0])-4,round(projected_point[0])+5)
                        for y in range(round(projected_point[1])-4,round(projected_point[1])+5)
                        if (x,y) in parents and not parked_at(x, y, floor[x,y])]
+        close = off_scenery(close)
         if not close:
             continue
         place = closest(close,floor,projected_point)
@@ -2747,6 +2852,7 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         close = [(x,y) for x in range(round(projected_point[0])-4,round(projected_point[0])+5)
                        for y in range(round(projected_point[1])-4,round(projected_point[1])+5)
                        if (x,y) in parents and not parked_at(x, y, floor[x,y])]
+        close = off_scenery(close)
         if not close:
             continue
         place = closest(close,floor,projected_point)
@@ -2821,7 +2927,16 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
     maps = output / 'maps'
     maps.mkdir(parents=True, exist_ok=True)
     title = f'{mission.title} | The Crash Site' if crash_site else f'{mission.title} | Section {part+1}'
-    cgz = encode_map(native_cubes(floor,ceilings,size),entries,factor,title.encode())
+    # The route's and the placed entities' cubes are open space even where a corner of the square has no
+    # floor (beside a wall, on another storey): nothing the route walks or the map places stands in a
+    # solid cube of the raster (the cube-raster stamp's static check, below and in the metrics' `raster`).
+    # An actor, weapon or equipment with nothing but scenery cubes in reach (b40 section 3's script-created
+    # items under a snow pine's low boughs) keeps its cell, and the stamp gives that cube back.
+    raster_reopened = {(e[0], e[1]) for e in entries} & raster_solid
+    raster_solid -= raster_reopened
+    opened = {(p[0], p[1]) for p in path} | {(e[0], e[1]) for e in entries}
+    opened = {cube for cube in opened if cube in floor and cube not in raster_solid}
+    cgz = encode_map(native_cubes(floor, ceilings, size, raster_solid, opened, raster_capped), entries, factor, title.encode())
     cgz_path = maps / f'{name}.cgz'
     cgz_current = cgz_path.is_file() and cgz_path.read_bytes() == cgz
     # The section's map .cfg (git-ignored; halo_a30.cfg, the Crash Site's, is tracked and not written
@@ -2985,6 +3100,31 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         # A stale file would switch the engine to collision this section has not been checked against.
         hcol.unlink(missing_ok=True)
         route_file.unlink(missing_ok=True)
+    # The cube-raster stamp's static check: route rows and entities in a solid cube of the raster written
+    # above. The route's own cubes and the placed entities' are open (`opened`), so what is left is rows
+    # with no native floor at their cube (a lift's deck, a flight over a drop, an exit fall's last step,
+    # a drive or flight leg off the raster's floor) and entities beside none (a vehicle at its retail point).
+    raster_rows, raster_entities = {}, {}
+    for line in (route_text or '').splitlines():
+        x, y = (int(v) for v in line.split()[:2])
+        if not native_cube_open(floor, x, y, raster_solid, opened):
+            why = 'scenery' if (x, y) in raster_solid else 'no floor' if (x, y) not in floor else 'corner'
+            raster_rows[why] = raster_rows.get(why, 0) + 1
+    labels = {0: 'actor', 1: 'start', 100: 'marker', WEAPON_PLACEMENT: 'weapon', VEHICLE_PLACEMENT: 'vehicle',
+              EQUIPMENT_PLACEMENT: 'equipment'}
+    for e in entries:
+        if not native_cube_open(floor, e[0], e[1], raster_solid, opened):
+            label = labels.get(e[5], 'start') if e[4] == PLAYERSTART else {LIGHT: 'light', MAPMODEL: 'mapmodel'}.get(e[4], 'item')
+            raster_entities[label] = raster_entities.get(label, 0) + 1
+    if raster_solid or raster_raised or raster_rows or raster_entities:
+        print(f'{name}: cube raster: {len(raster_solid)} cubes solid under scenery, {len(raster_raised)} floors raised onto it'
+              f'{f" ({len(raster_kept)} cubes of the route, vehicles and mapmodels kept as they were" if raster_kept else ""}'
+              f'{f", {len(raster_capped)} mapmodel cubes capped)" if raster_capped else ")" if raster_kept else ""}'
+              f'{f", {len(raster_reopened)} reopened under actors or items with no other cell in reach" if raster_reopened else ""}; '
+              f'{sum(raster_rows.values())} route rows in solid cubes' +
+              (' (' + ', '.join(f'{n} {why}' for why, n in sorted(raster_rows.items())) + ')' if raster_rows else '') +
+              (', entities in solid cubes: ' + ', '.join(f'{n} {what}' for what, n in sorted(raster_entities.items()))
+               if raster_entities else ''), flush=True)
     entry_offset = math.dist(xyz(path[0]), projected_start) / scale
     # A vehicle route is measured to its exit volume's middle (c40 section 4's anchor is the
     # raster's end on the canyon floor, its exit the landing pad).
@@ -3017,6 +3157,13 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         'assists': len(assists),
         # Scenery placements baked into the section's .hcol (SCENERY_COLLISION; 0 elsewhere).
         'scenery': len(scenery_baked),
+        # The cube-raster stamp (scenery_raster): the native cubes its scenery made solid (written with
+        # RASTER_SCENERY_VDELTA) and those whose floor it raised onto a low top, the cubes of the route,
+        # vehicles and mapmodels it left as they were, and the route rows and entities still in a solid
+        # cube of the raster, by reason and by kind (none from scenery).
+        'raster': {'scenery_solid': len(raster_solid), 'scenery_raised': len(raster_raised), 'scenery_kept': len(raster_kept),
+                   'scenery_capped': len(raster_capped), 'scenery_reopened': len(raster_reopened),
+                   'route_rows_solid': raster_rows, 'entities_solid': raster_entities},
         # A ThrowTarget's planned aims (the route batch): the target, yaw, pitch, damage, neighbours that
         # count, and the blast's distance from the thrower's body against the frag's outer radius
         # (retail units). Empty elsewhere.

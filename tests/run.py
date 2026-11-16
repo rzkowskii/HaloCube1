@@ -31,6 +31,7 @@ QUICK = [
     'test_traversal_routes.py',       # lift deck and light-bridge route rows are consistent (route files only)
     'test_retail_assists.py',         # walking assists (ASSISTS, .hcol AST1): loaded, rays and grenades pass, bodies stand on them
     'test_retail_scenery.py',         # scenery collision (SCENERY_COLLISION, .hcol SCN1): trailer matches metrics, loaded, hit by rays, grenades, bodies
+    'test_scenery_raster.py',         # the cube-raster stamp: scenery in the .cgz cube raster (metrics, route rows and entities clear of it), flood waypoints out of it
     'test_route_metrics.py',          # stub-route gate: importer metrics, the known-bad table may not grow (no game)
     'test_campaign_replay.py',        # all 55 sections complete in one run
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine

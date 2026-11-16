@@ -24,7 +24,8 @@ For every section that has an imported packages/maps/<section>.hcol this checks 
     stock run, and the route
     follower's speed on every straight it walks must be too.
 A mission's walk stops at the first section without an .hcol (stock geometry, reported and
-skipped, not failed). A missing .route or a route that stalls fails the section; the walk
+skipped, not failed; none since the d40 section 3 batch, which put d40 section 3 on retail collision,
+so d40's walk goes on to section 4). A missing .route or a route that stalls fails the section; the walk
 logs go to build/qa/. Lift rides, light-bridge waits, the actions of control, shoot, door and throw
 rows (route flags 256, 512, 1024 and 2048: `RETAIL_QA act ...`, with `GRENADE throw` where each frag
 lay before it went off), b30's Pelican boarding at its route's end (`RETAIL_QA interact`) and the
@@ -164,13 +165,18 @@ PENDING_WALK = {
     'halo_c40_01': "walks to fly_away_1, flies to pulse generator 1's platform, walks through the doorway corridor (BSPs 2 "
                    "and 12, no seals) into pulse_1_trigger and back, flies down to the c bridge and walks through door_c1 "
                    "into bsp 2,10 (door_c1 powered by pulse_1_trigger; the walker has no door row there)",
+    # The d40 section 3 batch: the last section on stock geometry is on retail collision (no longer
+    # STOCK_SECTIONS), with its 13 scenery placements; the walk no longer stops there.
+    'halo_d40_03': 'new on retail collision (the d40 section 3 batch): from the upper level where its stock route started '
+                   '(SECTION_ANCHORS; the lower floor round bsp 2,1 stays unreachable, as on stock geometry) along the '
+                   'upper level to bsp 2,3 (169 rows on the walkway level, no jumps, crouches or door rows)',
 }
 # Since the batch after the c10 section 5 batch every section on retail collision carries its scenery's
 # collision (SCENERY_COLLISION: rocks, trees, crates, barricades, computer banks, the invisible
 # door_blast_collision planes and a50_nutblockers), and the walked routes were re-planned round and over
 # it (most moved a few rows; every one still ends in its exit). None has been walked with it, the a10
 # sections walked in earlier batches included: each is pending a walk with its scenery.
-# (SCENERY_COLLISION also lists d40 section 3, which stays on stock geometry: no .hcol, no walk.)
+# (STOCK_SECTIONS is empty since the d40 section 3 batch; a section put back there has no .hcol and no walk.)
 for _key in SCENERY_COLLISION - STOCK_SECTIONS:
     _name = CRASH_SITE_NAME if _key[1] == 'crash' else f'halo_{_key[0]}_{_key[1] + 1:02}'
     PENDING_WALK.setdefault(_name, 're-planned round and over its scenery collision (SCENERY_COLLISION), '

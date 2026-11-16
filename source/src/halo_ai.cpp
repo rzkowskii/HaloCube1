@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <sstream>
 
+extern int halo_damagetrace;
+
 namespace
 {
     // Format 2 adds the team, unitmelee and material lines; format 1 tables still load (their
@@ -104,6 +106,7 @@ namespace
     // allies turn on a player who keeps killing them; the count is the engine's choice).
     const int betrayalKills = 2;
     int scriptDamage = 0;           // HaloScriptDamage scopes open
+    int ownerlessDamage = 0;        // of those, the ones dealing damage nobody owns (haloareablast, no owner)
     std::vector<const playerent *> preferred;
     bool grenadesAllowed = true;
     struct Noise { const playerent *source; vec at; int millis; };
@@ -1088,7 +1091,11 @@ bool halohovering(const playerent *p)
 }
 
 bool haloactorpassive(const playerent *p) { const Actor *a = find(p); return a && passive(*a); }
-void haloactorscriptdamage(bool on) { scriptDamage = max(0, scriptDamage + (on ? 1 : -1)); }
+void haloactorscriptdamage(bool on, bool ownerless)
+{
+    scriptDamage = max(0, scriptDamage + (on ? 1 : -1));
+    if(ownerless) ownerlessDamage = max(0, ownerlessDamage + (on ? 1 : -1));
+}
 const HaloActorDef *haloactorvariant(const playerent *p) { const Actor *a = find(p); return a ? a->def : nullptr; }
 
 bool haloactorthink(CBot *body)
@@ -1293,6 +1300,13 @@ void haloactornoise(const playerent *source)
 
 void haloactordeath(const playerent *victim, const playerent *killer)
 {
+    // Damage nobody owns (a vehicle's death explosion, effect_new's jpt! damage: haloareablast with
+    // no owner) is dealt in the player's name, because the stock engine needs an attacker; the kill
+    // is nobody's, as in Halo, where the blast's owner is the vehicle or NONE and no player: no
+    // betrayal, and the dead actor's hostile neighbours are not alerted to the player.
+    const bool ownerless = ownerlessDamage && killer == player1;
+    if(ownerless) killer = nullptr;
+    int alerted = 0;
     const Actor *dead = find(victim);
     const int team = haloactorteam(victim);
     const bool leader = dead && dead->def->type == TYPE_ELITE;
@@ -1335,8 +1349,13 @@ void haloactordeath(const playerent *victim, const playerent *killer)
         {
             a.awareness = ALERT;
             a.lastKnown = killer->o;
+            ++alerted;
         }
     }
+    // DEATH_TRACE victim=<name> killer=<player|name|-> ownerless=<0|1> alerted=<neighbours alerted to the killer>
+    if(dead && halo_damagetrace)
+        conoutf("DEATH_TRACE victim=%s killer=%s ownerless=%d alerted=%d", victim->name,
+                killer ? (killer == player1 ? "player" : killer->name) : "-", ownerless, alerted);
     haloactordetach(victim);
 }
 

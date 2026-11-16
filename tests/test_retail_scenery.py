@@ -4,7 +4,9 @@
 
 For each section SCENERY_COLLISION lists that is on retail collision (every section on retail
 collision since the batch after the c10 section 5 batch: the Crash Site and all 53 others, walked,
-driven and flown), it checks, without the game, that
+driven and flown, and d40 section 3 since the d40 section 3 batch put it on retail collision: all 55;
+c40 section 1's SCN1 also lists the scenery of BSP 12, EXTRA_BSPS, which the d40 section 3 batch
+scans too: one door blinker with no collision model, so none), it checks, without the game, that
   * the section's .hcol ends in an SCN1 trailer (after DEV1, before AST1) whose placements match the
     importer's metrics (`scenery` in packages/maps/<section>.metrics.json), whose surface ranges ascend
     without overlapping and fall inside the file's surfaces;

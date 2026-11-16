@@ -20,6 +20,11 @@ enum HaloSeatRole { HALO_SEAT_DRIVER, HALO_SEAT_GUNNER, HALO_SEAT_PASSENGER };
 // Map lifetime: clear on map start, add each placement entity, then restart once the section
 // (or a revert) begins. `checkpoint` restores the state halovehiclescheckpoint() saved.
 void halovehiclesclear();
+// Jump governors (halo_vehiclegovern lines of a map .cfg): resetmap drops the ones a .cfg left
+// pending, before the next map's .cfg runs; startmap makes the pending ones the map's (every load
+// path, the edit-mode xmap restore included), replacing the last map's.
+void halovehiclegovernorsreset();
+void halovehiclegovernorsadopt();
 void halovehicleplace(const entity &e);
 void halovehiclesrestart(bool checkpoint);
 void halovehiclescheckpoint();
