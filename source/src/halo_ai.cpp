@@ -9,6 +9,7 @@
 #include "halo.h"
 #include "halo_ai.h"
 #include "halo_collision.h"
+#include "halo_dialogue.h"
 #include "halo_script.h"
 #include "halo_vehicle.h"
 #include "halo_weapons.h"
@@ -24,6 +25,11 @@ VAR(halo_actormelee, 0, 1, 1);
 // firing its primary trigger only, as before the special fire change; 2 makes every chance roll
 // succeed (for the QA client: tests/test_actor_ai.py item 11).
 VAR(halo_specialfire, 0, 1, 2);
+// Halo's danger zones and dives (perceiveDanger, avoidDanger; actors.txt's `danger` and `dive` lines,
+// equipment.txt's and weapons.txt's `danger` lines, vehicles.txt's `flags`): 0 turns them off; 2 makes
+// every notice, dive and stuck-grenade berserk roll succeed and 3 every notice roll succeed and every
+// dive roll fail (for the QA client: tests/test_actor_ai.py item 12).
+VAR(halo_dangeravoid, 0, 1, 3);
 
 namespace
 {
@@ -40,8 +46,8 @@ namespace
     enum Awareness { UNAWARE, ALERT, COMBAT };
     enum Morale { STEADY, PANICKED, BERSERK };
     // Retail actr types used for leader and swarm rules.
-    enum { TYPE_ELITE = 0, TYPE_JACKAL = 1, TYPE_GRUNT = 2, TYPE_HUNTER = 3, TYPE_ENGINEER = 4, TYPE_MARINE = 7,
-           TYPE_INFECTION = 10, TYPE_MONITOR = 12, TYPE_SENTINEL = 13 };
+    enum { TYPE_ELITE = 0, TYPE_JACKAL = 1, TYPE_GRUNT = 2, TYPE_HUNTER = 3, TYPE_ENGINEER = 4, TYPE_MARINE = 7, TYPE_CREW = 8,
+           TYPE_FLOOD = 9, TYPE_INFECTION = 10, TYPE_CARRIER = 11, TYPE_MONITOR = 12, TYPE_SENTINEL = 13 };
     // Retail actr flags used by the brain: always charge at enemies, always berserk in attacking
     // mode, flying, always charge in attacking mode.
     enum { ACTR_ALWAYS_CHARGE = 1 << 11, ACTR_BERSERK_ATTACKING = 1 << 19, ACTR_FLYING = 1 << 21, ACTR_CHARGE_ATTACKING = 1 << 24 };
@@ -76,6 +82,8 @@ namespace
         // melee delay values on each swing (the slot's delay is rewritten there, so it is read once).
         int baseDelay = 0;
         bool hiding = false, berserkTried = false;
+        // Whether it ever had a target (Halo's target.any_target_ever, for the sighted-enemy line).
+        bool everTargeted = false;
         int startHealth = 0;
         const HaloCommandProgram *program = nullptr;
         size_t cursor = 0;
@@ -123,6 +131,33 @@ namespace
         int specialReadyAt = 0, chargeSince = 0, specialRelease = -1;
         bool overcharging = false, nextSecondary = false, burstSecondary = false, specialBurst = false;
         int specials = 0, chargedShots = 0, secondaryShots = 0;
+        // Halo's danger zone (actor_danger_zone, ../Halo3DS ai/actor_perception.c:476-500; the danger
+        // zones section below): one danger at a time, its type (DANGER_*), hostility (HOSTILITY_*: who
+        // is behind it), acknowledgement left (ms), whether it is perceived, noticed, a dive is allowed
+        // on it, it was called out and it is attached to the actor itself; what it is (a grenade's or
+        // shot's id, a vehicle's index, a carrier), the unit behind it; its radius, distance from the
+        // actor, position and velocity (AssaultCube units, a second), the position 45 ticks ahead, the
+        // sphere round both, and the ms to its detonation or death (-1 unknown).
+        struct Danger
+        {
+            int type = 0, hostility = 0, ackLeft = 0;
+            bool perceived = false, noticed = false, allowDive = false, communicated = false, attachedToUs = false;
+            bool stepped = false, diveFailed = false;       // for the trace: a step out or a failed dive was logged
+            int id = -1;
+            const playerent *unit = nullptr, *owner = nullptr;
+            float radius = 0, distance = 0, sphereRadius = 0;
+            vec position = vec(0, 0, 0), velocity = vec(0, 0, 0), predicted = vec(0, 0, 0), centre = vec(0, 0, 0);
+            int timeLeft = -1;
+        } danger;
+        // The last danger update (ms), a dive under way (until when, where to, the speed factor on the
+        // bot's step: halomovementscale), avoiding the danger (Halo's avoid action), the panic or berserk
+        // of a grenade stuck to it (and when its berserk chance was last rolled), and for the probe the
+        // dangers noticed, dives, avoid moves and positions dropped for the danger.
+        int dangerAt = 0, diveUntil = 0, attachedRollAt = 0;
+        vec diveTo = vec(0, 0, 0);
+        float diveFactor = 1;
+        bool avoiding = false, attachedPanic = false;
+        int dangerNotices = 0, dives = 0, avoids = 0, dangerDiscards = 0;
     };
     std::vector<Actor> actors;
     // Halo's per-encounter last_grenade_throw_time (../Halo3DS ai/encounters.h:77, set when any member
@@ -260,6 +295,9 @@ namespace
                 loopi(33) if(ok && !(bool(in >> d->unitMeleeMaterials[i]) && std::isfinite(d->unitMeleeMaterials[i]))) ok = false;
                 d->hasUnitMeleeMaterials = ok;
             }
+            // The melee jpt!'s category and instantaneous acceleration (the unit dialogue; older engines skip it).
+            else if(key == "unitmeleekind")
+                ok = bool(in >> d->unitMeleeCategory >> d->unitMeleeAcceleration) && std::isfinite(d->unitMeleeAcceleration);
             else if(key == "major") std::getline(in >> std::ws, d->majorPath);
             // Optional format 3 lines (tools/halo_actors.py; older engines skip them).
             else if(key == "unit") ok = d->hasUnitFlags = bool(in >> d->unitFlags >> d->bipedFlags);
@@ -303,6 +341,25 @@ namespace
                 // A mode or situation Halo has no case for, or a negative delay, gives no special fire.
                 if(ok && (d->specialMode < 0 || d->specialMode > 2 || d->specialSituation < 0 || d->specialSituation > 3 || d->specialDelay < 0))
                     d->specialMode = 0;
+            }
+            // danger <notice projectile> <notice vehicle> <grenade dive> <cover dive> <dive distance>
+            //        <suicide radius> <attached berserk> <berserk firing range>
+            else if(key == "danger")
+            {
+                ok = bool(in >> d->noticeProjectile >> d->noticeVehicle >> d->grenadeDive >> d->coverDive >> d->diveDistance >>
+                          d->suicideRadius >> d->attachedBerserk >> d->berserkFiringRange);
+                for(float v : {d->noticeProjectile, d->noticeVehicle, d->grenadeDive, d->coverDive, d->diveDistance, d->suicideRadius,
+                               d->attachedBerserk, d->berserkFiringRange})
+                    if(ok && !std::isfinite(v)) ok = false;
+                d->hasDanger = ok;
+            }
+            // dive <frames> <dx> <dy> x6: Halo's dive animation table (ai/actions.c:939-948)
+            else if(key == "dive")
+            {
+                for(HaloActorDef::DiveAnimation &dive : d->dives)
+                    if(ok && !(bool(in >> dive.frames >> dive.dx >> dive.dy) && dive.frames >= 0 && std::isfinite(dive.dx) && std::isfinite(dive.dy)))
+                        ok = false;
+                d->hasDive = ok;
             }
             else if(key == "end") d = nullptr;
             if(!ok)
@@ -357,10 +414,12 @@ namespace
         return (f & ACTR_ALWAYS_CHARGE) || (a.posture == HALO_ATTACKING && (f & (ACTR_CHARGE_ATTACKING | ACTR_BERSERK_ATTACKING)));
     }
     // Halo's actor melee applies (meleeAttack, infectionContact): a variant with actors.txt's `melee`
-    // line that is not a Hunter (its smash stays the engine's own), a flyer or a passive actor.
+    // line that is not a flyer or a passive actor. Hunters too: hunter_decide_action has no melee of
+    // its own (../Halo3DS ai/actor_type_hunter.c:56-114), so theirs is actions.c:2534-2610's like
+    // anyone's; without the line (or with halo_actormelee 0) a Hunter keeps the engine's smash.
     bool haloMelee(const Actor &a)
     {
-        return halo_actormelee && a.def->hasMelee && a.def->type != TYPE_HUNTER && !flyer(a) && !passive(a);
+        return halo_actormelee && a.def->hasMelee && !flyer(a) && !passive(a);
     }
 
     bool sees(const Actor &a, CBot *body, const playerent *t)
@@ -389,6 +448,24 @@ namespace
         const bool tracking = a.awareness == COMBAT && a.target == t && distance <= d.visionDistance * reach * 1.5f;
         if(!inCone && !inPeriphery && !tracking) return false;
         return body->IsVisible(centreOf(t));
+    }
+
+    // Whether the actor sees a point (actor_visibility_at_point at its maximum distance, ../Halo3DS ai/
+    // actor_perception.c:5143-5168, 5241-5265): inside its vision cone or its periphery and in clear sight
+    // from its eyes, as `sees` takes a unit, without the camouflage and the tracking of a target.
+    bool seesPoint(const Actor &a, CBot *body, const vec &point)
+    {
+        if(a.flags & HALO_AI_BLIND) return false;
+        const HaloActorDef &d = *a.def;
+        const vec delta = vec(point).sub(eyeOf(a.bot));
+        const float distance = delta.magnitude(), s = scale();
+        const float yaw = a.bot->yaw * RAD;
+        const vec facing(sinf(yaw), -cosf(yaw), 0);
+        vec flat(delta.x, delta.y, 0);
+        const float angle = flat.iszero() ? 0.0f : acosf(clamp(flat.normalize().dot(facing), -1.0f, 1.0f));
+        const bool inCone = distance <= d.visionDistance * s && angle <= d.visionMax * 0.5f + 0.3f;
+        const bool inPeriphery = distance <= d.peripheralDistance * s && angle <= d.peripheralAngle * 0.5f;
+        return (inCone || inPeriphery) && body->IsVisible(point);
     }
 
     bool hears(const Actor &a, vec &where)
@@ -433,6 +510,8 @@ namespace
         });
         if(best)
         {
+            const bool sighted = a.awareness != COMBAT;
+            const int seenBefore = a.lastSeen;
             if(a.awareness != COMBAT || a.target != best)
             {
                 // Reaction time before the first burst at a newly noticed target.
@@ -443,6 +522,18 @@ namespace
             a.awareness = COMBAT;
             a.lastKnown = best->o;
             a.lastSeen = lastmillis;
+            // Halo's sighted-enemy line on a newly noticed enemy (actor_stimulus.c:1043-1063,
+            // ai_communication.c's sighted_enemy rows): "never had a target" (enemy status 0) or,
+            // for one met again, "lost" (status 2: none seen for 6 s; the actor's own last sighting
+            // stands for the encounter's enemy_visible_timer).
+            if(sighted)
+            {
+                unsigned status = 1u << 5;
+                if(!a.everTargeted) status |= 1u;
+                else if(lastmillis - seenBefore >= 6000) status |= 1u << 2;
+                a.everTargeted = true;
+                halodialogueevent(HALO_COMM_SIGHTED_ENEMY, a.bot, best, HALO_HOSTILITY_ENEMY, -1, status);
+            }
             // Nearby squadmates are put on alert towards the same target.
             const float shout = 15.0f * scale();
             for(Actor &friendActor : actors)
@@ -584,6 +675,99 @@ namespace
         return false;
     }
 
+    // --- danger zone geometry ------------------------------------------------
+    //
+    // Halo's danger zone types and hostilities (../Halo3DS ai/actors.h:176-190) and escape directions
+    // (ai/actions.c:304-308). A danger's motion is looked 45 ticks (1.5 s) ahead: its line runs from where
+    // it is to where it will be, and the sphere round that line is its reach (actor_perception.c:5067-5079).
+    enum { DANGER_NONE = 0, DANGER_SUICIDE = 1, DANGER_PROJECTILE = 2, DANGER_VEHICLE = 3 };
+    enum { HOSTILITY_ENEMY = 0, HOSTILITY_FRIEND = 1, HOSTILITY_SELF = 2 };
+    enum { EVADE_NONE = -1, EVADE_LEFT = 0, EVADE_RIGHT = 1, EVADE_RANDOM = 4 };
+    constexpr float dangerLookahead = 1.5f;
+
+    vec feetOf(const playerent *p) { return vec(p->o.x, p->o.y, p->o.z - p->eyeheight); }
+
+    // point_to_line_distance_squared3d (../Halo3DS math/real_math.c:2531-2546): from a point to the
+    // segment base .. base + along (a point for a still danger).
+    float segmentDistanceSquared(const vec &point, const vec &base, const vec &along)
+    {
+        vec v = vec(point).sub(base);
+        const float length = along.squaredlen();
+        if(length > 1e-12f) v.sub(vec(along).mul(clamp(v.dot(along) / length, 0.0f, 1.0f)));
+        return v.squaredlen();
+    }
+
+    // vector_to_line_distance_squared3d (real_math.c:2548-2650): between the segments p .. p + u and
+    // q .. q + v (the closest points of two clamped segments).
+    float segmentsDistanceSquared(const vec &p, const vec &u, const vec &q, const vec &v)
+    {
+        const vec r = vec(p).sub(q);
+        const float a = u.squaredlen(), e = v.squaredlen(), f = v.dot(r);
+        float s = 0, t = 0;
+        if(a <= 1e-12f && e <= 1e-12f) return r.squaredlen();
+        if(a <= 1e-12f) t = clamp(f / e, 0.0f, 1.0f);
+        else
+        {
+            const float c = u.dot(r);
+            if(e <= 1e-12f) s = clamp(-c / a, 0.0f, 1.0f);
+            else
+            {
+                const float b = u.dot(v), denominator = a * e - b * b;
+                s = denominator > 1e-12f ? clamp((b * f - c * e) / denominator, 0.0f, 1.0f) : 0.0f;
+                t = (b * s + f) / e;
+                if(t < 0) { t = 0; s = clamp(-c / a, 0.0f, 1.0f); }
+                else if(t > 1) { t = 1; s = clamp((b - c) / a, 0.0f, 1.0f); }
+            }
+        }
+        return vec(p).add(vec(u).mul(s)).sub(vec(q).add(vec(v).mul(t))).squaredlen();
+    }
+
+    // fast_vector_intersection_with_sphere (real_math.c:471-510): the fraction of `along` at which a
+    // point moving from `point` enters the sphere, 0 when it starts inside it, 1e30 when it misses.
+    float sphereIntersection(const vec &point, const vec &along, const vec &centre, float radius)
+    {
+        const vec p = vec(point).sub(centre);
+        const float c = p.squaredlen() - radius * radius;
+        if(c < 0) return 0;
+        const float b = along.dot(p);
+        if(b >= 0) return 1e30f;
+        const float a = along.squaredlen(), discriminant = b * b - a * c;
+        if(a <= 0 || discriminant <= 0) return 1e30f;
+        return (-b - sqrtf(discriminant)) / a;
+    }
+
+    // Halo's left of a direction, (-j, i) (actions.c:4339-4343), in AssaultCube's coordinates, whose y
+    // runs the other way (tools/import_halo_a30.py ac_xy): (y, -x).
+    vec leftOf(const vec &f) { return vec(f.y, -f.x, 0); }
+
+    // Halo's danger clearance in the firing position search while a noticed danger's sphere comes within
+    // 3 world units of the actor (find_path_direction_from_actor, ../Halo3DS ai/actor_firing_position.c:
+    // 1956-1960, 1208-1293): near the sphere a position inside the danger radius of its line is rejected,
+    // one up to 2.5 units past it is worth 8 a unit past the radius and any other 20 (Halo's evaluations
+    // add; the engine's scores subtract), and while the actor stands outside the radius a position whose
+    // first 3 units of way cross it is rejected. False for a rejected position.
+    bool dangerClearance(const Actor &a, const vec &point, float &score)
+    {
+        const Actor::Danger &z = a.danger;
+        const float s = scale(), r = z.radius;
+        if(!halo_dangeravoid || z.type == DANGER_NONE || !z.noticed || z.distance >= z.sphereRadius + 3 * s) return true;
+        const vec line = vec(z.predicted).sub(z.position);
+        if(point.dist(z.centre) < z.sphereRadius + 2.5f * s)
+        {
+            const float d2 = segmentDistanceSquared(point, z.position, line), clearance = r + 2.5f * s;
+            if(d2 < r * r) return false;
+            score -= d2 < clearance * clearance ? (sqrtf(d2) - r) / s * 8 : 20;
+        }
+        const vec body = feetOf(a.bot);
+        if(body.dist(z.centre) < z.sphereRadius + 3 * s && z.distance > r && segmentDistanceSquared(body, z.position, line) > r * r)
+        {
+            vec way = vec(point).sub(body);
+            way.z = 0;
+            if(!way.iszero() && segmentsDistanceSquared(body, way.normalize().mul(3 * s), z.position, line) < r * r) return false;
+        }
+        return true;
+    }
+
     int maskFor(const Actor &a)
     {
         if(a.hiding || a.morale == PANICKED) return 3;                  // defending
@@ -616,6 +800,7 @@ namespace
                 else if(a.hiding) score += (::IsVisible(vec(p.point).add(vec(0, 0, a.bot->eyeheight)), a.lastKnown) ? 60 : 0) - d * 0.2f;
                 else score += d < wantMin ? (wantMin - d) * 2 : d > wantMax ? (d - wantMax) * 1.5f : 0;
             }
+            if(!dangerClearance(a, p.point, score)) continue;
             if(score < best) { best = score; pick = &p; }
         }
         if(!pick) return false;
@@ -669,9 +854,9 @@ namespace
     // melee_attack_delay_timer (0 while berserk) plus melee_delay_base seconds have passed since
     // last_melee_attack_time (actions.c:2563-2568, 2593-2601), which the charge refreshes on every
     // tick until its attack ends (action_charge.c:400-402): the delay follows the attack. The engine
-    // plays no melee animation, so `attack` stands for the attack itself (the Hunter's 1.6 to 2.2 s
-    // against its 61-frame, 2.03 s `stand unarmed melee`; a sword swing's 1.2 s against the Elite's
-    // 28 and 35-frame sword melees) and is not scaled (judgement call). Halo's rule skips swarm actors
+    // plays no melee animation, so `attack` stands for the attack itself (the fallback smash's 1.6 to
+    // 2.2 s against the Hunter's 61-frame, 2.03 s melee, which meleeAttack waits out; a sword swing's
+    // 1.2 s against the Elite's 28 and 35-frame sword melees) and is not scaled (judgement call). Halo's rule skips swarm actors
     // (actions.c:2541, the infection forms), and an older actors.txt has no timer: both keep the
     // engine's former rule, the whole interval scaled (halomeleedelay).
     int meleeInterval(const Actor &a, int attack)
@@ -939,6 +1124,8 @@ namespace
         --e->mag[GUN_GRENADE];
         // The throw starts the encounter's timeout for every member (actions.c:3604-3607).
         if(encounter >= 0) encounterThrows[encounter] = lastmillis;
+        // The thrower's call (actor_combat.c:1741-1748).
+        halodialogueevent(HALO_COMM_GRENADE_THROWING, e, nullptr);
     }
 
     // --- morale and defence -----------------------------------------------
@@ -1059,8 +1246,19 @@ namespace
 
     // --- Hunters ----------------------------------------------------------
 
-    // A Hunter's smash: the unit's melee jpt! (35 to 45 with a strong shove) against whatever it
-    // fights once it stands within reach and roughly faces it, every 1.6 to 2.2 s plus its melee delay.
+    // The engine's shove for a Hunter's blow (the smash, and Halo's melee strike: meleeStrike). Halo
+    // pushes every damaged unit by its jpt!'s instantaneous acceleration (objects/damage.c:1004-1060;
+    // the Hunter melee's 9, an Elite's 2.5), which the engine does not model for any damage; only the
+    // Hunter's blow keeps the push it always had (judgement call).
+    void hunterShove(playerent *t, const vec &dir)
+    {
+        if(t->state == CS_ALIVE) { t->vel.add(vec(dir).mul(1.2f)); t->vel.z += 0.5f; }
+    }
+
+    // A Hunter's smash, the engine's former Hunter melee, kept for a table without the `melee` line
+    // and for halo_actormelee 0 (with Halo's melee a Hunter charges as any actor does: meleeAttack):
+    // the unit's melee jpt! (35 to 45 with a strong shove) against whatever it fights once it stands
+    // within reach and roughly faces it, every 1.6 to 2.2 s plus its melee delay.
     void smash(Actor &a)
     {
         botent *e = a.bot;
@@ -1094,13 +1292,15 @@ namespace
         melee.upperMax = m[2];
         melee.hasMaterials = a.def->hasUnitMeleeMaterials;
         loopi(HALO_DAMAGE_MATERIALS) melee.materials[i] = a.def->unitMeleeMaterials[i];
+        melee.category = a.def->unitMeleeCategory;
+        melee.acceleration = a.def->unitMeleeAcceleration;
         halohit(full, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0, melee.hasMaterials ? &melee : nullptr);
         // The jpt!'s instantaneous acceleration throws the victim back.
-        if(t->state == CS_ALIVE) { t->vel.add(vec(dir).mul(1.2f)); t->vel.z += 0.5f; }
+        hunterShove(t, dir);
         ++a.smashes;
     }
 
-    // Charge distance: inside it a Hunter closes in to smash instead of firing the cannon.
+    // Charge distance of the smash: inside it a Hunter closes in to smash instead of firing the cannon.
     float chargeDistance(const Actor &a) { return 1.6f * scale(); }
 
     // --- melee ------------------------------------------------------------
@@ -1109,8 +1309,10 @@ namespace
     // actor outside a vehicle may start a melee charge (../Halo3DS ai/actions.c:2534-2610), strikes
     // once it is close and faces its target (ai/action_charge.c:269-706) and lands the blow at its
     // melee animation's key frame (units/units.c:4185-4235, 9993-10005, 8542-8638). The infection
-    // forms, swarm actors that never charge, strike on contact (infectionContact). Hunters keep their
-    // smash (smash, above). Distances are Halo world units, horizontal, between the bodies' centres.
+    // forms, swarm actors that never charge, strike on contact (infectionContact). Hunters charge like
+    // anyone (their tags: within 4, 9 berserk; reach 0.175 + 2.566 - 0.943 = 1.80; key frame 18 of 61);
+    // the smash (above) is only their fallback. Distances are Halo world units, horizontal, between the
+    // bodies' centres.
 
     enum { MELEE_NONE = 0, MELEE_CHARGING = 1, MELEE_ATTACKING = 2 };
     // meleeAttack and infectionContact: not handling the actor, handling its movement this think, or
@@ -1140,6 +1342,8 @@ namespace
         out.upperMax = d.unitMelee[2];
         out.hasMaterials = d.hasUnitMeleeMaterials;
         loopi(HALO_DAMAGE_MATERIALS) out.materials[i] = d.unitMeleeMaterials[i];
+        out.category = d.unitMeleeCategory;
+        out.acceleration = d.unitMeleeAcceleration;
         return true;
     }
 
@@ -1205,11 +1409,15 @@ namespace
         dir.normalize();
         const float full = source.roll();
         ++a.meleeHits;
+        // A Hunter's blow still counts as a smash (ACTOR_FACTION smashes=) and keeps its shove (hunterShove).
+        const bool hunter = a.def->type == TYPE_HUNTER && !weaponMelee;
+        if(hunter) ++a.smashes;
         e->lastattackweapon = e->weaponsel;
         e->lastaction = lastmillis;
         meleeTrace(a, weaponMelee ? "strike_weapon" : "strike_unit", t, distance, full);
         // Last: the hit can kill the target and detach it, which moves `a` in the actor list.
         halohit(full, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0, source.hasMaterials ? &source : nullptr);
+        if(hunter) hunterShove(t, dir);
         return MELEE_DONE;
     }
 
@@ -1412,6 +1620,681 @@ namespace
         return MELEE_DONE;
     }
 
+    // --- danger zones -------------------------------------------------------
+    //
+    // Halo's danger zones (../Halo3DS ai/actor_perception.c, ai/actions.c): every actor keeps one danger
+    // at a time, a live grenade or a projectile with a danger radius, a vehicle moving near it or a
+    // suicidal unit about to burst, notices it after an acknowledgement delay and a chance, and dives
+    // aside from it or moves out of its reach. halo_dangeravoid 0 turns it all off; an actors.txt without
+    // the `danger` line (older tables) gives an actor none.
+
+    int ticksMillis(int ticks) { return ticks * 1000 / 30; }
+
+    // A notice or dive roll (real_seed_random against the tag's chance): halo_dangeravoid 2 makes the draw
+    // 0 (every roll with a chance above 0 succeeds), 3 makes notice draws 0 and dive draws 1 (no dive).
+    float dangerDraw(bool dive) { return halo_dangeravoid == 2 ? 0.0f : halo_dangeravoid == 3 ? (dive ? 1.0f : 0.0f) : rndscale(1.0f); }
+
+    void dangerTrace(const Actor &a, const char *event, float value)
+    {
+        // ACTOR_DANGER <event> <name> variant=<index> type=<0 none|1 suicide|2 projectile|3 vehicle>
+        //   hostility=<0 enemy|1 friend|2 self> radius=<world units> distance=<world units> left=<ms to detonation or death, -1>
+        //   value=<event's number> ms=<lastmillis>
+        //   assess: the acknowledgement (ms); notice: 1 a dive is allowed; communicate: 1 urgent; discard: 1;
+        //   dive: the animation's length (world units); dive_no_animation, dive_cannot_move: 0; avoid: 1 a
+        //   position, 0 straight out; step: 0; panic: 0; berserk: the chance; exit: 0; gone: 1 a vehicle
+        //   too slow or far, 0 the object is gone
+        if(!halo_damagetrace) return;
+        const Actor::Danger &z = a.danger;
+        const float s = scale();
+        conoutf("ACTOR_DANGER %s %s variant=%d type=%d hostility=%d radius=%.2f distance=%.2f left=%d value=%.3f ms=%d", event, a.bot->name,
+                a.def->index, z.type, z.hostility, z.radius / s, z.distance / s, z.timeLeft, value, lastmillis);
+    }
+
+    // A new danger replaces the actor's (the assess functions' memset and fill, actor_perception.c:4986-5019,
+    // 5552-5599, 6310-6325): its acknowledgement restarts and nothing about it is noticed yet.
+    void assessDanger(Actor &a, int type, int id, const playerent *unit, const playerent *owner, int hostility, float radius,
+                      const vec &position, const vec &velocity, float distance, int acknowledgement, bool perceived)
+    {
+        Actor::Danger &z = a.danger;
+        z = Actor::Danger();
+        z.type = type;
+        z.id = id;
+        z.unit = unit;
+        z.owner = owner;
+        z.hostility = hostility;
+        z.radius = radius;
+        z.position = position;
+        z.velocity = velocity;
+        z.distance = distance;
+        z.ackLeft = acknowledgement;
+        z.perceived = perceived;
+        dangerTrace(a, "assess", acknowledgement);
+    }
+
+    // The actor's danger zone, each think: what its perception assesses (a projectile, actor_perception.c:
+    // 5511-5600; a moving vehicle, 4932-5026; a suicidal unit, 6286-6330), the zone's refresh (5028-5319)
+    // and its acknowledgement and notice (actor_perception_update, 6389-6486). Halo assesses on its
+    // perception timeslice; the engine on every think (judgement call: the lists are short).
+    void perceiveDanger(Actor &a, CBot *body)
+    {
+        Actor::Danger &z = a.danger;
+        const int elapsed = clamp(lastmillis - a.dangerAt, 0, 250);
+        a.dangerAt = lastmillis;
+        if(!halo_dangeravoid || !a.def->hasDanger)
+        {
+            z = Actor::Danger();
+            return;
+        }
+        botent *e = a.bot;
+        const float s = scale();
+        const vec feet = feetOf(e);
+        HaloDangerObject objects[64];
+        const int objectCount = halodangerobjects(objects, 64);
+        HaloVehicleDanger vehicles[16];
+        const int vehicleCount = halovehicledangers(vehicles, 16);
+        // A projectile with a danger radius, not attached to anything or counting down (5520-5523), within
+        // that radius plus 10 world units: it replaces a suicide or a farther projectile. Who is behind it
+        // (5567-5598): the actor itself, a unit not hostile to it (a friend), else an enemy or nobody.
+        loopi(objectCount)
+        {
+            const HaloDangerObject &o = objects[i];
+            if(o.attached && !o.countingDown) continue;
+            const float d = feet.dist(o.position);
+            if(d >= (o.dangerRadius + 10) * s) continue;
+            if(!(z.type < DANGER_PROJECTILE || (z.type == DANGER_PROJECTILE && z.id != o.id && d < z.distance))) continue;
+            int hostility = HOSTILITY_ENEMY;
+            if(o.owner == e) hostility = HOSTILITY_SELF;
+            else if(o.owner && !haloteamhostile(a.team, halodamageteam(o.owner))) hostility = HOSTILITY_FRIEND;
+            assessDanger(a, DANGER_PROJECTILE, o.id, nullptr, o.owner, hostility, o.dangerRadius * s, o.position, o.velocity, d,
+                         ticksMillis(30), false);
+        }
+        // A vehicle whose tag causes collision damage moving faster than a world unit a second (0.0011
+        // squared units a tick) within its bounding radius plus 10, not seen from a seat: it replaces
+        // anything but a nearer vehicle. A driver not hostile to the actor makes it a friend's; a driven
+        // one is perceived as its driver is (4465-4472), one nobody drives is not at first (5497-5510).
+        if(!halovehicleinside(e))
+            loopi(vehicleCount)
+            {
+                const HaloVehicleDanger &v = vehicles[i];
+                const float perTick = v.velocity.magnitude() / s / 30;
+                if(perTick * perTick <= 0.0011111111f) continue;
+                const float d = feet.dist(v.origin);
+                if(d >= (v.boundingRadius + 10) * s) continue;
+                if(!(z.type < DANGER_VEHICLE || (z.type == DANGER_VEHICLE && z.id != v.index && d < z.distance))) continue;
+                const int hostility = v.driver && !haloactorhostile(e, v.driver) ? HOSTILITY_FRIEND : HOSTILITY_ENEMY;
+                assessDanger(a, DANGER_VEHICLE, v.index, v.driver, v.driver, hostility, v.boundingRadius * s, v.origin, v.velocity, d,
+                             ticksMillis(20), v.driver && sees(a, body, v.driver));
+            }
+        // A unit with an ai danger radius (the carrier's 2) in its melee attack, within that radius plus 10
+        // (4474-4484, 5423-5441): the carrier's fatal melee, which the engine plays as the dying state that
+        // ends in its burst (meleeBurst). It replaces only none or a farther suicide. Halo counts a dead
+        // one too; the engine's carrier killed by fire bursts at once, so there is none.
+        for(const Actor &o : actors)
+        {
+            if(&o == &a || !alive(o.bot) || !o.def->hasDanger || !(o.def->suicideRadius > 0) || o.meleePhase != MELEE_ATTACKING ||
+               !o.def->meleeFatal())
+                continue;
+            const vec at = feetOf(o.bot);
+            const float d = feet.dist(at);
+            if(!((o.def->suicideRadius + 10) * s > d)) continue;
+            if(!(z.type < DANGER_SUICIDE || (z.type == DANGER_SUICIDE && z.unit != o.bot && d < z.distance))) continue;
+            assessDanger(a, DANGER_SUICIDE, o.bot->clientnum, o.bot, o.bot, haloactorhostile(e, o.bot) ? HOSTILITY_ENEMY : HOSTILITY_FRIEND,
+                         o.def->suicideRadius * s, at, vec(o.bot->vel).mul(16), d, ticksMillis(6), sees(a, body, o.bot));
+        }
+        if(z.type == DANGER_NONE) return;
+
+        // The refresh (5028-5319): where it is now, gone once its object is.
+        bool found = false;
+        const playerent *stuck = nullptr, *driver = nullptr;
+        float perception = 0, bounding = 0;
+        vec position, velocity;
+        int left = -1;
+        if(z.type == DANGER_PROJECTILE)
+        {
+            loopi(objectCount) if(objects[i].id == z.id)
+            {
+                const HaloDangerObject &o = objects[i];
+                position = o.position;
+                velocity = o.velocity;
+                stuck = o.stuckTo;
+                perception = o.perceptionRadius;
+                left = o.millisLeft;
+                z.owner = o.owner;
+                found = true;
+                break;
+            }
+        }
+        else if(z.type == DANGER_VEHICLE)
+        {
+            loopi(vehicleCount) if(vehicles[i].index == z.id)
+            {
+                position = vehicles[i].origin;
+                velocity = vehicles[i].velocity;
+                bounding = vehicles[i].boundingRadius;
+                driver = z.unit = z.owner = vehicles[i].driver;
+                found = true;
+                break;
+            }
+        }
+        else if(const Actor *o = find(z.unit))
+        {
+            if(alive(o->bot))
+            {
+                position = feetOf(o->bot);
+                velocity = vec(o->bot->vel).mul(16);
+                left = o->meleePhase == MELEE_ATTACKING ? max(0, o->meleeBusyUntil - lastmillis) : -1;
+                found = true;
+            }
+        }
+        if(!found)
+        {
+            dangerTrace(a, "gone", 0);
+            z = Actor::Danger();
+            return;
+        }
+        z.position = position;
+        z.velocity = velocity;
+        z.distance = feet.dist(position);
+        z.predicted = vec(velocity).mul(dangerLookahead).add(position);
+        z.centre = vec(z.predicted).add(position).mul(0.5f);
+        z.sphereRadius = z.centre.dist(position) + z.radius;
+        const bool asleep = a.state == STATE_SLEEP && a.awareness == UNAWARE, blind = (a.flags & HALO_AI_BLIND) != 0;
+        bool perceived = z.perceived;
+        z.attachedToUs = false;
+        if(z.type == DANGER_VEHICLE)
+        {
+            // Slower than 0.2 world units a second (0.000044 squared a tick) or out of range: no danger (5091-5098).
+            const float perTick = velocity.magnitude() / s / 30;
+            if(perTick * perTick < 0.000044444444f || z.distance > (bounding + 10) * s)
+            {
+                dangerTrace(a, "gone", 1);
+                z = Actor::Danger();
+                return;
+            }
+            // Through its driver; else seen by an actor neither asleep nor blind, or its engine heard (5100-5180:
+            // the unit's constant sound, taken as within the actor's hearing distance).
+            if(!perceived)
+                perceived = driver ? sees(a, body, driver)
+                                   : (!blind && !asleep && seesPoint(a, body, vec(position).add(vec(0, 0, 0.5f * s)))) ||
+                                     (!(a.flags & HALO_AI_DEAF) && z.distance <= a.def->hearing * s);
+        }
+        else if(z.type == DANGER_PROJECTILE)
+        {
+            // Attached to the actor itself (5190-5194); else seen within its perception radius (5216-5266).
+            z.attachedToUs = stuck == e;
+            z.timeLeft = left;
+            if(!perceived) perceived = z.attachedToUs || (!asleep && !blind && z.distance < perception * s && seesPoint(a, body, position));
+        }
+        else
+        {
+            if(!perceived) perceived = sees(a, body, z.unit);
+            z.timeLeft = left;
+        }
+        // The first sight of it turns the actor's head (its secondary look, 5303-5313), unless it fights.
+        if(perceived && !z.perceived && a.awareness != COMBAT) body->AimToVec(vec(position).add(vec(0, 0, 0.3f * s)));
+        z.perceived = perceived;
+
+        // Acknowledgement (6391-6417): at once for its own, a friend's or one stuck to it; an enemy's after
+        // 30 ticks (a projectile), 20 (a vehicle) or 6 (a suicide) perceived. Halo also acknowledges at once
+        // in an actor's first 2 s of uncertain combat (6405-6416), a state the engine has not: it counts.
+        bool acknowledge = false;
+        if(z.attachedToUs || z.hostility != HOSTILITY_ENEMY)
+        {
+            z.noticed = true;
+            acknowledge = z.ackLeft > 0;
+            z.ackLeft = 0;
+        }
+        else if(z.ackLeft > 0 && z.perceived)
+        {
+            z.ackLeft -= elapsed;
+            if(z.ackLeft <= 0) { z.ackLeft = 0; acknowledge = true; }
+        }
+        // Notice (6419-6469): a projectile or vehicle on the actr's notice chance, a suicide always; then
+        // a dive is allowed on one stuck to it never, on its own, a friend's, a vehicle or a suicide always,
+        // on an enemy's projectile on the actr's grenade_dive_chance. No difficulty factor (the port has none).
+        if(acknowledge)
+        {
+            const float chance = z.type == DANGER_VEHICLE ? a.def->noticeVehicle : a.def->noticeProjectile;
+            if(z.type == DANGER_SUICIDE || (chance > 0 && dangerDraw(false) < chance)) z.noticed = true;
+            if(z.noticed)
+            {
+                if(z.attachedToUs) z.allowDive = false;
+                else if(z.hostility != HOSTILITY_ENEMY || z.type == DANGER_VEHICLE || z.type == DANGER_SUICIDE) z.allowDive = true;
+                else z.allowDive = dangerDraw(true) < a.def->grenadeDive;
+                ++a.dangerNotices;
+                dangerTrace(a, "notice", z.allowDive ? 1 : 0);
+                // actor_stimulus_noticed_danger_zone (actor_stimulus.c:395-469): a combat stimulus; an unaware
+                // actor turns alert, towards whoever is behind it when that is an enemy. Its grenade sighted
+                // communication (actor_stimulus.c:432) is not raised yet; the grenade danger one is (avoidDanger).
+                if(a.awareness == UNAWARE)
+                {
+                    a.awareness = ALERT;
+                    a.heardAt = lastmillis;
+                    a.positionUntil = 0;
+                    if(z.owner && haloactorhostile(e, z.owner)) a.lastKnown = z.owner->o;
+                }
+            }
+        }
+        if(z.ackLeft == 0 && z.attachedToUs) { z.noticed = true; z.allowDive = false; }   // 6480-6484
+    }
+
+    // A grenade stuck to the actor (Halo's delayed attached projectile: the danger zone's own projectile,
+    // attached to it, ai/actors.c:1798-1830). A rider that does not drive gets out (actions.c:4483-4504).
+    // On foot an Elite in combat whose target stands within its berserk firing range rolls its grenade
+    // attached berserk chance every tick (actions.c:1938-1970, actor_type_elite.c:69), a Hunter too
+    // (actor_type_hunter.c:63); an Elite that stays calm (actor_type_elite.c:71-76), a Grunt, Jackal,
+    // marine, crewman or Engineer panics (actions.c:1443-1479 and the panic transitions of
+    // actor_type_grunt.c:68-71, jackal 68-71, marine 66-68, crew 66-69, engineer 65-68): it flees from
+    // whoever threw it until the grenade is gone (action_flee.c:640-643). The Flood do neither. Halo's
+    // panicked actor screams (unit_scream, action_flee.c:710-715; halo_dialogue.cpp).
+    void attachedDanger(Actor &a)
+    {
+        botent *e = a.bot;
+        const Actor::Danger &z = a.danger;
+        if(!halo_dangeravoid || z.type != DANGER_PROJECTILE || !z.attachedToUs)
+        {
+            if(a.attachedPanic)
+            {
+                a.attachedPanic = false;
+                if(a.morale == PANICKED) a.morale = STEADY;
+                a.positionUntil = 0;
+            }
+            a.attachedRollAt = 0;
+            return;
+        }
+        if(halovehicleinside(e))
+        {
+            if(!halovehicledriver(e) && halovehicleunseat(e)) dangerTrace(a, "exit", 0);
+            return;
+        }
+        const int type = a.def->type;
+        const float s = scale();
+        if((type == TYPE_ELITE || type == TYPE_HUNTER) && a.morale != BERSERK && a.awareness == COMBAT && alive(a.target) &&
+           e->o.dist(a.target->o) < a.def->berserkFiringRange * s)
+        {
+            if(!a.attachedRollAt) a.attachedRollAt = lastmillis - tickMillis;
+            for(int rolls = 0; rolls < 10 && lastmillis - a.attachedRollAt >= tickMillis; ++rolls)
+            {
+                a.attachedRollAt += tickMillis;
+                if((halo_dangeravoid == 2 ? 0.0f : rndscale(1.0f)) < a.def->attachedBerserk)
+                {
+                    a.morale = BERSERK;
+                    a.moraleUntil = lastmillis + 8000;
+                    a.hiding = false;
+                    a.positionUntil = 0;
+                    a.attachedPanic = false;
+                    dangerTrace(a, "berserk", a.def->attachedBerserk);
+                    break;
+                }
+            }
+            if(lastmillis - a.attachedRollAt >= tickMillis) a.attachedRollAt = lastmillis;
+        }
+        if(type == TYPE_HUNTER || a.morale == BERSERK) return;
+        if(type != TYPE_GRUNT && type != TYPE_JACKAL && type != TYPE_ELITE && type != TYPE_MARINE && type != TYPE_CREW && type != TYPE_ENGINEER) return;
+        if(!a.attachedPanic)
+        {
+            dangerTrace(a, "panic", 0);
+            a.hasDestination = false;
+            a.positionUntil = 0;
+        }
+        a.attachedPanic = true;
+        a.morale = PANICKED;
+        a.moraleUntil = lastmillis + 1000;      // renewed every think while the grenade is stuck
+        // Halo's panicked actor screams while the grenade is stuck (action_flee.c:695-715: again
+        // whenever its last line is done; halo_dialogue.cpp keeps one line at a time).
+        halodialoguescream(e, HALO_SCREAM_GRENADE_ATTACHED);
+        a.hiding = false;
+        // The panic's prop is the unit responsible for the grenade (actions.c:1451-1466).
+        if(z.owner && z.owner != e) a.lastKnown = z.owner->o;
+    }
+
+    // The actor types whose decisions handle danger avoidance (actions.c:4699-5054, called by
+    // actor_type_elite.c:82, jackal 76, grunt 76, hunter 66, marine 77, crew 71, flood 100, engineer 71 and
+    // sentinel 65; never the infection forms', the carrier's or the Monitor's). The engine leaves out its
+    // flyers (Sentinels and Engineers: Halo's flying actors find no evasion vector, actor_moving.c:1209,
+    // and the engine's flight keeps its own heights: judgement call) and passive actors.
+    bool avoidsDanger(const Actor &a)
+    {
+        const int t = a.def->type;
+        return !flyer(a) && !passive(a) &&
+               (t == TYPE_ELITE || t == TYPE_JACKAL || t == TYPE_GRUNT || t == TYPE_HUNTER || t == TYPE_MARINE || t == TYPE_CREW || t == TYPE_FLOOD);
+    }
+
+    // The floor under `from` within `depth` (AssaultCube units): the section's retail collision when it
+    // has it, else the cube grid.
+    bool floorBelow(const vec &from, float depth, float &z)
+    {
+        if(halocollisionactive())
+        {
+            HaloCollisionHit hit;
+            if(!halocollisiontrace(from, vec(from).sub(vec(0, 0, depth)), hit) || hit.fraction >= 1) return false;
+            z = from.z - hit.fraction * depth;
+            return true;
+        }
+        vec normal;
+        const float d = raycube(from, vec(0, 0, -1), normal);
+        if(d < 0 || d > depth) return false;
+        z = from.z - d;
+        return true;
+    }
+
+    // actor_move_try_evasion_vector (../Halo3DS ai/actor_moving.c:1191-1308): whether the actor can move
+    // `distance` world units along `dir`. Halo's pathfinding pill along the floor allows a rise or fall of
+    // half the distance; failing that an actor that dives off ledges (8 world units, actions.c:4326-4329)
+    // may go where nothing blocks its middle and a floor lies within that height below (a ledge). The
+    // engine traces its middle and knees to the point and looks for the floor under it (judgement call:
+    // a clear straight line stands for the pill).
+    bool evasionVector(const Actor &a, const vec &dir, float distance, float ledge, bool &isLedge)
+    {
+        isLedge = false;
+        if(flyer(a) || !(distance > 0)) return false;
+        const botent *e = a.bot;
+        const float s = scale(), vs = haloscenarioverticalscale();
+        const vec feet = feetOf(e), reach = vec(dir).mul(distance * s);
+        const vec middle = vec(feet).add(vec(0, 0, e->eyeheight * 0.5f)), knee = vec(feet).add(vec(0, 0, e->eyeheight * 0.25f));
+        const vec end = vec(middle).add(reach);
+        if(!::IsVisible(middle, end, NULL)) return false;
+        const float half = distance * 0.5f * vs, above = middle.z - feet.z;
+        float floor = 0;
+        if(::IsVisible(knee, vec(knee).add(reach), NULL) && floorBelow(end, above + half, floor) && fabsf(floor - feet.z) <= half) return true;
+        if(ledge <= 0 || !floorBelow(end, above + ledge * vs, floor)) return false;
+        isLedge = true;
+        return true;
+    }
+
+    // actor_action_find_escape_from_danger (actions.c:4265-4449): the side, left or right of the danger's
+    // motion (of the line to it when it moves slower than a world unit a second), to evade the unit's dive
+    // distance along. A side is clear when it is open (evasionVector) and ends outside the danger radius
+    // of the danger's line; a ledge, then a clear side, then one 0.3 world units further from the line
+    // wins, else either at random (clear when the left is). EVADE_NONE without a dive distance or an open side.
+    int findEscape(const Actor &a, float &distance, vec &alignment, bool &clear, bool &isLedge)
+    {
+        const Actor::Danger &z = a.danger;
+        const botent *e = a.bot;
+        const float s = scale();
+        clear = isLedge = false;
+        distance = a.def->diveDistance;
+        const vec feet = feetOf(e);
+        alignment = vec(-z.velocity.x, -z.velocity.y, 0);
+        if(alignment.magnitude() < s)
+        {
+            alignment = vec(z.position.x - feet.x, z.position.y - feet.y, 0);
+            if(alignment.iszero()) { const float yaw = e->yaw * RAD; alignment = vec(sinf(yaw), -cosf(yaw), 0); }
+        }
+        alignment.normalize();
+        if(!(distance > 0)) return EVADE_NONE;
+        const float ledge = a.def->diveOffLedges() ? 8.0f : 0.0f;
+        const vec line = vec(z.predicted).sub(z.position), left = leftOf(alignment), right = vec(left).mul(-1);
+        bool leftLedge = false, rightLedge = false;
+        const bool leftFound = evasionVector(a, left, distance, ledge, leftLedge), rightFound = evasionVector(a, right, distance, ledge, rightLedge);
+        const float leftDistance = sqrtf(segmentDistanceSquared(vec(feet).add(vec(left).mul(distance * s)), z.position, line));
+        const float rightDistance = sqrtf(segmentDistanceSquared(vec(feet).add(vec(right).mul(distance * s)), z.position, line));
+        const bool leftClear = leftFound && leftDistance > z.radius, rightClear = rightFound && rightDistance > z.radius;
+        const float difference = leftDistance - rightDistance, margin = 0.3f * s;
+        if(leftFound && rightFound)
+        {
+            if(leftLedge > rightLedge || leftClear > rightClear || difference > margin) { isLedge = leftLedge; clear = true; return EVADE_LEFT; }
+            if(rightLedge > leftLedge || rightClear > leftClear || difference < -margin) { isLedge = rightLedge; clear = true; return EVADE_RIGHT; }
+            isLedge = leftLedge;
+            clear = leftClear;
+            return EVADE_RANDOM;
+        }
+        if(leftFound) { isLedge = leftLedge; clear = leftClear; return EVADE_LEFT; }
+        if(rightFound) { isLedge = rightLedge; clear = rightClear; return EVADE_RIGHT; }
+        return EVADE_NONE;
+    }
+
+    // actor_action_try_to_dive (actions.c:3761-3952): the escape side is tried again (for a random one both,
+    // in a random order: actor_move_try_evasion_direction, actor_moving.c:1310-1394), then the unit's
+    // animation that best fits the evade vector against its facing, a dive (1.5 better) before an evade
+    // (global_dive_animation_table, actions.c:939-948; unit_test_animation_impulse: the unit has it for
+    // its weapon, the `dive` line); with none, no dive. The unit turns so that the animation runs along the
+    // evade vector (3881-3924). The engine draws no Halo animation: the body moves along the evade vector
+    // by the animation's root motion over its frames (30 a second), holding its fire, and decides nothing
+    // else until it ends (judgement call: a sideways move stands for the dive; no animation is invented).
+    bool tryDive(Actor &a, int direction, float distance, const vec &alignment, float ledge)
+    {
+        botent *e = a.bot;
+        Actor::Danger &z = a.danger;
+        int attempts = 1;
+        if(direction == EVADE_RANDOM) { direction = rnd(2) ? EVADE_LEFT : EVADE_RIGHT; attempts = 2; }
+        vec evade = direction == EVADE_LEFT ? leftOf(alignment) : vec(leftOf(alignment)).mul(-1);
+        bool open = false, isLedge = false;
+        for(int i = 0; i < attempts && !open; ++i)
+        {
+            if(evasionVector(a, evade, distance, ledge, isLedge)) open = true;
+            else { direction ^= 1; evade.mul(-1); }
+        }
+        if(!open)
+        {
+            if(!z.diveFailed) dangerTrace(a, "dive_cannot_move", 0);
+            z.diveFailed = true;
+            return false;
+        }
+        const float yaw = e->yaw * RAD;
+        const vec facing(sinf(yaw), -cosf(yaw), 0), left = leftOf(facing);
+        float desire[4];
+        desire[2] = evade.dot(facing);
+        desire[0] = evade.dot(left);
+        desire[3] = -desire[2];
+        desire[1] = -desire[0];
+        // Halo's table: diving left and evade left (left), diving right and evade right (right), diving front, diving back.
+        static const struct { int animation, direction; float bias; } table[6] = {
+            {0, 0, 1.5f}, {1, 0, 0.0f}, {2, 1, 1.5f}, {3, 1, 0.0f}, {4, 2, 1.5f}, {5, 3, 1.5f}};
+        int best = -1, bestDirection = -1;
+        float bestScore = -0.5f;
+        for(const auto &p : table)
+        {
+            const float score = desire[p.direction] + p.bias;
+            if(bestScore < score && a.def->dives[p.animation].frames > 0) { best = p.animation; bestDirection = p.direction; bestScore = score; }
+        }
+        if(best < 0)
+        {
+            if(!z.diveFailed) dangerTrace(a, "dive_no_animation", 0);
+            z.diveFailed = true;
+            return false;
+        }
+        // The facing the animation needs: its left (or right) along the evade vector, or the evade vector
+        // itself for the front and back dives.
+        const vec turned = bestDirection == 0 ? vec(-evade.y, evade.x, 0) : bestDirection == 1 ? vec(evade.y, -evade.x, 0) : evade;
+        e->yaw = e->targetyaw = fmodf(atan2f(turned.x, -turned.y) / RAD + 360.0f, 360.0f);
+        const HaloActorDef::DiveAnimation &dive = a.def->dives[best];
+        const float s = scale(), length = sqrtf(dive.dx * dive.dx + dive.dy * dive.dy);
+        const int millis = max(1, ticksMillis(dive.frames));
+        a.diveUntil = lastmillis + millis;
+        a.diveTo = vec(e->o).add(vec(evade).mul(length * s));
+        // The bot's step at its speed cap (16 a second, physics.cpp) scaled to the animation's pace
+        // (halomovementscale): bots only, the player's movement is not touched.
+        a.diveFactor = clamp(length * s / (millis / 1000.0f) / 16.0f, 0.05f, 2.0f);
+        a.meleePhase = MELEE_NONE;
+        a.meleeStrikeAt = 0;
+        e->attacking = false;
+        ++a.dives;
+        dangerTrace(a, "dive", length);
+        return true;
+    }
+
+    // A dive under way (tryDive) takes the whole think (actor_move_animation_busy): the body moves to its end.
+    bool continueDive(Actor &a)
+    {
+        if(!a.diveUntil) return false;
+        botent *e = a.bot;
+        if(lastmillis >= a.diveUntil)
+        {
+            a.diveUntil = 0;
+            a.diveFactor = 1;
+            return false;
+        }
+        e->attacking = false;
+        if(vec(a.diveTo).sub(e->o).magnitudexy() > 0.1f * scale()) steer(e, a.diveTo);
+        else e->move = e->strafe = 0;
+        return true;
+    }
+
+    // Straight out of the danger: away from the nearest point of its line.
+    void stepAway(Actor &a, CBot *body)
+    {
+        const Actor::Danger &z = a.danger;
+        botent *e = a.bot;
+        const vec feet = feetOf(e), line = vec(z.predicted).sub(z.position);
+        const float length = line.squaredlen();
+        vec nearest = z.position;
+        if(length > 1e-12f) nearest.add(vec(line).mul(clamp(vec(feet).sub(z.position).dot(line) / length, 0.0f, 1.0f)));
+        vec away = vec(feet).sub(nearest);
+        away.z = 0;
+        if(away.iszero()) { const float yaw = e->yaw * RAD; away = vec(-sinf(yaw), cosf(yaw), 0); }
+        steer(e, vec(e->o).add(away.normalize().mul(20)));
+        body->CheckStuck();
+    }
+
+    // Halo's avoid action (ai/action_avoid.c:47-142): a firing position chosen in avoid mode, with the
+    // danger clearance (choosePosition), looking at the danger; the engine walks straight out of it when
+    // the squad has no clear position (judgement call). It lasts until the danger is gone (:76).
+    void avoidMove(Actor &a, CBot *body)
+    {
+        botent *e = a.bot;
+        if(!a.avoiding)
+        {
+            a.avoiding = true;
+            ++a.avoids;
+            a.hasDestination = false;
+            a.positionUntil = 0;
+            if(a.positions && !a.positions->empty()) choosePosition(a);
+            dangerTrace(a, "avoid", a.hasDestination ? 1 : 0);
+        }
+        const Actor::Danger &z = a.danger;
+        const float reach = z.radius + 3.5f * scale();
+        if(a.hasDestination) walkTo(a, body, a.destination, 3.0f, false);
+        // Straight out only while within 3.5 world units past the radius of the danger's line.
+        else if(segmentDistanceSquared(feetOf(e), z.position, vec(z.predicted).sub(z.position)) < reach * reach) stepAway(a, body);
+        body->AimToVec(vec(z.position).add(vec(0, 0, e->eyeheight * 0.5f)));
+    }
+
+    // What avoidDanger did: nothing, took the movement (the actor may fight on) or began a dive.
+    enum { DANGER_IDLE = 0, DANGER_MOVES = 1, DANGER_BUSY = 2 };
+
+    // actor_action_handle_danger_avoidance (actions.c:4699-5054) for a noticed danger not stuck to the
+    // actor whose sphere comes within 3 world units, unless the actor is busy with its melee attack or
+    // seated: a position inside the danger radius of the danger's line, or whose way crosses it, is given
+    // up (4843-4857); with the body inside the radius, how soon the danger reaches it (45 ticks along its
+    // line) decides whether a dive the notice allowed is taken (a suicide: a clear side and it is on the
+    // actor, or under a second to its burst; a projectile: a clear side and under 7 ticks away, or under 20
+    // ticks to its detonation; a vehicle: under 30 ticks away). Otherwise, within 3.5 world units past
+    // the radius, at its position, standing or on a way that crosses it, an actor that guards or searches
+    // (Halo's passive and pursuit actions: the engine's unaware and alert) takes the avoid action; a
+    // fighting one (fight and charge are active) leaves by the position search's clearance or its dive.
+    // A fighting actor with no squad positions (the stock wave sections, scripts' spawns) has no position
+    // search to leave by: once inside the danger radius it steps straight out to 3.5 world units past it
+    // and holds there while it fights, until the danger is gone (a vehicle's: it steps only while inside
+    // the radius and never holds; judgement call).
+    int avoidDanger(Actor &a, CBot *body)
+    {
+        Actor::Danger &z = a.danger;
+        botent *e = a.bot;
+        if(a.avoiding && (z.type == DANGER_NONE || !halo_dangeravoid || (a.awareness == COMBAT && a.target)))
+        {
+            a.avoiding = false;
+            a.positionUntil = 0;
+        }
+        if(!halo_dangeravoid || !avoidsDanger(a) || z.type == DANGER_NONE || !z.noticed || z.attachedToUs) return DANGER_IDLE;
+        const float s = scale(), r = z.radius;
+        const vec feet = feetOf(e);
+        // Its own grenade still flying away from it: Halo's thrower is busy with its throw animation
+        // (actor_move_animation_busy) until the grenade is well clear; the engine's throw has no animation
+        // and launches it from the eyes, inside the danger radius (judgement call: ignored until it stops
+        // or comes back).
+        if(z.type == DANGER_PROJECTILE && z.hostility == HOSTILITY_SELF && z.velocity.dot(vec(z.position).sub(feet)) > 0) return DANGER_IDLE;
+        // A moving vehicle stays a danger as long as it drives about within reach, so a positionless
+        // fighter steps out of its line again each time but does not hold still for it (judgement call).
+        const bool holds = z.type != DANGER_VEHICLE;
+        bool within = false, bodyWithin = false, reenters = false, moving = false;
+        if(feet.dist(z.centre) <= z.sphereRadius + 3 * s && a.meleePhase != MELEE_ATTACKING && !halovehicleinside(e))
+        {
+            const vec line = vec(z.predicted).sub(z.position);
+            const float bodyLine = segmentDistanceSquared(feet, z.position, line);
+            bodyWithin = bodyLine < r * r;
+            within = bodyLine < (r + 3.5f * s) * (r + 3.5f * s);
+            moving = a.hasDestination && vec(a.destination).sub(feet).magnitudexy() > 3.0f;
+            bool destinationWithin = bodyWithin;
+            if(a.hasDestination)
+            {
+                destinationWithin = segmentDistanceSquared(a.destination, z.position, line) < r * r;
+                if(moving && !bodyWithin && !destinationWithin)
+                {
+                    vec toward = vec(a.destination).sub(feet);
+                    toward.z = 0;
+                    if(!toward.iszero()) reenters = segmentsDistanceSquared(feet, toward.normalize().mul(3 * s), z.position, line) < r * r;
+                }
+            }
+            if(destinationWithin || (reenters && !bodyWithin))
+            {
+                if(a.hasDestination) { ++a.dangerDiscards; dangerTrace(a, "discard", 1); }
+                a.hasDestination = false;
+                a.positionUntil = 0;
+            }
+            if(bodyWithin)
+            {
+                float urgency = sphereIntersection(z.position, line, feet, r);
+                if(urgency < 1e30f) urgency *= 45;
+                bool urgent = false;
+                if(z.type == DANGER_SUICIDE) urgent = urgency == 0 && z.timeLeft >= 0 && z.timeLeft < ticksMillis(30);
+                else if(z.type == DANGER_PROJECTILE) urgent = urgency == 0 && z.timeLeft >= 0 && z.timeLeft < ticksMillis(20);
+                else urgent = urgency < 30;
+                // The grenade call (actions.c:4897-4929): a projectile's danger raises Halo's grenade
+                // danger event with its hostility (halo_dialogue.cpp: "Grenade!").
+                if((z.hostility == HOSTILITY_ENEMY || urgent) && !z.communicated)
+                {
+                    dangerTrace(a, "communicate", urgent ? 1 : 0);
+                    z.communicated = true;
+                    if(z.type == DANGER_PROJECTILE)
+                        halodialogueevent(HALO_COMM_GRENADE_DANGER, a.bot, nullptr,
+                                          z.hostility == HOSTILITY_ENEMY ? HALO_HOSTILITY_ENEMY :
+                                          z.hostility == HOSTILITY_FRIEND ? HALO_HOSTILITY_FRIEND : HALO_HOSTILITY_SELF);
+                }
+                float distance = 0;
+                vec alignment;
+                bool clear = false, ledge = false;
+                const int direction = findEscape(a, distance, alignment, clear, ledge);
+                if(direction != EVADE_NONE && z.allowDive)
+                {
+                    bool dive = false;
+                    if(z.type == DANGER_SUICIDE) dive = ((clear || ledge) && urgency == 0) || urgent;
+                    else if(z.type == DANGER_PROJECTILE) dive = ((clear || ledge) && urgency < 7) || urgent;
+                    else dive = urgent;
+                    if(dive && tryDive(a, direction, distance, alignment, a.def->diveOffLedges() ? 8.0f : 0.0f)) return DANGER_BUSY;
+                }
+            }
+        }
+        if(within && (!moving || reenters) && a.morale != BERSERK)
+        {
+            if(a.awareness != COMBAT || !a.target)
+            {
+                avoidMove(a, body);
+                return DANGER_MOVES;
+            }
+            if((!a.positions || a.positions->empty()) && (bodyWithin || (z.stepped && holds)))
+            {
+                if(!z.stepped) dangerTrace(a, "step", 0);
+                z.stepped = true;
+                stepAway(a, body);
+                return DANGER_MOVES;
+            }
+        }
+        // Once out, it holds where it stands, fighting, until the danger is gone (rather than walk back
+        // into it to keep its combat range).
+        if(z.stepped && holds && a.awareness == COMBAT && a.target && (!a.positions || a.positions->empty()))
+        {
+            e->move = e->strafe = 0;
+            return DANGER_MOVES;
+        }
+        if(a.avoiding)
+        {
+            avoidMove(a, body);
+            return DANGER_MOVES;
+        }
+        return DANGER_IDLE;
+    }
+
     // Hunters pair off with the nearest unpartnered Hunter of their team.
     void pairHunter(Actor &a)
     {
@@ -1470,6 +2353,9 @@ namespace
         perceive(a, body);
         updateMorale(a);
         pairHunter(a);
+        perceiveDanger(a, body);
+        // A dive under way takes the whole think (actor_move_animation_busy).
+        if(continueDive(a)) return;
         if(giveWay(a)) return;
 
         if(a.boarding)
@@ -1487,6 +2373,17 @@ namespace
             if(a.program->flags & COMMAND_ALLOW_TARGETING) fire(a, body);
             return;
         }
+        // The danger handling of the actor types' decisions (a grenade stuck to the actor, then danger
+        // avoidance: actor_type_grunt.c:68-76 and the others); a list without initiative keeps control.
+        attachedDanger(a);
+        const int danger = avoidDanger(a, body);
+        if(danger == DANGER_BUSY) return;
+        if(danger == DANGER_MOVES)
+        {
+            // Moving out of it, a fighting actor (or one avoiding with a target) still shoots (action_avoid.c:118-122).
+            if(a.awareness == COMBAT && alive(a.target) && !passive(a)) { body->AimToVec(centreOf(a.target)); fire(a, body); }
+            return;
+        }
 
         const float s = scale();
         if(seekCorpse(a, body)) return;
@@ -1502,9 +2399,10 @@ namespace
         {
             const bool hunter = a.def->type == TYPE_HUNTER;
             const float distance = e->o.dist(a.target->o);
-            if(hunter && (a.morale == BERSERK || distance < chargeDistance(a)))
+            if(hunter && !haloMelee(a) && (a.morale == BERSERK || distance < chargeDistance(a)))
             {
-                // Hunters close in and smash; a Hunter whose brother fell does nothing else.
+                // The fallback smash: Hunters close in and smash; a Hunter whose brother fell does nothing
+                // else. With Halo's melee they charge in meleeAttack, below, and fire as they close in.
                 walkTo(a, body, a.target->o, e->radius + a.target->radius, false);
                 body->AimToVec(centreOf(a.target));
                 smash(a);
@@ -1514,13 +2412,6 @@ namespace
             if(flyer(a))
             {
                 flyCombat(a, body);
-                fire(a, body);
-                return;
-            }
-            if(hunter && alive(a.partner) && e->o.dist(a.partner->o) > 10.0f * s)
-            {
-                // Bond brothers fight side by side: rejoin a partner that drifted off.
-                walkTo(a, body, a.partner->o, 4.0f * s, false);
                 fire(a, body);
                 return;
             }
@@ -1534,6 +2425,16 @@ namespace
                 // A charging actor keeps shooting with a ranged weapon (action_charge_control's
                 // shoot_at_target, action_charge.c:330); none during the attack itself.
                 if(a.meleePhase == MELEE_CHARGING && rangedWeapon(a)) fire(a, body);
+                return;
+            }
+            if(hunter && alive(a.partner) && e->o.dist(a.partner->o) > 10.0f * s)
+            {
+                // Bond brothers fight side by side: rejoin a partner that drifted off. After the melee
+                // check, so a Hunter far from its brother still charges a target within melee_range
+                // (Halo's melee check, actions.c:2534-2610, has no such rejoin in front of it) and a
+                // charge or attack under way is not left behind.
+                walkTo(a, body, a.partner->o, 4.0f * s, false);
+                fire(a, body);
                 return;
             }
             if(a.morale == BERSERK || charges(a) || e->weaponsel->type == GUN_KNIFE)
@@ -1976,7 +2877,14 @@ void haloactordetach(const playerent *bot)
     preferred.erase(std::remove(preferred.begin(), preferred.end(), bot), preferred.end());
 }
 
-void haloactorsclear() { actors.clear(); noises.clear(); encounterThrows.clear(); }
+void haloactorsclear()
+{
+    actors.clear();
+    noises.clear();
+    encounterThrows.clear();
+    // The units' speech goes with them (a section start, a revert).
+    halodialoguereset();
+}
 bool haloisactor(const playerent *p) { return find(p) != nullptr; }
 
 int haloactorteam(const playerent *p)
@@ -2121,6 +3029,8 @@ float halomovementscale(const playerent *p)
     // engine does not keep its own movement apart from momentum). Vertical motion is untouched.
     if(!p || p->type != ENT_BOT || p->state != CS_ALIVE || !haloactive()) return 1;
     const Actor *a = find(p);
+    // A dive under way moves at its animation's pace (tryDive), not the bot's own.
+    if(a && a->diveUntil && lastmillis < a->diveUntil) return a->diveFactor;
     if(!a || !a->def->randomSpeedIncrease() || a->awareness != COMBAT || !alive(a->target)) return 1;
     const float value = halodifficultyget(HALO_DIFFICULTY_INFECTION_FORMS);
     const unsigned ordinal = unsigned(max(0, p->clientnum)) % 137;
@@ -2454,6 +3364,10 @@ void haloactordeath(const playerent *victim, const playerent *killer)
             a.morale = PANICKED;
             a.moraleUntil = lastmillis + 3000 + rnd(3000);
             a.positionUntil = 0;
+            // The flight's call (action_flee.c:717-738): flee leader died for a leader's death when
+            // the variant's leader_killed chance decided it, else flee, from whoever caused it.
+            const bool fromLeader = leader && a.def->type != TYPE_ELITE && a.def->leaderKilled >= a.def->friendKilled;
+            halodialogueevent(fromLeader ? HALO_COMM_FLEE_LEADER_DIED : HALO_COMM_FLEE, a.bot, (playerent *)killer);
         }
         if(killer && haloactorhostile(a.bot, killer) && a.awareness != COMBAT)
         {
@@ -2514,6 +3428,33 @@ void haloactordump(const char *label)
                 "key_ms=%d length_ms=%d delay_timer=%.2f", label, e->clientnum, haloMelee(a), e->weaponsel && e->weaponsel->type == GUN_KNIFE,
                 rangedWeapon(a), a.meleePhase, a.melees, a.meleeHits, meleeReach(*a.def), a.def->meleeRange, a.def->berserkMeleeRange,
                 meleeKeyMillis(*a.def), meleeLengthMillis(*a.def), a.def->meleeDelayTimer);
+    }
+    fflush(stdout);
+}
+
+void haloactordangerdump(const char *label)
+{
+    static const char *const morale[] = {"steady", "panicked", "berserk"};
+    const float s = scale();
+    for(const Actor &a : actors)
+    {
+        const botent *e = a.bot;
+        if(!alive(e)) continue;
+        const Actor::Danger &z = a.danger;
+        const vec line = vec(z.predicted).sub(z.position);
+        // ACTOR_DANGER_QA <label> cn= variant= type=<0 none|1 suicide|2 projectile|3 vehicle> hostility=<0 enemy|1 friend|2 self>
+        //   perceived= noticed= dive_allowed= attached=<0|1 stuck to it> ack=<ms left> radius= distance= line=<world units from
+        //   its line> left=<ms to detonation or death, -1> name=<the bot's name, spaces and all, last>
+        conoutf("ACTOR_DANGER_QA %s cn=%d variant=%d type=%d hostility=%d perceived=%d noticed=%d dive_allowed=%d attached=%d ack=%d "
+                "radius=%.2f distance=%.2f line=%.2f left=%d name=%s", label, e->clientnum, a.def->index, z.type, z.hostility, z.perceived,
+                z.noticed, z.allowDive, z.attachedToUs, z.ackLeft, z.radius / s, z.distance / s,
+                z.type ? sqrtf(segmentDistanceSquared(feetOf(e), z.position, line)) / s : -1.0f, z.timeLeft, e->name);
+        // ACTOR_DANGER_STATE <label> cn= table=<0|1 the danger line> anims=<0|1 the dive line> diving=<0|1> dives= avoiding=<0|1>
+        //   avoids= notices= discards= morale= panic=<0|1 a stuck grenade's> pos=<x,y,z feet>
+        const vec feet = feetOf(e);
+        conoutf("ACTOR_DANGER_STATE %s cn=%d table=%d anims=%d diving=%d dives=%d avoiding=%d avoids=%d notices=%d discards=%d morale=%s "
+                "panic=%d pos=%.2f,%.2f,%.2f", label, e->clientnum, a.def->hasDanger, a.def->hasDive, a.diveUntil && lastmillis < a.diveUntil,
+                a.dives, a.avoiding, a.avoids, a.dangerNotices, a.dangerDiscards, morale[a.morale], a.attachedPanic, feet.x, feet.y, feet.z);
     }
     fflush(stdout);
 }

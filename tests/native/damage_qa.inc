@@ -500,3 +500,14 @@ COMMANDF(qa_fall_state, "s", (const char *label)
             int(playerFall.armed), playerFall.apex, -playerFall.velocity.z, player1->health, shield, player1->state == CS_ALIVE);
     fflush(stdout);
 });
+
+// Kill credit (clientgame.cpp dodamage and dokill, haloownerless; tests/test_kill_credit.py):
+// qa_kill_credit LABEL: KILL_CREDIT <label> frags= tks= deaths= lasthit=<lastmillis of the last hit
+// credited to the player, which the hit sound goes by> alive=
+COMMANDF(qa_kill_credit, "s", (const char *label)
+{
+    extern int lasthit;
+    conoutf("KILL_CREDIT %s frags=%d tks=%d deaths=%d lasthit=%d alive=%d", label, player1->frags, player1->tks, player1->deaths, lasthit,
+            player1->state == CS_ALIVE);
+    fflush(stdout);
+});

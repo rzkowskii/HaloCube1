@@ -29,6 +29,13 @@ EXPORT_SCALE = 4
 # the first looping sound among the object's attachments (warthog_7_engine, ghost, banshee_engine).
 VEHICLE_SECTION = 380 + 372
 SUSPENSION_SOUND, CRASH_SOUND = VEHICLE_SECTION + 192, VEHICLE_SECTION + 208
+# The vehicle section's flags (u32 at its start, +752; ../Halo3DS ai/actor_perception.c:1021-1022
+# asserts the 0x2F0): bit 7 causes collision damage (units/vehicle_definitions.h:24, read by
+# vehicle_causes_collision_damage, units/vehicles.c:357-365), which makes a moving vehicle a danger zone
+# for Halo's actors (ai/actor_perception.c:4949-4951, 4883-4885). Checked against the cache bytes: set on
+# all six (Warthog 0xcd1, turret 0xc0, Ghost 0x29c5, Scorpion 0x8d1, Banshee 0x1984, Wraith 0x28c5), clear
+# on the Pelican and the dropship.
+VEHICLE_FLAGS, VEHICLE_CAUSES_COLLISION_DAMAGE = VEHICLE_SECTION, 1 << 7
 OBJECT_ATTACHMENTS, ATTACHMENT_STRIDE = 320, 72
 # The object's collision model (coll, object +112): flags u32 at 0 (bit 5 only damaged by
 # explosives, bit 6 only damaged while occupied, bit 1 takes body damage for its children), the
@@ -73,6 +80,8 @@ FIELDS = '''# vehicle <index> <name>
 # motion <kind> <forward> <reverse> <accel> <decel> <turn> <slide>   per 30 Hz tick
 # bounds <x0> <y0> <z0> <x1> <y1> <z1>   model frame, Halo units (x forward, y left, z up)
 # radius <r>
+# flags <vehicle flags>         the vehicle section's flags (bit 7: causes collision damage, a danger zone
+#                              for actors when it moves); older games skip the line
 # weapon <tag>|-
 # seat <name> <marker> <x> <y> <z> <enter x> <enter y> <enter z> [<flags>]   marker positions in the
 #                              model frame; the unit seat flags (1 invisible: the rider is inside the
@@ -152,7 +161,7 @@ def record(halo, tag, index, name, kind, weapon, player, output):
              f'model {path} {EXPORT_SCALE}',
              'motion %d %s' % (motion, ' '.join(f'{r:.6g}' for r in rates)),
              'bounds ' + ' '.join(f'{v:.4f}' for v in low + high),
-             f'radius {radius:.4f}', f'weapon {weapon or "-"}']
+             f'radius {radius:.4f}', f'flags {t.read("I", tag.address + VEHICLE_FLAGS)[0]}', f'weapon {weapon or "-"}']
     lines += ['seat %s %s %.4f %.4f %.4f %.4f %.4f %.4f %d' % row for row in rows]
     lines += ['camera %.4f %.4f %.4f' % tuple(camera)]
     lines += [f'sound {role} {sound}' for role, sound in vehicle_sounds(halo, tag)]

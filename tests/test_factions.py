@@ -14,7 +14,10 @@ Written while testing was on hold: this test has not been run yet.
    the player-human allegiance (marines then fight the player).
 5. Hunters: the shield arm stops an assault rifle hit from the front, the back takes a pistol hit
    in full (skin), the side a fifth of it (armour), a blast reaches the armour whatever the
-   facing; two Hunters pair off, the survivor of a pair goes berserk, a close Hunter smashes.
+   facing; two Hunters pair off, the survivor of a pair goes berserk, a close Hunter smashes. Since the
+   Hunter-melee change (not run): actors.txt's Hunter `melee` lines hold the tag values (reach 1.80); the
+   Hunter charges within 4 world units and strikes by Halo's melee (ACTOR_MELEE_QA, ACTOR_MELEE
+   strike_unit 35 to 45, counted in smashes=), and with halo_actormelee 0 it smashes as before.
 6. Stealth Elites: the actv camouflage flag cloaks them (drawn translucent), a hit makes the cloak
    flicker weaker; plain Elites are opaque.
 7. Sentinels and the Monitor fly: they rise off the floor and hold their height; the shielded
@@ -60,6 +63,8 @@ def actor_table():
             current['team'] = int(rest)
         elif key == 'unitmelee':
             current['unitmelee'] = [float(x) for x in rest.split()]
+        elif key == 'melee':
+            current['melee'] = [float(x) for x in rest.split()]
         elif key == 'material':
             # The optional fifth field (the shield leak) is checked by test_actor_tags.py.
             kind, flags, body, shield = rest.split()[:4]
@@ -94,6 +99,14 @@ actors = actor_table()
 hunter = actors[r'characters\hunter\hunter']
 assert hunter['team'] == 3 and hunter['unitmelee'][1:] == [35, 45], hunter
 assert (SHIELD, 0, 0.0, 0.0) in hunter['materials'] and any(m[0] == SKIN and m[1] & 1 for m in hunter['materials']), hunter
+# The Hunters' melee charge from their tags (the Hunter-melee change): melee_range 4, abort 3, berserk 9 and
+# 10 (actv +352/+356/+368/+372), attack range 0.175, charge timer 4 s (actr +892/+896), no weapon melee, and
+# the 61-frame melee animation with its key frame at 18 (x 0.943 there, 2.566 in all): reach 1.80.
+HUNTER_MELEE = [4, 3, 9, 10, 0.175, 4, 0, 0, 61, 18, 0.9425, 2.566]
+for path in (r'characters\hunter\hunter', r'characters\hunter\hunter major'):
+    line = actors[path].get('melee')
+    assert line and all(abs(a - b) < 2e-3 for a, b in zip(line, HUNTER_MELEE)) and len(line) == 12, (path, line)
+    assert abs(line[4] + line[11] - line[10] - 1.798) < .005, ('the Hunter reach', path, line)
 monitor = actors[r'characters\monitor\monitor']
 assert monitor['kind'] == MONITOR_KIND and monitor['team'] == 5 and monitor['materials'][0][:3] == (MONITOR, 0, 0.0), monitor
 assert monitor['actr'] >> 21 & 1, 'the Monitor flies'
@@ -219,14 +232,39 @@ paired = rows(text, 'ACTOR_FACTION', 'paired')
 assert len(paired) == 2 and all(p['partner'] != '-' for p in paired), ('two Hunters pair off', paired, log)
 rage = [a for a in rows(text, 'ACTOR_QA', 'rage') if a['family'] == 'hunter' and a['alive'] == '1']
 assert rage and rage[0]['morale'] == 'berserk', ('the surviving Hunter goes berserk', rage, log)
-text, log = run('hunter-smash', 'halo_preview', [
+# Since the Hunter-melee change (NOT YET RUN) the Hunter melees by Halo's charge (meleeAttack): its
+# ACTOR_MELEE_QA values are the tags' (reach 1.80, range 4, berserk 9, key frame 18 x 33 ms, 61 frames,
+# delay 0.1 s), it charges within 4 world units, strikes with its unit melee jpt! (35 to 45) and the
+# blow still counts as a smash. With halo_actormelee 0 it falls back to the engine's smash.
+text, log = run('hunter-smash', 'halo_damagetrace 1; halo_preview', [
     (0, 'qa_combat_protect 1; qa_actor_spawn 3 0 1.2 0'),
+    (300, 'qa_actor_state armed'),
+    (7000, 'qa_actor_state smash'),
+    (7300, 'quit'),
+])
+state = next((dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_MELEE_QA armed ')), None)
+assert state and state['model'] == '1' and state['ranged'] == '1', ('Halo\'s melee applies to the armed Hunter', state, log)
+assert abs(float(state['reach']) - 1.798) < .005 and state['range'] == '4.00' and state['berserk_range'] == '9.00', state
+assert state['key_ms'] == '594' and state['length_ms'] == '2013' and state['delay_timer'] == '0.10', state
+strikes = [float(m.group(1)) for m in re.finditer(r'ACTOR_MELEE strike_unit Hunter \d+ variant=\d+ target=player distance=\S+ value=([\d.]+)', text)]
+assert strikes and all(35 <= v <= 45 for v in strikes), ('the Hunter\'s unit melee jpt!', strikes, log)
+charges = [float(m.group(1)) for m in re.finditer(r'ACTOR_MELEE charge Hunter \d+ variant=\d+ target=player distance=(\S+) value=4', text)]
+assert charges and all(d <= 4.01 for d in charges), ('charges within melee_range 4', charges, log)
+smash = rows(text, 'ACTOR_FACTION', 'smash')
+assert smash and int(smash[0]['smashes']) >= len(strikes) >= 1, ('a Hunter at arm\'s length strikes, counted as smashes', smash, strikes, log)
+text, log = run('hunter-smash-fallback', 'halo_damagetrace 1; halo_actormelee 0; halo_preview', [
+    (0, 'qa_combat_protect 1; qa_actor_spawn 3 0 1.2 0'),
+    (300, 'qa_actor_state armed'),
     (5000, 'qa_actor_state smash'),
     (5300, 'quit'),
 ])
-smash = rows(text, 'ACTOR_FACTION', 'smash')
-assert smash and int(smash[0]['smashes']) >= 1, ('a Hunter at arm\'s length smashes', smash, log)
-print(f'Hunters: armour losses {loss}, pair and rage, {smash[0]["smashes"]} smash(es).')
+fallback = next((dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_MELEE_QA armed ')), None)
+assert fallback and fallback['model'] == '0', ('halo_actormelee 0: no Halo melee', fallback, log)
+assert 'ACTOR_MELEE strike_unit Hunter' not in text, ('halo_actormelee 0: no Halo strike', log)
+old = rows(text, 'ACTOR_FACTION', 'smash')
+assert old and int(old[0]['smashes']) >= 1, ('halo_actormelee 0: the engine\'s smash', old, log)
+print(f'Hunters: armour losses {loss}, pair and rage, {len(strikes)} Halo strike(s) for {[round(v, 1) for v in strikes]}, '
+      f'{old[0]["smashes"]} fallback smash(es).')
 
 # 6. Stealth Elites: cloaked, translucent, flickering when hit.
 text, log = run('stealth', 'halo_preview', [

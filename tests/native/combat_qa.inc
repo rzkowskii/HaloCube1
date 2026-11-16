@@ -132,6 +132,58 @@ COMMANDF(qa_item_goto, "i", (int *powerup)
 });
 COMMANDF(qa_camo_give, "i", (int *ms) { camoUntil = lastmillis + *ms; qaCombatState("camo"); });
 
+// Halo's danger zones (tests/test_actor_ai.py item 12; written while testing was on hold, not run).
+// qa_grenade_place <type> <cn> <distance> <stick> <owner>: a live grenade of `type` (0 frag, 1 plasma) at
+// rest `distance` world units from bot `cn` (-1: the living actor nearest the player) towards the player,
+// at its feet, its timer started; with stick 1 stuck to that bot. Owner -1 the player, -2 the bot itself,
+// -3 the living actor nearest it on its team, else the bot with that client number.
+// COMBAT_QA grenade-place actor=<name|-> owner=<player|name|-> type= ok=<0|1> pos=<x,y,z>
+static playerent *qaBotByClient(int cn)
+{
+    loopv(players) if(players[i] && players[i]->clientnum == cn) return players[i];
+    return NULL;
+}
+static playerent *qaNearestActor(const playerent *to, const playerent *besides, bool sameTeam)
+{
+    playerent *best = NULL;
+    float distance = 1e16f;
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot == besides || bot->state != CS_ALIVE) continue;
+        if(sameTeam && haloactorteam(bot) != haloactorteam(besides)) continue;
+        const float d = to->o.squareddist(bot->o);
+        if(d < distance) { distance = d; best = bot; }
+    }
+    return best;
+}
+COMMANDF(qa_grenade_place, "iifii", (int *type, int *cn, float *distance, int *stick, int *ownerCn)
+{
+    playerent *bot = *cn < 0 ? qaNearestActor(player1, NULL, false) : qaBotByClient(*cn);
+    playerent *owner = NULL;
+    if(*ownerCn == -1) owner = player1;
+    else if(*ownerCn == -2) owner = bot;
+    else if(*ownerCn == -3) owner = bot ? qaNearestActor(bot, bot, true) : NULL;
+    else owner = qaBotByClient(*ownerCn);
+    vec at;
+    at.x = at.y = at.z = 0;
+    bool ok = false;
+    if(bot && bot->state == CS_ALIVE && owner)
+    {
+        vec toward = vec(player1->o).sub(bot->o);
+        toward.z = 0;
+        if(toward.iszero()) toward = vec(1, 0, 0);
+        toward.normalize().mul(*distance * haloscenarioscale());
+        at = feetOf(bot).add(toward).add(vec(0, 0, .2f));
+        ok = haloqagrenadeplace(*type, at, owner, *stick ? bot : NULL);
+    }
+    conoutf("COMBAT_QA grenade-place actor=%s owner=%s type=%d ok=%d pos=%.2f,%.2f,%.2f", bot ? bot->name : "-",
+            owner == player1 ? "player" : owner ? owner->name : "-", *type, ok, at.x, at.y, at.z);
+    fflush(stdout);
+});
+// qa_actor_danger <label>: ACTOR_DANGER_QA and ACTOR_DANGER_STATE per living actor (haloactordangerdump).
+COMMANDF(qa_actor_danger, "s", (const char *label) { haloactordangerdump(label); });
+
 // The nearest hostile actor throws its own grenade type at the player (as halo_ai.cpp's throw does).
 COMMANDF(qa_enemy_throw, "", ()
 {
@@ -197,5 +249,46 @@ COMMANDF(qa_sound_table, "", ()
     }
     qaSound("interface", "shield-low", halointerfacesound("shield-low"));
     qaSound("interface", "health-low", halointerfacesound("health-low"));
+    fflush(stdout);
+});
+
+// The unit dialogue (halo_dialogue.cpp; tests/test_dialogue.py, written while testing was on hold, NOT
+// YET RUN). qa_dialogue_state <label>: DIALOGUE_STATE label= loaded= active= dialogues= sounds= units=
+// speakers= ticks= triggers=, then DIALOGUE_UNIT label= unit= dialogue= priority= vocalization= queued=
+// timer= lines= recent= major= minor= per unit with speech state.
+COMMANDF(qa_dialogue_state, "s", (const char *label) { halodialoguedump(label); fflush(stdout); });
+// qa_dialogue_event <type> <hostility> <label>: raises Halo's communication event `type` (halo_dialogue.h)
+// with the nearest living actor as its subject and the player as its cause (DIALOGUE_EVENT label= subject=),
+// as the brain's hooks do; halo_dialoguetrace 1 logs the outcome (COMM_EVENT, VOCALIZATION).
+COMMANDF(qa_dialogue_event, "iis", (int *type, int *hostility, const char *label)
+{
+    botent *subject = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot->state != CS_ALIVE) continue;
+        const float d = player1->o.squareddist(bot->o);
+        if(d < best) { best = d; subject = bot; }
+    }
+    conoutf("DIALOGUE_EVENT label=%s subject=%s type=%d hostility=%d", label, subject ? subject->name : "-", *type, *hostility);
+    if(subject) halodialogueevent(*type, subject, player1, *hostility);
+    fflush(stdout);
+});
+// qa_dialogue_scream <type> <label>: unit_scream on the nearest living actor (0 falling fear, 1 grenade
+// attached, 2 burning). DIALOGUE_SCREAM label= subject=
+COMMANDF(qa_dialogue_scream, "is", (int *type, const char *label)
+{
+    botent *subject = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot->state != CS_ALIVE) continue;
+        const float d = player1->o.squareddist(bot->o);
+        if(d < best) { best = d; subject = bot; }
+    }
+    conoutf("DIALOGUE_SCREAM label=%s subject=%s type=%d", label, subject ? subject->name : "-", *type);
+    if(subject) halodialoguescream(subject, *type);
     fflush(stdout);
 });

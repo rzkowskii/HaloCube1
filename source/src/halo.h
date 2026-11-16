@@ -8,6 +8,12 @@ void halodrawhud();
 bool halotitleactive();
 void halodrawtitle();
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun);
+// What halodamage made of its last hit, for the unit's pain or death line (halo_dialogue.cpp): whether
+// the shield (or overshield) took damage, whether it was a headshot (Halo's killed instantly), the
+// jpt! category (-1 not known) and its instantaneous acceleration. True for the target of a hit this
+// frame.
+struct HaloHitReport { bool shield = false, instant = false; int category = -1; float acceleration = 0; };
+bool halohitreport(const playerent *target, HaloHitReport &out);
 // Falling damage (halo.cpp updateFalling): physics.cpp's retailmove reports each surface an
 // airborne player or actor touches (`floor`: one it can stand on), read only to project the
 // Halo-equivalent fall velocity along a steep face it slides down and onto the floor it lands on.
@@ -31,6 +37,16 @@ void halopendinghit(const playerent *target, float damage, int sideEffect, const
 // name inside an ownerless script-damage scope: no betrayal, its kills reach haloactordeath with no
 // killer; the player's own hurt as self-inflicted).
 void haloareablast(const vec &centre, const HaloDamage &damage, float inner, float outer, int sideEffect, playerent *owner);
+// Whether a hit or kill dealt in `attacker`'s name is nobody's: the player's name inside an
+// ownerless script-damage scope (halo_ai.h). clientgame.cpp's dodamage and dokill and weapon.cpp's
+// hit() then credit nobody: no hit sound, frag or team kill, no "you ..." kill message (the
+// player's own death reads "you died", an actor's goes to the console), and -1 as the actor of the
+// onHit and onKill hooks.
+bool haloownerless(const playerent *attacker);
+// The engine's and the scripts' forced death of the player (game_lost, game_revert, the escape
+// deadline, a recovery with no safe floor): an INT_MAX kill inside an ownerless scope, so it reads
+// "you died", not a suicide, and costs no frag.
+void halokillplayer();
 // Effect `tag`'s jpt! area damage (effects.txt `damage` line, halofxeffectdamage) at `centre`
 // through haloareablast: a vehicle's death explosion (halo_vehicle.cpp) and, unless
 // halo_effectdamage 0, the scripts' effect_new. False when the table gives the effect no damage.
@@ -68,6 +84,25 @@ bool halothrowgrenade(playerent *owner, int type, const vec &velocity);
 void halogrenadesupdate();
 void halogrenadeforget(const playerent *unit);        // a unit is gone: grenades stuck to it fall
 int halogrenadedump(const char *label);               // one console line per grenade (QA); the count
+// Halo's actor danger zones (halo_ai.cpp): the live projectiles whose proj tag has a danger radius
+// (equipment.txt's and weapons.txt's `danger` lines): retail grenades in flight, at rest or stuck,
+// and shots in flight (the Wraith mortar). `id` stays the same while the object lives; position and
+// velocity are AssaultCube units (a second); radii world units; `owner` is null when it is gone;
+// `stuckTo` the unit a grenade is attached to; `attached` it is stuck to a unit or a vehicle;
+// `countingDown` its detonation timer runs, with `millisLeft` to detonation (-1 when it does not).
+struct HaloDangerObject
+{
+    int id = -1;
+    vec position = vec(0, 0, 0), velocity = vec(0, 0, 0);
+    float dangerRadius = 0, perceptionRadius = 0;
+    const playerent *owner = nullptr, *stuckTo = nullptr;
+    bool attached = false, countingDown = false;
+    int millisLeft = -1;
+};
+int halodangerobjects(HaloDangerObject *out, int capacity);
+// QA (tests/test_actor_ai.py item 12): a live grenade of `type` owned by `owner` at rest at `at`, its
+// timer started as if it had bounced, stuck to `stick` when that is given. False without the table.
+bool haloqagrenadeplace(int type, const vec &at, playerent *owner, playerent *stick);
 // The player's grenades (halo.cpp): count of a type (-1 all types), the selected type, and
 // taking one to throw (the selected type, or the other when it has run out; -1 when none).
 int haloplayergrenades(int type);

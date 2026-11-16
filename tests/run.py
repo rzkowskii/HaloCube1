@@ -46,7 +46,7 @@ QUICK = [
     'test_damage_targets.py',         # d40's manifold detectors: HSCB 8 targets, placed whole, damage rules, a real shot from the route
     'test_frag_throw.py',             # d40's s3 manifold: the importer's planned frag throws (2048 rows) thrown in the game destroy it
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine (shield leak, resistance, shieldtime)
-    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty, playfight, effect damage, melee, special fire
+    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty, playfight, effect damage, melee, special fire, danger zones and dives
     'test_factions.py',               # allegiance matrix and commands, betrayal, Hunters, stealth Elites, flyers, Monitor, Keyes
     'test_ai_attach.py',              # HSCB 9 story-figure flags; ai_attach makes a50's Keyes and marines actors (health, revert, destroy, carried into section 5, own start across checkpoints, spared the kill from behind)
     'test_starting_profiles.py',      # HSCB 9 starting profiles: a10 unarmed, player_add_equipment, a30/c20 loadouts, carry, empty slots saved
@@ -58,6 +58,7 @@ QUICK = [
     'test_script_seats.py',           # a10's cryotube as a scripted seat (held, released by the script, guards), b40's Pelican ride, marker effects, the Monitor spared
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
     'test_falling_damage.py',         # falling damage: player.txt's matg block, the planned-drop scan, the player's and an actor's falls on a30
+    'test_kill_credit.py',            # ownerless kills credit nobody: no frag, team kill, hit credit or "you ..." message; the player's fall and game_revert read "you died"
     'test_script_damage.py',          # damage_object/damage_new by their jpt!: effects.txt records, pulse generator only on the shield, oven, a10 zapper 0
     'test_major_upgrades.py',         # major upgrades at squad placement (chance table, error diffusion, revert, Continue), Halo's squad sizes
     'test_flood.py',                  # squad cap counts living actors; carrier burst from the tag, corpse infection, leap, pop, stagger; forms in the carrier's squad, blast
@@ -65,6 +66,7 @@ QUICK = [
     'test_enemy_vehicles.py',         # Ghost, Wraith, Scorpion, flown Banshee, AI pilots, dropship cargo, Pelican boarding, c40 flown
     'test_vehicle_damage.py',         # vehicle body vitality: the Wraith destroyed with its pilot, occupied-only Ghost, vehicle gun variants, covered riders, death explosion, tilted hit box, wreck
     'test_vehicle_jump.py',           # d40 section 8's planned Warthog jumps flown by the engine (launch along the ramp, retail-derived gravity), capped and governed
+    'test_dialogue.py',               # unit dialogue: dialogue.txt against the caches, decoded permutations, jpt! kinds, pain, death, death event, calls, screams, stock fallback
     'test_presentation.py',           # script effects, shake, screen effects, flashlight, damage indicator, class gains, lunge, engine loops, effect_new damage cvar
     'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
 ]

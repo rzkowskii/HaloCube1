@@ -109,6 +109,12 @@ namespace
         // The physics (`physics` line): the phys tag's gravity scale and the world's gravity in
         // Halo units per tick squared (the globals' falling damage block); 0: none in the table.
         float gravityScale = 1, worldGravity = 0;
+        // The vehicle section's flags (`flags` line): bit 7 causes collision damage (../Halo3DS
+        // units/vehicle_definitions.h:24, vehicles.c:357-365), which makes the moving vehicle a danger
+        // zone for actors (halovehicledangers). Without the line (an older table) every vehicle counts
+        // as causing it: all six the engine has carry the bit in the caches.
+        unsigned vehicleFlags = 0;
+        bool hasVehicleFlags = false;
     };
     constexpr unsigned collTakesRiderDamage = 2, collOnlyExplosives = 32, collOnlyOccupied = 64;
 
@@ -325,6 +331,12 @@ namespace
                                                 >> def->deceleration >> def->turn >> def->slide);
             else if(key == "bounds") ok = bool(in >> def->low.x >> def->low.y >> def->low.z >> def->high.x >> def->high.y >> def->high.z);
             else if(key == "radius") ok = bool(in >> def->radius);
+            else if(key == "flags")
+            {
+                unsigned long long value = 0;
+                ok = def->hasVehicleFlags = bool(in >> value) && value <= 0xffffffffull;
+                def->vehicleFlags = unsigned(value);
+            }
             else if(key == "weapon") { std::getline(in >> std::ws, def->weaponPath); if(def->weaponPath == "-") def->weaponPath.clear(); }
             else if(key == "seat")
             {
@@ -1731,7 +1743,7 @@ namespace
             // Not back into this one later (halovehiclereclaim): it is out of the world, and goes
             // back to its placement or away on the next frame.
             thrownVehicle = thrownSeat = -1;
-            if(!halorecoverplayer(why)) dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+            if(!halorecoverplayer(why)) halokillplayer();
             return;
         }
         if(!falling) return;
@@ -2580,7 +2592,12 @@ namespace
         v.sleeping = false;
         // Nobody walks to a seat of it any more.
         for(Boarding &b : boardings) if(b.vehicle == index) b.until = 0;
-        playerent *killer = attacker && (attacker == player1 || aliveBot(attacker)) ? attacker : player1;
+        // A destroyer that is unknown or no longer alive (a dead Grunt's grenade): the riders' deaths
+        // are nobody's, dealt in the player's name inside an ownerless scope (no betrayal, no frag,
+        // no kill message), not the player's (judgement call: the engine keeps no dead owner).
+        const bool owned = attacker && (attacker == player1 || aliveBot(attacker));
+        playerent *killer = owned ? attacker : player1;
+        if(!owned) haloactorscriptdamage(true, true);
         loopi(maxSeats)
         {
             playerent *p = riders[i];
@@ -2589,6 +2606,7 @@ namespace
             // QA walker's protection.
             dodamage(100000, p, killer, GUN_GRENADE, true);
         }
+        if(!owned) haloactorscriptdamage(false, true);
         if(v.wreck && halo_vehicletrace) conoutf("Halo vehicle: the %s leaves its wreck at %.1f,%.1f,%.1f", d.displayName.c_str(), v.pos.x, v.pos.y, v.pos.z);
         // `v` is not used past here: the blast below runs other code (deaths, other vehicles).
         const int object = v.object;
@@ -3767,6 +3785,37 @@ bool halovehiclearmedseat(const playerent *unit)
         if(!v.exists || !d) continue;
         loopj(min(maxSeats, int(d->seats.size()))) if(v.riders[j] == unit) return armedSeat(*d, j);
     }
+    return false;
+}
+
+int halovehicledangers(HaloVehicleDanger *out, int capacity)
+{
+    // Halo's actors take a vehicle whose tag causes collision damage for a danger zone when it moves
+    // (../Halo3DS ai/actor_perception.c:4932-5026: a driven one through its driver's prop, 4465-4472 and
+    // 4883-4885; one nobody drives through the object scan, 5497-5510). The engine lists every such
+    // vehicle; the brain applies the speed and distance tests. A vehicle a dropship carries is left out
+    // (it moves with the dropship, whose motion the engine's vehicle does not track: judgement call).
+    int count = 0;
+    loopv(vehicles)
+    {
+        const Vehicle &v = vehicles[i];
+        const VehicleDef *d = defOf(v);
+        if(count >= capacity || !v.exists || !d || v.carried) continue;
+        if(d->hasVehicleFlags && !((d->vehicleFlags >> 7) & 1)) continue;
+        HaloVehicleDanger &o = out[count++];
+        o.index = i;
+        o.origin = v.pos;
+        o.velocity = v.vel;
+        o.boundingRadius = d->radius;
+        o.driver = driverOf(v);
+    }
+    return count;
+}
+
+bool halovehicledriver(const playerent *unit)
+{
+    if(!unit) return false;
+    loopv(vehicles) if(vehicles[i].exists && driverOf(vehicles[i]) == unit) return true;
     return false;
 }
 

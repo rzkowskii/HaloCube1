@@ -29,6 +29,10 @@ melee_range and strikes with the unit's melee jpt! (30 to 35); the stealth sword
 Special fire (item 11, the special-fire change, not yet run): actors.txt's `special` lines match the tags, a
 Jackal major rolls its special fire 5 to 6.5 s apart, releases the charged bolt after a 0.6 s hold and its
 charged bolt hits for 70 x 0.5 x 0.4; a Grunt has none, and halo_specialfire 0 turns it off.
+Danger zones and dives (item 12, the danger-zone work, not yet run): the `danger`, `dive` and `flags` lines match
+the tags; a Grunt notices an enemy frag after 30 ticks and dives by its animation before it goes off, steps out of
+a plasma grenade's radius when it may not dive, panics with one stuck to it (an Elite goes berserk), and a
+marine dives from the player's Warthog and notices a carrier's fatal melee.
 """
 import re
 import subprocess
@@ -753,3 +757,181 @@ for mode in (2, 0):
     assert int(row['specials']) >= 1 and int(row['charged']) <= sum(e[1] == 1 for e in releases), row
     print(f'Special fire: {len(rolls)} roll(s), {sum(e[1] == 1 for e in releases)} charged release(s), '
           f'{len(charged_hits)} charged hit(s) of {sorted(set(charged_hits))}.')
+
+
+# 12. Danger zones and dives (the danger-zone work; written while testing was on hold, NOT YET RUN).
+#     Halo's actors keep one danger (../Halo3DS ai/actor_perception.c:4932-5600, 6286-6486): a live
+#     grenade within its danger radius + 10, a moving vehicle within its bounding radius + 10, a carrier
+#     in its fatal melee; an enemy's after 30, 20 or 6 ticks perceived and the actr's notice chance, its
+#     own or a friend's at once; a dive allowed on an enemy grenade by grenade_dive_chance, always on
+#     the rest. The dive (actions.c:3761-3952, 4699-5054) moves the body by the unit's dive animation;
+#     a grenade stuck to a Grunt makes it panic (actions.c:1443-1479), to an Elite in combat within its
+#     berserk firing range roll its attached berserk chance every tick (1938-1970).
+#     Static: actors.txt's `danger` and `dive` lines, equipment.txt's and weapons.txt's `danger` lines and
+#     vehicles.txt's `flags` against the tag bytes when HALO_SOURCE has the caches.
+def records(path, keys):
+    out, current = {}, None
+    for entry in (root / path).read_text().splitlines():
+        key, _, rest = entry.partition(' ')
+        if key in ('path', 'vehicle'):
+            current = rest
+        elif key in keys and current:
+            out.setdefault(current, {})[key] = [float(v) for v in rest.split()]
+    return out
+
+
+dangers = records('packages/halo/actors.txt', ('danger', 'dive'))
+grunt = dangers.get(r'characters\grunt\grunt minor plasma pistol', {})
+assert grunt.get('danger') and all(abs(a - b) < 1e-4 for a, b in zip(grunt['danger'], [.5, .75, .3, .3, 1, 0, 0, 0])), grunt
+assert grunt.get('dive') and grunt['dive'][0] == 47 and abs(grunt['dive'][2] - 1.5824) < 1e-3, ('the Grunt dives left 1.58 over 47 frames', grunt)
+carrier = dangers.get(r'characters\floodcarrier\floodcarrier', {})
+assert carrier.get('danger') and abs(carrier['danger'][5] - 2) < 1e-4 and 'dive' not in carrier, ('the carrier: suicide radius 2, no dive', carrier)
+assert not any('dive' in v for k, v in dangers.items() if 'flood' in k), ('the Flood have no dive animations', [k for k, v in dangers.items() if 'flood' in k and 'dive' in v])
+equipment = [line for line in (root / 'packages/halo/equipment.txt').read_text().splitlines() if line.startswith('danger ')]
+assert equipment == ['danger 2.25 8', 'danger 2.25 8'], ('both grenades: danger radius 2.25, perception 8; rerun tools/halo_weapons.py', equipment)
+weapons = records('packages/halo/weapons.txt', ('danger',))
+assert weapons == {r'vehicles\wraith\wraith mortar': {'danger': [2.0, 0.0]}}, ('only the Wraith mortar has a danger radius (2, perceived nowhere)', weapons)
+flags = records('packages/halo/vehicles.txt', ('flags',))
+assert len(flags) == 6 and all(int(v['flags'][0]) & 0x80 for v in flags.values()), ('every engine vehicle causes collision damage', flags)
+if (HALO_SOURCE / 'a30.map').exists():
+    import mmap  # noqa: E402
+    sys.path.insert(0, str(root / 'tools'))
+    from import_halo_a30 import HaloMap  # noqa: E402
+    from halo_weapons import CAMPAIGN  # noqa: E402
+    expected = {}
+    for cache in CAMPAIGN:
+        with (HALO_SOURCE / f'{cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            halo = HaloMap(data)
+            for tag in halo.directory:
+                if tag.group != 'actv' or tag.name in expected:
+                    continue
+                t, a = halo.tags, tag.address
+                actr, unit = halo.reference(t, a + 4), halo.reference(t, a + 20)
+                if not actr or actr.group != 'actr':
+                    expected[tag.name] = None
+                    continue
+                r, u = actr.address, unit.address if unit and unit.group == 'bipd' else None
+                expected[tag.name] = [*t.read('2f', r + 80), t.read('f', r + 136)[0], t.read('f', r + 128)[0],
+                                      t.read('f', u + 568)[0] if u else 0, t.read('f', u + 644)[0] if u else 0,
+                                      t.read('f', r + 936)[0], t.read('f', a + 364)[0]]
+    for path, values in expected.items():
+        if values is None:
+            assert 'danger' not in dangers.get(path, {}), path
+        else:
+            assert all(abs(x - y) < 1e-4 for x, y in zip(dangers[path]['danger'], values)), (path, values, dangers[path])
+    print(f'Danger zones: actors.txt matches the tag bytes ({sum(v is not None for v in expected.values())} variants with a danger line).')
+
+
+def danger_events(text, event):
+    return [(m.group(1), dict(re.findall(r'(\w+)=(\S+)', m.group(2)))) for m in re.finditer(rf'^ACTOR_DANGER {event} (.+?) (variant=.*)$', text, re.M)]
+
+
+def danger_rows(text, kind, label):
+    rows = []
+    for line in text.splitlines():
+        if line.startswith(f'{kind} {label} '):
+            head, _, name = line.partition(' name=')
+            rows.append({**dict(re.findall(r'(\w+)=(\S+)', head)), 'name': name})
+    return rows
+
+
+# a. An enemy frag 0.8 world units in front of a Grunt minor (halo_dangeravoid 2: every roll succeeds):
+#    assessed at once (hostility 0, acknowledgement 1000 ms), noticed about 1 s later with a dive
+#    allowed, and since no side is clear of a still grenade 0.8 units off, the dive comes once the frag
+#    has under 20 ticks left (urgent): the Grunt's diving animation, 1.58 units, before the blast.
+text, log = run('danger-dive', 'halo_damagetrace 1; halo_difficulty 1; halo_dangeravoid 2; halo_preview', [
+    (0, 'qa_combat_protect 1; botsshoot 0; qa_variant_spawn "grunt minor plasma pistol" -1 6 0'),
+    (1500, 'qa_grenade_place 0 -1 0.8 0 -1'),
+    (2800, 'qa_actor_danger mid'),
+    (4000, 'quit'),
+])
+placed = re.search(r'COMBAT_QA grenade-place actor=(.+?) owner=player type=0 ok=1', text)
+assert placed, ('the frag was placed', log)
+name = placed.group(1)
+assess = [f for n, f in danger_events(text, 'assess') if n == name and f['type'] == '2']
+notice = [f for n, f in danger_events(text, 'notice') if n == name]
+dives = [f for n, f in danger_events(text, 'dive') if n == name]
+assert assess and assess[0]['hostility'] == '0' and float(assess[0]['value']) == 1000, ('assessed as an enemy grenade', assess, log)
+assert notice and notice[0]['value'] == '1.000', ('noticed with a dive allowed', notice, log)
+assert int(notice[0]['ms']) - int(assess[0]['ms']) >= 950, ('noticed after the 30-tick acknowledgement', assess[0], notice[0])
+assert dives and abs(float(dives[0]['value']) - 1.582) < .01, ('the Grunt dives by its animation', dives, log)
+assert 0 <= int(dives[0]['left']) < 667, ('the dive waits until the frag is under 20 ticks from going off', dives[0])
+print(f'Danger: the Grunt noticed the frag {int(notice[0]["ms"]) - int(assess[0]["ms"])} ms after it and dove with {dives[0]["left"]} ms left.')
+
+# b. halo_dangeravoid 3 (notices succeed, dives fail): an enemy plasma grenade 1.5 units in front of a
+#    fighting Grunt without squad positions: no dive; it steps out of the 2.25 radius before the blast.
+text, log = run('danger-step', 'halo_damagetrace 1; halo_difficulty 1; halo_dangeravoid 3; halo_preview', [
+    (0, 'qa_combat_protect 1; botsshoot 0; qa_variant_spawn "grunt minor plasma pistol" -1 6 0'),
+    (1500, 'qa_grenade_place 1 -1 1.5 0 -1'),
+    (3300, 'qa_actor_danger late'),
+    (4500, 'quit'),
+])
+late = danger_rows(text, 'ACTOR_DANGER_QA', 'late')
+state = danger_rows(text, 'ACTOR_DANGER_STATE', 'late')
+steps = danger_events(text, 'step')
+assert late and state and late[0]['type'] == '2' and late[0]['noticed'] == '1' and late[0]['dive_allowed'] == '0', (late, log)
+assert state[0]['dives'] == '0' and steps, ('no dive; a step out instead', state, steps, log)
+assert float(late[0]['line']) > 2.25, ('out of the danger radius before the plasma grenade goes off', late, log)
+print(f'Danger: without a dive the Grunt stepped {late[0]["line"]} units from the plasma grenade.')
+
+# c. A plasma grenade stuck to a Grunt minor: attached (no dive), it panics; a second Grunt 2 units to
+#    its side takes the stuck grenade for its own danger. Stuck to an Elite minor 3 units off, in combat:
+#    its attached berserk chance (0.3 a tick within 4 units) makes it berserk instead.
+text, log = run('danger-stuck', 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+    (0, 'qa_combat_protect 1; botsshoot 0; qa_variant_spawn "grunt minor plasma pistol" -1 6 0; '
+        'qa_variant_spawn "grunt minor plasma pistol" -1 6 2'),
+    (1500, 'qa_grenade_place 1 -1 0 1 -1'),
+    (2300, 'qa_actor_danger stuck'),
+    (4500, 'quit'),
+])
+stuck = danger_rows(text, 'ACTOR_DANGER_QA', 'stuck')
+attached = [r for r in stuck if r['attached'] == '1']
+others = [r for r in stuck if r['attached'] == '0']
+assert attached and attached[0]['type'] == '2' and attached[0]['dive_allowed'] == '0', ('the stuck Grunt: its own danger, no dive', stuck, log)
+assert any(n == attached[0]['name'] for n, _ in danger_events(text, 'panic')), ('the stuck Grunt panics', log)
+panic = {r['cn']: r for r in danger_rows(text, 'ACTOR_DANGER_STATE', 'stuck')}
+assert panic[attached[0]['cn']]['morale'] == 'panicked' and panic[attached[0]['cn']]['panic'] == '1', panic
+assert others and others[0]['type'] == '2', ('the other Grunt fears the stuck grenade', others, log)
+# halo_dangeravoid 2 makes the berserk roll succeed at its first tick: a failed roll would panic it first.
+text, log = run('danger-berserk', 'halo_damagetrace 1; halo_difficulty 1; halo_dangeravoid 2; halo_preview', [
+    (0, 'qa_combat_protect 1; botsshoot 0; qa_variant_spawn "elite minor plasma rifle" -1 3 0'),
+    (1500, 'qa_grenade_place 1 -1 0 1 -1'),
+    (3800, 'quit'),
+])
+assert danger_events(text, 'berserk') and not danger_events(text, 'panic'), ('the stuck Elite goes berserk', log)
+print('Danger: a stuck Grunt panics and its neighbour fears the grenade; a stuck Elite goes berserk.')
+
+# d. The player drives a Warthog at a marine (d40 section 3 on stock geometry, as test_damage_model.py's
+#    EMP drive): a friend's vehicle (hostility 1) is noticed at once and the marine dives (an urgent
+#    impact: under 30 ticks along the Warthog's line) by its evade animation (or its dive-front).
+text, log = run('danger-vehicle', 'halo_damagetrace 1; halo_difficulty 1; qa_stock_geometry 1; halo_section 10 3', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_vehicle_spawn 0 8; qa_variant_spawn "marine assault rifle" 1 9 0'),
+    (600, 'qa_vehicle_enter 0 0'),
+    (900, 'qa_vehicle_input 1 0 2500'),
+    (3800, 'qa_actor_danger after'),
+    (4200, 'quit'),
+], timeout=120)
+marine = re.search(r'^FACTION_SPAWN (.+?) kind=9 ', text, re.M)
+assert marine, ('the marine spawned', log)
+seen = [f for n, f in danger_events(text, 'assess') if n == marine.group(1) and f['type'] == '3']
+dove = [f for n, f in danger_events(text, 'dive') if n == marine.group(1) and f['type'] == '3']
+assert seen and seen[0]['hostility'] == '1', ('the player\'s Warthog, a friend\'s vehicle', seen, log)
+# Its evade-left or evade-right (1.574, 1.588) or, facing across the Warthog's way, its dive-front (2.175).
+assert dove and any(abs(float(dove[0]['value']) - v) < .01 for v in (1.574, 1.588, 2.175)), ('the marine dives aside', dove, log)
+print(f'Danger: the marine dove {dove[0]["value"]} units from the player\'s Warthog.')
+
+# e. A carrier in its fatal melee beside a marine: a suicide danger (radius 2) noticed after 6 ticks,
+#    a dive allowed, taken with a clear side or under a second before the burst.
+text, log = run('danger-carrier', 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+    (0, 'qa_combat_protect 1; qa_variant_spawn "floodcarrier" -1 2 0; qa_variant_spawn "marine assault rifle" 1 1 1.5'),
+    (6000, 'quit'),
+])
+marine = re.search(r'^FACTION_SPAWN (.+?) kind=9 ', text, re.M)
+if re.search(r'^ACTOR_MELEE suicide ', text, re.M):
+    seen = [f for n, f in danger_events(text, 'assess') if marine and n == marine.group(1) and f['type'] == '1']
+    assert seen and float(seen[0]['value']) == 200, ('the carrier is a suicide danger, acknowledged after 6 ticks', seen, log)
+    assert any(marine and n == marine.group(1) and f['type'] == '1' for n, f in danger_events(text, 'notice')), log
+    print(f'Danger: the marine noticed the carrier\'s melee; dives: {len(danger_events(text, "dive"))}.')
+else:
+    print('Danger: the carrier made no fatal melee in the run; item 12e checked nothing.')

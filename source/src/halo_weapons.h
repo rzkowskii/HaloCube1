@@ -69,10 +69,15 @@ struct HaloDamage
     // halodamage, ../Halo3DS objects/damage.c:1178-1190).
     unsigned flags = 0;
     bool headshots() const { return (flags & HALO_DAMAGE_CAN_CAUSE_HEADSHOTS) != 0; }
-    // The jpt! damage category when the caller knows it (-1: not known; the weapon tables do not
-    // carry it): HALO_DAMAGE_CATEGORY_FALLING on the falling damage (halo.cpp updateFalling), which
-    // a unit on the player team takes without the difficulty scale (damage.c:820-825, 1142-1147).
+    // The jpt! damage category when the caller knows it (-1: not known): a projectile's, a grenade's,
+    // an effect's, or a `jptkind` line's (a melee's); HALO_DAMAGE_CATEGORY_FALLING on the falling
+    // damage (halo.cpp updateFalling), which a unit on the player team takes without the difficulty
+    // scale (damage.c:820-825, 1142-1147).
     int category = -1;
+    // The jpt! instantaneous acceleration (an optional `jptkind <category> <acceleration>` line after
+    // the damage's line; 0 without it): a death by damage of 2 or more is Halo's flying death
+    // (unit_make_damage_sound, ../Halo3DS units/unit_dialogue.c:771-776; halo_dialogue.cpp).
+    float acceleration = 0;
     // A full-strength hit.
     float roll() const;
     // [lower, upperMax]: what actors' grenades roll (the balance grenades had before the
@@ -101,6 +106,11 @@ struct HaloProjectileDef
     float radius = 0, innerRadius = 0;      // area damage: full inside the inner, the lower bound at the outer
     float rangeStart = 0, rangeEnd = 0;     // air damage range: impacts fall to the lower bound across it
     int category = -1, sideEffect = 0;      // side effect 3: EMP (the charged plasma bolt)
+    // The optional `danger` line: the proj's danger_radius and ai_perception_radius (world units;
+    // ../Halo3DS items/projectile_definitions.h:79-82): actors take the projectile in flight for a
+    // danger zone within danger_radius + 10 and see it within the perception radius (ai/
+    // actor_perception.c:5511-5600, 5223-5228). 0: none (every weapon projectile but the Wraith mortar).
+    float dangerRadius = 0, perceptionRadius = 0;
     std::string path;
     // The needle's super detonation (a `supercombine` line): when enough of these rounds are stuck
     // in one body within `timer` seconds of each other (halo_supercombine, an engine choice: the
@@ -205,6 +215,9 @@ struct HaloGrenadeDef
     HaloDamage blast;
     int sideEffect = 0, category = 0;       // side effect 3: EMP
     HaloDamage attached;                    // to the unit a sticky grenade is stuck to
+    // The optional `danger` line (as HaloProjectileDef's): 2.25 and 8 for both grenades; 0 without it,
+    // so an older equipment.txt makes no grenade a danger zone.
+    float dangerRadius = 0, perceptionRadius = 0;
     std::string path, equipment;
     HaloSounds sounds;
     const char *sound(int role) const { return sounds.get(role); }

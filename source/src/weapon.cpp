@@ -626,7 +626,8 @@ void hit(int damage, playerent *d, playerent *at, const vec &vel, int gun, bool 
     const bool impervious = haloactive() && d != player1 && (haloactorflags(d) & HALO_AI_IMPERVIOUS);
     if(!impervious && (d==player1 || d->type==ENT_BOT || !m_mp(gamemode))) d->hitpush(damage, vel, at, gun);
 
-    if(at == player1 && d != player1)
+    // No hit sound for damage nobody owns (dealt in the player's name: halo.h haloownerless).
+    if(at == player1 && d != player1 && !haloownerless(at))
     {
         extern int hitsound;
         extern int lasthit;
@@ -1946,8 +1947,11 @@ namespace
         vec position, direction;
         float travelled;                    // Halo world units
         playerent *target;
+        int serial;                         // halodangerobjects' id
     };
     vector<HaloShot> haloShots;
+    // Ids for halodangerobjects: shots and grenades draw from one counter, so they never collide.
+    int dangerSerial = 0;
     // Retail gravity, in world units per second squared.
     const float haloGravity = 3.22f;
 
@@ -2193,6 +2197,7 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
             shot.travelled = 0;
             shot.target = p.guided > 0 ? target : NULL;
             shot.expire = lastmillis + 8000;
+            shot.serial = ++dangerSerial;
             continue;
         }
         vec end = vec(dir).mul((p.range > 0 ? p.range : 1000) * scale).add(from);
@@ -2288,6 +2293,7 @@ void haloaddbolt(playerent *owner, const vec &position, const vec &direction, in
     shot.travelled = 0;
     shot.target = NULL;
     shot.expire = lastmillis + 1500;
+    shot.serial = ++dangerSerial;
 }
 
 void haloupdatebolts(int elapsed)
@@ -2378,6 +2384,7 @@ namespace
     {
     public:
         int type, thrown, timerStart = 0;
+        int serial = ++dangerSerial;        // halodangerobjects' id
         bool bounced = false, exploded = false;
         playerent *stuckTo = NULL, *touched = NULL;   // touched: the body the last bounce hit
         int stuckVehicle = -1;
@@ -2561,7 +2568,8 @@ void haloareablast(const vec &centre, const HaloDamage &damage, float innerRadiu
     // A blast with no owner (a vehicle's death explosion, effect_new's jpt! damage) is dealt in the
     // player's name, because the stock engine's hit and kill paths need an attacker, inside an
     // ownerless script-damage scope: no ally's death counts as a betrayal, and haloactordeath gets
-    // no killer, so the dead actor's hostile neighbours are not alerted to the player (in Halo the
+    // no killer, so the dead actor's hostile neighbours are not alerted to the player, and nobody
+    // gets the hit sound, the frag or a kill message (haloownerless; in Halo the
     // effect's damage owner is the vehicle, or NONE for effect_new, and carries no player). The
     // player's own hurt is self-inflicted (halodamage: no difficulty scale, no damage arc).
     playerent *attacker = owner ? owner : player1;
@@ -2675,6 +2683,68 @@ void halogrenadeforget(const playerent *unit)
         if(g.touched == unit) g.touched = NULL;
         if(g.stuckTo == unit) g.detach();
     }
+}
+
+int halodangerobjects(HaloDangerObject *out, int capacity)
+{
+    int count = 0;
+    if(!out || capacity <= 0 || !haloactive()) return 0;
+    const float scale = haloscenarioscale();
+    auto present = [](const playerent *p) { return p && (p == player1 || players.find((playerent *)p) >= 0); };
+    loopv(bounceents)
+    {
+        if(count >= capacity) break;
+        if(!bounceents[i] || bounceents[i]->bouncetype != BT_HALO) continue;
+        const halogrenade &g = *(halogrenade *)bounceents[i];
+        const HaloGrenadeDef *def = halogrenadedef(g.type);
+        if(g.exploded || !def || !(def->dangerRadius > 0)) continue;
+        HaloDangerObject &o = out[count++];
+        o.id = g.serial;
+        o.position = g.o;
+        // A bounce entity moves vel x maxspeed units a second (physics.cpp moveplayer); a grenade stuck
+        // to a body moves with it (a bot's vel x its speed cap of 16), one stuck to a vehicle is taken
+        // as still (judgement call).
+        if(g.stuckTo) o.velocity = vec(g.stuckTo->vel).mul(min(g.stuckTo->maxspeed, 16.0f));
+        else if(g.stuckVehicle < 0) o.velocity = vec(g.vel).mul(g.maxspeed);
+        o.dangerRadius = def->dangerRadius;
+        o.perceptionRadius = def->perceptionRadius;
+        o.owner = present(g.owner) ? g.owner : nullptr;
+        o.stuckTo = g.stuckTo;
+        o.attached = g.attached();
+        // Counting down once its timer started; it goes off once armed, too (halogrenadesupdate).
+        o.countingDown = g.timerStart != 0;
+        if(o.countingDown)
+            o.millisLeft = max(0, max(int(def->fuse * 1000) - (lastmillis - g.timerStart), int(def->arming * 1000) - (lastmillis - g.thrown)));
+    }
+    loopv(haloShots)
+    {
+        if(count >= capacity) break;
+        const HaloShot &shot = haloShots[i];
+        const HaloProjectileDef *p = shotprojectile(shot);
+        if(!p || !(p->dangerRadius > 0)) continue;
+        HaloDangerObject &o = out[count++];
+        o.id = shot.serial;
+        o.position = shot.position;
+        o.velocity = vec(shot.direction).mul(max(p->speed, 0.5f) * scale);
+        o.dangerRadius = p->dangerRadius;
+        o.perceptionRadius = p->perceptionRadius;
+        o.owner = present(shot.owner) ? shot.owner : nullptr;
+    }
+    return count;
+}
+
+bool haloqagrenadeplace(int type, const vec &at, playerent *owner, playerent *stick)
+{
+    const HaloGrenadeDef *def = halogrenadedef(type);
+    if(!haloactive() || !owner || !def) return false;
+    halogrenade *g = new halogrenade(owner, type);
+    bounceents.add(g);
+    g->o = at;
+    g->vel = vec(0, 0, 0);
+    g->bounced = true;
+    g->resetinterp();
+    if(stick && stick->state == CS_ALIVE) g->stick(stick);
+    return true;
 }
 
 int halogrenadedump(const char *label)

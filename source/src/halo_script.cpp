@@ -5,6 +5,7 @@
 #include "halo_script.h"
 #include "halo_fx.h"
 #include "halo_ai.h"
+#include "halo_dialogue.h"
 #include "halo_weapons.h"
 #include "halo_vehicle.h"
 #include "halo_hud.h"
@@ -2385,7 +2386,11 @@ namespace
         }
         if(is("ai_kill") || is("ai_kill_silent") || is("ai_erase"))
         {
+            // ai_kill's dead speak Halo's act-of-god death (halo_dialogue.cpp); the silent kill and the erase do not.
+            const bool spoken = is("ai_kill");
+            if(spoken) halodialogueactofgod(true);
             if(!scene) eraseSquads(index(0), is("ai_erase"));
+            if(spoken) halodialogueactofgod(false);
             return {};
         }
         if(is("ai_erase_all"))
@@ -3040,7 +3045,7 @@ namespace
         if(is("game_save_cancel")) { pendingCheckpoint = false; return handled(); }
         if(is("game_revert"))
         {
-            if(!scene && player1->state == CS_ALIVE) dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+            if(!scene && player1->state == CS_ALIVE) halokillplayer();
             return handled();
         }
         if(is("game_time")) return answer(tick);
@@ -6435,6 +6440,13 @@ const char *haloscenarioobjectname(int object)
 bool haloscenarioexit() { return scenario.beginCue(SceneTrigger::Exit); }
 bool halopelicanready() { return scenario.pelicanReady(); }
 bool haloscenarioescapetimeout() { return scenario.beginCue(SceneTrigger::Timeout); }
+bool haloscenariodialogueplaying()
+{
+    if(!scenario.loaded) return false;
+    for(const Voice &voice : scenario.voices) if(voice.id >= 0 && voice.until > scenario.tick) return true;
+    return false;
+}
+
 bool haloscenarioescapefailed()
 {
     const bool result = scenario.failedEscape;

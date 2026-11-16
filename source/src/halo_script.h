@@ -123,6 +123,9 @@ void haloscenariocargodump(const char *label);
 bool haloscenarioqaboardpoint(const char *object, vec &feet);
 bool haloscenarioescapetimeout();
 bool haloscenarioescapefailed();
+// A scripted dialogue line (sound_impulse_start) is playing: Halo's sound_scripted_dialog_is_playing,
+// which keeps the actors' lower-priority combat lines quiet (ai/ai_communication.c:6357-6366).
+bool haloscenariodialogueplaying();
 bool halocinematicskip();
 bool halocinematic();
 bool halocinematiccamera(physent &camera);

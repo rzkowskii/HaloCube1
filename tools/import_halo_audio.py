@@ -11,7 +11,9 @@ sounds) is decoded from the first campaign cache next to the given map that hold
 the tag, to packages/audio/halo/tags/<sample>.wav; source/src/halo_weapons.cpp names
 the samples the same way (halosoundsample). tags/classes.txt lists each decoded
 sample's retail sound class (`<sample> <class>`), which sound_class_set_gain fades
-(source/src/halo_fx.cpp).
+(source/src/halo_fx.cpp). Every permutation of each sound packages/halo/dialogue.txt names
+(tools/halo_dialogue.py: the units' dialogue) is decoded on its own to
+packages/audio/halo/dialogue/<sample>_<n>.wav, its class in the same classes.txt.
 """
 
 import argparse
@@ -80,7 +82,10 @@ def xbox_ima(source, channels):
     return pcm
 
 
-def decode_sound(halo, tag):
+def decode_sound(halo, tag, permutation=0):
+    """PCM of one permutation of a sound tag (its first pitch range): the chain from the
+    permutation through each next_permutation_index (the dialogue's permutations, decoded one by
+    one for tools/halo_dialogue.py's table; every other sound plays its first)."""
     tags = halo.tags
     sample_rate_id, = tags.read('H', tag.address + 6)
     channel_id, codec = tags.read('2H', tag.address + 108)
@@ -95,7 +100,7 @@ def decode_sound(halo, tag):
 
     pcm = bytearray()
     seen = set()
-    index = 0
+    index = permutation
     while index != -1:
         if not 0 <= index < len(permutations) or index in seen:
             raise ValueError(f'Invalid sound permutation chain for {tag.name}')
@@ -135,6 +140,27 @@ def table_sounds(root):
                 if name:
                     names.add(name)
     return names
+
+
+def dialogue_sounds(root):
+    """{snd! tag: permutation count} from packages/halo/dialogue.txt (tools/halo_dialogue.py), or {}."""
+    path = root / 'packages/halo/dialogue.txt'
+    found = {}
+    if not path.exists():
+        return found
+    for line in path.read_text().splitlines():
+        key, _, rest = line.partition(' ')
+        if key == 'sound':
+            fields = rest.split(' ', 3)
+            if len(fields) == 4 and fields[1].isdigit():
+                found[fields[3]] = int(fields[1])
+    return found
+
+
+def dialogue_sample(tag_name, permutation):
+    """The engine's sample for one dialogue permutation: 'sound\\dialog\\grunt\\pain' permutation 2
+    becomes 'dialogue/dialog-grunt-pain_2' (dialoguesample in source/src/halo_dialogue.cpp)."""
+    return 'dialogue/' + sample_name(tag_name)[len('tags/'):] + f'_{permutation}'
 
 
 def write_wav(path, pcm, channels, rate):
@@ -196,6 +222,40 @@ def main():
         print(f'warning: no decodable {name} in the campaign caches', file=sys.stderr)
     print(f'{len(done)} weapon, equipment and interface sounds -> {destination / "tags"}'
           + (f' ({len(missing)} missing)' if missing else ''))
+
+    # The unit dialogue (packages/halo/dialogue.txt): every permutation of each sound, one file each,
+    # whose class goes to the same classes.txt (the engine plays them through haloplaysound).
+    dialogue, spoken = dialogue_sounds(args.destination), {}
+    for cache in CAMPAIGN:
+        path = maps / f'{cache}.map'
+        if not set(dialogue) - set(spoken) or not path.exists():
+            continue
+        with path.open('rb') as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            halo = HaloMap(data)
+            for tag in halo.directory:
+                if tag.group != 'snd!' or tag.name not in dialogue or tag.name in spoken:
+                    continue
+                written = 0
+                for permutation in range(dialogue[tag.name]):
+                    try:
+                        pcm, channels, rate = decode_sound(halo, tag, permutation)
+                    except (ValueError, struct.error) as error:
+                        print(f'warning: {cache}: {error} (permutation {permutation})', file=sys.stderr)
+                        continue
+                    sample = dialogue_sample(tag.name, permutation)
+                    write_wav(destination / (sample + '.wav'), pcm, channels, rate)
+                    classes[sample] = halo.tags.read('h', tag.address + 4)[0]
+                    written += 1
+                spoken[tag.name] = written
+    if dialogue:
+        (destination / 'tags/classes.txt').write_text(
+            '# <sample> <retail sound class> (tools/import_halo_audio.py)\n' +
+            ''.join(f'{name} {value}\n' for name, value in sorted(classes.items())))
+        short = sorted(name for name in dialogue if spoken.get(name, 0) < dialogue[name])
+        for name in short:
+            print(f'warning: {name}: {spoken.get(name, 0)} of {dialogue[name]} dialogue permutations decoded', file=sys.stderr)
+        print(f'{sum(spoken.values())} dialogue permutations of {len(spoken)} sounds -> {destination / "dialogue"}'
+              + (f' ({len(short)} incomplete)' if short else ''))
 
 
 if __name__ == '__main__':

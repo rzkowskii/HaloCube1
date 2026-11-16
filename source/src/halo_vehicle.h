@@ -161,6 +161,20 @@ bool halovehicleinside(const playerent *unit);
 bool halovehiclearmedseat(const playerent *unit);
 // Whoever sits in the driver's seat of the vehicle standing for scenario object `object`, or null.
 playerent *halovehicledriverof(int object);
+// Halo's actor danger zones (halo_ai.cpp): every existing vehicle whose tag causes collision damage
+// (vehicles.txt `flags` bit 7; without the line every vehicle), not carried by a dropship: its index,
+// origin (the model's floor) and velocity (AssaultCube units, a second), its object bounding radius
+// (world units, vehicles.txt `radius`) and its driver (null: nobody). Returns how many.
+struct HaloVehicleDanger
+{
+    int index = -1;
+    vec origin = vec(0, 0, 0), velocity = vec(0, 0, 0);
+    float boundingRadius = 0;
+    playerent *driver = nullptr;
+};
+int halovehicledangers(HaloVehicleDanger *out, int capacity);
+// `unit` sits in a vehicle's driver's seat (Halo's vehicle_passenger is a rider who does not drive).
+bool halovehicledriver(const playerent *unit);
 // ai_going_to_vehicle: actors still walking to a seat of the vehicle for `object`.
 int halovehicleaigoing(int object);
 void halovehicleenterable(int object, bool player);

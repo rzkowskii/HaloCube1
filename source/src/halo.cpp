@@ -7,6 +7,7 @@
 #include "halo_weapons.h"
 #include "halo_ai.h"
 #include "halo_hud.h"
+#include "halo_dialogue.h"
 #include "halo_fx.h"
 #include "halo_vehicle.h"
 #include "halo_state.h"
@@ -134,6 +135,8 @@ namespace
         vec floorNormal = vec(0, 0, 1);
         int slideCount = 0;
         vec slides[4];
+        // When the body left the floor and last screamed (an actor's falling scream, updateFall).
+        int airborneAt = 0, screamAt = 0;
     };
 
     struct HaloEnemy
@@ -178,6 +181,9 @@ namespace
         vec at = vec(0, 0, 0);
     };
     PendingHit pendingHit;
+    // What halodamage made of its last hit (halohitreport, for the unit dialogue's pain and death lines).
+    struct HitRecord { const playerent *target = NULL; int millis = -1; HaloHitReport report; };
+    HitRecord lastHit;
     // The fraction of a health point exact hits on the player have left over.
     float playerHealthCarry = 0;
 
@@ -2764,7 +2770,7 @@ namespace
             return;
         }
         conoutf("Halo recovery: %s, no safe floor left, reverting to the checkpoint", why);
-        dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+        halokillplayer();
     }
 
     // A wedged body is first moved to the nearest clear floor within three units.
@@ -2888,8 +2894,9 @@ namespace
 
     // Dealt with no owner (object_cause_damage with NONE, bipeds.c:822 and 836): in the player's
     // name inside an ownerless script-damage scope, as haloareablast's ownerless blasts (no
-    // betrayal, no killer for haloactordeath, no difficulty factor); no push, no gibs. The player's
-    // own is self-inflicted. A blast's indirect material (GUN_GRENADE) for an actor, Halo's for a hit
+    // betrayal, no killer for haloactordeath, no difficulty factor, and no hit sound, frag or kill
+    // message: haloownerless); no push, no gibs. The player's own is self-inflicted, and a fatal
+    // fall reads "you died", not a suicide. A blast's indirect material (GUN_GRENADE) for an actor, Halo's for a hit
     // with no struck material; the knife for the player only to keep the grenade's deafening off.
     void dealFall(playerent *body, const HaloFallingDef &def, bool distance, float scale, float drop, float velocity)
     {
@@ -2955,10 +2962,26 @@ namespace
             return;
         }
         // Leaving the floor: the apex starts at the take-off (the feet before this update's descent).
-        if(!f.airborne) f.apex = feet.z + max(dz, 0.0f);
+        if(!f.airborne) { f.apex = feet.z + max(dz, 0.0f); f.airborneAt = lastmillis; }
         f.airborne = true;
         f.floorSeen = false;
         f.apex = max(f.apex, feet.z);
+        // An actor airborne for over a second screams in fear every half second while the fall would
+        // land harder than the falling damage's maximum (biped_falling_danger, ../Halo3DS
+        // units/bipeds.c:1690-1741: more than 30 airborne ticks, every 15; quiet over ground within 6
+        // world units it would reach below the maximum damage velocity). halo_dialogue.cpp speaks it.
+        if(!player && f.armed && !flying && lastmillis - f.airborneAt > 1000 && lastmillis - f.screamAt > 500)
+        {
+            f.screamAt = lastmillis;
+            bool dangerous = true;
+            vec ground;
+            if(haloplayerfloorbelow(feet, ground) && (feet.z - ground.z) / zscale <= 6)
+            {
+                const float h = max(0.0f, feet.z - ground.z) / zscale, v = f.velocity.z;
+                if(h * haloGravity * 2 + v * v < def->maximumDamageVelocity * def->maximumDamageVelocity) dangerous = false;
+            }
+            if(dangerous) halodialoguescream(body, HALO_SCREAM_FALLING);
+        }
         // Falling too fast and not landing (bipeds.c:826-838): the distance jpt! every Halo tick
         // until the body dies; not for a flying biped. Over nothing at all down to the recovery's
         // depth (a hole the engine's mesh has and Halo's may not), the recovery puts the body back
@@ -3234,7 +3257,7 @@ void haloupdate(int elapsed)
     if(haloscenariogamelost() && !ending && !halocinematic() && player1->state == CS_ALIVE)
     {
         conoutf("Halo game over: game_lost, reverting");
-        dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+        halokillplayer();
     }
     if(!ending && !halocinematic() && (winPending || (campaignFinished && stage == COMPLETE))) beginEnding();
     if(ending)
@@ -3253,6 +3276,7 @@ void haloupdate(int elapsed)
     }
     halovehiclesupdate(elapsed);
     halofxupdate(elapsed);
+    halodialogueupdate();
     updateFiringLoop();
     if(halocinematic() || player1->state != CS_ALIVE || stage == COMPLETE) return;
     // The run's first section on stock geometry starts on foot by the parked Warthogs; when the
@@ -3277,7 +3301,7 @@ void haloupdate(int elapsed)
     if(escaping && lastmillis >= escapeDeadline)
     {
         if(haloscenarioescapefailed() || !haloscenarioescapetimeout())
-            dodamage(INT_MAX, player1, player1, GUN_GRENADE);
+            halokillplayer();
         return;
     }
     if(!retailCartographer() && (stage == INSERTION || stage == REACH_PASS || stage == EXTRACTION))
@@ -3617,6 +3641,18 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     const PendingHit pendingAt = pendingHit;
     pendingHit.target = NULL;
     pendingHit.source = NULL;
+    // The report halo_dialogue.cpp reads (halohitreport): the shield before the hit, the jpt!'s
+    // category and instantaneous acceleration (an exact hit's source; unknown otherwise).
+    HaloEnemy *const reported = target == player1 ? NULL : enemyState(target);
+    const float shieldBefore = target == player1 ? shield + overshield : reported ? reported->shield : 0;
+    lastHit = HitRecord();
+    lastHit.target = target;
+    lastHit.millis = lastmillis;
+    if(exact && pendingSource)
+    {
+        lastHit.report.category = pendingSource->category;
+        lastHit.report.acceleration = pendingSource->acceleration;
+    }
     const float given = amount;
     // The jpt!'s only-hurts-shields and skips-shields flags (damage.c:1667-1694): the first leaves
     // out the body step (nothing reaches the body, what breaks the shield and the leak included),
@@ -3629,6 +3665,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
                 skipShields);
     auto trace = [&](float shieldLeft, float carry)
     {
+        lastHit.report.shield = (target == player1 ? shield + overshield : reported ? reported->shield : 0) < shieldBefore - 1e-4f;
         if(halo_damagetrace)
             conoutf("DAMAGE_TRACE attacker=%s target=%s exact=%d amount=%.3f side=%d gun=%d health=%d shield=%.2f carry=%.3f",
                     attacker ? (attacker == player1 ? "player" : attacker->name) : "-", target == player1 ? "player" : target->name,
@@ -3942,7 +3979,15 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     amount *= bodyScale;
     if(unsuspecting || headshot) amount = max(amount, float(max(target->health, 0)) + 1);
     damage = wholeDamage(amount, enemy->healthCarry);
+    lastHit.report.instant = headshot;
     trace(enemy->shield, enemy->healthCarry);
+}
+
+bool halohitreport(const playerent *target, HaloHitReport &out)
+{
+    if(!target || lastHit.target != target || lastHit.millis != lastmillis) return false;
+    out = lastHit.report;
+    return true;
 }
 
 bool halopickup(int index, playerent *p)
@@ -4545,6 +4590,7 @@ void haloremoveactor(const playerent *p)
     loopv(enemies) if(enemies[i].bot == p) enemies[i].bot = NULL;
     halogrenadeforget(p);
     halovehicleforget(p);
+    halodialogueforget(p);
     haloactordetach(p);
     haloscenarioremovebot(p);
 }
@@ -4835,6 +4881,23 @@ playerent *haloaimtarget(const vec &from, const vec &direction, const HaloWeapon
         best = bot;
     }
     return best;
+}
+
+// Halo credits a kill to the damage's owner_player_index (game_statistics_record_kill,
+// ../Halo3DS objects/damage.c:1081-1085), NONE for ownerless damage, and the campaign shows no kill
+// or death message at all (game_engine_player_killed returns with no game engine,
+// game/game_engine.c:4019). The engine keeps its HUD messages for kills someone owns; an ownerless
+// one credits nobody.
+bool haloownerless(const playerent *attacker)
+{
+    return attacker == player1 && haloactive() && haloactorownerlessdamage();
+}
+
+void halokillplayer()
+{
+    if(player1->state != CS_ALIVE) return;
+    HaloScriptDamage nobody(true);
+    dodamage(INT_MAX, player1, player1, GUN_GRENADE);
 }
 
 void halokilled(playerent *victim, playerent *killer)

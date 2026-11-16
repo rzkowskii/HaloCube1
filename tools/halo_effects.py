@@ -23,7 +23,8 @@ source/src/halo_fx.cpp:
   shield-tutorial zapper, a30's shock explosion, c40's pulse generator, d40's oven heat and the
   guaranteed kills), as optional `jpt` records after the effects: radii, damage, side effect,
   category, AOE core, damage flags (0x40 only hurts shields), the effect's own flags and the 33
-  material modifiers. The engine deals them as Halo's hs_damage_object and hs_damage_new do
+  material modifiers (and, after them, an optional `jptkind <category> <acceleration>` line, as in
+  weapons.txt, for the unit dialogue's death lines). The engine deals them as Halo's hs_damage_object and hs_damage_new do
   (source/src/halo_script_ai.inc); older games skip the records and keep the flat 40 and the
   name-based kills.
 - the player's flashlight (`characters\\cyborg\\flashlight_cyborg`): radius and cone angles.
@@ -38,7 +39,7 @@ from pathlib import Path
 
 from import_halo_a30 import HaloMap
 from halo_weapons import CAMPAIGN, EFFECT_EVENTS, EVENT_STRIDE, EVENT_PARTS, JPT_FLAGS, PART_STRIDE, PART_TYPE, \
-    effect_sound, jpt_damage, jpt_materials, materials_line, number
+    effect_sound, jpt_damage, jpt_kind, jpt_materials, kind_line, materials_line, number
 
 FORMAT = 1
 EVENT_PARTICLES, PARTICLE_STRIDE = 56, 232     # an effect event's particles block
@@ -111,7 +112,7 @@ def script_damage(halo):
 def jpt_record(halo, tag):
     d = jpt_damage(halo, tag)
     effect_flags, = halo.tags.read('I', tag.address + JPT_FLAGS)
-    return {'damage': d, 'effect_flags': effect_flags, 'materials': jpt_materials(halo, tag)}
+    return {'damage': d, 'effect_flags': effect_flags, 'materials': jpt_materials(halo, tag), 'kind': jpt_kind(halo, tag)}
 
 
 def light_values(halo, tag):
@@ -153,7 +154,7 @@ def unit_effects(halo):
 def effect_record(halo, tag):
     t = halo.tags
     light, blast, strongest, systems, particles, names = None, 0.0, None, 0, 0, [tag.name.lower()]
-    damage, materials = None, None
+    damage, materials, damage_kind = None, None, None
     for event in t.block(tag.address + EFFECT_EVENTS, EVENT_STRIDE):
         for part in t.block(event + EVENT_PARTS, PART_STRIDE):
             found = halo.reference(t, part + PART_TYPE)
@@ -168,7 +169,7 @@ def effect_record(halo, tag):
                     strongest, blast = (d.upper_max, d.outer), d.outer
                     # Its damage, when it deals any (a shock wave only pushes).
                     if d.upper_max > 0 and d.outer > 0:
-                        damage, materials = d, jpt_materials(halo, found)
+                        damage, materials, damage_kind = d, jpt_materials(halo, found), jpt_kind(halo, found)
             elif found.group == 'pctl':
                 systems += 1
                 names.append(found.name.lower())
@@ -187,7 +188,8 @@ def effect_record(halo, tag):
     else:
         kind = 'glow'
     return {'path': tag.name, 'kind': kind, 'scale': scale, 'light': light, 'blast': blast, 'systems': systems,
-            'particles': particles, 'sound': effect_sound(halo, tag), 'damage': damage, 'materials': materials}
+            'particles': particles, 'sound': effect_sound(halo, tag), 'damage': damage, 'materials': materials,
+            'jptkind': damage_kind}
 
 
 def main():
@@ -232,6 +234,8 @@ def main():
                          f' {d.side_effect} {d.category} {number(d.core)}')
             if e['materials']:
                 lines.append(materials_line(e['materials']))
+            if e.get('jptkind'):
+                lines.append(kind_line(e['jptkind']))
         lines.append(f'particles {e["systems"]} {e["particles"]}')
         if e['sound']:
             lines.append(f'sound play {e["sound"]}')
@@ -245,6 +249,8 @@ def main():
                   f' {d.side_effect} {d.category} {number(d.core)} {d.flags} {j["effect_flags"]}']
         if j['materials']:
             lines.append(materials_line(j['materials']))
+        if j.get('kind'):
+            lines.append(kind_line(j['kind']))
         lines.append('end')
     lines += classes
     target = args.output / 'packages/halo/effects.txt'

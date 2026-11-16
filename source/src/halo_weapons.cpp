@@ -55,6 +55,8 @@ namespace
         if(!(in >> p.finalSpeed >> p.range >> p.gravity >> p.guided) || !parseDamage(in, p.damage)
            || !(in >> p.category >> p.radius >> p.innerRadius >> p.rangeStart >> p.rangeEnd >> p.sideEffect)) return false;
         p.innerRadius = clamp(p.innerRadius, 0.0f, max(p.radius, 0.0f));
+        // The jpt!'s category rides on the damage too (halodamage's report, the unit dialogue).
+        p.damage.category = p.category;
         std::getline(in >> std::ws, p.path);
         p.valid = true;
         return true;
@@ -145,9 +147,22 @@ namespace
                 if(ok)
                 {
                     d.innerRadius = clamp(d.innerRadius, 0.0f, d.radius);
+                    d.damage.category = d.category;
+                    // The optional instantaneous acceleration after the category (tools/halo_weapons.py).
+                    float acceleration = 0;
+                    if(in >> acceleration && std::isfinite(acceleration)) d.damage.acceleration = max(acceleration, 0.0f);
                     d.valid = true;
                     p->super = d;
                 }
+            }
+            // The projectile's danger and perception radii (older games skip it).
+            else if(key == "danger")
+            {
+                HaloProjectileDef *p = weapon->triggers.empty() ? nullptr : &weapon->triggers.back().projectile;
+                float radius = 0, perception = 0;
+                ok = p && p->valid && bool(in >> radius >> perception) && std::isfinite(radius) && std::isfinite(perception) &&
+                     radius >= 0 && perception >= 0;
+                if(ok) { p->dangerRadius = radius; p->perceptionRadius = perception; }
             }
             // The jpt! damage flags of the last melee or projectile line (older games skip it).
             else if(key == "jptflags")
@@ -155,6 +170,15 @@ namespace
                 unsigned long long value = 0;
                 ok = flagged && bool(in >> value) && value <= 0xffffffffull;
                 if(ok) flagged->flags = unsigned(value);
+            }
+            // The jpt!'s damage category and instantaneous acceleration of the last melee or
+            // projectile line (the unit dialogue's death lines; older games skip it).
+            else if(key == "jptkind")
+            {
+                int category = -1;
+                float acceleration = 0;
+                ok = flagged && bool(in >> category >> acceleration) && std::isfinite(acceleration);
+                if(ok) { flagged->category = category; flagged->acceleration = max(acceleration, 0.0f); }
             }
             else if(key == "sound")
             {
@@ -369,6 +393,7 @@ namespace
         HaloGrenadeDef *grenade = nullptr;
         HaloEquipmentDef *item = nullptr;
         HaloDamage *lastDamage = nullptr;       // what a following `materials` line belongs to
+        HaloDamage *kinded = nullptr;           // what a following `jptkind` line belongs to: the last blast or attached
         bool versioned = false;
         int number = 0;
         while(std::getline(lines, line))
@@ -416,13 +441,26 @@ namespace
             else if(grenade)
             {
                 if(key == "blast") { ok = bool(in >> grenade->innerRadius >> grenade->outerRadius) && parseDamage(in, grenade->blast)
-                                          && bool(in >> grenade->sideEffect >> grenade->category); damage = &grenade->blast; }
+                                          && bool(in >> grenade->sideEffect >> grenade->category); damage = &grenade->blast;
+                                     grenade->blast.category = grenade->attached.category = grenade->category; }
                 else if(key == "attached") { ok = parseDamage(in, grenade->attached); damage = &grenade->attached; }
+                // The jpt!'s category and instantaneous acceleration (older games skip the line).
+                else if(key == "jptkind")
+                {
+                    int category = -1;
+                    float acceleration = 0;
+                    ok = kinded && bool(in >> category >> acceleration) && std::isfinite(acceleration);
+                    if(ok) { kinded->category = category; kinded->acceleration = max(acceleration, 0.0f); }
+                }
                 // The blast's AOE core radius (older games skip the line).
                 else if(key == "core") ok = bool(in >> grenade->blast.core) && grenade->blast.core >= 0 && std::isfinite(grenade->blast.core);
                 else if(key == "materials") ok = parseMaterials(in, lastDamage);
                 else if(key == "path") std::getline(in >> std::ws, grenade->path);
                 else if(key == "equipment") std::getline(in >> std::ws, grenade->equipment);
+                // The projectile's danger and perception radii (older games skip the line).
+                else if(key == "danger")
+                    ok = bool(in >> grenade->dangerRadius >> grenade->perceptionRadius) && std::isfinite(grenade->dangerRadius) &&
+                         std::isfinite(grenade->perceptionRadius) && grenade->dangerRadius >= 0 && grenade->perceptionRadius >= 0;
             }
             else if(item)
             {
@@ -433,6 +471,8 @@ namespace
             }
             else ok = false;
             lastDamage = damage;
+            if(damage) kinded = damage;
+            else if(key == "grenade" || key == "equipment" || key == "end") kinded = nullptr;
             if(!ok)
             {
                 conoutf("\f3Halo equipment: invalid line %d in packages/halo/equipment.txt", number);

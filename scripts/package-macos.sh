@@ -32,10 +32,14 @@ for asset in ('maps/halo_a30.cgz', 'maps/halo_a30.cfg', 'maps/halo_a30.mesh') + 
         missing.append(asset)
 if not partial:
     # player.txt (tools/halo_actors.py) carries the player's materials, shield and falling damage:
-    # without it the engine silently falls back to its built-in player rules.
-    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'player.txt', 'vehicles.txt', 'effects.txt'):
+    # without it the engine silently falls back to its built-in player rules. dialogue.txt
+    # (tools/halo_dialogue.py) gives the units Halo's voices; without it (or its decoded sounds,
+    # tools/import_halo_audio.py) they fall back to AssaultCube's stock pain and death sounds.
+    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'player.txt', 'vehicles.txt', 'effects.txt', 'dialogue.txt'):
         if not (packages / 'halo' / table).is_file():
             missing.append(f'halo/{table}')
+    if (packages / 'halo/dialogue.txt').is_file() and not any((packages / 'audio/halo/dialogue').glob('*.wav')):
+        missing.append('audio/halo/dialogue/*.wav')
     for mission in MISSIONS:
         if not (packages / f'halo/{mission.cache}.hscb').is_file():
             missing.append(f'halo/{mission.cache}.hscb')

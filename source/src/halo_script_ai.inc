@@ -259,8 +259,14 @@
         }
         // Actors do not drive or board vehicles; these are accepted so the scripts that order it go on.
         if(is("ai_exit_vehicle") || is("ai_vehicle_enterable_actor_type") || is("ai_vehicle_enterable_disable") ||
-           is("ai_reconnect") || is("ai_timer_expire") || is("ai_dialogue_triggers"))
+           is("ai_reconnect") || is("ai_timer_expire"))
             return handled();
+        // The actors' combat lines (halo_dialogue.cpp; ai_dialogue_triggers, ../Halo3DS ai/ai_script.c).
+        if(is("ai_dialogue_triggers"))
+        {
+            halodialoguetriggers(truth(0));
+            return handled();
+        }
 
         // --- Allegiances ---------------------------------------------------------
         // Team literals carry the retail game team (1 player, 2 human, 3 covenant, 4 flood,

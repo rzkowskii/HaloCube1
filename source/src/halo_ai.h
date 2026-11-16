@@ -58,6 +58,10 @@ struct HaloActorDef
     // material type (a Hunter's smash: 0 on hunter armor and skin, 1 on the cyborg's 21 and 22).
     bool hasUnitMeleeMaterials = false;
     float unitMeleeMaterials[33] = {};
+    // The optional `unitmeleekind` line: that jpt!'s damage category (-1 none) and instantaneous
+    // acceleration, which pick a victim's death line (halo_dialogue.cpp: 2 or more is the flying death).
+    int unitMeleeCategory = -1;
+    float unitMeleeAcceleration = 0;
     // `leak`: the material's shield_leak_fraction (../Halo3DS objects/damage_resistances.h:27), the
     // optional fifth field of the `material` line; -1 when the table has none.
     struct Material { int type; unsigned flags; float body, shield; float leak = -1; };
@@ -121,6 +125,21 @@ struct HaloActorDef
     // burst (0 none) and the error added to it (radians, actor_combat.c:1339-1348).
     int specialMode = 0, specialSituation = 0;
     float specialChance = 0, specialDelay = 0, specialDamage = 0, specialError = 0;
+    // The optional `danger` line (tools/halo_actors.py, for a variant with an actr; older engines skip
+    // it, and without it the actor has no danger zones): the actr's notice_projectile_chance,
+    // notice_vehicle_chance, grenade_dive_chance and cover_dive_chance (../Halo3DS ai/
+    // actor_definitions.h:96-97, 110-112), the unit's dive_distance and ai_danger_radius (units/
+    // unit_definitions.h:147, 163; world units), the actr's grenade_attached_chance (:234) and the actv's
+    // berserk_firing_range_upper_bound (:355). The `dive` line: the unit's dive animations for its
+    // weapon in Halo's global_dive_animation_table order (ai/actions.c:939-948: diving left, evade
+    // left, diving right, evade right, diving front, diving back), frames and root motion (world units,
+    // x forward, y left); frames 0 for none.
+    bool hasDanger = false, hasDive = false;
+    float noticeProjectile = 0, noticeVehicle = 0, grenadeDive = 0, coverDive = 0, diveDistance = 0, suicideRadius = 0,
+          attachedBerserk = 0, berserkFiringRange = 0;
+    struct DiveAnimation { int frames = 0; float dx = 0, dy = 0; };
+    DiveAnimation dives[6];
+    bool diveOffLedges() const { return (actrFlags >> 25) & 1; }   // _actor_definition_dive_off_ledges_bit
     bool inconsequential() const { return (unitFlags >> 19) & 1; }     // _unit_is_inconsequential_bit
     bool meleeFatal() const { return (unitFlags >> 8) & 1; }           // _unit_melee_attack_is_fatal_bit (the carrier)
     bool meleeAttaches() const { return (unitFlags >> 12) & 1; }       // _unit_impact_melee_attaches_bit
@@ -407,7 +426,8 @@ void haloactorrenew(playerent *bot);
 // with no owner: a vehicle's death explosion, effect_new's jpt! damage; and since the final
 // integration review of the ownerless-kill batch ai_kill, ai_kill_silent, ai_erase, ai_erase_all,
 // damage_object and damage_new, which Halo deals with no owner) also makes its kills nobody's:
-// haloactordeath gets no killer, so no hostile neighbour is alerted to the player.
+// haloactordeath gets no killer, so no hostile neighbour is alerted to the player, and the stock
+// hit and kill paths credit nobody (halo.h haloownerless).
 void haloactorscriptdamage(bool on, bool ownerless = false);
 // Whether an ownerless scope is open (halo.cpp's hitMaterial: a scripted kill is no direct hit).
 bool haloactorownerlessdamage();
@@ -428,6 +448,9 @@ playerent *haloactorhit(const playerent *owner, const vec &from, const vec &to, 
 
 // One console line per actor for the QA client.
 void haloactordump(const char *label);
+// QA (tests/test_actor_ai.py item 12): one ACTOR_DANGER_QA line per living actor with its danger zone
+// and dive state (halo_ai.cpp danger zones).
+void haloactordangerdump(const char *label);
 
 // A living flyer (actr "flying": Sentinels, the Monitor, Engineers): physics.cpp gives it no
 // gravity and no ground snap; the brain sets its climb rate in vel.z.

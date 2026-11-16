@@ -122,6 +122,28 @@ ACTV_SPECIAL_DAMAGE, ACTV_SPECIAL_FIRE = 248, 340
 OBJECT_ANIMATION_GRAPH, ANTR_UNIT_SEATS, SEAT_STRIDE, SEAT_WEAPON_CLASSES = 56, 12, 100, 88
 CLASS_STRIDE, CLASS_ANIMATIONS, CLASS_WEAPON_TYPES, TYPE_STRIDE = 188, 152, 176, 60
 ANTR_ANIMATIONS, ANIMATION_STRIDE, MELEE_ATTACK_SLOT = 116, 180, 39
+# Halo's danger zones and dives (the optional `danger` and `dive` lines; ../Halo3DS ai/actor_perception.c:
+# 4932-5026, 5028-5319, 5511-5600, 6286-6486; ai/actions.c:3761-3952, 4265-4449, 4699-5054). actr
+# perception (+24, actor_definitions.h:84-106): notice_projectile_chance and notice_vehicle_chance at +80
+# and +84 (after the hearing distance at +76); actr moving (+128, :108-119): cover_dive_chance +128,
+# grenade_dive_chance +136; actr berserk (+888): grenade_attached_chance +936 (:234, after the suicide
+# sensing distance at +932); actv ranged_combat berserk_firing_range_upper_bound +364 (:355, after the
+# lower bound at +360). The unit (unit_definitions.h:146-163): dive_distance +568 (actions.c:398-400
+# asserts 0x238) and ai_danger_radius +644 (the carrier's suicide radius, actor_perception.c:5423).
+# Checked against the cache bytes: Grunt minor 0.5, 0.75, 0.3, 0.3; marine 1, 1, 0, 0.75; Hunter 1, 1,
+# 0, 0; the Grunt, Elite, Hunter and flood units 1, the Jackal's 0.5, the marine's 1.5, the carrier's
+# danger radius 2; Elite minor and major attached berserk 0.3 and 0.45 within 4 world units, the
+# Hunter's 0.7 within 2; the unused fields after the notice chances (+88) and the attached chance (+940)
+# and the unit's movement_unused after the dive distance (+572) zero in every tag of the ten caches.
+ACTR_NOTICE_CHANCES, ACTR_COVER_DIVE, ACTR_GRENADE_DIVE, ACTR_ATTACHED_BERSERK = 80, 128, 136, 936
+ACTV_BERSERK_FIRING_UPPER, UNIT_DIVE_DISTANCE, UNIT_AI_DANGER_RADIUS = 364, 568, 644
+# The dive animations Halo's actor_action_try_to_dive picks from, in its global_dive_animation_table
+# order (actions.c:939-948: diving left, evade left, diving right, evade right, diving front, diving
+# back), as the weapon class animation slots unit_animation_impulse_get_index maps the impulses 10, 6,
+# 11, 7, 8 and 9 to (units/units.c:8210-8263; slots in units/units.h:233-288: diving front 4, back 5,
+# left 6, right 7, evade left 30, evade right 31). The marines' and crewmen's diving left and right
+# slots hold their evade-left and evade-right animations; no unit has a diving back; the Flood have none.
+DIVE_SLOTS = (6, 30, 7, 31, 4, 5)
 FRAME_INFO_SIZES = {1: 8, 2: 12, 3: 16}         # dx dy, dx dy dyaw, dx dy dz dyaw (model_animations.c:428-441)
 # matg: player_information (../Halo3DS game/game_globals.h:253, the eleventh block after the
 # difficulty block at 284: 368), one 244-byte element (game_globals.h:143-174) whose first field
@@ -157,6 +179,8 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # team <unit default team>          retail numbering: 0 default, 1 player, 2 human, 3 covenant, 4 flood, 5 sentinel
 # unitmelee <lower> <upper min> <upper max>   the unit's own melee jpt! (a Hunter's smash)
 # unitmeleematerials <33 modifiers>  that jpt!'s damage modifier per retail material type (absent: none; older engines skip it)
+# unitmeleekind <category> <acceleration>  that jpt!'s damage category and instantaneous acceleration (weapons.txt
+#                                    `jptkind`: the unit dialogue's death lines; older engines skip it)
 # material <type> <flags> <body multiplier> <shield multiplier> <shield leak>   each collision material (flags 1: head); older engines read the first four
 # resistance <indirect material> <coll body> <coll shield> <shield material type> <failure function> <failure threshold> <maximum failure>   the coll's (absent: none)
 # shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>   the coll's shield stun and recharge, velocity per tick (absent: none)
@@ -172,6 +196,13 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # special <mode> <situation> <chance> <delay s> <damage modifier> <projectile error>
 #                                   the actv's special fire (mode 1 overcharge, 2 secondary trigger; situation 0 never,
 #                                   1 enemy visible, 2 enemy out of sight, 3 strafing), only for mode > 0; older engines skip it
+# danger <notice projectile> <notice vehicle> <grenade dive> <cover dive> <dive distance> <suicide radius> <attached berserk> <berserk firing range>
+#                                   Halo's danger zones: the actr's notice and dive chances, the unit's dive distance and ai
+#                                   danger radius (world units), the actr's grenade attached berserk chance and the actv's
+#                                   berserk firing range upper bound; only with an actr; older engines skip it
+# dive <frames> <dx> <dy> x6         the unit's dive animations for its weapon in Halo's table order (diving left, evade left,
+#                                   diving right, evade right, diving front, diving back): frames and root motion (world
+#                                   units, x forward, y left; 0 0 0 none); older engines skip it
 '''
 
 PLAYER_FIELDS = '''# player <unit tag>                 the globals' player_information unit (game_globals.h:143-145)
@@ -228,7 +259,74 @@ def actor_record(halo, tag, weapons):
     record['meleecharge'] = (*t.read('2f', a + ACTV_MELEE_RANGE), *t.read('2f', a + ACTV_BERSERK_MELEE_RANGE), *charge,
                              1 if weapon_flags & WEAPON_NON_PLAYERS_USE_MELEE else 0,
                              *melee_animation(halo, unit, carried))
+    if actr and actr.group == 'actr':
+        r = actr.address
+        biped = unit if unit and unit.group == 'bipd' else None
+        record['danger'] = (*t.read('2f', r + ACTR_NOTICE_CHANCES), t.read('f', r + ACTR_GRENADE_DIVE)[0],
+                            t.read('f', r + ACTR_COVER_DIVE)[0],
+                            t.read('f', biped.address + UNIT_DIVE_DISTANCE)[0] if biped else 0.0,
+                            t.read('f', biped.address + UNIT_AI_DANGER_RADIUS)[0] if biped else 0.0,
+                            t.read('f', r + ACTR_ATTACHED_BERSERK)[0], t.read('f', a + ACTV_BERSERK_FIRING_UPPER)[0])
+        dives = dive_animations(halo, unit, carried)
+        if dives:
+            record['dive'] = dives
     return record
+
+
+def weapon_class(halo, unit, weapon):
+    """(antr, weapon class) of the unit's 'stand' seat (else its first) for the carried weapon: the class
+    whose weapon types carry the weapon's label, an empty label for no weapon (units.c:7912-7921); or None."""
+    t = halo.tags
+    if not unit or unit.group != 'bipd':
+        return None
+    antr = halo.reference(t, unit.address + OBJECT_ANIMATION_GRAPH)
+    if not antr or antr.group != 'antr':
+        return None
+    label = t.name(weapon.address + WEAPON_SECTION + 4, 32) if weapon else 'unarmed'
+    seats = t.block(antr.address + ANTR_UNIT_SEATS, SEAT_STRIDE)
+    seat = next((s for s in seats if t.name(s, 32) == 'stand'), seats[0] if seats else None)
+    if seat is None:
+        return None
+    for candidate in t.block(seat + SEAT_WEAPON_CLASSES, CLASS_STRIDE):
+        types = [t.name(w, 32) for w in t.block(candidate + CLASS_WEAPON_TYPES, TYPE_STRIDE)]
+        if any((label == 'unarmed' and not name) or name.lower() == label.lower() for name in types):
+            return antr, candidate
+    return None
+
+
+def animation_motion(halo, clip):
+    """(frames, frame info x and y sums) of an antr animation: its root motion in world units
+    (models/model_animations.c:416-457, the frame info sizes of :428-441)."""
+    t = halo.tags
+    frames, = t.read('h', clip + 34)
+    info_type, = t.read('h', clip + 38)
+    size, _, _, pointer = t.read('4I', clip + 72)
+    stride = FRAME_INFO_SIZES.get(info_type, 0)
+    x = y = 0.0
+    for frame in range(max(0, frames)):
+        if stride and (frame + 1) * stride <= size:
+            dx, dy = t.read('2f', pointer + frame * stride)
+            x += dx
+            y += dy
+    return max(0, frames), x, y
+
+
+def dive_animations(halo, unit, weapon):
+    """The unit's dive animations for the carried weapon (DIVE_SLOTS order) as (frames, dx, dy) each,
+    (0, 0, 0) for a slot without one (unit_test_animation_impulse fails, units.c:8382-8420); None
+    when the unit has no animation graph or class for the weapon, or no dive at all."""
+    t = halo.tags
+    found = weapon_class(halo, unit, weapon)
+    if not found:
+        return None
+    antr, klass = found
+    slots = t.block(klass + CLASS_ANIMATIONS, 2)
+    animations = t.block(antr.address + ANTR_ANIMATIONS, ANIMATION_STRIDE)
+    values = []
+    for slot in DIVE_SLOTS:
+        index = t.read('h', slots[slot])[0] if len(slots) > slot else -1
+        values.extend(animation_motion(halo, animations[index]) if 0 <= index < len(animations) else (0, 0.0, 0.0))
+    return tuple(values) if any(values[i] > 0 for i in range(0, len(values), 3)) else None
 
 
 def melee_animation(halo, unit, weapon):
@@ -278,7 +376,7 @@ def melee_animation(halo, unit, weapon):
 def unit_record(halo, unit):
     """The unit's default team, flags, melee jpt! damage, collision materials, the actors it
     releases when destroyed and its infection-form pop."""
-    from halo_weapons import jpt_damage, jpt_materials, referenced
+    from halo_weapons import jpt_damage, jpt_kind, jpt_materials, referenced
     t = halo.tags
     record = {'team': -1, 'unitmelee': (0.0, 0.0, 0.0), 'materials': []}
     if not unit or unit.group not in ('bipd', 'vehi'):
@@ -297,6 +395,7 @@ def unit_record(halo, unit):
         d = jpt_damage(halo, melee)
         record['unitmelee'] = (d.lower, d.upper_min, d.upper_max)
         record['unitmeleematerials'] = jpt_materials(halo, melee)
+        record['unitmeleekind'] = jpt_kind(halo, melee)
     coll = halo.reference(t, unit.address + UNIT_COLLISION)
     if coll and coll.group == 'coll':
         c = coll.address
@@ -391,6 +490,8 @@ def write(records, path, difficulty=None):
         lines.append('unitmelee ' + ' '.join(map(number, r.get('unitmelee', (0.0, 0.0, 0.0)))))
         if r.get('unitmeleematerials'):
             lines.append('unitmeleematerials ' + ' '.join(map(number, r['unitmeleematerials'])))
+        if r.get('unitmeleekind'):
+            lines.append('unitmeleekind ' + ' '.join(map(number, r['unitmeleekind'])))
         lines += ['material ' + ' '.join(map(number, m)) for m in r.get('materials', [])]
         if r.get('major'):
             lines.append(f'major {r["major"]}')
@@ -410,6 +511,10 @@ def write(records, path, difficulty=None):
             lines.append('melee ' + ' '.join(map(number, r['meleecharge'])))
         if r.get('special'):
             lines.append('special ' + ' '.join(map(number, r['special'])))
+        if r.get('danger'):
+            lines.append('danger ' + ' '.join(map(number, r['danger'])))
+        if r.get('dive'):
+            lines.append('dive ' + ' '.join(map(number, r['dive'])))
         lines.append('end')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('\n'.join(lines) + '\n')

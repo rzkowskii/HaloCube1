@@ -2,6 +2,7 @@
 
 #include "cube.h"
 #include "halo.h"
+#include "halo_dialogue.h"
 #include "halo_script.h"
 #include "halo_vehicle.h"
 #include "bot/bot.h"
@@ -923,21 +924,33 @@ void dodamage(int damage, playerent *pl, playerent *actor, int gun, bool gib, bo
     pl->lastpain = lastmillis;
     playerent *h = player1->isspectating() && player1->followplayercn >= 0 && (player1->spectatemode == SM_FOLLOW1ST || player1->spectatemode == SM_FOLLOW3RD || player1->spectatemode == SM_FOLLOW3RD_TRANSPARENT) ? getclient(player1->followplayercn) : NULL;
     if(!h) h = player1;
-    exechook(HOOK_SP, "onHit", "%d %d %d %d %d", actor->clientnum, pl->clientnum, damage, gun, gib ? 1 : 0);
+    // A hit nobody owns (dealt in the player's name inside an ownerless scope: halo.h haloownerless)
+    // credits nobody: no hit sound, and no actor for the hook.
+    const bool ownerless = campaign && haloownerless(actor);
+    exechook(HOOK_SP, "onHit", "%d %d %d %d %d", ownerless ? -1 : actor->clientnum, pl->clientnum, damage, gun, gib ? 1 : 0);
 
-    if(actor==h && pl!=actor)
+    if(actor==h && pl!=actor && !ownerless)
     {
         if( (hitsound == 1 || (hitsound && h != player1) ) && lasthit != lastmillis) audiomgr.playsound(S_HITSOUND, SP_HIGHEST);
         lasthit = lastmillis;
     }
 
+    // In the campaign with packages/halo/dialogue.txt the units speak Halo's pain and death lines
+    // (halo_dialogue.cpp) in place of the stock sounds; halo_dialogue 0 brings the stock ones back.
+    const bool voices = campaign && halodialogueactive();
     if (pl != player1 && damage > 0)
     {
         damageeffect(damage == INT_MAX ? pl->health : damage, pl);
-        audiomgr.playsound(S_PAIN1+rnd(5), pl);
+        if(!voices) audiomgr.playsound(S_PAIN1+rnd(5), pl);
     }
 
-    if(local && campaign && damage == 0) return;
+    if(local && campaign && damage == 0)
+    {
+        // A hit the shield took whole: Halo's shield pain.
+        if(voices) halodialoguedamage(pl, actor, 0, false, gun);
+        return;
+    }
+    const int healthBefore = pl->health;
     if(local) damage = pl->dodamage(damage, gun);
     else if(actor==player1) return;
 
@@ -948,7 +961,15 @@ void dodamage(int damage, playerent *pl, playerent *actor, int gun, bool gib, bo
         pl->damageroll(damage);
     }
 
-    if(pl->health<=0) { if(local) dokill(pl, actor, gib, gun >= 0 ? gun : actor->weaponsel->type); }
+    if(pl->health<=0)
+    {
+        if(local)
+        {
+            if(voices) halodialoguedamage(pl, actor, max(0, healthBefore), true, gun);
+            dokill(pl, actor, gib, gun >= 0 ? gun : actor->weaponsel->type);
+        }
+    }
+    else if(voices) halodialoguedamage(pl, actor, max(0, healthBefore - pl->health), false, gun);
     else if(pl==player1) audiomgr.playsound(S_PAIN6, SP_HIGH);
     else audiomgr.playsound(S_PAIN1+rnd(5), pl);
 }
@@ -956,16 +977,31 @@ void dodamage(int damage, playerent *pl, playerent *actor, int gun, bool gib, bo
 void dokill(playerent *pl, playerent *act, bool gib, int gun)
 {
     if(pl->state!=CS_ALIVE || intermission) return;
-    if(haloactive()) halokilled(pl, act);
+    if(haloactive())
+    {
+        // Halo's death communication (the killer's and the friends' lines) before the actor goes.
+        halodialoguedeath(pl, act);
+        halokilled(pl, act);
+    }
 
-    exechook(HOOK_SP, "onKill", "%d %d %d %d", act->clientnum, pl->clientnum, gun, gib ? 1 : 0);
+    // A kill nobody owns (halo.h haloownerless: a fall, the scripts' kills and damage, an ownerless
+    // blast, a forced revert) credits nobody: no frag or team kill, no "you ..." message (Halo's
+    // campaign shows no kill message at all); the player's own death reads neutral and an actor's
+    // goes to the console only.
+    const bool ownerless = haloownerless(act);
+    exechook(HOOK_SP, "onKill", "%d %d %d %d", ownerless ? -1 : act->clientnum, pl->clientnum, gun, gib ? 1 : 0);
 
     const char *pname = pl == player1 ? "you" : colorname(pl);
     const char *aname = act == player1 ? "you" : colorname(act);
     const char *death = killmessage(gun, gib);
     void (*outf)(const char *s, ...) = (pl == player1 || act == player1) ? hudoutf : conoutf;
 
-    if(pl==act)
+    if(ownerless)
+    {
+        if(pl == player1) hudoutf("\f2you died");
+        else conoutf("\f2%s died", pname);
+    }
+    else if(pl==act)
     {
         outf("\f2%s suicided%s", pname, pl==player1 ? "!" : "");
     }
@@ -980,22 +1016,26 @@ void dokill(playerent *pl, playerent *act, bool gib, int gun)
         else outf("\f2%s %s %s", aname, death, pname);
     }
 
-    if(pl == act || isteam(pl->team, act->team))
+    if(!ownerless)
     {
-        if(pl != act) act->tks++;
-        if(!m_mp(gamemode)) act->frags--;
+        if(pl == act || isteam(pl->team, act->team))
+        {
+            if(pl != act) act->tks++;
+            if(!m_mp(gamemode)) act->frags--;
+        }
+        else if(!m_mp(gamemode)) act->frags += ( gib && gun != GUN_GRENADE && gun != GUN_SHOTGUN) ? 2 : 1;
     }
-    else if(!m_mp(gamemode)) act->frags += ( gib && gun != GUN_GRENADE && gun != GUN_SHOTGUN) ? 2 : 1;
 
     if(gib)
     {
-        if(pl!=act && gun == GUN_SNIPER) audiomgr.playsound(S_HEADSHOT, SP_LOW);
+        if(pl!=act && !ownerless && gun == GUN_SNIPER) audiomgr.playsound(S_HEADSHOT, SP_LOW);
         addgib(pl);
     }
 
     deathstate(pl);
     pl->deaths++;
-    audiomgr.playsound(rnd(2) ? S_DIE1 : S_DIE2, pl);
+    // The unit's own death line came from halo_dialogue.cpp (halodialoguedamage).
+    if(!halodialogueactive()) audiomgr.playsound(rnd(2) ? S_DIE1 : S_DIE2, pl);
 }
 
 void pstat_weap(int *cn)

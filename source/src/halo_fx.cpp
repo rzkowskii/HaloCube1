@@ -222,6 +222,17 @@ namespace
                     }
                     d.hasMaterials = read == HALO_DAMAGE_MATERIALS;
                 }
+                // The jpt!'s category and instantaneous acceleration (the unit dialogue; older games skip it).
+                else if(key == "jptkind")
+                {
+                    int category = -1;
+                    float acceleration = 0;
+                    if(in >> category >> acceleration && std::isfinite(acceleration))
+                    {
+                        jpt->damage.damage.category = category;
+                        jpt->damage.damage.acceleration = max(acceleration, 0.0f);
+                    }
+                }
                 else if(key == "end") jpt = nullptr;
                 continue;
             }
@@ -250,8 +261,15 @@ namespace
                     d.damage.upperMin = clamp(low, 0.0f, high);
                     d.damage.lower = clamp(lower, 0.0f, high);
                     d.damage.core = clamp(core, 0.0f, d.outer);
+                    d.damage.category = d.category;
                     def->hasDamage = true;
                 }
+            }
+            else if(key == "jptkind")
+            {
+                int category = -1;
+                float acceleration = 0;
+                if(in >> category >> acceleration && std::isfinite(acceleration)) def->damage.damage.acceleration = max(acceleration, 0.0f);
             }
             else if(key == "materials")
             {
