@@ -6,6 +6,10 @@ packages/halo/actors.txt with the perception, firing, burst, grenade, defence,
 morale and vitality values its actr and actv tags carry. Distances are in Halo
 world units, times in seconds and angles in radians. source/src/halo_ai.cpp
 reads it; tools/import_halo_scripts.py stores record indices per squad start.
+The player's own unit (the globals' player_information unit, characters\\cyborg\\cyborg)
+goes to packages/halo/player.txt (PLAYER_FIELDS): its coll's materials, shield
+material type and shield stun and recharge, which halodamage's player branch takes
+in place of the engine's built-in rule when the file is there.
 """
 import argparse
 import mmap
@@ -17,7 +21,7 @@ from halo_weapons import CAMPAIGN, weapon_index
 FORMAT = 3                        # 2: team, unitmelee and material lines; 3: major and difficulty lines
 # Format 3 also carries the optional unit, spawn, pop, destroyed, resistance and shieldtime lines and the
 # material lines' fifth field, the shield leak, the berserk line's fourth (the actr melee delay) and the
-# grenade line's seventh (the encounter grenade timeout; below). The format number stays 3:
+# grenade line's seventh (the encounter grenade timeout; below) and the unitmeleematerials line. The format number stays 3:
 # an engine that predates them skips keys it does not know and fields past a line's last (halo_ai.cpp
 # parse), so a newer table still loads there, and an older table (without them) loads in a newer
 # engine, which keeps its built-in carrier burst, has no infection pop or speed stagger, puts
@@ -87,6 +91,12 @@ COLL_SHIELD_FAILURE, COLL_SHIELD_STUN, COLL_RECHARGE_VELOCITY = 236, 264, 448
 # padding around them is zero in every actv and actr of the ten caches). The optional last field of
 # the `berserk` (only for a variant with an actr) and `grenade` lines; older engines read the rest.
 ACTR_MELEE_DELAY, ACTV_GRENADE_TIMEOUT = 888, 424
+# matg: player_information (../Halo3DS game/game_globals.h:253, the eleventh block after the
+# difficulty block at 284: 368), one 244-byte element (game_globals.h:143-174) whose first field
+# is the player_unit reference: the unit every player spawns as (characters\cyborg\cyborg in all
+# ten caches; checked against the cache bytes).
+GLOBALS_PLAYER_INFORMATION, PLAYER_INFORMATION_STRIDE = 368, 244
+PLAYER_FORMAT = 1
 
 FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible>   the globals (matg) difficulty table, before the actors
 # actor <index>
@@ -104,6 +114,7 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # positions <guard min> <max> <combat min> <max>
 # team <unit default team>          retail numbering: 0 default, 1 player, 2 human, 3 covenant, 4 flood, 5 sentinel
 # unitmelee <lower> <upper min> <upper max>   the unit's own melee jpt! (a Hunter's smash)
+# unitmeleematerials <33 modifiers>  that jpt!'s damage modifier per retail material type (absent: none; older engines skip it)
 # material <type> <flags> <body multiplier> <shield multiplier> <shield leak>   each collision material (flags 1: head); older engines read the first four
 # resistance <indirect material> <coll body> <coll shield> <shield material type> <failure function> <failure threshold> <maximum failure>   the coll's (absent: none)
 # shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>   the coll's shield stun and recharge, velocity per tick (absent: none)
@@ -112,6 +123,13 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # spawn <actor index> <lower> <upper> <throw velocity>   the actors the unit releases when destroyed (absent: none), velocity in world units a second
 # pop <inner> <outer> <lower> <upper min> <upper max> <jpt flags>   the body destroyed effect's infection-form pop damage (absent: none)
 # destroyed <effe tag>              the body destroyed effect a unit destroyed after dying sets off, when it is not the pop (absent: none; effects.txt holds its damage)
+'''
+
+PLAYER_FIELDS = '''# player <unit tag>                 the globals' player_information unit (game_globals.h:143-145)
+# material, resistance, shieldtime   its coll, as in actors.txt (the cyborg: every material type 21,
+#                                    cyborg armor, leak 0; shield material type 22, cyborg energy shield;
+#                                    indirect material 1; stun 6 s, recharge 4 s)
+# end
 '''
 
 
@@ -151,7 +169,7 @@ def actor_record(halo, tag, weapons):
 def unit_record(halo, unit):
     """The unit's default team, flags, melee jpt! damage, collision materials, the actors it
     releases when destroyed and its infection-form pop."""
-    from halo_weapons import jpt_damage, referenced
+    from halo_weapons import jpt_damage, jpt_materials, referenced
     t = halo.tags
     record = {'team': -1, 'unitmelee': (0.0, 0.0, 0.0), 'materials': []}
     if not unit or unit.group not in ('bipd', 'vehi'):
@@ -169,6 +187,7 @@ def unit_record(halo, unit):
     if melee and melee.group == 'jpt!':
         d = jpt_damage(halo, melee)
         record['unitmelee'] = (d.lower, d.upper_min, d.upper_max)
+        record['unitmeleematerials'] = jpt_materials(halo, melee)
     coll = halo.reference(t, unit.address + UNIT_COLLISION)
     if coll and coll.group == 'coll':
         c = coll.address
@@ -261,6 +280,8 @@ def write(records, path, difficulty=None):
             lines.append(key + ' ' + ' '.join(map(number, r[key])))
         lines.append(f'team {r.get("team", -1)}')
         lines.append('unitmelee ' + ' '.join(map(number, r.get('unitmelee', (0.0, 0.0, 0.0)))))
+        if r.get('unitmeleematerials'):
+            lines.append('unitmeleematerials ' + ' '.join(map(number, r['unitmeleematerials'])))
         lines += ['material ' + ' '.join(map(number, m)) for m in r.get('materials', [])]
         if r.get('major'):
             lines.append(f'major {r["major"]}')
@@ -277,6 +298,34 @@ def write(records, path, difficulty=None):
             if r.get(key):
                 lines.append(key + ' ' + ' '.join(map(number, r[key])))
         lines.append('end')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(lines) + '\n')
+
+
+def player_record(halo):
+    """The globals' player unit (matg player_information[0].player_unit) and its unit record, or None."""
+    t = halo.tags
+    matg = next((tag for tag in halo.directory if tag.group == 'matg'), None)
+    if not matg:
+        return None
+    elements = t.block(matg.address + GLOBALS_PLAYER_INFORMATION, PLAYER_INFORMATION_STRIDE)
+    unit = halo.reference(t, elements[0]) if elements else None
+    if not unit or unit.group != 'bipd':
+        return None
+    record = unit_record(halo, unit)
+    if not record.get('materials') or not record.get('resistance'):
+        return None
+    return {'path': unit.name, **record}
+
+
+def write_player(record, path):
+    lines = [f'format {PLAYER_FORMAT}', '# The player\'s unit from the Xbox campaign caches (tools/halo_actors.py)',
+             PLAYER_FIELDS.rstrip(), f'player {record["path"]}']
+    lines += ['material ' + ' '.join(map(number, m)) for m in record['materials']]
+    for key in ('resistance', 'shieldtime'):
+        if record.get(key):
+            lines.append(key + ' ' + ' '.join(map(number, record[key])))
+    lines.append('end')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('\n'.join(lines) + '\n')
 
@@ -304,12 +353,13 @@ def main():
     weapons = weapon_index(args.output)
     if not weapons:
         raise SystemExit('run tools/halo_weapons.py first to write packages/halo/weapons.txt')
-    records, tables = {}, {}
+    records, tables, players = {}, {}, {}
     for cache in CAMPAIGN:
         with (args.maps / f'{cache}.map').open('rb') as file, \
                 mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
             tables[cache] = difficulty_rows(halo)
+            players[cache] = player_record(halo)
             for tag in halo.directory:
                 if tag.group == 'actv' and tag.name not in records:
                     records[tag.name] = actor_record(halo, tag, weapons)
@@ -322,6 +372,16 @@ def main():
         print('warning: the caches disagree on the globals difficulty table; using the first cache\'s')
     target = args.output / 'packages/halo/actors.txt'
     write(ordered, target, difficulty)
+    # The player's unit: the same in every cache (else the first cache's, as for the difficulty table).
+    found = [p for p in players.values() if p]
+    player_target = args.output / 'packages/halo/player.txt'
+    if found:
+        if any(p != found[0] for p in found):
+            print('warning: the caches disagree on the player unit; using the first cache\'s')
+        write_player(found[0], player_target)
+        print(f'player unit {found[0]["path"]} -> {player_target}')
+    else:
+        print('warning: no cache has a player unit with a collision model; player.txt not written')
     bodies = sum(r['kind'] >= 0 for r in ordered)
     majors = sum(bool(r.get('major')) for r in ordered)
     spawns = sum(bool(r.get('spawn')) for r in ordered)

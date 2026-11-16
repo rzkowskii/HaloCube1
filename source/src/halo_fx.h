@@ -28,7 +28,7 @@ void halofxblast(const vec &point, float radius);
 // The jpt! area damage of effect `tag` (effects.txt's optional `damage` and `materials` lines: the
 // effect's strongest damaging jpt! part; radii in world units), false when the table gives it none.
 // Drawing an effect deals nothing: halo.h haloeffectblast deals it, for a vehicle's death
-// explosion and (halo_effectdamage 1) the scripts' effect_new.
+// explosion and (halo_effectdamage, on by default) the scripts' effect_new.
 struct HaloEffectDamage
 {
     HaloDamage damage;

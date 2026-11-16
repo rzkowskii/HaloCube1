@@ -621,7 +621,10 @@ vector<hitmsg> hits;
 
 void hit(int damage, playerent *d, playerent *at, const vec &vel, int gun, bool gib, int info)
 {
-    if(d==player1 || d->type==ENT_BOT || !m_mp(gamemode)) d->hitpush(damage, vel, at, gun);
+    // An actor under unit_impervious is not knocked around (the one thing Halo's impervious bit
+    // stops besides the ping animations: ../Halo3DS objects/damage.c:1043); it is still hurt.
+    const bool impervious = haloactive() && d != player1 && (haloactorflags(d) & HALO_AI_IMPERVIOUS);
+    if(!impervious && (d==player1 || d->type==ENT_BOT || !m_mp(gamemode))) d->hitpush(damage, vel, at, gun);
 
     if(at == player1 && d != player1)
     {
@@ -1964,7 +1967,8 @@ namespace
         return t && t->projectile.valid ? &t->projectile : NULL;
     }
 
-    // Plasma and needles reduce shields faster; halodamage keys that on the gun.
+    // Plasma and needles reduce shields faster; halodamage's built-in rule (without player.txt)
+    // keys that on the gun (an actor's fallback gun is its GUN_SUBGUN slot, so every direct hit).
     int halodamagegun(const HaloProjectileDef &p, int fallback)
     {
         return p.category == 10 || p.guided > 0 ? GUN_SUBGUN : fallback;

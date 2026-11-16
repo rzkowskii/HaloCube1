@@ -32,11 +32,14 @@ VARP(halo_difficulty, 0, 1, 3);
 VAR(halo_scriptseat, 0, 1, 1);
 VAR(halo_scriptseatmax, 0, 180, 3600);
 // effect_new and effect_new_on_object_marker also deal the effect's jpt! area damage
-// (effects.txt `damage` lines, haloeffectblast): off by default, an optional fidelity item. The
-// explosions the scripts create (effects\explosions\...) carry the medium explosion's jpt!, 15 to
-// 25 inside 1.5 world units and 5 at 2.5; their cinematic variants carry none. With it on, a
-// scripted explosion hurts what stands in it, which the planned routes were not made for.
-VAR(halo_effectdamage, 0, 0, 1);
+// (effects.txt `damage` lines, haloeffectblast) with no owner, as Halo does: hs_effect_new creates
+// the effect with owner NONE (../Halo3DS hs/hs_library_external.c:699-724) and its jpt! part deals
+// area damage whatever the owner (effects/effects.c:1760-1781). The scripts' explosions carry the
+// medium explosion's jpt! (15 to 25 inside 1.5 world units, 5 at 2.5), their cinematic variants
+// none, the plasma grenade's 120 inside 0.5 and 80 at 2. On by default since tools/halo_effect_reach.py
+// found the projected blasts where Halo sets them off (docs/macos-build.md, Script effects); 0 is
+// the old visual-only behaviour.
+VAR(halo_effectdamage, 0, 1, 1);
 // QA hold (tests/test_ai_attach.py item 12): 1 keeps the attached actors carried in from the
 // section before from spawning (Scenario::spawnCarried), so a script's commands can reach their
 // pending entries; 0, the default, lets them come along on the section's first live ticks.
@@ -757,6 +760,10 @@ namespace
         std::set<int> maneuvered, flipped;
         std::vector<std::pair<int, int>> links;       // ai_link_activation
         std::set<int> migrationTargets;               // ai_automatic_migration_target
+        // ai_playfight: the encounters playing at fighting (Halo's encounter_datum::playfighting,
+        // ai/ai_script.c:1336), which every member takes (configureActor, migrateBot), and the
+        // checkpoint's copy. Kept into the mission's next section (Halo's mission is one map).
+        std::set<int> playfighting, savedPlayfighting;
         std::vector<DeviceGroup> groups, savedGroups;
         std::vector<DeviceState> devices, savedDevices;
         std::vector<int> objectDevices;
@@ -2425,9 +2432,29 @@ namespace
             eachActor(index(0), [&](SquadBot &bot, int) { status = max(status, haloactorstatus(bot.bot)); });
             return result(status);
         }
-        // Switches the mission scripts flip on whole encounters, platoons or squads.
+        if(is("ai_playfight"))
+        {
+            // ai_scripting_playfight (../Halo3DS ai/ai_script.c:1323-1339) sets the encounter's flag
+            // whatever part of it the reference names (b40's `ext_a_area_a_cov/jackals_e` sets all of
+            // ext_a_area_a_cov), and every actor of the encounter takes it (configureActor and
+            // migrateBot for later members; encounters.c:3734). Kept by checkpoints and saves.
+            const int reference = index(0), id = reference & 0xffff;
+            if(!scene && reference != -1 && at(program.encounters, id))
+            {
+                const bool on = truth(1);
+                if(on) playfighting.insert(id);
+                else playfighting.erase(id);
+                for(SquadBot &bot : squadBots)
+                    if(bot.bot && bot.bot->state == CS_ALIVE && bot.encounter == id) haloactorsetflag(bot.bot, HALO_AI_PLAYFIGHT, on);
+                if(halo_scripttrace) conoutf("HaloScript: ai_playfight %s %s", program.encounters[id].name.c_str(), on ? "on" : "off");
+            }
+            return {};
+        }
+        // Switches the mission scripts flip on whole encounters, platoons or squads, remembered on
+        // each member (setUnitFlag) so that a revert, which respawns the actors, puts them back
+        // (Halo's checkpoint keeps the actors' orders with them).
         struct { const char *name; int flag; bool fixed; } switches[] = {
-            {"ai_braindead", HALO_AI_BRAINDEAD, false}, {"ai_playfight", HALO_AI_PLAYFIGHT, false},
+            {"ai_braindead", HALO_AI_BRAINDEAD, false},
             {"ai_disregard", HALO_AI_DISREGARD, false}, {"ai_set_blind", HALO_AI_BLIND, false},
             {"ai_set_deaf", HALO_AI_DEAF, false}, {"ai_force_active", HALO_AI_FORCE_ACTIVE, false},
             {"ai_magically_see_players", HALO_AI_MAGIC_SIGHT, true}, {"ai_magically_see_encounter", HALO_AI_MAGIC_SIGHT, true},
@@ -2437,7 +2464,7 @@ namespace
         for(const auto &sw : switches) if(is(sw.name))
         {
             const bool on = sw.fixed ? true : truth(1);
-            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { haloactorsetflag(bot.bot, sw.flag, on); });
+            if(!scene) eachActor(index(0), [&](SquadBot &bot, int) { setUnitFlag(bot.bot, sw.flag, on); });
             return {};
         }
         if(is("ai_attack") || is("ai_defend") || is("ai_retreat") || is("ai_maneuver"))
@@ -3099,7 +3126,7 @@ namespace
             }
             else if(!scene) found = objectMarkerPosition(object(1), text(2), point);
             if(found || scene) halofxeffect(text(0), point, found);
-            // Its jpt! damage in play (halo_effectdamage, off by default), in the scripts' name.
+            // Its jpt! damage in play (halo_effectdamage, on by default), owned by nobody.
             if(found && !scene && halo_effectdamage)
             {
                 const bool dealt = haloeffectblast(text(0), point, nullptr);
@@ -3157,8 +3184,8 @@ namespace
     // A unit the scripts set to no body vitality (object_deplete_body, ../Halo3DS
     // units/unit_scripting_commands.c:127-128) dies with no owner, as ai_kill's do (eraseSquads),
     // whatever protects it (Halo's depletion does not ask object_cannot_take_damage). The death is
-    // dealt directly (dokill), not as a hit: halodamage would let object_cannot_take_damage,
-    // unit_impervious or a Jackal's hand-held shield stop it. The Monitor is spared, as by ai_kill.
+    // dealt directly (dokill), not as a hit: halodamage would let object_cannot_take_damage or a
+    // Jackal's hand-held shield stop it. The Monitor is spared, as by ai_kill.
     void depleteBody(playerent *bot)
     {
         if(!bot || bot->state != CS_ALIVE || monitorBody(bot)) return;
@@ -3236,6 +3263,11 @@ namespace
         haloactorsetposture(bot, platoon && (platoon->flags & 4) ? HALO_DEFENDING : HALO_ATTACKING);
         if(start.commandList >= 0 && start.commandList < int(commandPrograms.size()))
             haloactorcommand(bot, &commandPrograms[start.commandList]);
+        // The encounter's playfight flag, which Halo copies onto every actor of the encounter on its
+        // update (encounter_control_actors, ../Halo3DS ai/encounters.c:3734, every half second):
+        // here at once, so a member placed, released, attached, carried in or reverted after the
+        // ai_playfight takes it.
+        haloactorsetflag(bot, HALO_AI_PLAYFIGHT, playfighting.count(e) > 0);
     }
 
     // The actors.txt variant a start is placed as: its own, or with `major` its major upgrade
@@ -4171,6 +4203,8 @@ namespace
             // do not reset them (only a new map does, ai.c:1929).
             if(upgrade.squads.size() != program.encounters.size()) resetUpgrade();
             savedUpgrade = upgrade;
+            // So do the encounters' playfight flags (no members come along but the carried ones).
+            savedPlayfighting = playfighting;
             std::fill(attachedAt.begin(), attachedAt.end(), -1);
             std::fill(savedAttachedAt.begin(), savedAttachedAt.end(), -1);
             std::fill(attachRetry.begin(), attachRetry.end(), 0);
@@ -4214,6 +4248,8 @@ namespace
         squadBots.clear();
         spawnedStarts.clear();
         resetUpgrade();
+        playfighting.clear();
+        savedPlayfighting.clear();
         objectStarts.assign(program.objects.size(), SquadStart{});
         attachedAt.assign(program.objects.size(), -1);
         savedAttachedAt.assign(program.objects.size(), -1);
@@ -5353,6 +5389,7 @@ void haloscenariocheckpoint()
     }
     scenario.savedAttachedAt = scenario.attachedAt;
     scenario.savedUpgrade = scenario.upgrade;
+    scenario.savedPlayfighting = scenario.playfighting;
     scenario.savedCarried = scenario.carriedAttached;
     scenario.savedAttachVitality = scenario.attachVitality;
     scenario.savedBoarded = {};
@@ -5418,6 +5455,8 @@ void haloscenariorevert()
         // The upgrade errors and seed as at the checkpoint, so the squads placed after it are
         // placed as they were (Halo's revert restores its game state, the errors with it).
         scenario.upgrade = scenario.savedUpgrade;
+        // The encounters playing at fighting as at the checkpoint, before the members come back.
+        scenario.playfighting = scenario.savedPlayfighting;
         scenario.restoreSquads();
         scenario.tick = scenario.savedTick;
         scenario.accumulator = 0;
@@ -5497,6 +5536,8 @@ namespace
         const std::vector<CarriedAttach> *carried = nullptr;
         // The major upgrade errors and seed (the optional `s upgrade` record).
         const Scenario::UpgradeState *upgrade = nullptr;
+        // The encounters playing at fighting (the optional `s playfight` record).
+        const std::set<int> *playfight = nullptr;
     };
 
     // ` max <body> <shield>`: a maximum vitality a script set on the actor (unit_set_maximum_vitality,
@@ -5834,6 +5875,10 @@ namespace
             out += entries;
             out += '\n';
         }
+        // Optional, written only while an encounter plays at fighting (so other saves still load in
+        // an older engine, which refuses the record and restarts the section's script): the
+        // encounters by index. A save without it has none playing at fighting.
+        if(v.playfight && !v.playfight->empty()) writeInts(out, "playfight", *v.playfight);
         float gains[HALO_SOUND_CLASSES];
         if(halofxgains(gains))
         {
@@ -5875,6 +5920,7 @@ namespace
         float gain[HALO_SOUND_CLASSES] = {};
         bool upgraded = false;
         Scenario::UpgradeState upgrade;
+        std::set<int> playfight;
     };
 
     bool parseState(const std::vector<std::string> &records, ParsedState &s, std::string &why)
@@ -6218,6 +6264,11 @@ namespace
                 }
                 s.upgraded = true;
             }
+            else if(r.key("playfight"))
+            {
+                if(!readInts(r, [&](int v) { s.playfight.insert(v); })) return fail("bad playfight encounters", line);
+                for(int v : s.playfight) if(!at(p.encounters, v)) return fail("bad playfight encounters", line);
+            }
             else if(r.key("gain"))
             {
                 const int count = r.i();
@@ -6269,6 +6320,7 @@ bool haloscenariostatesave(std::string &out, bool live)
                        s.savedHudBlinking, s.savedChapter, s.savedChapterStart, s.savedTick, s.savedBoarded, {}};
     v.carried = live ? &s.carriedAttached : &s.savedCarried;
     v.upgrade = live ? &s.upgrade : &s.savedUpgrade;
+    v.playfight = live ? &s.playfighting : &s.savedPlayfighting;
     // The objects attached in play still waiting for their actor (a50's jailed marines, posed in
     // their cells until the rescue): without them a Continue would leave them figures for good.
     const std::vector<int> &attachedAt = live ? s.attachedAt : s.savedAttachedAt;
@@ -6322,6 +6374,8 @@ bool haloscenariostaterestore(const std::vector<std::string> &records, bool comm
         s.savedUpgrade = s.upgrade;
         s.upgrade = live;
     }
+    // Into the checkpoint's copy too (none playing at fighting without the record).
+    s.savedPlayfighting = std::move(parsed.playfight);
     if(s.objectStarts.size() != s.program.objects.size()) s.objectStarts.assign(s.program.objects.size(), SquadStart{});
     for(auto &entry : parsed.attached)
     {

@@ -521,7 +521,7 @@ static void qaCommandStatus(const char *encounter)
 COMMANDF(qa_hs_command, "s", (const char *encounter) { qaCommandStatus(encounter); });
 // Script commands with several arguments (tests/test_actor_ai.py). Each token is a number, an encounter or
 // squad name, `list:NAME` (ai_actors), `unit:NAME:N` (the N-th actor of NAME), `obj:NAME` (a scripted object),
-// `player`, `players`, `s:TEXT` (a string argument) or true/false.
+// `flag:NAME` (a cutscene flag's index), `player`, `players`, `s:TEXT` (a string argument) or true/false.
 // qa_hs_cmd ai_follow_target_ai "squad_a squad_b" prints HS_CMD <command> <value>.
 static double qaToken(const char *token)
 {
@@ -541,6 +541,7 @@ static double qaToken(const char *token)
         return haloscenariocall("list_get", list, n);
     }
     if(!strncmp(token, "obj:", 4)) return haloscenarioobject(token + 4);
+    if(!strncmp(token, "flag:", 5)) return haloscenarioflag(token + 5);
     char *end = NULL;
     const double number = strtod(token, &end);
     if(end && !*end) return number;

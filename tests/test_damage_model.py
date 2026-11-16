@@ -7,7 +7,8 @@ Tables (no game): weapons.txt is format 3 with each projectile's area inner radi
 range and side effect; the grenade blasts carry their lower bound; and the time an actor's gun
 takes to kill the player on Normal (shots from full shield and health, the cadence unchanged)
 stays within 16% of the integer slot damage it replaced at close range, for every actor variant
-and weapon in actors.txt (the Sentinel beam by its 1-point floor).
+and weapon in actors.txt (a variant whose modifier is 0, the Sentinels', deals full damage: Halo
+scales only by a modifier above 0, ai/ai.c:654-675; the engine's 0.5 is for no actors.txt).
 
 a30 section 2 (no enemies): the engine's damage table (qa_damage_table) falls from the upper
 bound to the lower across a projectile's damage range and a grenade's radius bounds, actors'
@@ -26,6 +27,21 @@ a30 section 3 (Covenant): with halo_damagetrace, every shot an actor lands on th
 player is an exact hit within its weapon's [lower, upper max] times the variant's modifier
 (at least 1), some of them fractional; an actor's grenade blast deals at least the lower bound;
 the player's EMP hit drains an Elite's shield.
+
+The modifier-0 work (written while testing was on hold, not yet run; docs "Damage fidelity", Enemy
+fire): on a30 section 2 the `elite commander energy sword` and `sentinel` variants (actv weapon
+damage modifier 0) spawn with damage scale 1 (DAMAGE_ACTOR weapon ... scale=1.000), an `elite minor
+plasma rifle` with its own 0.5.
+
+The cyborg item (written while testing was on hold, not yet run; docs "Damage fidelity", Enemy fire):
+packages/halo/player.txt holds the cyborg's coll (every material type 21, shield type 22, indirect
+material 1); on a30 section 2 `qa_damage_player_unit` reports it loaded with the 6 s stun and 4 s
+recharge, and exact hits of 10 carrying a weapon's jpt! (`qa_damage_shot`) take the shield and body
+by its modifiers: the plasma rifle bolt 20 off the shield and 5 off the body, its excess over a 5
+shield 15 at 0.5 (7 and a half carried), the plasma pistol bolt 6 off the shield, the pistol bullet
+15 off the body, the needle 10 and the assault rifle's melee 14 off the shield; with
+`halo_playermaterials 0` an actor's plasma pistol bolt takes the built-in 20. (The table check
+above models the built-in rule's factor, for the rounding change only.)
 """
 import re
 import subprocess
@@ -130,7 +146,7 @@ for a in actors:
     p = w['triggers'][0]['p'] if w and w['triggers'] else None
     if not p or a.get('kind') == 9:       # marines are allies
         continue
-    scale = a['fire'][8] if a['fire'][8] > 0 else 0.5
+    scale = a['fire'][8] if a['fire'][8] > 0 else 1.0
     pellets = max(1, int(w['triggers'][0]['values'][5]))
     factor = 2 if (p['cat'] == 10 or p['guided'] > 0) and p['outer'] <= 0 else 1
     old = max(1, int(p['umin'] * scale + .5))
@@ -212,6 +228,41 @@ assert float(vitals[6]['overshield']) == 0 and float(vitals[6]['shield']) == 0 a
     ('EMP drains the overshield and the shield', vitals[6])
 print('a30 section 2: range and blast falloff to the lower bound, actor grenade rolls, exact hits, EMP on the player.')
 
+# ---- a30 section 2: the player's damage by the cyborg's coll (player.txt; damage.c:898-899, 1174)
+PLAYER = root / 'packages/halo/player.txt'
+require(PLAYER, 'run python3 tools/halo_actors.py with the expanded caches (it writes player.txt)')
+assert 'resistance 1 75 75 22 ' in PLAYER.read_text() and 'material 21 0 1 1 0' in PLAYER.read_text(), PLAYER.read_text()
+shot = lambda path, trigger: f'{index[path]} {trigger}'  # noqa: E731
+RIFLE, PPISTOL = shot(r'weapons\plasma rifle\plasma rifle', 0), shot(r'weapons\plasma pistol\plasma pistol', 0)
+PISTOL, NEEDLE = shot(r'weapons\pistol\pistol', 0), shot(r'weapons\needler\needler', 0)
+MELEE = shot(r'weapons\assault rifle\assault rifle', -1)
+text, log = run('cyborg', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_damage_player_unit'),
+    (200, f'qa_damage_vitals 75 75; qa_damage_shot {RIFLE} 10 rifle-shield'),
+    (300, f'qa_damage_vitals 75 75; qa_damage_shot {PPISTOL} 10 ppistol-shield'),
+    (400, f'qa_damage_vitals 75 0; qa_damage_shot {PISTOL} 10 pistol-body'),
+    (500, f'qa_damage_vitals 75 0; qa_damage_shot {RIFLE} 10 rifle-body'),
+    (600, f'qa_damage_vitals 75 5; qa_damage_shot {RIFLE} 10 rifle-excess'),
+    (700, f'qa_damage_vitals 75 75; qa_damage_shot {NEEDLE} 10 needle-shield'),
+    (800, f'qa_damage_vitals 75 75; qa_damage_shot {MELEE} 10 melee-shield'),
+    (900, 'qa_variant_spawn "elite minor plasma rifle" 0 10 0'),
+    (1100, f'halo_playermaterials 0; qa_damage_vitals 75 75; qa_damage_shot {PPISTOL} 10 builtin-shield'),
+    (1200, 'quit'),
+])
+unit = labelled(text, 'DAMAGE_PLAYER_UNIT')
+unit = next(iter(unit.values()), {}) if unit else {}
+assert unit.get('loaded') == '1' and unit.get('shield_type') == '22' and unit.get('indirect') == '1', ('player.txt loads', unit, log)
+assert unit.get('stun_ms') == '6000' and unit.get('recharge_ms') == '4000', ('the coll\'s 6 s stun and 4 s recharge', unit)
+got = labelled(text, 'DAMAGE_QA')
+expect = {'rifle-shield': (75, 55), 'ppistol-shield': (75, 69), 'pistol-body': (60, 0), 'rifle-body': (70, 0),
+          'rifle-excess': (68, 0), 'needle-shield': (75, 65), 'melee-shield': (75, 61), 'builtin-shield': (75, 55)}
+for label, (hp, shield_left) in expect.items():
+    row = got.get(label, {})
+    assert row.get('hp') == str(hp) and close(float(row.get('shield', -1)), shield_left), (label, hp, shield_left, row, log)
+assert close(float(got['rifle-excess']['carry']), .5), ('the excess 15 at 0.5 on the armour: 7 taken, a half carried', got['rifle-excess'])
+print('a30 section 2: the cyborg coll: plasma rifle 2 on the shield and 0.5 on the armour (its excess post-modifier), '
+      'plasma pistol 0.6, pistol 1.5 on the armour, needle 1, melee 1.4; 6 s stun, 4 s recharge; halo_playermaterials 0 keeps the 2x rule.')
+
 # ---- d40 section 3 (stock geometry, qa_stock_geometry 1): EMP stuns the Warthog the player drives
 text, log = run('vehicle', 'qa_stock_geometry 1; halo_section 10 3', [
     (100, 'botsshoot 0; qa_combat_protect 1'),
@@ -278,6 +329,25 @@ free = row('free', ghost)
 assert int(free['stunned']) == 0, free
 if moved(row('stun2', ghost), free) <= 1.0:
     print('  (the Ghost did not drive off after the stun within the window: its Elite had nowhere to go; not asserted)')
+
+# ---- a30 section 2: a variant whose modifier is 0 deals full damage (ai.c:654-675)
+text, log = run('modifier', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_variant_spawn "elite commander energy sword" 0 8 0; qa_variant_spawn "sentinel\\sentinel" 0 10 4; '
+          'qa_variant_spawn "elite minor plasma rifle" 0 10 -4'),
+    (700, 'qa_damage_actors'),
+    (900, 'quit'),
+])
+spawned = [l[len('FACTION_SPAWN '):].split(' kind=', 1)[0] for l in text.splitlines() if l.startswith('FACTION_SPAWN ')]
+assert len(spawned) == 3 and '-' not in spawned, ('three variants spawned', spawned, log)
+scales = {}
+for line in text.splitlines():
+    if line.startswith('DAMAGE_ACTOR weapon '):
+        scales[line.split(' name=', 1)[1].split(' kind=', 1)[0]] = float(fields(line)['scale'])
+sword, sentinel, minor = (scales.get(n) for n in spawned)
+assert sword == 1 and sentinel == 1, ('modifier 0 means no scaling', scales, log)
+assert minor is not None and abs(minor - .5) < 1e-3, ('a variant\'s own modifier still applies', scales)
+print('a30 section 2: the energy-sword commander and the Sentinel deal full damage (modifier 0), the Elite minor 0.5.')
 
 # ---- a30 section 3: actors' exact shots and grenades on the player, EMP on an Elite
 text, log = run('actors', 'qa_campaign_resume 2 3', [

@@ -39,6 +39,8 @@ struct HaloSounds
 // scale s (1 full strength, 0 weakest: the far end of a projectile's damage range, the outer
 // edge of a blast) deals lower + (full - lower) * s.
 enum { HALO_DAMAGE_MATERIALS = 33 };
+// jpt! damage flags (damage.c:196-206 of ../Halo3DS objects: _damage_can_cause_headshots_bit is bit 1).
+enum { HALO_DAMAGE_CAN_CAUSE_HEADSHOTS = 1 << 1 };
 
 struct HaloDamage
 {
@@ -54,6 +56,12 @@ struct HaloDamage
     bool hasMaterials = false;
     float materials[HALO_DAMAGE_MATERIALS] = {};
     float material(int type) const { return hasMaterials && type >= 0 && type < HALO_DAMAGE_MATERIALS ? materials[type] : 1.0f; }
+    // The jpt! damage flags (a `jptflags` line after the damage's line and its materials line;
+    // 0 without it): 0x2 can cause headshots (the pistol and sniper bullets: a hit that still hurts
+    // the body after the shield, on a head-flagged material of an actor, kills it outright,
+    // halodamage, ../Halo3DS objects/damage.c:1178-1190).
+    unsigned flags = 0;
+    bool headshots() const { return (flags & HALO_DAMAGE_CAN_CAUSE_HEADSHOTS) != 0; }
     // A full-strength hit.
     float roll() const;
     // [lower, upperMax]: what actors' grenades roll (the balance grenades had before the

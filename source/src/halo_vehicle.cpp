@@ -1993,8 +1993,8 @@ namespace
 
     // The vehicle variant when its fire block is authored (a damage modifier above 0), else null.
     // The Warthog gunner's fire block is all zeros (no modifier, rate or error): it stands for
-    // nothing, so its gunner fights as the seated actor's own variant, error included (a marine
-    // at the gun would otherwise never miss).
+    // nothing, so its gunner aims with the seated actor's own variant's error (a marine at the gun
+    // would otherwise never miss; an engine judgement), though its shots are unscaled (gunModifier).
     const HaloActorDef *fightingVariant(const VehicleDef &d)
     {
         const HaloActorDef *a = variantOf(d);
@@ -2002,13 +2002,21 @@ namespace
     }
 
     // The damage modifier an actor's shot from this vehicle's gun carries: the vehicle variant's,
-    // or -1 (rollshot then takes the seated actor's own; the player's shots carry 1). A variant
-    // with no modifier (0: the Warthog gunner's) falls back to the actor's too.
+    // or -1 (rollshot then takes the seated actor's own; the player's shots carry 1). Halo fires a
+    // gun whose weapon names an ai_firing_parameters actv with that variant's modifier (../Halo3DS
+    // ai/actor_combat.c:443-463, 1285-1335), and a modifier of 0 with no damage per second (the
+    // Warthog gunner's, the only retail case) means no scaling (ai/ai.c:654-675): full damage, 1.
+    // Its error stays the seated actor's own (fightingVariant).
+    float actorGunModifier(const VehicleDef &d)
+    {
+        if(const HaloActorDef *a = fightingVariant(d)) return a->damageScale;
+        return variantOf(d) ? 1.0f : -1;
+    }
+
     float gunModifier(const VehicleDef &d, const playerent *owner)
     {
         if(!owner || owner == player1) return -1;
-        const HaloActorDef *a = fightingVariant(d);
-        return a ? a->damageScale : -1;
+        return actorGunModifier(d);
     }
 
     // One shot of trigger `trigger` (0 or 1) of the vehicle's gun by `owner` in `seat`, towards
@@ -2105,9 +2113,10 @@ namespace
         {
             if(lastmillis >= v.aiNextBurst && lastmillis >= v.aiBurstUntil)
             {
-                v.aiBurstUntil = lastmillis + 900 + rnd(900);
+                // Playing at fighting, bursts last 0.6 as long (actor_combat.c:1259-1262).
+                v.aiBurstUntil = lastmillis + int((900 + rnd(900)) * (in.playfight ? .6f : 1.0f) + .5f);
                 // The pause between bursts times the seated actor's burst_separation
-                // (../Halo3DS ai/actor_combat.c:599-605; halocombatscaling).
+                // (../Halo3DS ai/actor_combat.c:599-605; halocombatscaling) and playfight's 1.7.
                 v.aiNextBurst = v.aiBurstUntil + int((700 + rnd(800)) * in.separationScale + .5f);
             }
             if(lastmillis >= v.aiBurstUntil) return;
@@ -2118,7 +2127,9 @@ namespace
         const float speed = max(1.0f, t->projectile.speed * s);
         target.add(vec(in.target->vel).mul(.7f * distance / speed));
         const HaloActorDef *variant = fightingVariant(d);
-        const float error = variant ? variant->error * in.errorScale : in.error;
+        // Playing at fighting, doubled plus one degree (actor_combat.c:1278-1281; in.error has it).
+        float error = variant ? variant->error * in.errorScale : in.error;
+        if(variant && in.playfight) error = 2 * error + RAD;
         if(error > 0)
         {
             const float spread = tanf(error) * distance;
@@ -3219,6 +3230,8 @@ float halovehiclehit(int index, float damage, const HaloDamage *source, bool exp
     // Ghost, a vehicle nobody has sat in) or friend_vitality for the player's side (the player's
     // own vehicle, a marine's) (441). Vehicles have no shields.
     const int team = teamOf(v);
+    // Owned by an actor playing at fighting: times 0.3 (ai_adjust_damage, ../Halo3DS ai/ai.c:671-675).
+    amount *= haloactordamagefactor(attacker);
     amount *= halodifficultydamagefactor(halodamageteam(attacker), team);
     amount /= max(.1f, halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, team));
     if(!(amount > 0)) return 0;
@@ -3834,13 +3847,14 @@ void halovehicledump(const char *label)
                 v.aiPhase, pilot && pilot != player1 && haloactortarget(pilot) ? haloactortarget(pilot)->name : "-", v.carried,
                 v.gun.lastShot ? 1 : 0);
         // A line of its own (conoutf cuts lines at 260 characters): body health, vitality and the
-        // variant its gun fires as (halovehiclehit, variantOf).
+        // variant its gun fires as (halovehiclehit, variantOf); gun_modifier is what an actor's shot
+        // from the gun carries (actorGunModifier; -1: the seated actor's own).
         const HaloActorDef *variant = d ? variantOf(*d) : nullptr;
         const char *object = haloscenarioobjectname(v.object);
         conoutf("VEHICLE_HEALTH %s vehicle=%d name=%s health=%.3f destroyed=%d vitality=%g flags=%u material=%d occupied=%d "
-                "variant=%d modifier=%g error=%g wreck=%d", label, i, object && *object ? object : "-", v.health, v.destroyed,
+                "variant=%d modifier=%g error=%g wreck=%d gun_modifier=%g", label, i, object && *object ? object : "-", v.health, v.destroyed,
                 d ? d->vitality : 0.0f, d ? d->collFlags : 0u, d ? d->material : -1, occupied(v), variant ? variant->index : -1,
-                variant ? variant->damageScale : 0.0f, variant ? variant->error : 0.0f, v.wreck && !v.exists);
+                variant ? variant->damageScale : 0.0f, variant ? variant->error : 0.0f, v.wreck && !v.exists, d ? actorGunModifier(*d) : -1.0f);
     }
     fflush(stdout);
 }

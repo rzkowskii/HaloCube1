@@ -58,6 +58,8 @@
         static const unsigned anyGroup[7] = {};
         if(bot.bot && bot.encounter < int(encounterPositions.size()))
             haloactorsetpositions(bot.bot, &encounterPositions[bot.encounter], squad ? squad->masks : anyGroup);
+        // It plays at fighting as its new encounter does (encounter_control_actors, encounters.c:3734).
+        if(bot.bot) haloactorsetflag(bot.bot, HALO_AI_PLAYFIGHT, playfighting.count(bot.encounter) > 0);
     }
 
     // ai_link_activation: once any actor of the first encounter is alert, the second one is woken too.
@@ -297,13 +299,16 @@
             const int flag = is("unit_impervious") ? HALO_AI_IMPERVIOUS : HALO_AI_NO_DAMAGE;
             if(isUnit(index(0)))
             {
+                // unit_impervious only stops knocks and pings (unit_scripting_impervious,
+                // ../Halo3DS units/unit_scripting_commands.c:206-222): on the player, whose knock
+                // the engine keeps, it does nothing (no retail script aims it at the player).
                 eachUnit(index(0), [&](playerent *unit)
                 {
-                    if(unit == player1) haloplayerprotect(on);
+                    if(unit == player1) { if(flag == HALO_AI_NO_DAMAGE) haloplayerprotect(on); }
                     else setUnitFlag(unit, flag, on);
                 });
             }
-            else if(Actor *item = scripted(object(0))) item->cannotTakeDamage = on;
+            else if(Actor *item = scripted(object(0))) { if(flag == HALO_AI_NO_DAMAGE) item->cannotTakeDamage = on; }
             return handled();
         }
         if(is("unit_doesnt_drop_items"))

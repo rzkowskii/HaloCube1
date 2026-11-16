@@ -15,8 +15,9 @@ source/src/halo_fx.cpp:
   AssaultCube's own particles (fireballs, sparks, smoke) and a flash sprite sized from these;
   the tags' particle systems, decals and debris are not converted. The strongest damaging `jpt!`
   part is written as the optional `damage` and `materials` lines (batch 5's critic, gap 11): the
-  engine deals it for a vehicle's death explosion and, with halo_effectdamage 1, for the
-  scripts' effect_new (haloeffectblast in source/src/weapon.cpp). The format stays 1: older
+  engine deals it for a vehicle's death explosion and, unless halo_effectdamage 0, for the
+  scripts' effect_new (haloeffectblast in source/src/weapon.cpp; tools/halo_effect_reach.py lists
+  where the scripts set them off against the planned routes). The format stays 1: older
   games skip the new lines.
 - the player's flashlight (`characters\\cyborg\\flashlight_cyborg`): radius and cone angles.
 - the sound class of every `snd!` tag in each cache (the `classes` lines), which

@@ -7,6 +7,7 @@
 //              at0= atStart= atMid= atEnd= atFar=   (the upper min's hit at those distances, world units)
 //              core=<AOE core radius> super=<0|1> super_timer= super_inner= super_outer= super_umin=
 //              super_side= melee_side=<the weapon's melee side effect>
+// DAMAGE_FLAGS weapon=<index> trigger=<n> flags=<jpt! damage flags> headshots=<0|1> melee_flags=
 // DAMAGE_GRENADE type=<n> inner= outer= lower= umin= umax= side= centre= mid= edge=   (the retail roll)
 //              actor_min= actor_max= player_min= player_max=   (400 rolls each: actors [lower, umax])
 //              attached_actor_min= attached_actor_max=
@@ -29,6 +30,8 @@ static void qaDamageTable()
                     at(0), at(p.rangeStart), at((p.rangeStart + p.rangeEnd) * .5f), at(p.rangeEnd), at(p.rangeEnd * 2 + 1), g.core,
                     int(p.super.valid), p.super.timer, p.super.innerRadius, p.super.radius, p.super.damage.upperMin, p.super.sideEffect,
                     d->meleeSideEffect, d->path.c_str());
+            // The jpt! flags (weapons.txt `jptflags`; 0x2 can cause headshots), on a line of their own.
+            conoutf("DAMAGE_FLAGS weapon=%d trigger=%d flags=%u headshots=%d melee_flags=%u", i, j, g.flags, int(g.headshots()), d->melee.flags);
         }
     }
     loopi(HALO_GRENADE_TYPES)
@@ -384,3 +387,41 @@ static void qaShieldTiming()
     fflush(stdout);
 }
 COMMANDF(qa_shield_timing, "", () { qaShieldTiming(); });
+
+// ---- The player's damage by the cyborg's coll (tests/test_damage_model.py, the cyborg item)
+
+// qa_damage_player_unit: the player's unit (player.txt, haloplayerunit) and the shield timing it gives:
+// DAMAGE_PLAYER_UNIT loaded=<0|1> enabled=<halo_playermaterials> path= materials=<type:flags:body:shield:leak,...>
+//                    indirect= shield_type= stun_ms= recharge_ms= scaled_ms=<recharge on this difficulty>
+static void qaDamagePlayerUnit()
+{
+    const HaloActorDef *unit = haloplayerunit();
+    string materials = "";
+    if(unit) for(const HaloActorDef::Material &m : unit->materials)
+        concatformatstring(materials, "%s%d:%u:%.3g:%.3g:%.3g", materials[0] ? "," : "", m.type, m.flags, m.body, m.shield, m.leak);
+    int stun = 0, recharge = 0;
+    playerShieldTiming(stun, recharge);
+    conoutf("DAMAGE_PLAYER_UNIT loaded=%d enabled=%d path=%s materials=%s indirect=%d shield_type=%d stun_ms=%d recharge_ms=%d scaled_ms=%d",
+            unit != NULL, halo_playermaterials, unit && !unit->path.empty() ? unit->path.c_str() : "-", materials[0] ? materials : "-",
+            unit ? unit->indirectMaterial : -1, unit ? unit->shieldMaterial : -1, stun, recharge,
+            recharge > 0 ? rechargeTime(recharge, HALO_TEAM_PLAYER) : 0);
+    fflush(stdout);
+}
+COMMANDF(qa_damage_player_unit, "", () { qaDamagePlayerUnit(); });
+
+// qa_damage_shot WEAPON TRIGGER AMOUNT LABEL: an exact hit of AMOUNT on the player at mid-body that
+// carries weapons.txt weapon WEAPON's trigger TRIGGER projectile jpt! (TRIGGER -1: its melee jpt!),
+// with its material modifiers, from the nearest hostile actor (else the player), on the gun an
+// actor's shot or melee comes in on (GUN_SUBGUN, GUN_KNIFE). Then DAMAGE_QA <label> hp= shield= ...
+COMMANDF(qa_damage_shot, "iifs", (int *weapon, int *trigger, float *amount, const char *label)
+{
+    const HaloWeaponDef *d = haloweapon(*weapon);
+    const HaloTriggerDef *t = d && *trigger >= 0 ? d->trigger(*trigger) : NULL;
+    const HaloDamage *source = !d ? NULL : *trigger < 0 ? &d->melee : t && t->projectile.valid ? &t->projectile.damage : NULL;
+    if(!source) { conoutf("DAMAGE_QA %s no-weapon", label); fflush(stdout); return; }
+    HaloEnemy *from = qaDamageActor(false);
+    playerent *attacker = from ? (playerent *)from->bot : (playerent *)player1;
+    const vec at = vec(player1->o).sub(vec(0, 0, player1->eyeheight * .5f));
+    halohit(*amount, HALO_SIDE_EFFECT_NONE, player1, attacker, vec(0, 0, 1), *trigger < 0 ? GUN_KNIFE : GUN_SUBGUN, false, 0, source, &at);
+    qaDamageVitals(label);
+});

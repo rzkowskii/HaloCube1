@@ -53,6 +53,10 @@ struct HaloActorDef
     // jpt! (lower, upper min, upper max) and its collision materials.
     int team = -1;
     float unitMelee[3] = {0, 0, 0};
+    // The optional `unitmeleematerials` line: that melee jpt!'s 33 damage modifiers, one per retail
+    // material type (a Hunter's smash: 0 on hunter armor and skin, 1 on the cyborg's 21 and 22).
+    bool hasUnitMeleeMaterials = false;
+    float unitMeleeMaterials[33] = {};
     // `leak`: the material's shield_leak_fraction (../Halo3DS objects/damage_resistances.h:27), the
     // optional fifth field of the `material` line; -1 when the table has none.
     struct Material { int type; unsigned flags; float body, shield; float leak = -1; };
@@ -145,6 +149,11 @@ struct HaloCommandProgram { unsigned flags = 0; std::vector<HaloCommand> command
 bool haloactorsload();
 int haloactordefcount();
 const HaloActorDef *haloactordef(int index);
+// The player's own unit from packages/halo/player.txt (tools/halo_actors.py: the globals'
+// player_information unit, characters\cyborg\cyborg): its coll's materials, `resistance` and
+// `shieldtime`, in a HaloActorDef (only those fields are set). Null without the file or with an
+// unusable one: halodamage's player branch then keeps the engine's built-in rule.
+const HaloActorDef *haloplayerunit();
 // The variant to use when only an actor family and weapon are known (wave sections, scripts).
 const HaloActorDef *haloactordefault(int kind, int weaponIndex);
 // The variant whose actv tag path is `path` (case-insensitive), or null: the vehicle variants
@@ -302,6 +311,9 @@ struct HaloActorIntent
     // firing: on a vehicle variant's error, the pause between bursts and a semi-automatic gun's
     // wait between rounds (divided by rateScale).
     float errorScale = 1, separationScale = 1, rateScale = 1;
+    // Playing at fighting (ai_playfight; separationScale already has its 1.7): a vehicle variant's
+    // error is doubled plus a degree and bursts last 0.6 as long (actor_combat.c:1259, 1278-1281).
+    bool playfight = false;
 };
 bool haloactorintent(const playerent *bot, HaloActorIntent &intent);
 // ai_go_to_vehicle: the actor walks to `point` (a seat's entry point), fighting on the way,
@@ -310,6 +322,9 @@ void haloactorgoto(const playerent *bot, const vec *point);
 // Current health over the health the actor spawned with; the player uses 75.
 float haloactorhealthfraction(const playerent *bot);
 int haloactorflags(const playerent *bot);
+// What ai_adjust_damage multiplies damage owned by `attacker` by: 0.3 while it plays at fighting
+// (ai_playfight), else 1 (anything that is not an actor, a dead actor's projectiles included).
+float haloactordamagefactor(const playerent *attacker);
 // The grenade type the actor throws (and drops when killed), or -1 for anything that is not an actor.
 int haloactorgrenadetype(const playerent *bot);
 // ai_grenades: whether any actor may throw grenades (on by default; the scenario resets it per section).

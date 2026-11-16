@@ -17,6 +17,13 @@ Normal's, and the melee delays and guidance_vs_player follow the level for all.
 Script vitality in Halo's points (item 7, the script-vitality change, not yet run):
 unit_set_current_vitality counts points of the stored maximum, unit_set_maximum_vitality
 sets new maxima at full vitality that ai_renew and a revert keep, and 0 points kill.
+ai_playfight (item 8, the playfight change, not yet run): the flag is the encounter's, members placed or
+migrated in later take it, a squad reference sets the whole encounter, the brain fires with Halo's
+playfighting values, a revert and the progress file keep it, and the damage is 0.3 of itself.
+unit_impervious no longer protects (the unit-commands item): only object_cannot_take_damage does.
+The scripts' effect damage on actors (item 9, the effect-damage default change, not yet run): a10's
+containment_1 doom_crewman, set to 1 point as the script does, lives through the containment_1_flag_4
+plasma blast with halo_effectdamage 0 and dies to it, ownerless, by default.
 """
 import re
 import subprocess
@@ -174,7 +181,12 @@ text, log = run('unitcmds', 'qa_campaign_resume 2 2', [
     (3500, hs(('unit_set_maximum_vitality', 'player 100 0')) + '; qa_player_vitals'),
     (3600, hs(('unit_set_current_vitality', 'player 25 0')) + '; qa_player_vitals'),
     (3700, hs(('unit_set_maximum_vitality', 'player 100 75'), ('unit_set_current_vitality', 'player 100 75')) + '; qa_player_vitals'),
-    (3800, hs(('unit_impervious', 'player true'), ('damage_object', 's:shock player')) + '; qa_player_vitals'),
+    # object_cannot_take_damage protects the player; unit_impervious does not (Halo's impervious bit
+    # stops only knocks and pings: ../Halo3DS units/unit_scripting_commands.c:206-222, the
+    # unit_impervious change, not yet run).
+    (3800, hs(('object_cannot_take_damage', 'player'), ('damage_object', 's:shock player')) + '; qa_player_vitals'),
+    (3850, hs(('object_can_take_damage', 'player'), ('unit_impervious', 'player true'), ('damage_object', 's:shock player')) +
+           '; qa_player_vitals'),
     (3900, hs(('unit_impervious', 'player false'), ('damage_object', 's:shock player')) + '; qa_player_vitals'),
     # Scripted objects: hover, collision, open, enterable, permutation, damage.
     (4000, hs(('vehicle_hover', 'obj:foehammer_cliff false'), ('object_set_collideable', 'obj:back_cship false'),
@@ -220,11 +232,11 @@ for i, name in enumerate(names[:6]):
 
 hurt = by_name('hurt')
 assert int(hurt[names[0]]['health']) == int(base[names[0]]['health']), ('cannot-take-damage actor is unhurt', hurt[names[0]])
-assert int(hurt[names[1]]['health']) == int(base[names[1]]['health']), ('impervious actor is unhurt', hurt[names[1]])
-# Shielded actors take the damage on their shield first.
-assert names[6] not in hurt or int(hurt[names[6]]['health']) < int(base[names[6]]['health']) or \
-    float(hurt[names[6]]['shield']) < float(flags[names[6]]['shield']), \
-    ('damage_object hurts or kills an unprotected actor', hurt.get(names[6]))
+# Shielded actors take the damage on their shield first. unit_impervious does not protect (the
+# unit_impervious change, not yet run): the impervious actor is hurt like the unprotected one.
+for n, why in ((names[1], 'damage_object hurts an impervious actor'), (names[6], 'damage_object hurts or kills an unprotected actor')):
+    assert n not in hurt or int(hurt[n]['health']) < int(base[n]['health']) or float(hurt[n]['shield']) < float(flags[n]['shield']), \
+        (why, hurt.get(n))
 assert float(hurt[names[0]]['shield']) == float(flags[names[0]]['shield']), 'protected actors keep their shield'
 
 vital = by_name('vital')
@@ -269,12 +281,14 @@ assert lz[1] == lz[0] - 2 and fm[1] == fm[0] + 2, ('ai_migrate_by_unit and ai_at
 assert lz[2] == 0 and fm[2] == fm[0] + lz[0], ('ai_migrate_and_speak moves the rest', lz, fm)
 
 vitals = [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('QA_VITALS')]
-assert len(vitals) >= 6, (vitals, log)
-base_v, no_shield, low, full, protected, hurt_v = vitals[:6]
+assert len(vitals) >= 7, (vitals, log)
+base_v, no_shield, low, full, protected, impervious, hurt_v = vitals[:7]
 assert float(no_shield['shield']) == 0.0, ('maximum shield 0 removes the shield', no_shield)
 assert int(low['health']) == round(25 / 100 * 75), ('25 of 100 health is a quarter', low)
 assert int(full['health']) == 75 and float(full['shield']) > 0.99, ('full vitality refills health and shield', full)
-assert protected['protected'] == '1' and int(protected['health']) == 75 and float(protected['shield']) > 0.99, ('impervious player takes no damage', protected)
+assert protected['protected'] == '1' and int(protected['health']) == 75 and float(protected['shield']) > 0.99, ('a protected player takes no damage', protected)
+assert impervious['protected'] == '0' and (int(impervious['health']) < 75 or float(impervious['shield']) < 0.99), \
+    ('unit_impervious leaves the player hurt by damage_object', impervious)
 assert hurt_v['protected'] == '0' and (int(hurt_v['health']) < 75 or float(hurt_v['shield']) < 0.99), ('damage_object hurts the player', hurt_v)
 
 # The first nine probes read the state after the commands; the last two read it after the reversals.
@@ -480,3 +494,140 @@ saved = read_progress(log.parent)
 maxima = sorted(r.split()[-2:] for r in saved['records']['s'] if r.startswith('squad ') and ' max ' in r)
 assert maxima == [['1', '0'], ['40', '0']], ('the checkpoint records end with the maxima', maxima)
 print('Script vitality: points of the stored maximum, a script maximum kept by ai_renew and a revert, depletion kills.')
+
+
+# 8. ai_playfight (the playfight change; written while testing was on hold, NOT YET RUN). Halo's flag
+#    is the encounter's (ai_scripting_playfight, ../Halo3DS ai/ai_script.c:1323-1339: a squad
+#    reference sets its whole encounter) and every member takes it, later ones included
+#    (encounters.c:3734); a playfighting actor aims with 2 x error + 1 degree (actor_combat.c:
+#    1278-1281), pauses 1.7 x as long between bursts of 0.6 x the length (612-615, 1259-1262), waits
+#    2 x the encounter grenade timeout (actions.c:2361-2362), and its damage is 0.3 of itself
+#    (ai.c:671-675). The checkpoint keeps the encounters' flags (the optional `s playfight` record).
+hscb = read_hscb(root / 'packages/halo/a30.hscb')
+encounter_index = {name: i for i, (name, squads) in enumerate(hscb['encounters'])}
+LZ, FM = encounter_index['lz_search'], encounter_index['first_marine']
+fm_squad = hscb['encounters'][FM][1][0]
+text, log = run('playfight', 'halo_difficulty 1; qa_campaign_play 2 2', [
+    (0, 'botsshoot 0; qa_combat_protect 1; qa_actor_place first_marine'),
+    (100, hs(('ai_playfight', 'lz_search true'))),
+    (200, 'qa_actor_place lz_search'),
+    (400, 'qa_actor_state joined; qa_actor_combat joined'),
+    (500, hs(('ai_migrate_by_unit', 'unit:lz_search:0 first_marine'))),
+    (600, 'qa_actor_state migrated; qa_actor_combat migrated'),
+    (700, hs(('ai_playfight', f'first_marine/{fm_squad} true'))),
+    (800, 'qa_actor_state squadref; qa_actor_combat squadref'),
+    (900, 'qa_checkpoint_save'),
+    (1000, hs(('ai_playfight', 'lz_search false'), ('ai_playfight', 'first_marine false'))),
+    (1100, 'qa_actor_state off; qa_actor_combat off'),
+    (1200, 'qa_combat_protect 0; qa_halo_damage 100000'),
+    (3000, 'qa_halo_revert'),
+    (3300, 'qa_actor_state reverted; qa_actor_combat reverted'),
+    (3400, 'qa_combat_protect 1; halo_damagetrace 1; botsshoot 1; ' +
+           hs(('ai_magically_see_encounter', 'lz_search first_marine'), ('ai_magically_see_encounter', 'first_marine lz_search'))),
+    (9400, 'quit'),
+], timeout=200)
+
+
+def members(label):
+    """{cn: (encounter, playfight flag, ACTOR_COMBAT fields, ACTOR_TIMERS fields)} of the living actors."""
+    flags = {a['cn']: int(a['flags']) for a in actors(text, label) if a['alive'] == '1'}
+    combat = {f['cn']: f for f in (dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith(f'ACTOR_COMBAT {label} '))}
+    timers = {f['cn']: f for f in (dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith(f'ACTOR_TIMERS {label} '))}
+    return {cn: (int(timers[cn]['encounter']), bool(bits & 8), combat[cn], timers[cn]) for cn, bits in flags.items() if cn in timers}
+
+
+def check_values(row, on):
+    """The brain's values for a member that plays at fighting (on) or not, against actors.txt."""
+    _, flag, c, t = row
+    v = variants[int(c['variant'])]
+    assert flag == on and t['playfight'] == ('1' if on else '0'), ('the playfight flag', on, row)
+    error = v['fire'][2] * table['projectile_error'][1]
+    assert near(float(c['scaled_error']), 2 * error + 0.0174533 if on else error, .0002), ('2 x error + 1 degree', on, c)
+    separation = [s * table['burst_separation'][1] * (1.7 if on else 1) for s in v['burst'][2:4]]
+    assert all(near(float(a), b) for a, b in zip(c['separation'].split(','), separation)), ('1.7 x the separation', on, c)
+    burst = [b * (.6 if on else 1) for b in v['burst'][0:2]]
+    assert all(near(float(a), b) for a, b in zip(t['burst'].split(','), burst)), ('0.6 x the burst', on, t)
+    if float(t['grenade_timeout']) >= 0 and t['encounter'] != '-1':
+        want = int(float(t['grenade_timeout']) * table['grenade_timer_scale'][1] * (2 if on else 1) * 30) * 1000 // 30
+        assert abs(int(t['grenade_wait']) - want) <= 34, ('2 x the grenade timeout', on, t, want)
+
+
+joined = members('joined')
+assert any(r[0] == LZ for r in joined.values()) and any(r[0] == FM for r in joined.values()), ('both encounters placed', joined, log)
+for row in joined.values():
+    check_values(row, row[0] == LZ)   # placed after the ai_playfight: the joiners take it
+migrated = members('migrated')
+moved = [cn for cn, r in migrated.items() if r[0] == FM and joined.get(cn, (None,))[0] == LZ]
+assert len(moved) == 1 and not migrated[moved[0]][1], ('a member migrated out leaves the playfight behind', moved, migrated)
+squadref = members('squadref')
+assert all(r[1] == (r[0] in (LZ, FM)) for r in squadref.values()), ('a squad reference sets its whole encounter', squadref)
+assert squadref[moved[0]][1], ('the migrated member takes its new encounter flag', squadref[moved[0]])
+assert not any(r[1] for r in members('off').values()), ('ai_playfight false clears every member', log)
+reverted = members('reverted')
+assert reverted and all(check_values(r, r[0] in (LZ, FM)) is None for r in reverted.values()), ('the revert restores the flags', reverted)
+saved = read_progress(log.parent)
+records = [r.split()[1:] for r in saved['records']['s'] if r.startswith('playfight ')]
+assert records == [[str(2)] + [str(i) for i in sorted((LZ, FM))]], ('the checkpoint keeps both encounters', records)
+hits = [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('DAMAGE_PLAYFIGHT ')]
+assert hits, ('the playfighting encounters hurt each other (or the player)', log)
+for h in hits:
+    assert near(float(h['factor']), .3) and near(float(h['scaled']), float(h['amount']) * .3, .002), ('0.3 of the damage', h)
+print(f'Playfight: encounter-wide, joiners and migrations, the burst and grenade values, kept by a revert; {len(hits)} hits at 0.3.')
+
+
+# 9. The scripts' effect damage on actors (the effect-damage default change; written while testing was
+#    on hold, NOT YET RUN). hs_effect_new creates its effect with owner NONE (../Halo3DS
+#    hs/hs_library_external.c:699-724) and the effect's jpt! part deals area damage whatever the owner
+#    (effects/effects.c:1760-1781). a10's mission_containment_1 sets the doom_crewman to 1 point, lifts
+#    his protection once he is in containment_1_slam and sets off the plasma grenade's explosion at
+#    containment_1_flag_4 (inside that volume): in Halo he dies to it. Static part: the flag lies in the
+#    slam volume and tools/halo_effect_reach.py finds the call after the player enters
+#    containment_1_trigger_4. Run: placed, braindead, at 1 point and stood at the flag, he lives
+#    through the blast with halo_effectdamage 0 and dies to it by default, with no killer.
+sys.path.insert(0, str(root / 'tools'))
+import halo_effect_reach  # noqa: E402
+a10 = halo_effect_reach.read_program(root / 'packages/halo/a10.hscb')
+flag4 = next(pose[:3] for name, pose in a10['flags'] if name == 'containment_1_flag_4')
+slam = next(v for v in a10['volumes'] if v[0] == 'containment_1_slam')
+assert halo_effect_reach.inside_volume(slam, flag4), ('containment_1_flag_4 lies in containment_1_slam', flag4, slam)
+reach = [e for e in halo_effect_reach.analyse(root / 'packages', ['a10'])
+         if e['script'] == 'mission_containment_1' and e['where'] == 'flag containment_1_flag_4']
+assert len(reach) == 1 and reach[0]['effect'] == r'weapons\plasma grenade\effects\explosion', ('the flag_4 blast', reach)
+assert reach[0]['trigger'] == 'containment_1_trigger_4' and reach[0]['outer'] == 2, ('after containment_1_trigger_4, 2 wu', reach[0])
+DOOM = 'containment_1/doom_crewman'
+PLASMA = r'weapons\plasma grenade\effects\explosion'
+text, log = run('effect-blast', 'halo_difficulty 2; halo_damagetrace 1; halo_scripttrace 1; qa_campaign_play 1 1', [
+    (4000, 'botsshoot 0; halo_effectdamage; qa_actor_vitality pre'),
+    (4300, hs(('ai_place', DOOM), ('ai_braindead', f'{DOOM} true'))),
+    (4600, hs(('units_set_current_vitality', f'list:{DOOM} 1 0'), ('object_can_take_damage', f'list:{DOOM}'),
+              ('object_teleport', f'unit:{DOOM}:0 flag:containment_1_flag_4')) + '; qa_actor_vitality doom'),
+    (5000, f'qa_hs_ai ai_living_count {DOOM} 0; halo_effectdamage 0; qa_fx_script_effect "{PLASMA}" containment_1_flag_4'),
+    (5400, f'qa_hs_ai ai_living_count {DOOM} 0; halo_effectdamage 1; qa_fx_script_effect "{PLASMA}" containment_1_flag_4'),
+    (5800, f'qa_hs_ai ai_living_count {DOOM} 0'),
+    (5900, 'quit'),
+], timeout=200)
+assert re.search(r'halo_effectdamage = 1\b', text), ('effect damage is on by default', log)
+
+
+# Actor names have a space ("<profile> <n>"): read them whole, and leave out the actors placed before
+# the doom crewman (a10's other crew may be at 1 point too).
+def vitality_names(label, health=None):
+    return {m.group(1) for l in text.splitlines() if l.startswith(f'ACTOR_VITALITY {label} ')
+            for m in [re.search(r' name=(.+?) kind=', l)] if m and (health is None or f' health={health} ' in l)}
+
+
+doom = vitality_names('doom', 1) - vitality_names('pre')
+assert doom, ('the doom crewman at 1 point (1 health)', log)
+counts = [float(v) for c, enc, v in probes(text, 'HS_AI') if c == 'ai_living_count' and enc == DOOM]
+assert len(counts) == 3 and counts[0] >= 1, ('three counts of the placed squad', counts, log)
+assert counts[1] == counts[0], ('halo_effectdamage 0: the blast is only drawn', counts, log)
+assert counts[2] == counts[1] - 1, ('the blast at the flag kills the crewman stood on it (the other start is 3.5 wu away)', counts, log)
+deaths = [dict(re.findall(r'(\w+)=(\S+)', l), victim=m.group(1)) for l in text.splitlines() if l.startswith('DEATH_TRACE ')
+          for m in [re.search(r'victim=(.+?) killer=', l)] if m]
+blasted = [d for d in deaths if d['victim'] in doom]
+assert blasted and blasted[-1]['killer'] == '-' and blasted[-1]['ownerless'] == '1', ('an ownerless kill, as in Halo', deaths, log)
+# The mission's own scripts may set off their explosions meanwhile (tutorial_asst_kill): only the plasma's count.
+dealt = [d for d in re.findall(r'HaloScript: (.+?) (deals its jpt! damage|has no jpt! damage)', text) if d[0] == PLASMA]
+assert dealt == [(PLASMA, 'deals its jpt! damage')], ('only the second blast deals damage', dealt)
+print(f'Effect damage: the doom crewman lives through the flag_4 blast with halo_effectdamage 0 and dies to it by default, '
+      f'ownerless ({counts}).')

@@ -19,10 +19,11 @@ a30 section 2 (no enemies), with Elites, a Hunter and a Flood combat form spawne
    side at head height skin, at belly height armour (12); from the front the shield arm (32) at
    both heights (it is not firing: botsshoot 0); with halo_hunterregions 0 the side head hit is
    armour again.
-4. The general material model: with halo_actormaterials 0 (the default) a sniper hit on an Elite
-   logs no DAMAGE_MATERIAL; with 1 it logs material 14 at scale 1, the Elite's shield takes the
-   sniper's elite-energy-shield modifier (2: twice the shield of the same hit with it off), and a
-   Flood combat form takes 0.05 of a sniper hit (material 19).
+4. The general material model: by default (halo_actormaterials 1, since the headshot and actor
+   material work) a sniper hit on an Elite logs material 14 at scale 1 (its indirect damage
+   material, body multiplier 1) and the Elite's shield takes the sniper's elite-energy-shield
+   modifier (2: twice the shield of the same hit with halo_actormaterials 0, which logs no
+   DAMAGE_MATERIAL), and a Flood combat form takes 0.05 of a sniper hit (material 19).
 5. The needle supercombine (qa_damage_needles): 6 needles at once set off nothing, 7 set off one
    super detonation (SUPERCOMBINE needles=7), and with halo_supercombine 0, 7 set off none.
 
@@ -41,8 +42,9 @@ docs "Factions and special enemies", Material damage, and "Difficulty", Shield r
    shield 200; DAMAGE_SHIELD lines): a frontal plasma rifle hit of 10 lands on material 3 (type 16,
    leak 0) and takes 10 off the shield, none off the body; the pistol's frontal 10 lands there too
    and does nothing (its modifier for the jackal energy shield is 0); from behind (material 0,
-   leak 1), at the head from the front (material 1) and as a rocket blast (the indirect material,
-   0) the body loses 10 and the shield stays full; a frontal 250 empties the shield and leaves the
+   leak 1), the plasma rifle at the head from the front (material 1; the pistol there would be a
+   headshot, item 11) and as a rocket blast (the indirect material, 0) the body loses 10 (the
+   modifiers for the jackal, 15, are 1) and the shield stays full; a frontal 250 empties the shield and leaves the
    body whole (body multiplier 0); with the shield down (qa_damage_keep 1) a frontal pistol hit
    reaches the body (material 0).
 9. Shield timing (qa_shield_timing): the Jackal stuns 15000 ms and recharges in 33, the Elite minor
@@ -54,6 +56,22 @@ docs "Factions and special enemies", Material damage, and "Difficulty", Shield r
    a pistol hit of 10 from behind at full shield has leak 0.2 and share 0.8 (8 to the shield, 2
    passed); a second hit (qa_damage_keep 1) shares 0.8 x (0.8 x shield/shield_max + 0.2), the
    failure curve (threshold 1, maximum 0.2).
+
+Headshots and the actors' material modifiers (written while testing was on hold, not yet run; docs
+"Damage fidelity", Material damage and Headshots):
+11. Tables: weapons.txt's `jptflags` lines give the pistol and sniper bullets bit 0x2 (can cause
+   headshots) and no other projectile; DAMAGE_FLAGS headshots=1 for exactly those two. An `elite
+   minor plasma rifle` (shield 100, body 100 on Normal): a pistol 10 at the head with the shield up
+   only drains the shield (alive, no DAMAGE_HEADSHOT); after a plasma rifle 50 at the body empties it
+   (2 x 50 = 100, no excess: health 100), the pistol 10 at the body takes 10 (alive) and, with
+   halo_headshots 0, at the head another 10 (alive, health 80); with halo_headshots 1 the pistol 10
+   at the head kills it (DAMAGE_HEADSHOT kind=1 material=14). A Hunter: the sniper's 5 at the side
+   (armour) leaves it standing, at its back (skin, head-flagged) kills it (DAMAGE_HEADSHOT kind=3
+   material=13). A Flood combat form takes the pistol at head height without a headshot (no head
+   material: alive). A `sentinel_shielded` (shield 60, body 60) takes needles on its shield only:
+   the needler's 40 empties 40 of the shield (its modifier for the elite energy shield, the coll's
+   shield type 30, is 1) and leaves the body whole (0 for the sentinel material), then a second 40
+   (qa_damage_keep 1) empties the rest and its excess does nothing to the body either.
 """
 import re
 import subprocess
@@ -195,21 +213,21 @@ for label, material in want.items():
     assert got['kind'] == '3' and got['material'] == material, (label, material, got)
 print('a30 section 2: Hunter skin from behind and at the head from the side, armour at the side belly, the shield arm in front.')
 
-# ---- 4. The general material model (behind halo_actormaterials, off by default)
+# ---- 4. The general material model (halo_actormaterials, on by default)
 s = index[sniper['path']]
 text, log = run('materials', 'qa_campaign_resume 2 2', [
     (100, 'botsshoot 0; qa_combat_protect 1'),
     (300, 'qa_actor_spawn 1 0 8 0'),
-    (1000, f'qa_damage_region 1 0 0.5 {s} 10 off'),
-    (1300, f'halo_actormaterials 1; qa_damage_region 1 0 0.5 {s} 10 on'),
-    (1600, 'qa_actor_spawn 4 2 14 4'),
+    (1000, f'qa_damage_region 1 0 0.5 {s} 10 on'),
+    (1300, f'halo_actormaterials 0; qa_damage_region 1 0 0.5 {s} 10 off'),
+    (1600, 'halo_actormaterials 1; qa_actor_spawn 4 2 14 4'),
     (2300, f'qa_damage_region 4 0 0.5 {s} 100 flood'),
     (2600, 'quit'),
 ])
 r = regions(text)
 for label in ('off', 'on', 'flood'):
     assert label in r and 'name' in r[label], (label, log)
-assert r['off']['material_line'] is None, ('the model is off by default: no material for an Elite', r['off'])
+assert r['off']['material_line'] is None, ('halo_actormaterials 0: no material for an Elite', r['off'])
 on = r['on']['material_line']
 assert on and on['kind'] == '1' and on['material'] == '14' and abs(float(on['scale']) - 1) < 1e-3, on
 lost_off = float(r['off']['shield_max']) - float(r['off']['shield'])
@@ -218,7 +236,7 @@ if float(r['off']['shield_max']) >= 20:
     assert abs(lost_on - 2 * lost_off) < .1, ('the sniper hits an Elite shield twice as hard with the model on', lost_off, lost_on)
 flood = r['flood']['material_line']
 assert flood and flood['kind'] == '4' and flood['material'] == '19' and abs(float(flood['scale']) - .05) < 1e-3, flood
-print(f'a30 section 2: material model off by default; on, an Elite shield lost {lost_on:.1f} to the sniper (off {lost_off:.1f}), '
+print(f'a30 section 2: material model on by default: an Elite shield lost {lost_on:.1f} to the sniper (off {lost_off:.1f}), '
       'a Flood combat form took 0.05 of it.')
 
 # ---- 5. The needle supercombine (several Elites: a supercombine can kill the one it strikes)
@@ -309,7 +327,7 @@ text, log = run('jackal', 'qa_campaign_resume 2 2', [
     (1000, f'qa_damage_region 2 0 0.5 {pr} 10 front'),
     (1300, f'qa_damage_region 2 0 0.5 {p} 10 frontpistol'),
     (1600, f'qa_damage_region 2 180 0.5 {p} 10 back'),
-    (1900, f'qa_damage_region 2 0 0.9 {p} 10 head'),
+    (1900, f'qa_damage_region 2 0 0.9 {pr} 10 head'),
     (2200, f'qa_damage_blast 2 {rl} 10 blast'),
     (2500, f'qa_damage_region 2 0 0.5 {pr} 250 break'),
     (2800, f'qa_damage_keep 1; qa_damage_region 2 0 0.5 {p} 10 downed'),
@@ -367,3 +385,59 @@ fraction = float(r['full']['shield']) / float(r['full']['shield_max'])
 half = r['half']['shield_line']
 assert half and abs(float(half['share']) - .8 * (.8 * fraction + .2)) < 1e-3, (fraction, half)
 print(f'a30 section 2: a marine\'s shield leaks 0.2 at full strength and {1 - float(half["share"]):.2f} at {fraction:.2f}.')
+
+# ---- 11. Headshots and the actors' material modifiers
+flags = {}
+for line in WEAPONS.read_text().splitlines():
+    key, _, rest = line.partition(' ')
+    if key == 'weapon':
+        current = int(rest)
+        last = None
+    elif key in ('melee', 'projectile'):
+        last = key if rest != '-' else None
+        if key == 'projectile' and last:
+            flags.setdefault(current, []).append(None)
+    elif key == 'jptflags' and last == 'projectile':
+        flags[current][-1] = int(rest)
+headshot = {weapons[i]['path'] for i, f in flags.items() if any(v is not None and v & 2 for v in f)}
+assert headshot == {pistol['path'], sniper['path']}, ('only the pistol and sniper bullets can cause headshots', headshot)
+text, log = run('headshot', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1; qa_damage_table'),
+    (300, 'qa_variant_spawn "elite minor plasma rifle" 0 8 0; qa_actor_spawn 3 0 14 6; qa_actor_spawn 4 2 14 -6'),
+    (400, 'qa_variant_spawn "sentinel_shielded" 0 18 0'),
+    (1000, f'qa_damage_region 1 0 0.9 {p} 10 shielded'),
+    (1300, f'qa_damage_region 1 0 0.5 {pr} 50 drained'),
+    (1600, f'qa_damage_keep 1; qa_damage_region 1 0 0.5 {p} 10 bodyshot'),
+    (1900, f'halo_headshots 0; qa_damage_region 1 0 0.9 {p} 10 nohead'),
+    (2200, f'halo_headshots 1; qa_damage_region 1 0 0.9 {p} 10 headshot'),
+    (2500, f'qa_damage_keep 0; qa_damage_region 3 90 0.5 {s} 5 hunterside'),
+    (2800, f'qa_damage_region 3 180 0.5 {s} 5 hunterback'),
+    (3100, f'qa_damage_region 4 0 0.9 {p} 10 floodhead'),
+    (3400, f'qa_damage_region 8 0 0.5 {index[needler["path"]]} 40 needled'),
+    (3700, f'qa_damage_keep 1; qa_damage_region 8 0 0.5 {index[needler["path"]]} 40 needled2'),
+    (4000, 'qa_damage_keep 0; quit'),
+])
+table = {(r['weapon'], r['trigger']): r for r in (fields(l) for l in text.splitlines() if l.startswith('DAMAGE_FLAGS '))}
+parsed = {weapons[int(w)]['path'] for (w, t), r in table.items() if r['headshots'] == '1'}
+assert parsed == {pistol['path'], sniper['path']}, ('the engine reads jptflags', parsed, log)
+r = regions(text)
+for label in ('shielded', 'drained', 'bodyshot', 'nohead', 'headshot', 'hunterside', 'hunterback', 'floodhead', 'needled', 'needled2'):
+    assert label in r and 'name' in r[label], (label, log)
+heads = [fields(l) for l in text.splitlines() if l.startswith('DAMAGE_HEADSHOT ')]
+assert r['shielded']['alive'] == '1' and abs(float(r['shielded']['shield']) - (float(r['shielded']['shield_max']) - 8)) < .01, \
+    ('a head hit the shield takes whole is no headshot: 10 x 0.8 off the shield', r['shielded'])
+assert float(r['drained']['shield']) == 0 and int(r['drained']['health']) == 100, ('the plasma rifle 50 at 2 empties 100, no excess', r['drained'])
+assert r['bodyshot']['alive'] == '1' and int(r['bodyshot']['health']) == 90, r['bodyshot']
+assert r['nohead']['alive'] == '1' and int(r['nohead']['health']) == 80, ('halo_headshots 0', r['nohead'])
+assert r['headshot']['alive'] == '0', ('the pistol at the head of an unshielded Elite kills it', r['headshot'], log)
+assert r['hunterside']['alive'] == '1', ('the sniper on a Hunter\'s armour', r['hunterside'])
+assert r['hunterback']['alive'] == '0', ('the sniper on a Hunter\'s back skin kills it', r['hunterback'], log)
+assert r['floodhead']['alive'] == '1', ('the Flood have no head material', r['floodhead'])
+kinds = sorted((h['kind'], h['material']) for h in heads)
+assert kinds == [('1', '14'), ('3', '13')], ('two headshots: the Elite\'s head and the Hunter\'s skin', heads, log)
+needled, needled2 = r['needled'], r['needled2']
+assert abs(float(needled['shield']) - (float(needled['shield_max']) - 40)) < .01 and int(needled['health']) == 60, \
+    ('needles drain a shielded Sentinel\'s shield at 1 and leave its body', needled)
+assert int(needled2['health']) == 60 and needled2['alive'] == '1', ('the sentinel material takes 0 from needles', needled2)
+print('a30 section 2: headshots kill an unshielded Elite and a Hunter from behind, not a shielded Elite, a Flood form or with '
+      'halo_headshots 0; needles drain a shielded Sentinel\'s shield only.')

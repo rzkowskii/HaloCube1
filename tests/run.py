@@ -41,12 +41,12 @@ QUICK = [
     'test_weapon_tags.py',            # retail weapon table imported and parsed by the engine
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
     'test_combat_equipment.py',       # grenade types, sticky plasma, equipment pickups, overshield, camouflage, weapon sounds
-    'test_damage_model.py',           # jpt! range and blast falloff, actor grenade rolls, exact actor shots, EMP, time to kill
+    'test_damage_model.py',           # jpt! range and blast falloff, actor grenade rolls, exact actor shots, EMP, time to kill, the cyborg coll
     'test_melee_materials.py',        # melee from behind (allies spared), Hunter head and belly (cannon-fire window), material model cvar, needle supercombine, AOE core, shield leak and timing
     'test_damage_targets.py',         # d40's manifold detectors: HSCB 8 targets, placed whole, damage rules, a real shot from the route
     'test_frag_throw.py',             # d40's s3 manifold: the importer's planned frag throws (2048 rows) thrown in the game destroy it
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine (shield leak, resistance, shieldtime)
-    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty
+    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty, playfight, effect damage
     'test_factions.py',               # allegiance matrix and commands, betrayal, Hunters, stealth Elites, flyers, Monitor, Keyes
     'test_ai_attach.py',              # HSCB 9 story-figure flags; ai_attach makes a50's Keyes and marines actors (health, revert, destroy, carried into section 5, own start across checkpoints, spared the kill from behind)
     'test_starting_profiles.py',      # HSCB 9 starting profiles: a10 unarmed, player_add_equipment, a30/c20 loadouts, carry, empty slots saved

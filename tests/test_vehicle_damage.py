@@ -53,6 +53,13 @@ Batch 7, the critic's worry 3 of batch 6 (written while testing was on hold, not
    destroyer's kill (DEATH_TRACE killer=player, alerted>=1, which is what makes Grunt B a candidate
    neighbour). Grunt A, killed by the explosion (55 to 65 against 25 points), has killer=- ownerless=1
    alerted=0, with no "turn on the player" line, and Grunt B is alive afterwards.
+
+The modifier-0 work (written while testing was on hold, not yet run; docs "Retail weapons", the vehicle
+actor variants):
+10. The shot an actor fires from a vehicle's gun carries the gun's ai_firing_parameters variant's
+   modifier, and a variant whose modifier is 0 means full damage (ai/ai.c:654-675): on b40 section 3
+   the VEHICLE_HEALTH rows' gun_modifier is 1 for a spawned Warthog (the `warthog gunner`'s 0), the
+   variant's own for a spawned turret (0.333) and the parked Ghosts (their `ghost pilot` modifier).
 """
 import re
 import subprocess
@@ -325,3 +332,23 @@ after = [fields(l) for l in text.splitlines() if l.startswith('ACTOR_QA after ')
 assert after and after[0]['alive'] == '1', ('Grunt B stands outside the blast and lives', after, text[-3000:])
 assert 'turn on the player' not in text, text[-3000:]
 print(f'death explosion: {victim} killed by nobody (no neighbour alerted); {neighbour} lives; the driver is the player\'s kill.')
+
+# 10. A vehicle gun variant with modifier 0 (the Warthog gunner's) means full damage.
+def modifier_of(path):
+    for block in actors.split('\nactor '):
+        if f'path {path}\n' in block:
+            return float(next(l for l in block.splitlines() if l.startswith('fire ')).split()[9])
+    return None
+
+
+assert modifier_of(records['warthog']['variant']) == 0, ('the Warthog gunner has no modifier', records['warthog'])
+text = run('gunmod', [
+    (300, 'qa_combat_protect 1'), (400, 'qa_vehicle_spawn 0 8'), (500, 'qa_vehicle_spawn 1 14'),
+    (800, 'qa_vehicle_state gunmod'), (1000, 'quit')])
+types = {int(r['vehicle']): r['type'] for r in rows(text, 'VEHICLE_QA', 'gunmod')[1:] if 'type' in r}
+mods = {int(r['vehicle']): float(r['gun_modifier']) for r in rows(text, 'VEHICLE_HEALTH', 'gunmod')}
+want = {'warthog': 1.0, 'turret': modifier_of(records['turret']['variant']), 'ghost': modifier_of(records['ghost']['variant'])}
+for kind, expected in want.items():
+    found = [mods[i] for i, t in types.items() if t == kind and i in mods]
+    assert found and all(abs(m - expected) < 1e-3 for m in found), (kind, expected, found, types, mods)
+print(f'gun modifiers: Warthog 1 (its gunner variant has 0), turret {want["turret"]:g}, Ghost {want["ghost"]:g}.')

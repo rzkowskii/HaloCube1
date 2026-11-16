@@ -137,6 +137,40 @@ namespace
         return nullptr;
     }
 
+    // The coll lines actors.txt and player.txt share: `material`, `resistance` and `shieldtime`
+    // (tools/halo_actors.py). Whether the line parsed.
+    bool parseColl(const std::string &key, std::istringstream &in, HaloActorDef &d)
+    {
+        bool ok = true;
+        if(key == "material")
+        {
+            HaloActorDef::Material m{};
+            ok = bool(in >> m.type >> m.flags >> m.body >> m.shield);
+            // The optional shield leak (tools/halo_actors.py); a table without it leaves -1.
+            float leak = -1;
+            if(ok && (in >> leak) && std::isfinite(leak)) m.leak = clamp(leak, 0.0f, 1.0f);
+            if(ok) d.materials.push_back(m);
+        }
+        else if(key == "resistance")
+        {
+            // resistance <indirect material> <coll body> <coll shield> <shield material type>
+            //            <failure function> <failure threshold> <maximum failure>
+            ok = bool(in >> d.indirectMaterial >> d.collBody >> d.collShield >> d.shieldMaterial >> d.shieldFailureFunction >>
+                      d.shieldFailureThreshold >> d.shieldFailureMaximum);
+            for(float v : {d.collBody, d.collShield, d.shieldFailureThreshold, d.shieldFailureMaximum}) if(ok && !std::isfinite(v)) ok = false;
+            d.hasResistance = ok;
+        }
+        else if(key == "shieldtime")
+        {
+            // shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>
+            ok = bool(in >> d.shieldStunDamage >> d.shieldStunTime >> d.shieldRechargeTime >> d.shieldRechargeVelocity);
+            for(float v : {d.shieldStunDamage, d.shieldStunTime, d.shieldRechargeTime, d.shieldRechargeVelocity})
+                if(ok && !(std::isfinite(v) && v >= 0)) ok = false;
+            d.hasShieldTime = ok;
+        }
+        return ok;
+    }
+
     bool parse(const char *text)
     {
         std::istringstream lines(text);
@@ -193,31 +227,12 @@ namespace
             else if(key == "positions") ok = bool(in >> d->guardMin >> d->guardMax >> d->positionMin >> d->positionMax);
             else if(key == "team") ok = bool(in >> d->team);
             else if(key == "unitmelee") ok = bool(in >> d->unitMelee[0] >> d->unitMelee[1] >> d->unitMelee[2]);
-            else if(key == "material")
+            else if(key == "material" || key == "resistance" || key == "shieldtime") ok = parseColl(key, in, *d);
+            // unitmeleematerials <33 modifiers>: the unit melee jpt!'s (optional; older engines skip it).
+            else if(key == "unitmeleematerials")
             {
-                HaloActorDef::Material m{};
-                ok = bool(in >> m.type >> m.flags >> m.body >> m.shield);
-                // The optional shield leak (tools/halo_actors.py); a table without it leaves -1.
-                float leak = -1;
-                if(ok && (in >> leak) && std::isfinite(leak)) m.leak = clamp(leak, 0.0f, 1.0f);
-                if(ok) d->materials.push_back(m);
-            }
-            else if(key == "resistance")
-            {
-                // resistance <indirect material> <coll body> <coll shield> <shield material type>
-                //            <failure function> <failure threshold> <maximum failure>
-                ok = bool(in >> d->indirectMaterial >> d->collBody >> d->collShield >> d->shieldMaterial >> d->shieldFailureFunction >>
-                          d->shieldFailureThreshold >> d->shieldFailureMaximum);
-                for(float v : {d->collBody, d->collShield, d->shieldFailureThreshold, d->shieldFailureMaximum}) if(ok && !std::isfinite(v)) ok = false;
-                d->hasResistance = ok;
-            }
-            else if(key == "shieldtime")
-            {
-                // shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>
-                ok = bool(in >> d->shieldStunDamage >> d->shieldStunTime >> d->shieldRechargeTime >> d->shieldRechargeVelocity);
-                for(float v : {d->shieldStunDamage, d->shieldStunTime, d->shieldRechargeTime, d->shieldRechargeVelocity})
-                    if(ok && !(std::isfinite(v) && v >= 0)) ok = false;
-                d->hasShieldTime = ok;
+                loopi(33) if(ok && !(bool(in >> d->unitMeleeMaterials[i]) && std::isfinite(d->unitMeleeMaterials[i]))) ok = false;
+                d->hasUnitMeleeMaterials = ok;
             }
             else if(key == "major") std::getline(in >> std::ws, d->majorPath);
             // Optional format 3 lines (tools/halo_actors.py; older engines skip them).
@@ -585,6 +600,8 @@ namespace
     {
         HaloCombatScaling scale;
         float error = 0;        // aim error (radians), before the camouflage term
+        float separation = 1;   // on the pause between bursts: burst_separation, times 1.7 playfighting
+        float duration = 1;     // on a burst's length: 0.6 playfighting (actor_combat.c:1259-1262)
         bool leads = false;     // the lead gate (actor_combat.c:2194-2199)
         int fireDelay = 0;      // ms between trigger pulls in a burst; 0: the weapon's own cadence
         int meleeDelay = 0;     // ms between a melee-only actor's swings; 0: not melee-only
@@ -622,7 +639,9 @@ namespace
         encounter = -1;
         int squad = -1;
         if(a.def->grenadeTimeout < 0 || !haloscenariosquadof(a.bot, encounter, squad)) { encounter = -1; return 0; }
-        const long ticks = long(a.def->grenadeTimeout * timerScale * 30);
+        // Doubled while the actor plays at fighting (actions.c:2361-2362).
+        const float playfight = (a.flags & HALO_AI_PLAYFIGHT) ? 2.0f : 1.0f;
+        const long ticks = long(a.def->grenadeTimeout * timerScale * playfight * 30);
         wait = int(ticks * 1000 / 30);
         const auto last = encounterThrows.find(encounter);
         // A throw time ahead of now (the clock went back) counts as long past.
@@ -638,6 +657,16 @@ namespace
         // actor_combat.c:1268-1272: burst_error = projectile_error_angle * projectile_error (the
         // error every projectile of the burst takes).
         v.error = d.error * v.scale.projectileError;
+        v.separation = v.scale.burstSeparation;
+        // ai_playfight (actor_external_orders.playfighting, the encounter's flag): the error doubled
+        // plus one degree (actor_combat.c:1278-1281), the pause between bursts 1.7 times as long
+        // (612-615) and the bursts 0.6 as long (1259-1262).
+        if(a.flags & HALO_AI_PLAYFIGHT)
+        {
+            v.error = 2 * v.error + RAD;
+            v.separation *= 1.7f;
+            v.duration = .6f;
+        }
         // actor_combat.c:2194-2210: target_leading is added to the variant's lead fraction only
         // for the test MIN(1, sum) > 0; the lead itself (point_from_line3d) is the variant's own
         // fraction. Followed as written (the conservative reading): no difficulty leads harder,
@@ -693,9 +722,9 @@ namespace
         body->AimToVec(aim);
         if(lastmillis >= a.nextBurst && lastmillis >= a.burstUntil)
         {
-            a.burstUntil = lastmillis + millisFor(frand(d.burstMin, d.burstMax));
-            // actor_combat.c:599-605: the separation times burst_separation.
-            a.nextBurst = a.burstUntil + millisFor(frand(d.separationMin, d.separationMax) * combat.scale.burstSeparation);
+            a.burstUntil = lastmillis + millisFor(frand(d.burstMin, d.burstMax) * combat.duration);
+            // actor_combat.c:599-605: the separation times burst_separation (and playfight's 1.7).
+            a.nextBurst = a.burstUntil + millisFor(frand(d.separationMin, d.separationMax) * combat.separation);
         }
         if(lastmillis >= a.burstUntil && !melee) return;
         // Fire only once roughly facing the target.
@@ -735,9 +764,21 @@ namespace
         const HaloCombatScaling scaling = halocombatscaling(a.team);
         if(rndscale(1.0f) > d.grenadeChance * scaling.grenadeChance) return;
         int timeout = 0, encounter = -1;
-        if(d.grenadeTimeout < 0) a.nextGrenade = lastmillis + max(1, int(wait * scaling.grenadeTimer + .5f));
+        // Playing at fighting doubles the timeout (grenadeTimeoutLeft), and its stand-in too.
+        const bool playfight = (a.flags & HALO_AI_PLAYFIGHT) != 0;
+        if(d.grenadeTimeout < 0) a.nextGrenade = lastmillis + max(1, int(wait * scaling.grenadeTimer * (playfight ? 2 : 1) + .5f));
         else if(grenadeTimeoutLeft(a, scaling.grenadeTimer, timeout, encounter) > 0) return;
-        vec direction = vec(a.target->o).sub(e->o);
+        // Playing at fighting, the grenade is aimed 1.5 world units off the target in a random
+        // direction (actor_combat.c:834-837, actor_combat_find_nearby_target at 519-580). Judgement
+        // call: only the horizontal miss; Halo's aim point also sits 1.5 units above the target and
+        // is pulled in short of a wall, which the engine's distance-based throw has no use for.
+        vec at = a.target->o;
+        if(playfight)
+        {
+            const float heading = rndscale(2 * PI);
+            at.add(vec(cosf(heading), sinf(heading), 0).mul(1.5f * s));
+        }
+        vec direction = vec(at).sub(e->o);
         const float flight = clamp(direction.magnitude() / 60.0f, 0.4f, 1.6f);
         direction.normalize().mul(1.6f);
         direction.z += 0.25f * flight;
@@ -747,7 +788,7 @@ namespace
         {
             grenadeent *g = new grenadeent(e);
             bounceents.add(g);
-            g->activate(e->o, a.target->o);
+            g->activate(e->o, at);
             g->moveoutsidebbox(direction, e);
             g->_throw(g->o, direction);
         }
@@ -900,7 +941,16 @@ namespace
         dir.normalize();
         e->lastattackweapon = e->weaponsel;
         e->lastaction = lastmillis;
-        halohit(full, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0);
+        // The smash carries its jpt!'s material modifiers (actors.txt `unitmeleematerials`), as any
+        // damage does in Halo (../Halo3DS objects/damage.c:898-899, 1174): 1 on the player's
+        // cyborg armour and shield, 0 on another Hunter. Without the line, none, as before.
+        HaloDamage melee;
+        melee.lower = m[0];
+        melee.upperMin = m[1];
+        melee.upperMax = m[2];
+        melee.hasMaterials = a.def->hasUnitMeleeMaterials;
+        loopi(HALO_DAMAGE_MATERIALS) melee.materials[i] = a.def->unitMeleeMaterials[i];
+        halohit(full, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0, melee.hasMaterials ? &melee : nullptr);
         // The jpt!'s instantaneous acceleration throws the victim back.
         if(t->state == CS_ALIVE) { t->vel.add(vec(dir).mul(1.2f)); t->vel.z += 0.5f; }
         ++a.smashes;
@@ -1037,7 +1087,8 @@ namespace
             if(!a.hasDestination && a.morale != BERSERK) keepRange(a, body);
             leap(a);
             fire(a, body);
-            if(!(a.flags & HALO_AI_PLAYFIGHT)) throwGrenade(a, body);
+            // Playfighting actors throw too, with a doubled timeout and a miss (throwGrenade).
+            throwGrenade(a, body);
             return;
         }
         if(passive(a) && a.awareness == COMBAT)
@@ -1110,6 +1161,62 @@ bool haloactorsload()
 }
 
 int haloactordefcount() { haloactorsload(); return int(definitions.size()); }
+
+namespace
+{
+    HaloActorDef playerUnit;
+    bool playerAttempted = false, playerLoaded = false;
+
+    // packages/halo/player.txt (tools/halo_actors.py PLAYER_FIELDS): `format 1`, then `player <unit
+    // tag>`, its `material`, `resistance` and `shieldtime` lines and `end`. Keys it does not know are
+    // skipped (a newer file still loads). Usable only with a material, a resistance line whose
+    // shield material type is a retail material type and an indirect material that is one of them
+    // or none (-1).
+    bool parsePlayer(const char *text)
+    {
+        std::istringstream lines(text);
+        std::string line;
+        bool versioned = false, open = false, closed = false;
+        HaloActorDef d;
+        while(std::getline(lines, line))
+        {
+            if(line.empty() || line[0] == '#') continue;
+            std::istringstream in(line);
+            std::string key;
+            in >> key;
+            bool ok = true;
+            if(key == "format") { int v = 0; in >> v; ok = versioned = v == 1; }
+            else if(key == "player") { ok = !open && !closed; open = true; std::getline(in >> std::ws, d.path); }
+            else if(key == "end") { ok = open; open = false; closed = true; }
+            else if(open && (key == "material" || key == "resistance" || key == "shieldtime")) ok = parseColl(key, in, d);
+            if(!ok) { conoutf("\f3Halo player: invalid line in packages/halo/player.txt: %s", line.c_str()); return false; }
+        }
+        if(!versioned || open || !closed || d.materials.empty() || !d.hasResistance || d.shieldMaterial < 0 || d.shieldMaterial >= 33 ||
+           d.indirectMaterial < -1 || d.indirectMaterial >= int(d.materials.size()))
+            return false;
+        for(const HaloActorDef::Material &m : d.materials) if(m.type < 0 || m.type >= 33) return false;
+        playerUnit = d;
+        return true;
+    }
+}
+
+const HaloActorDef *haloplayerunit()
+{
+    if(!playerAttempted)
+    {
+        playerAttempted = true;
+        int size = 0;
+        // Optional: without it the player takes damage by the engine's built-in rule (halodamage).
+        if(char *text = loadfile(path("packages/halo/player.txt", true), &size))
+        {
+            playerLoaded = parsePlayer(text);
+            delete[] text;
+            if(playerLoaded) conoutf("Halo player: %s, %d collision materials", playerUnit.path.c_str(), int(playerUnit.materials.size()));
+            else conoutf("\f3Halo player: packages/halo/player.txt is unusable; re-run tools/halo_actors.py");
+        }
+    }
+    return playerLoaded ? &playerUnit : nullptr;
+}
 
 float halodifficultyvalue(int type, int level, float fallback)
 {
@@ -1599,6 +1706,13 @@ bool haloactorintent(const playerent *bot, HaloActorIntent &intent)
     intent.separationScale = scaling.burstSeparation;
     intent.rateScale = max(scaling.rateOfFire, 1e-3f);
     intent.error = a->def->error * intent.errorScale;
+    // Playing at fighting, as combatValues has it for the actor's own weapon.
+    intent.playfight = (a->flags & HALO_AI_PLAYFIGHT) != 0;
+    if(intent.playfight)
+    {
+        intent.error = 2 * intent.error + RAD;
+        intent.separationScale *= 1.7f;
+    }
     if(!intent.active) return true;
     if(a->awareness == COMBAT && alive(a->target) && haloactorhostile(a->bot, a->target)) intent.target = a->target;
     intent.mayFire = intent.target && BotManager.BotsShoot() && lastmillis >= a->reactUntil && a->morale != PANICKED && !passive(*a);
@@ -1638,6 +1752,17 @@ float haloactorhealthfraction(const playerent *bot)
 }
 
 int haloactorflags(const playerent *bot) { const Actor *a = find(bot); return a ? a->flags : 0; }
+
+float haloactordamagefactor(const playerent *attacker)
+{
+    // ai_adjust_damage (../Halo3DS ai/ai.c:654-680), which object_cause_damage calls for damage
+    // owned by a unit with an actor, its gunner's or its swarm actor's (objects/damage.c:1386-1406),
+    // before difficulty and the materials: times 0.3 while that actor plays at fighting, whoever is
+    // hit (the player too). Its weapon_damage_modifier (664-669) is the spawn's damageScale here.
+    // A dead actor's record is gone, so its grenades still in flight count in full: Halo's dead
+    // unit has no actor either (actor_detach_from_unit).
+    return haloactorflags(attacker) & HALO_AI_PLAYFIGHT ? .3f : 1.0f;
+}
 
 int haloactorgrenadetype(const playerent *bot)
 {
@@ -1844,16 +1969,17 @@ void haloactorcombatdump(const char *label)
         conoutf("ACTOR_COMBAT %s cn=%d variant=%d team=%s rate=%.3f delay=%d slot=%d error=%.4f scaled_error=%.4f lead=%.3f leads=%d "
                 "separation=%.3f,%.3f grenade=%.3f grenade_scaled=%.3f melee=%d smash=%d,%d", label, e->clientnum, d.index,
                 haloteamname(a.team), d.rate, v.fireDelay, e->weaponsel ? int(e->weaponsel->info.attackdelay) : -1, d.error, v.error,
-                d.lead, v.leads, d.separationMin * v.scale.burstSeparation, d.separationMax * v.scale.burstSeparation, d.grenadeChance,
+                d.lead, v.leads, d.separationMin * v.separation, d.separationMax * v.separation, d.grenadeChance,
                 d.grenadeChance * v.scale.grenadeChance, v.meleeDelay, meleeInterval(a, 1600), meleeInterval(a, 2199));
         // ACTOR_TIMERS <label> cn= variant= berserk=<0|1> swarm=<0|1> melee_timer=<actr s, -1 none>
         //   grenade_timeout=<actv s, -1 none> encounter=<index, -1 none> grenade_wait=<scaled ms>
-        //   grenade_left=<ms of the encounter's timeout left>
+        //   grenade_left=<ms of the encounter's timeout left> playfight=<0|1> burst=<min>,<max> (s, scaled)
         int wait = 0, encounter = -1;
         const int left = grenadeTimeoutLeft(a, v.scale.grenadeTimer, wait, encounter);
         conoutf("ACTOR_TIMERS %s cn=%d variant=%d berserk=%d swarm=%d melee_timer=%.3f grenade_timeout=%.3f encounter=%d "
-                "grenade_wait=%d grenade_left=%d", label, e->clientnum, d.index, a.morale == BERSERK ? 1 : 0, d.swarm() ? 1 : 0,
-                d.meleeDelayTimer, d.grenadeTimeout, encounter, wait, left);
+                "grenade_wait=%d grenade_left=%d playfight=%d burst=%.3f,%.3f", label, e->clientnum, d.index, a.morale == BERSERK ? 1 : 0,
+                d.swarm() ? 1 : 0, d.meleeDelayTimer, d.grenadeTimeout, encounter, wait, left, (a.flags & HALO_AI_PLAYFIGHT) ? 1 : 0,
+                d.burstMin * v.duration, d.burstMax * v.duration);
     }
     fflush(stdout);
 }

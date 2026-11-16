@@ -141,6 +141,9 @@ WEAPON_FIELDS = '''# path <tag>                 retail weapon tag
 # materials <33 modifiers>     after a melee or projectile line: its jpt! damage modifier per retail
 #                              material type (0 dirt ... 12 hunter armor, 13 hunter skin, 25 sentinel,
 #                              26 monitor, 32 hunter shield); older games ignore the line
+# jptflags <flags>             after a melee or projectile line (and its materials line): the jpt!
+#                              damage flags (0x2 can cause headshots: the pistol and sniper bullets;
+#                              0x40 only hurts shields, 0x80 flaming death); older games skip the line
 '''
 
 EQUIPMENT_FIELDS = '''# grenade <type> <maximum carried> <sticks to units 0|1> <timer starts> <arming s> <fuse s> <flags>
@@ -192,6 +195,13 @@ def jpt_materials(halo, tag):
 
 def materials_line(values):
     return 'materials ' + ' '.join(map(number, values)) if values else None
+
+
+def jpt_flags(halo, tag):
+    """A jpt! tag's damage flags (JPT_DAMAGE_FLAGS), or None without a tag."""
+    if tag is None or tag.group != 'jpt!':
+        return None
+    return jpt_damage(halo, tag).flags
 
 
 def damage_values(halo, tag):
@@ -385,6 +395,7 @@ def weapon_record(halo, tag, viewmodels, models):
         'aim': t.read('4f', a + 220),
         'melee': melee,
         'melee_materials': jpt_materials(halo, melee_tag),
+        'melee_flags': jpt_flags(halo, melee_tag),
         'magazines': [], 'triggers': [],
         'sounds': weapon_sounds(halo, tag),
         'ammo': weapon_ammo(halo, tag),
@@ -409,6 +420,7 @@ def weapon_record(halo, tag, viewmodels, models):
                        charge, heat, age, magazine),
             'projectile': projectile_record(halo, proj) if proj and proj.group == 'proj' else None,
             'materials': jpt_materials(halo, projectile_jpt(halo, proj)) if proj and proj.group == 'proj' else None,
+            'flags': jpt_flags(halo, projectile_jpt(halo, proj)) if proj and proj.group == 'proj' else None,
             'core': projectile_core(halo, proj) if proj and proj.group == 'proj' else 0.0,
             'supercombine': super_detonation(halo, proj) if proj and proj.group == 'proj' else None,
         })
@@ -435,6 +447,8 @@ def write(records, path):
                   'melee ' + ' '.join(map(number, record['melee']))]
         if materials_line(record.get('melee_materials')):
             lines.append(materials_line(record['melee_materials']))
+        if record.get('melee_flags') is not None:
+            lines.append(f'jptflags {record["melee_flags"]}')
         lines += ['magazine ' + ' '.join(map(number, m)) for m in record['magazines']]
         for trigger in record['triggers']:
             lines.append('trigger ' + ' '.join(map(number, trigger['values'])))
@@ -442,6 +456,8 @@ def write(records, path):
             lines.append('projectile ' + (' '.join(map(number, p[:-1])) + ' ' + p[-1] if p else '-'))
             if p and materials_line(trigger.get('materials')):
                 lines.append(materials_line(trigger['materials']))
+            if p and trigger.get('flags') is not None:
+                lines.append(f'jptflags {trigger["flags"]}')
             # Optional lines older games skip; they come after the materials line, which belongs
             # to the projectile.
             if p and trigger.get('core', 0) > 0:

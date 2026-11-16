@@ -66,6 +66,7 @@ namespace
         std::string line;
         HaloWeaponDef *weapon = nullptr;
         HaloDamage *lastDamage = nullptr;       // what a following `materials` line belongs to
+        HaloDamage *flagged = nullptr;          // what a following `jptflags` line belongs to: the last melee or projectile
         bool versioned = false;
         int number = 0;
         while(std::getline(lines, line))
@@ -148,6 +149,13 @@ namespace
                     p->super = d;
                 }
             }
+            // The jpt! damage flags of the last melee or projectile line (older games skip it).
+            else if(key == "jptflags")
+            {
+                unsigned long long value = 0;
+                ok = flagged && bool(in >> value) && value <= 0xffffffffull;
+                if(ok) flagged->flags = unsigned(value);
+            }
             else if(key == "sound")
             {
                 // Unknown roles are skipped, so a newer table still loads.
@@ -158,6 +166,8 @@ namespace
             }
             else if(key == "end") weapon = nullptr;
             lastDamage = damage;
+            if(damage) flagged = damage;
+            else if(key == "weapon" || key == "magazine" || key == "trigger" || key == "end") flagged = nullptr;
             if(!ok)
             {
                 conoutf("\f3Halo weapons: invalid line %d in packages/halo/weapons.txt", number);

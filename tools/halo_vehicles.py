@@ -86,8 +86,9 @@ FIELDS = '''# vehicle <index> <name>
 #                              damage), the retail material type of its indirect damage material
 #                              (the jpt! modifier column) and that material's body multiplier
 # destroyed <effe tag>         the body depleted effect, played where it is destroyed
-# variant <actv tag>           the actor variant an actor seated at its gun fights as (by name:
-#                              "<vehicle tag> pilot" or "gunner"; the retail tags reference none)
+# variant <actv tag>           the actor variant an actor seated at its gun fights as: the gun weap's
+#                              ai_firing_parameters (weapon section +180; every retail vehicle gun names
+#                              "<vehicle tag> pilot" or "gunner"), else the actv named so
 # physics <mass> <gravity scale> <world gravity> <ground depth>   the phys tag's mass, gravity
 #                              scale and ground depth (Halo units), and the world's gravity (Halo
 #                              units per tick squared, from the globals' falling damage block): the
@@ -159,7 +160,7 @@ def record(halo, tag, index, name, kind, weapon, player, output):
     lines.append(f'vitality {vitality:.6g} {flags} {material} {multiplier:.6g}')
     if effect:
         lines.append(f'destroyed {effect}')
-    variant = vehicle_variant(halo, tag.name)
+    variant = vehicle_variant(halo, tag.name, weapon)
     if variant:
         lines.append(f'variant {variant}')
     physics = vehicle_physics(halo, tag)
@@ -221,8 +222,20 @@ def vehicle_physics(halo, tag):
     return mass, scale, gravity, depth
 
 
-def vehicle_variant(halo, path):
-    """The actv tag named after the vehicle (`<path> pilot`, `<path> gunner`), or None."""
+# The weap tag's ai_firing_parameters actv reference, inside the weapon section (object 380 + item
+# 396 = 776; ../Halo3DS items/weapon_definitions.h:188, after the melee damage and response at +140
+# and +156 and 8 unused bytes): the variant an actor firing it fires as (ai/actor_combat.c:443-463).
+WEAPON_AI_FIRING_PARAMETERS = 776 + 180
+
+
+def vehicle_variant(halo, path, weapon=None):
+    """The actv tag an actor at the vehicle's gun fires as: the gun's ai_firing_parameters, else the
+    actv named after the vehicle (`<path> pilot`, `<path> gunner`), or None."""
+    gun = next((tag for tag in halo.directory if tag.group == 'weap' and tag.name == weapon), None) if weapon else None
+    if gun is not None:
+        found = halo.reference(halo.tags, gun.address + WEAPON_AI_FIRING_PARAMETERS)
+        if found and found.group == 'actv':
+            return found.name
     names = sorted(tag.name for tag in halo.directory if tag.group == 'actv' and tag.name.lower().startswith(path.lower() + ' '))
     return names[0] if names else None
 

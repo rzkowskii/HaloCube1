@@ -28,8 +28,8 @@ void halopendinghit(const playerent *target, float damage, int sideEffect, const
 // killer; the player's own hurt as self-inflicted).
 void haloareablast(const vec &centre, const HaloDamage &damage, float inner, float outer, int sideEffect, playerent *owner);
 // Effect `tag`'s jpt! area damage (effects.txt `damage` line, halofxeffectdamage) at `centre`
-// through haloareablast: a vehicle's death explosion (halo_vehicle.cpp) and, with
-// halo_effectdamage 1, the scripts' effect_new. False when the table gives the effect no damage.
+// through haloareablast: a vehicle's death explosion (halo_vehicle.cpp) and, unless
+// halo_effectdamage 0, the scripts' effect_new. False when the table gives the effect no damage.
 bool haloeffectblast(const char *tag, const vec &centre, playerent *owner);
 // An actor fired a weapon trigger (halofiretrigger): the Hunter's belly window (halodamage) opens
 // from its own cannon fire, not from its smash.

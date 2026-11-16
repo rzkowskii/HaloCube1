@@ -171,8 +171,8 @@ namespace
         HaloWeaponState state;
     };
 
-    // Enemies deal a share of the retail projectile damage, standing in for
-    // the AI damage modifiers that the actor definitions apply on Normal.
+    // Enemies deal a share of the retail projectile damage, standing in for the AI damage
+    // modifiers that the actor definitions apply on Normal, when there is no actors.txt.
     const float aiDamageScale = 0.5f;
     const char *const defaultWeapons[2] = {"weapons\\assault rifle\\assault rifle", "weapons\\pistol\\pistol"};
 
@@ -182,7 +182,7 @@ namespace
     int shieldHit = 0;
     bool shieldRecharging = false;
     float shield = playerShield;
-    // Script-set limits: unit_set_maximum_vitality and unit_impervious on the player.
+    // Script-set limits: unit_set_maximum_vitality and object_cannot_take_damage on the player.
     float shieldCap = playerShield, maxVitalityHealth = 100, maxVitalityShield = 75;
     bool playerProtected = false;
     bool atCheckpoint = false;
@@ -653,7 +653,14 @@ namespace
         // modifier) for the plain bolt of an actor without weapon data. The variant's rate of
         // fire sets the cadence inside a burst.
         const HaloTriggerDef *t = def ? def->trigger() : nullptr;
-        const float damageScale = actor && actor->damageScale > 0 ? actor->damageScale : aiDamageScale;
+        // Halo scales an actor's weapon damage by its burst damage modifier only when that is above
+        // 0 (../Halo3DS ai/ai.c:654-675): the firing variant's weapon_damage_modifier (actv +196),
+        // else damage_per_second (+200) over the weapon's damage potential (ai/actor_combat.c:
+        // 1285-1335), else 0, no scaling. Every retail actv with modifier 0 also has damage per
+        // second 0 (the energy-sword commander, the Sentinels, the wounded marine, the unarmed
+        // forms), so a variant with modifier 0 deals full damage. Only without actors.txt does the
+        // engine's 0.5 stand in.
+        const float damageScale = actor ? (actor->damageScale > 0 ? actor->damageScale : 1.0f) : aiDamageScale;
         enemies.last().damageScale = damageScale;
         // A melee-only variant strikes with its weapon's melee jpt! (the sword's 151) times the modifier.
         const int damage = meleeOnly && def && def->melee.upperMin > 0 ? max(1, int(def->melee.upperMin * damageScale + .5f)) :
@@ -1611,7 +1618,7 @@ namespace
         return r.ok;
     }
 
-    // The "p" records: what the scripts set on the player (unit_set_maximum_vitality, unit_impervious),
+    // The "p" records: what the scripts set on the player (unit_set_maximum_vitality, object_cannot_take_damage),
     // which a revert keeps, and the powerups running now (the time left on each).
     void writePlayerState(std::string &out)
     {
@@ -1978,6 +1985,20 @@ namespace
         delay = eliteDelay;
         recharge = eliteRecharge;
         const HaloActorDef *def = enemy.bot ? haloactorvariant(enemy.bot) : NULL;
+        if(!def || !def->hasShieldTime) return;
+        delay = int(min(def->shieldStunTime * 30, 32767.0f)) * 1000 / 30;
+        recharge = def->shieldRechargeVelocity > 0 ? max(1, int(1000 / (def->shieldRechargeVelocity * 30) + .5f)) : 0;
+    }
+
+    // The player's shield stun and full-recharge time (ms) before the difficulty scale: the cyborg
+    // coll's (player.txt `shieldtime`, read as enemyShieldTiming reads an actor's: (short)(6 x 30)
+    // ticks of stun, then 1 / (velocity x 30) s, 6 s and 4 s, the same as the engine's own
+    // shieldDelay and shieldRecharge, which stand in without the file). recharge 0: no recharge.
+    void playerShieldTiming(int &delay, int &recharge)
+    {
+        delay = shieldDelay;
+        recharge = shieldRecharge;
+        const HaloActorDef *def = haloplayerunit();
         if(!def || !def->hasShieldTime) return;
         delay = int(min(def->shieldStunTime * 30, 32767.0f)) * 1000 / 30;
         recharge = def->shieldRechargeVelocity > 0 ? max(1, int(1000 / (def->shieldRechargeVelocity * 30) + .5f)) : 0;
@@ -2399,7 +2420,7 @@ void haloplayeraddequipment(const HaloStartingProfile &profile, bool reset)
     if(profile.shield > 0) shield = clamp(shieldCap * min(profile.shield, 1.0f), 0.0f, shieldCap);
 }
 
-// Script control of the player's and the enemies' vitality (unit_set_*_vitality, unit_impervious, ai_renew, ai_teleport_*).
+// Script control of the player's and the enemies' vitality (unit_set_*_vitality, object_cannot_take_damage, ai_renew, ai_teleport_*).
 // Values are in the script's units: the player's maximum defaults to 100 health and 75 shield, an actor's to 1.
 void haloplayersetvitality(float health, float shieldValue, bool maximum)
 {
@@ -3006,12 +3027,14 @@ void haloupdate(int elapsed)
         }
         else if(markers.inrange(nextRouteMarker) && near(markers[nextRouteMarker], 13.0f)) ++nextRouteMarker;
     }
-    if(shield < shieldCap && !shieldRecharging && lastmillis - shieldHit >= shieldDelay)
+    int stun, recharge;
+    playerShieldTiming(stun, recharge);
+    if(shield < shieldCap && !shieldRecharging && recharge > 0 && lastmillis - shieldHit >= stun)
     {
         haloplaysound("shield-charge", S_NULL);
         shieldRecharging = true;
     }
-    shieldTick(shield, shieldCap, shieldHit, shieldDelay, rechargeTime(shieldRecharge, HALO_TEAM_PLAYER), elapsed);
+    if(recharge > 0) shieldTick(shield, shieldCap, shieldHit, stun, rechargeTime(recharge, HALO_TEAM_PLAYER), elapsed);
     updateWeapons(elapsed);
     updateItems(elapsed);
     updateFlood();
@@ -3076,10 +3099,22 @@ void halopendinghit(const playerent *target, float damage, int sideEffect, const
 // The Hunter's head and belly (materialScale): halo_hunterregions 0 leaves every hit that is not
 // on the shield arm or the back on the armour, as before.
 VAR(halo_hunterregions, 0, 1, 1);
-// The retail material model for every other actor (materialScale): off by default, for a later
-// balance pass (it moves every time to kill: the sniper rifle's modifier on Flood combat forms is
-// 0.05, the assault rifle's on an Elite's shield 0.7, the plasma rifle's 2).
-VAR(halo_actormaterials, 0, 0, 1);
+// The retail material model for every other actor (materialScale, generalMaterial): on by default,
+// as Halo always applies the jpt! material modifiers (../Halo3DS objects/damage.c:898-899 for the
+// shield, 1129 and 1174 for the body): the sniper rifle's 0.05 on Flood combat forms, the
+// plasma rifle's 2 on an Elite's shield. 0 switches back to the old model (every shield at 1 but the
+// assault rifle's 0.7 and the hand-held shields, every body at 1).
+VAR(halo_actormaterials, 0, 1, 1);
+// Headshots (halodamage, damage.c:1178-1190): a hit from a jpt! that can cause headshots (the pistol
+// and sniper bullets, weapons.txt `jptflags` 0x2) that still hurts the body after the shield, on a
+// head-flagged material of an actor (the top fifth of the body; the Hunter's skin), kills it
+// outright. 0 turns it off. halo_damagetrace 1 logs DAMAGE_HEADSHOT target= kind= material= amount=.
+VAR(halo_headshots, 0, 1, 1);
+// The player's damage by the cyborg's coll (halodamage's player branch, packages/halo/player.txt):
+// each jpt!'s modifiers for the cyborg energy shield (22) and armour (21). 0 (or no player.txt)
+// keeps the engine's built-in rule: every actor's direct hit (GUN_SUBGUN) at 2 on the shield, the body at 1.
+// halo_damagetrace 1 logs DAMAGE_PLAYER material= type= shield_modifier= body_scale= leaked=.
+VAR(halo_playermaterials, 0, 1, 1);
 
 void haloactorfired(const playerent *p)
 {
@@ -3114,6 +3149,19 @@ namespace
         return clamp((hit->at.z - feet) / height, 0.0f, 1.0f);
     }
 
+    // The cyborg material a hit on the player lands on (no coll regions on the player): the
+    // head-flagged material for a hit in the top fifth of the body, as hitMaterial for an actor, else
+    // the coll's indirect damage material, Halo's for every blast (damage.c:1617-1630) and the
+    // engine's for every other hit (the cyborg's `body`, body multiplier 1: the `legs` at 0.8 are
+    // never struck, a conservative judgement), else the first material.
+    const HaloActorDef::Material *playerMaterial(const HaloActorDef &unit, const PendingHit *hit)
+    {
+        if(hitHeight(player1, hit) >= .8f)
+            for(const HaloActorDef::Material &m : unit.materials) if(m.flags & 1) return &m;
+        if(unit.indirectMaterial >= 0 && unit.indirectMaterial < int(unit.materials.size())) return &unit.materials[unit.indirectMaterial];
+        return unit.materials.empty() ? NULL : &unit.materials[0];
+    }
+
     // A hand-held shield material: not head-flagged, no body damage, a shield that takes the hit and
     // a leak under 1 (the Jackal's `shield`: type 16, leak 0, shield multiplier 1, body multiplier 0).
     bool handShield(const HaloActorDef::Material &m) { return !(m.flags & 1) && m.body <= 0 && m.shield > 0 && m.leak >= 0 && m.leak < 1; }
@@ -3129,7 +3177,10 @@ namespace
     //   a direct hit from within 60 degrees of where the actor faces, below the top fifth of its body,
     //   lands on a hand-held shield material while the shield holds (the Hunter shield arm's rule;
     //   once the shield is down its region's permutation is swapped out, object_deplete_shield,
-    //   damage.c:636-658, so it falls to the body); else the head-flagged material in the top fifth, else the first other material.
+    //   damage.c:636-658, so it falls to the body); else the head-flagged material in the top fifth;
+    //   else the indirect damage material, Halo's own whole-body material (the Elite major's flesh at
+    //   body multiplier 1, not its 0.5 limbs; an engine judgement without coll regions) when it is
+    //   not head-flagged or a hand-held shield, else the first other material.
     const HaloActorDef::Material *hitMaterial(const HaloEnemy &enemy, const playerent *target, const playerent *attacker, int gun,
                                               const PendingHit *hit)
     {
@@ -3146,17 +3197,23 @@ namespace
             if(!delta.iszero() && delta.normalize().dot(vec(sinf(yaw), -cosf(yaw), 0)) > cosf(60 * RAD))
                 for(const HaloActorDef::Material &m : def->materials) if(handShield(m)) return &m;
         }
+        if(!head && def->indirectMaterial >= 0 && def->indirectMaterial < int(def->materials.size()))
+        {
+            const HaloActorDef::Material &m = def->materials[def->indirectMaterial];
+            if(!(m.flags & 1) && !handShield(m)) return &m;
+        }
         for(const HaloActorDef::Material &m : def->materials) if(((m.flags & 1) != 0) == head) return &m;
         return &def->materials[0];
     }
 
-    // The retail material model for an actor that has no special body (halo_actormaterials 1): the
-    // hit material is `chosen` (hitMaterial) or, without it, the variant's head-flagged material for
-    // a hit at head height (the top fifth), else its first other material; the hit takes that
-    // material's body multiplier times the jpt! damage's modifier for its type. The energy shield
-    // takes the modifier for the coll's shield material type (actors.txt `resistance`; the elite
-    // energy shield, 30, for an Elite without it) in `shieldScale` (in place of the assault rifle's
-    // 0.7). Without the weapon's `materials` line or the variant's `material` lines nothing changes.
+    // The retail material model for an actor that has no special body (halo_actormaterials, on by
+    // default): the hit material is `chosen` (hitMaterial) or, without it, the variant's head-flagged
+    // material for a hit at head height (the top fifth), else its first other material; the hit takes
+    // that material's body multiplier times the jpt! damage's modifier for its type (damage.c:1129,
+    // 1174). The energy shield takes the modifier for the coll's shield material type
+    // (actors.txt `resistance`, damage.c:898-899) in `shieldScale` (in place of the assault rifle's
+    // 0.7). Without the weapon's `materials` line or the variant's `material` lines nothing changes;
+    // without the `resistance` line (an older actors.txt) the shield keeps the old 0.7 and 1.
     float generalMaterial(const HaloEnemy &enemy, const playerent *target, const HaloDamage *source, const PendingHit *hit,
                           int &region, float &shieldScale, const HaloActorDef::Material *chosen)
     {
@@ -3164,7 +3221,6 @@ namespace
         const HaloActorDef *def = haloactorvariant(target);
         if(!halo_actormaterials || !source || !source->hasMaterials || !def || def->materials.empty()) return 1;
         if(def->hasResistance && def->shieldMaterial >= 0) shieldScale = source->material(def->shieldMaterial);
-        else if(enemy.kind == ELITE) shieldScale = source->material(30);
         if(!chosen)
         {
             const bool head = hitHeight(target, hit) >= .8f;
@@ -3177,8 +3233,8 @@ namespace
 
     // Bodies whose retail collision materials decide what hurts them: the hit material's body
     // multiplier (the unit's coll tag, actors.txt) times the jpt! damage's modifier for that
-    // material type (weapons.txt and equipment.txt `materials` lines). Every other body takes its
-    // damage as before unless halo_actormaterials is on (generalMaterial).
+    // material type (weapons.txt and equipment.txt `materials` lines). Every other body takes the
+    // general model (generalMaterial; halo_actormaterials 0: its damage as before).
     //   Hunter: a direct hit from within 60 degrees of where it faces lands on the shield arm
     //   (hunter shield: body multiplier 0, and every campaign weapon but the energy sword has
     //   modifier 0 for it); from behind (beyond 130 degrees) on the exposed skin (hunter skin);
@@ -3198,7 +3254,7 @@ namespace
     // null: none known). A hand-held shield always takes the jpt! modifier for the coll's shield
     // material type (damage.c:898-899: the jackal energy shield, 16, is 0 for the assault rifle,
     // pistol, shotgun and sniper rifle and 1 for the plasma weapons), with or without the general
-    // model, which batch 9 left off for the energy shields.
+    // model (halo_actormaterials 0 leaves the other energy shields at the old 0.7 and 1).
     float materialScale(const HaloEnemy &enemy, const playerent *target, const playerent *attacker, int gun,
                         const HaloDamage *source, int &region, const PendingHit *hit, float &shieldScale,
                         const HaloActorDef::Material *&hitAt)
@@ -3244,6 +3300,11 @@ namespace
         // Without actors.txt format 2: the retail multipliers of these bodies.
         if(body < 0) body = region == HALO_MATERIAL_HUNTER_SHIELD || region == HALO_MATERIAL_MONITOR ? 0 : 1;
         const bool tagged = source && source->hasMaterials;
+        // An energy shield on a special body (the shielded Sentinels: coll shield material type 30)
+        // takes the jpt! modifier for its shield material type, as every unit's does (damage.c:898-
+        // 899), and the body's material then scales only what passes it (halodamage).
+        if(halo_actormaterials && tagged && def && def->hasResistance && def->shieldMaterial >= 0)
+            shieldScale = source->material(def->shieldMaterial);
         float modifier = tagged ? source->material(region) : 1;
         // Hits that carry no jpt! modifiers (actors' melee, the stock weapons, a weapon table
         // written before the `materials` lines): the armour's usual 0.5.
@@ -3300,10 +3361,22 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
                     attacker ? (attacker == player1 ? "player" : attacker->name) : "-", target == player1 ? "player" : target->name,
                     exact, given, side, gun, damage, shieldLeft, carry);
     };
-    // Playfighting actors go through the motions without hurting anyone.
-    if(haloactorflags(attacker) & HALO_AI_PLAYFIGHT) { damage = 0; trace(-1, 0); return; }
-    // object_cannot_take_damage and unit_impervious (traced with shield -1).
-    if((target == player1 && playerProtected) || (haloactorflags(target) & (HALO_AI_NO_DAMAGE | HALO_AI_IMPERVIOUS))) { damage = 0; trace(-1, 0); return; }
+    // Damage owned by an actor playing at fighting (ai_playfight) is 0.3 of itself, whoever it hits
+    // (ai_adjust_damage, ../Halo3DS ai/ai.c:671-675, from objects/damage.c:1386-1406, before the
+    // difficulty factor): the staged fights cost lives slowly.
+    const float playfight = haloactordamagefactor(attacker);
+    if(playfight != 1)
+    {
+        if(halo_damagetrace)
+            conoutf("DAMAGE_PLAYFIGHT attacker=%s target=%s factor=%.3f amount=%.3f scaled=%.3f", attacker->name,
+                    target == player1 ? "player" : target->name, playfight, amount, amount * playfight);
+        amount *= playfight;
+    }
+    // object_cannot_take_damage (traced with shield -1). Not unit_impervious: Halo's impervious bit
+    // stops only the knock and the ping animations (../Halo3DS objects/damage.c:1043,
+    // units/units.c:6879; hs.c's own help says so), so an impervious actor is hurt (weapon.cpp's
+    // hit() leaves out its push).
+    if((target == player1 && playerProtected) || (haloactorflags(target) & HALO_AI_NO_DAMAGE)) { damage = 0; trace(-1, 0); return; }
     // Difficulty (../Halo3DS objects/damage.c:1415-1419): damage owned by a team hostile to the
     // player is multiplied by enemy_damage whoever it hits; the player's own, the allies' and
     // ownerless damage are not. On a target the owner's team is friendly to (its own side) the
@@ -3331,17 +3404,56 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         if(!(bodyVitality > 0)) bodyVitality = 1;
         // In a Warthog the body takes some of the fire.
         if(halodriving()) amount = halovehicledamage(amount);
+        // The shield stun (damage.c:978-982): the cyborg's minimum stun damage is 0, so every hit
+        // restarts it (playerShieldTiming).
         shieldHit = lastmillis;
         shieldRecharging = false;
-        const float factor = (attacker != player1 && gun == GUN_SUBGUN ? 2 : 1) / shieldVitality;
-        // The overshield's extra layers take the hit first.
-        if(overshield > 0)
+        // The cyborg's coll (player.txt, haloplayerunit) and a hit that carries its jpt!'s material
+        // modifiers: Halo's own rule. The shield step takes (1 - the struck material's leak) of the
+        // hit (damage.c:842-843; the cyborg's leaks are 0) at the material's shield multiplier times
+        // the jpt! modifier for the coll's shield material type, 22 cyborg energy shield (890-899),
+        // and passes what breaks through in post-modifier units (908-913); the body step takes the
+        // material's body multiplier times the modifier for its type, 21 cyborg armor (1129,
+        // 1174). So the plasma rifle bolt hits the shield at 2 and the body at 0.5, the plasma
+        // pistol at 0.6 and 0.6, the needle at 1 and 1, the pistol bullet at 1 and 1.5 and every
+        // weapon's melee at 1.4. Without the file, or for a hit without modifiers (the stock weapons,
+        // a weapons.txt without `materials` lines, the sword Elites' slot melee), the engine's
+        // built-in rule: an actor's direct hit (GUN_SUBGUN: the actors' slot, halodamagegun's fallback)
+        // at 2 on the shield, blasts and melee at 1, the body at 1.
+        const HaloActorDef *cyborg = halo_playermaterials && exact && pendingSource && pendingSource->hasMaterials ? haloplayerunit() : NULL;
+        const HaloActorDef::Material *struckAt = cyborg ? playerMaterial(*cyborg, &pendingAt) : NULL;
+        float factor = (attacker != player1 && gun == GUN_SUBGUN ? 2 : 1) / shieldVitality, leaked = 0, bodyScale = 1;
+        if(struckAt)
+        {
+            factor = pendingSource->material(cyborg->shieldMaterial) * max(struckAt->shield, 0.0f) / shieldVitality;
+            bodyScale = max(struckAt->body, 0.0f) * pendingSource->material(struckAt->type);
+            // The leak and the failure curve only while a shield is up (damage.c:828-857).
+            if(shield > 0 || overshield > 0)
+            {
+                float share = 1 - max(struckAt->leak, 0.0f);
+                const float threshold = cyborg->shieldFailureThreshold;
+                if(threshold > 0 && shieldCap > 0 && shield / shieldCap <= threshold)
+                    share *= (1 - clamp(cyborg->shieldFailureMaximum, 0.0f, 1.0f)) * clamp(shield / shieldCap / threshold, 0.0f, 1.0f) +
+                             clamp(cyborg->shieldFailureMaximum, 0.0f, 1.0f);
+                share = clamp(share, 0.0f, 1.0f);
+                leaked = amount * (1 - share);
+                amount -= leaked;
+            }
+            if(halo_damagetrace)
+                conoutf("DAMAGE_PLAYER material=%d type=%d shield_modifier=%.3f body_scale=%.3f leaked=%.3f", int(struckAt - cyborg->materials.data()),
+                        struckAt->type, factor * shieldVitality, bodyScale, leaked);
+        }
+        // The overshield's extra layers take the hit first. What they leave is the hit's share before
+        // the factor, which the shield step below takes at the same factor (with the cyborg's coll the
+        // overshield is the one shield vitality above 1, as in Halo, so the modifier applies once).
+        const bool layered = overshield > 0;
+        if(layered)
         {
             const float layer = min(overshield, amount * factor);
             overshield -= layer;
-            amount = max(0.0f, amount - layer / factor);
+            amount = factor > 0 ? max(0.0f, amount - layer / factor) : 0;
             if(emp) overshield = overshieldTarget = 0;
-            if(amount <= 1e-4f)
+            if(amount <= 1e-4f && leaked <= 1e-4f)
             {
                 if(emp) shield = 0;
                 haloplaysound(emp ? "shield-depleted" : "shield-hit", S_NULL);
@@ -3352,12 +3464,21 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
             }
         }
         const bool hadShield = shield > 0;
-        const float absorbed = min(shield, amount * factor);
-        shield -= absorbed;
-        amount = max(0.0f, amount - absorbed / factor);
+        if(hadShield || layered)
+        {
+            const float absorbed = min(shield, amount * factor);
+            shield -= absorbed;
+            // What breaks through: with the cyborg's coll Halo's excess, post-modifier (damage.c:
+            // 908-913; the shield's units times the scale are the absolute shield points), so the
+            // plasma rifle's 2 passes twice what 1 would; the built-in rule passes the hit's share
+            // before the factor. A shield immune to the hit (factor 0) stops it whole.
+            amount = struckAt ? max(0.0f, amount * factor - absorbed) * shieldVitality :
+                     factor > 0 ? max(0.0f, amount - absorbed / factor) : 0;
+        }
+        amount += leaked;
         if(emp) { shield = 0; overshield = overshieldTarget = 0; }
         if(hadShield) haloplaysound(shield > 0 ? "shield-hit" : "shield-depleted", S_NULL);
-        damage = wholeDamage(amount / bodyVitality, playerHealthCarry);
+        damage = wholeDamage(amount * bodyScale / bodyVitality, playerHealthCarry);
         // The damage-direction arc points at the attacker, for a hit the shield took too.
         if(attacker && attacker != player1) halofxdamage(attacker->o, given, damage <= 0);
         trace(shield, playerHealthCarry);
@@ -3370,16 +3491,21 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     int region = -1;
     float shieldScale = 1;
     const HaloActorDef::Material *hitAt = NULL;
+    // The hit before its material (a special body's headshot test, below).
+    const float struck = amount;
     const float material = materialScale(*enemy, target, attacker, gun, exact ? pendingSource : NULL, region,
                                          exact ? &pendingAt : NULL, shieldScale, hitAt);
     // The general material model's body multiplier (generalMaterial) is for the body: an energy
     // shield takes the hit at its own modifier (shieldScale), and only what passes it is scaled by
-    // the body's. The special bodies (no shields) take theirs on the whole hit.
+    // the body's. The special bodies take theirs on the whole hit, unless they have an energy
+    // shield with its own modifier (the shielded Sentinels and the Monitor, materialScale), which
+    // then works as the general model's: a needle (0 on the sentinel material, 1 on its shield)
+    // drains a shielded Sentinel's shield and leaves its body whole, as in Halo.
     const bool special = enemy->kind == HUNTER || enemy->kind == SENTINEL || enemy->kind == MONITOR || enemy->kind == ENGINEER;
     float bodyScale = 1;
     if(region >= 0)
     {
-        if(special) amount *= material;
+        if(special && !(enemy->shieldMax > 0 && shieldScale >= 0)) amount *= material;
         else bodyScale = material;
         if(halo_damagetrace) conoutf("DAMAGE_MATERIAL target=%s kind=%d material=%d scale=%.3f", target->name, int(enemy->kind), region, material);
     }
@@ -3431,6 +3557,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         enemy->shield = 0;
         particle_splash(PART_PLASMA, 6, 220, target->o);
     }
+    const bool shieldUp = enemy->shieldMax > 0 && enemy->shield > 0;
     if(enemy->shieldMax > 0)
     {
         // The assault rifle's 0.7 on shields is its jpt! modifier for the elite energy shield; with
@@ -3475,8 +3602,12 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         if((amount > 0 && enemy->shield > 0 && (absorbed > 0 || modifier <= 0)) || (emp && enemy->shield > 0))
         {
             enemy->shield -= absorbed;
-            // A modifier of 0 (a weapon the shield is immune to): the shield stops the hit whole.
-            amount = modifier > 0 ? max(0.0f, amount - absorbed / modifier) : 0;
+            // The excess of a hit that breaks the shield passes to the body in the shield's own
+            // units, after its modifiers (damage.c:908-913: actual_shield_damage - remaining), so a
+            // weapon at 2 on the shield passes twice what it would at 1. A modifier of 0 (a weapon
+            // the shield is immune to): the shield stops the hit whole. halo_actormaterials 0 keeps
+            // the old model's pre-modifier excess.
+            amount = modifier <= 0 ? 0 : halo_actormaterials ? max(0.0f, amount * modifier - absorbed) : max(0.0f, amount - absorbed / modifier);
             if(emp) enemy->shield = 0;
             particle_splash(PART_PLASMA, emp ? 12 : 6, 220, target->o);
             // What passes a shield is divided once more on the owner's own side: Halo's shield
@@ -3491,8 +3622,44 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         // retail unit's minimum is 0, so every hit does, as before (also a hit on a Jackal's body).
         if(!variant || !variant->hasShieldTime || shieldPart >= variant->shieldStunDamage || enemy->shield <= 0) enemy->hitTime = lastmillis;
     }
+    // Headshots (damage.c:1178-1190): the body still takes damage after the shield (the material's
+    // body multiplier times what passed it, before the jpt! modifier), the struck material is
+    // head-flagged (hitMaterial's head material in the top fifth of the body; a Hunter's skin, the
+    // coll's head-flagged material, from behind or at the head), the jpt! can cause headshots and
+    // the target is not the player's biped (this is the actors' branch): it is killed outright,
+    // whatever the material's modifier. The Flood, Sentinels, the Monitor and Engineers have no
+    // head-flagged material. HALO_AI_NO_DAMAGE returned earlier (the cannot_take_damage test at
+    // 1176). A special body takes its material on the whole hit before
+    // the shield step; the Hunter, the one with a head material, has no shield.
+    bool headshot = false;
+    if(halo_headshots && exact && pendingSource && pendingSource->headshots())
+    {
+        const HaloActorDef *variant = haloactorvariant(target);
+        bool head = false;
+        float body = 0;
+        if(special && region >= 0)
+        {
+            head = region == HALO_MATERIAL_HUNTER_SKIN;
+            if(variant && !variant->materials.empty())
+            {
+                head = false;
+                for(const HaloActorDef::Material &m : variant->materials) if(m.type == region && (m.flags & 1)) head = true;
+            }
+            const float multiplier = variant ? variant->bodyMultiplier(region) : -1;
+            body = shieldUp ? amount : struck * (multiplier >= 0 ? multiplier : 1.0f);
+        }
+        else if(!special && hitAt)
+        {
+            head = (hitAt->flags & 1) != 0;
+            body = amount * max(hitAt->body, 0.0f);
+        }
+        headshot = head && body > 0;
+        if(headshot && halo_damagetrace)
+            conoutf("DAMAGE_HEADSHOT target=%s kind=%d material=%d amount=%.3f health=%d", target->name, int(enemy->kind),
+                    special ? region : hitAt->type, body, target->health);
+    }
     amount *= bodyScale;
-    if(unsuspecting) amount = max(amount, float(max(target->health, 0)) + 1);
+    if(unsuspecting || headshot) amount = max(amount, float(max(target->health, 0)) + 1);
     damage = wholeDamage(amount, enemy->healthCarry);
     trace(enemy->shield, enemy->healthCarry);
 }

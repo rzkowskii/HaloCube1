@@ -36,9 +36,10 @@ In the QA client:
 Batch 5's critic, gap 11 (written while testing was on hold, not yet run):
 8. Tables: effects.txt gives the damaging explosions a `damage` line (the large explosion's medium
    explosion jpt!: 1.5 2.5 5 15 25, category 4) with a 33-value `materials` line, and the cinematic
-   variant none. c10 section 1: effect_new of the large explosion at enc_swamp2_turret deals nothing
-   with halo_effectdamage 0 (the default: no "jpt! damage" line); with it 1 it deals its jpt! damage
-   ("HaloScript: ... deals its jpt! damage"), and the medium explosion's cinematic variant has none.
+   variant none. c10 section 1: halo_effectdamage is 1 by default (the effect-damage default change,
+   not yet run); effect_new of the large explosion at enc_swamp2_turret deals nothing with
+   halo_effectdamage 0 (no "jpt! damage" line); with it 1 it deals its jpt! damage ("HaloScript: ...
+   deals its jpt! damage"), and the medium explosion's cinematic variant has none.
 """
 import re
 import subprocess
@@ -324,7 +325,8 @@ else:
     print('a30 section 2: blur copy and flashlight spot made again after resetgl; screenres kept 800x600 (a fixed window?).')
 
 
-# ---- 8. effect_new's jpt! damage behind halo_effectdamage (gap 11 of batch 5's critic; off by default)
+# ---- 8. effect_new's jpt! damage behind halo_effectdamage (gap 11 of batch 5's critic; on by default
+#      since the effect-damage default change)
 table, current = {}, None
 for line in EFFECTS.read_text().splitlines():
     if line.startswith('path '):
@@ -336,12 +338,14 @@ assert large.get('damage', [])[:5] == [1.5, 2.5, 5, 15, 25] and large['damage'][
 assert len(large.get('materials', [])) == 33, large
 assert 'damage' not in table.get(r'effects\explosions\medium explosion cinematic', {}), 'the cinematic variant deals nothing'
 text = run('effect-damage', 'halo_scripttrace 1; halo_section 6 1', [
-    (400, r'qa_fx_script_effect "effects\explosions\large explosion no objects" enc_swamp2_turret'),
+    (300, 'halo_effectdamage'),
+    (400, r'halo_effectdamage 0; qa_fx_script_effect "effects\explosions\large explosion no objects" enc_swamp2_turret'),
     (600, r'halo_effectdamage 1; qa_fx_script_effect "effects\explosions\large explosion no objects" enc_swamp2_turret'),
     (800, r'qa_fx_script_effect "effects\explosions\medium explosion cinematic" enc_swamp2_turret'),
     (1000, 'quit'),
 ])
+assert re.search(r'halo_effectdamage = 1\b', text), ('effect_new deals its damage by default', text[-3000:])
 dealt = re.findall(r'HaloScript: (.+?) (deals its jpt! damage|has no jpt! damage)', text)
 assert dealt == [(r'effects\explosions\large explosion no objects', 'deals its jpt! damage'),
                  (r'effects\explosions\medium explosion cinematic', 'has no jpt! damage')], ('only with halo_effectdamage 1', dealt, text[-3000:])
-print('c10: effect_new deals its jpt! damage only with halo_effectdamage 1; the cinematic variant has none.')
+print('c10: effect_new deals its jpt! damage by default and not with halo_effectdamage 0; the cinematic variant has none.')

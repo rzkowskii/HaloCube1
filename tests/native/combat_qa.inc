@@ -39,7 +39,7 @@ COMMANDF(qa_grenade_give, "ii", (int *type, int *count)
 });
 COMMANDF(qa_grenade_select, "i", (int *type) { if(*type >= 0 && *type < HALO_GRENADE_TYPES && grenadeKnown(*type)) grenadeType = *type; });
 COMMANDF(qa_grenade_switch, "s", (const char *label) { switchGrenade(); qaCombatState(label); });
-// The player takes no damage (as unit_impervious), so actors' grenades cannot end a run.
+// The player takes no damage (as object_cannot_take_damage), so actors' grenades cannot end a run.
 COMMANDF(qa_combat_protect, "i", (int *on) { playerProtected = *on != 0; });
 COMMANDF(qa_grenade_throw, "", ()
 {
