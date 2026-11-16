@@ -24,6 +24,13 @@ ai/ai_script.c:4681-4725, ai/actors.c:2539-2555), ai_migrate takes them along an
 them with no pop and no burst (actors.c:3845-3886) where ai_kill pops them; a checkpoint, a revert
 and a Continue keep them (`s spawned`); the carrier's body destroyed effect deals its damage before
 the forms appear.
+
+Halo's actor melee (written while testing was on hold, NOT YET RUN; items 12 to 16): actors.txt's `melee`
+lines and player.txt's `unit` line equal the tag bytes (static); an unarmed Flood combat form carries no
+gun and strikes the player with its unit melee jpt! (20 to 30) at its animation's key frame; an infection
+form touching the shielded player deals its jpt! (3) and is spent with no pop, and with the shield down
+deals Halo's continuous melee (about 2.9 every ten ticks); a carrier within its melee range dies of its
+own fatal melee as its melee animation ends, setting off its blast and releasing its forms, and never swings.
 """
 import shutil
 import mmap
@@ -176,8 +183,9 @@ assert late['flood_human'] == 1 and late['infection'] == 0, ('the infected body 
 assert 'infection form takes a Marine body' in text, log
 print('Corpse: infection form took a marine body, a Flood combat form rose.')
 
-# 4. Infection forms leap at a target a few strides away.
-text, log = run('leap', 'halo_preview', [
+# 4. Infection forms leap at a target a few strides away. Since Halo's melee (item 13) a form that
+#    reaches the shielded player is spent on it, so this item leaves the melee out (halo_actormelee 0).
+text, log = run('leap', 'halo_actormelee 0; halo_preview', [
     (0, 'qa_actor_spawn 6 2 10 0'),
     (5000, 'qa_actor_state leap'),
     (5300, 'quit'),
@@ -208,8 +216,9 @@ if actors[r'characters\flood_infection\flood_infection'].get('pop'):
         print(f'Pop on difficulty {level}: {hit} of {candidates} neighbours popped ({resisted} resisted).')
 
 # 6. The speed stagger: c10's nopop form has the flag; fighting the player on Impossible it moves at
-#    infection_forms * (cn % 137) * 0.00729927 + 1. An ordinary form keeps 1.
-text, log = run('stagger', 'halo_difficulty 3; halo_preview', [
+#    infection_forms * (cn % 137) * 0.00729927 + 1. An ordinary form keeps 1. Without Halo's melee
+#    (halo_actormelee 0), so neither form is spent on the player's shield before the probe.
+text, log = run('stagger', 'halo_actormelee 0; halo_difficulty 3; halo_preview', [
     (0, 'qa_variant_spawn "flood_infection nopop" 2 8 0; qa_variant_spawn "flood_infection\\flood_infection" 2 8 2'),
     (2500, 'qa_flood_stagger fight'),
     (2800, 'quit'),
@@ -365,3 +374,139 @@ else:
     first_adopt = text.find('FLOOD_ADOPT')
     assert first_adopt < 0 or blast_at < first_adopt, ('the blast comes before the forms', log)
     print('Blast: the carrier\'s body destroyed effect went off before its forms appeared.')
+
+
+# Halo's actor melee (written while testing was on hold, NOT YET RUN).
+def melee_lines():
+    """actors.txt `melee` lines by actv path, as strings, and player.txt's `unit` line."""
+    found, current = {}, None
+    for line in (root / 'packages/halo/actors.txt').read_text().splitlines():
+        key, _, rest = line.partition(' ')
+        if key == 'path':
+            current = rest
+        elif key == 'melee' and current:
+            found[current] = rest.split()
+    player = root / 'packages/halo/player.txt'
+    unit = next((l.split()[1:] for l in player.read_text().splitlines() if l.startswith('unit ')), None) if player.exists() else None
+    return found, unit
+
+
+melee, player_unit = melee_lines()
+
+# 12. Static: the `melee` lines against the tag bytes (actv +352, +356, +368, +372; actr +892, +896,
+#     +932; the carried weapon's flags bit 15; the unit's 'stand' melee animation) in every cache, the
+#     retail values the engine is expected to use, and player.txt's cyborg flags (bit 22: shields fry
+#     infection forms).
+if (HALO_SOURCE / 'c10.map').exists():
+    sys.path.insert(0, str(root / 'tools'))
+    from import_halo_a30 import HaloMap  # noqa: E402
+    from halo_actors import melee_animation, number  # noqa: E402
+    from halo_weapons import CAMPAIGN  # noqa: E402
+    for cache in CAMPAIGN:
+        with (HALO_SOURCE / f'{cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            halo = HaloMap(data)
+            t = halo.tags
+            for tag in halo.directory:
+                if tag.group != 'actv' or tag.name not in melee:
+                    continue
+                a = tag.address
+                actr, weapon, unit = (halo.reference(t, a + o) for o in (4, 100, 20))
+                weapon = weapon if weapon and weapon.group == 'weap' else None
+                want = [*t.read('2f', a + 352), *t.read('2f', a + 368)]
+                want += [*t.read('2f', actr.address + 892), t.read('f', actr.address + 932)[0]] if actr and actr.group == 'actr' else [0.0] * 3
+                want.append(1 if weapon and t.read('I', weapon.address + 776)[0] >> 15 & 1 else 0)
+                want += list(melee_animation(halo, unit, weapon))
+                assert melee[tag.name] == [number(v) for v in want], (cache, tag.name, melee[tag.name], want)
+    retail = {
+        r'characters\floodcombat_human\floodcombat_human unarmed': ['4', '6', '6', '8', '0.75', '3', '0', '0', '50', '15'],
+        r'characters\floodcombat elite\floodcombat elite unarmed': ['4', '6', '14', '18', '0.75', '3', '0', '0', '51', '16'],
+        r'characters\floodcarrier\floodcarrier': ['2.5', '6', '4.5', '6', '0.1', '3', '3.7', '0', '40', '0'],
+        r'characters\flood_infection\flood_infection': ['2.8', '4', '1.5', '4', '1', '3', '0', '0', '40', '0'],
+        r'characters\elite\elite minor\elite minor plasma rifle': ['1.75', '2', '2.5', '2.75', '0', '3', '0', '0', '40', '20'],
+        r'characters\elite\elite commander\elite commander energy sword': ['12', '15', '16', '20', '0.4', '8', '0', '1', '28', '15'],
+    }
+    for path, fields in retail.items():
+        assert melee[path][:10] == fields, (path, melee[path], fields)
+    assert not any(float(v) for p, f in melee.items() if p.startswith(r'characters\marine') for v in f[:4]), 'marines never melee'
+    assert player_unit and int(player_unit[0]) >> 22 & 1, ('player.txt: the cyborg\'s shields fry infection forms', player_unit)
+    print(f'Melee tags: {len(melee)} `melee` lines equal the tag bytes; the cyborg\'s unit flags {player_unit[0]} carry bit 22.')
+
+
+def melee_rows(text, phase):
+    """ACTOR_MELEE lines of a phase: (actor name, fields)."""
+    found = []
+    for line in text.splitlines():
+        m = re.match(rf'ACTOR_MELEE {phase} (.+?) variant=', line)
+        if m:
+            found.append((m.group(1), dict(re.findall(r'(\w+)=(\S+)', line))))
+    return found
+
+
+def player_hits(text, name):
+    """The exact amounts the DAMAGE_TRACE lines give for `name`'s hits on the player."""
+    return [float(m.group(1)) for m in re.finditer(rf'DAMAGE_TRACE attacker={re.escape(name)} target=player exact=1 amount=([\d.]+) side=0 gun=0 ', text)]
+
+
+if melee:
+    # 13. An unarmed Flood combat form (weapon -1) carries no gun, charges inside its berserk melee range
+    #     (6 for the human form: unarmed and not stalking) and strikes the unprotected player with its
+    #     unit melee jpt! (20 to 30) at the key frame (15 ticks), unmodified and unrolled by the slot.
+    text, log = run('melee-unarmed', 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+        (0, 'qa_combat_protect 0; qa_variant_spawn "floodcombat_human unarmed" 2 3 0'),
+        (300, 'qa_actor_state armed'),
+        (9000, 'qa_actor_state struck'),
+        (9300, 'quit'),
+    ])
+    states = [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_MELEE_QA armed ')]
+    assert states and states[0]['model'] == '1' and states[0]['knife'] == '1' and states[0]['ranged'] == '0', ('melee slot, no gun', states, log)
+    assert abs(float(states[0]['reach']) - (0.75 + 0.895889 - 0.465491)) < 2e-3 and states[0]['key_ms'] == str(15 * 33), (states, log)
+    charges, strikes = melee_rows(text, 'charge'), melee_rows(text, 'strike_unit')
+    assert charges and float(charges[0][1]['distance']) <= 6.01 and charges[0][1]['target'] == 'player', ('the charge', charges, log)
+    assert strikes and all(f['target'] == 'player' and 20 <= float(f['value']) <= 30 for _, f in strikes), ('unit melee 20 to 30', strikes, log)
+    hits = player_hits(text, strikes[0][0])
+    assert hits and all(20 <= h <= 30 for h in hits), ('halohit carries the roll to the player', hits, log)
+    print(f'Unarmed form: {len(strikes)} blow(s) of {[round(h, 1) for h in hits]} on the player.')
+
+    # 14. An infection form touching the player's full shield deals its jpt! (0.2, 3 to 3) and is spent:
+    #     no pop, no body (units.c:4430-4451).
+    text, log = run('melee-fried', 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+        (0, 'qa_combat_protect 0; qa_actor_spawn 6 2 2 0'),
+        (6000, 'qa_actor_count after'),
+        (6300, 'quit'),
+    ])
+    fried = melee_rows(text, 'contact_fried')
+    assert fried and float(fried[0][1]['value']) == 3.0 and fried[0][1]['target'] == 'player', ('the form strikes the shield', fried, log)
+    assert player_hits(text, fried[0][0]) == [3.0], ('3 points on the shield', log)
+    assert counts(text, 'after')['infection'] == 0 and 'FLOOD_POP' not in text, ('spent without a pop', log)
+    print('Infection on the shield: 3 points, the form spent without a pop.')
+
+    # 15. With the shield down the form stays on the player and deals Halo's continuous melee: ten ticks
+    #     of (1 - 1/30) x 0.2 + 3/30 = 2.93 each time (units.c:11336-11428, damage.c:1374-1383).
+    text, log = run('melee-attached', 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+        (0, 'qa_combat_protect 0; qa_halo_damage 75; qa_actor_spawn 6 2 2 0'),
+        (3500, 'qa_actor_count after'),
+        (3800, 'quit'),
+    ])
+    attached = melee_rows(text, 'contact_attached')
+    want = 10 * ((1 - 1 / 30) * 0.2 + 3 / 30)
+    assert attached and all(abs(float(f['value']) - want) < 2e-3 for _, f in attached), ('continuous melee', attached, want, log)
+    assert counts(text, 'after')['infection'] == 1 and not melee_rows(text, 'contact_fried'), ('the form stays on', log)
+    print(f'Infection on the bare player: {len(attached)} contact blows of {want:.3f}.')
+
+    # 16. A carrier within its melee range (2.5: unarmed and stalking) dies of its fatal melee (unit bit 8,
+    #     units.c:4209-4217): destroyed when its 40-tick melee animation ends (10020-10045), its blast
+    #     (UNIT_BLAST) and its forms (FLOOD_SPAWN) follow; it never swings.
+    text, log = run('melee-carrier', 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+        (0, 'qa_combat_protect 1; qa_actor_spawn 7 2 2 0'),
+        (5000, 'qa_actor_count after'),
+        (5300, 'quit'),
+    ])
+    suicides = melee_rows(text, 'suicide')
+    assert suicides and float(suicides[0][1]['distance']) < 3.7, ('the carrier bursts at the player', suicides, log)
+    assert melee_rows(text, 'burst') and text.find('ACTOR_MELEE suicide') < text.find('ACTOR_MELEE burst') < text.find('UNIT_BLAST'), \
+        ('the burst follows the melee animation', log)
+    assert counts(text, 'after')['carrier'] == 0 and 'UNIT_BLAST variant=characters\\floodcarrier\\floodcarrier' in text, log
+    spawned = re.search(r'FLOOD_SPAWN .*? count=(\d+)', text)
+    assert spawned and 3 <= int(spawned.group(1)) <= 6, ('3 to 6 forms released', log)
+    assert not melee_rows(text, 'strike_unit') and not player_hits(text, suicides[0][0]), ('no swing', log)
+    print(f'Carrier: burst at {suicides[0][1]["distance"]} world units into {spawned.group(1)} forms.')

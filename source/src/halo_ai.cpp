@@ -17,6 +17,13 @@
 #include <sstream>
 
 extern int halo_damagetrace;
+// Halo's actor melee (meleeAttack, infectionContact; the `melee` line of actors.txt): 0 returns
+// every actor to the engine's former melee (the melee slot's knife swing, the Hunter's smash).
+VAR(halo_actormelee, 0, 1, 1);
+// Halo's infantry special fire (specialFire; the `special` line of actors.txt): 0 leaves every actor
+// firing its primary trigger only, as before the special fire change; 2 makes every chance roll
+// succeed (for the QA client: tests/test_actor_ai.py item 11).
+VAR(halo_specialfire, 0, 1, 2);
 
 namespace
 {
@@ -45,7 +52,7 @@ namespace
     enum { ATOM_PAUSE = 0, ATOM_GO_TO = 1, ATOM_GO_TO_FACE = 2, ATOM_LOOK = 4, ATOM_CROUCH = 6, ATOM_SCRIPT = 12,
            ATOM_WAIT = 19, ATOM_LOOP = 20, ATOM_DIE = 21, ATOM_MOVE_IMMEDIATE = 22, ATOM_LOOK_PLAYER = 24,
            ATOM_SET_RADIUS = 26, ATOM_TELEPORT = 27 };
-    enum { COMMAND_ALLOW_INITIATIVE = 1, COMMAND_ALLOW_TARGETING = 2 };
+    enum { COMMAND_ALLOW_INITIATIVE = 1, COMMAND_ALLOW_TARGETING = 2, COMMAND_DISABLE_FALLING_DAMAGE = 16 };
 
     struct Actor
     {
@@ -97,6 +104,25 @@ namespace
         // ai_go_to_vehicle (haloactorgoto): walking to a vehicle seat's entry point.
         bool boarding = false;
         vec boardAt;
+        // Halo's melee charge (meleeAttack): the phase (0 none, 1 charging, 2 attacking), when the
+        // charge began, Halo's last_melee_attack_time and last_melee_check_time (ms, -1 none),
+        // when the blow lands (0 landed) and the attack ends, the distance to the target at the
+        // last think (world units, for the carrier's suicide sensing), charges begun, blows landed
+        // and the next contact blow of an attached infection form.
+        int meleePhase = 0, meleeChargeStart = 0, meleeLast = -1, meleeCheck = -1, meleeStrikeAt = 0, meleeBusyUntil = 0;
+        float meleePrevDistance = -1;
+        const playerent *meleePrevTarget = nullptr;
+        int meleePrevAt = 0, melees = 0, meleeHits = 0, nextContact = 0;
+        // Halo's special fire (specialFire, actor_control in ../Halo3DS ai/actors.h:855-861): when
+        // the next check may run (special_fire_delay), whether the primary trigger is held to
+        // overcharge (since chargeSince), whether the next burst fires the secondary trigger and the
+        // current one does, whether the current burst is special (fire_burst_secondary or
+        // overcharging at its start: the damage modifier and error), the trigger the next shot
+        // pulls on an overcharge release (-1 none), and for the probe the successful rolls, the
+        // charged bolts released and the secondary shots fired.
+        int specialReadyAt = 0, chargeSince = 0, specialRelease = -1;
+        bool overcharging = false, nextSecondary = false, burstSecondary = false, specialBurst = false;
+        int specials = 0, chargedShots = 0, secondaryShots = 0;
     };
     std::vector<Actor> actors;
     // Halo's per-encounter last_grenade_throw_time (../Halo3DS ai/encounters.h:77, set when any member
@@ -236,7 +262,22 @@ namespace
             }
             else if(key == "major") std::getline(in >> std::ws, d->majorPath);
             // Optional format 3 lines (tools/halo_actors.py; older engines skip them).
-            else if(key == "unit") ok = bool(in >> d->unitFlags >> d->bipedFlags);
+            else if(key == "unit") ok = d->hasUnitFlags = bool(in >> d->unitFlags >> d->bipedFlags);
+            // melee <range> <abort> <berserk range> <berserk abort> <attack range> <charge timer>
+            //       <suicide sensing> <weapon melee> <frames> <key frame> <key x> <total x>
+            else if(key == "melee")
+            {
+                int weaponMelee = 0;
+                ok = bool(in >> d->meleeRange >> d->meleeAbort >> d->berserkMeleeRange >> d->berserkMeleeAbort >> d->meleeAttackRange >>
+                          d->meleeChargeTimer >> d->suicideSensing >> weaponMelee >> d->meleeFrames >> d->meleeKeyFrame >> d->meleeKeyX >>
+                          d->meleeTotalX);
+                for(float v : {d->meleeRange, d->meleeAbort, d->berserkMeleeRange, d->berserkMeleeAbort, d->meleeAttackRange,
+                               d->meleeChargeTimer, d->suicideSensing, d->meleeKeyX, d->meleeTotalX})
+                    if(ok && !std::isfinite(v)) ok = false;
+                if(ok && (d->meleeFrames < 0 || d->meleeKeyFrame < 0)) ok = false;
+                d->meleeWeaponDamage = weaponMelee != 0;
+                d->hasMelee = ok;
+            }
             else if(key == "spawn")
             {
                 // spawn <actor index> <lower> <upper> <throw velocity>: the index is checked once
@@ -253,6 +294,16 @@ namespace
             }
             // destroyed <effe tag>: the body destroyed effect set off when the unit is destroyed.
             else if(key == "destroyed") std::getline(in >> std::ws, d->destroyedEffect);
+            // special <mode> <situation> <chance> <delay s> <damage modifier> <projectile error>
+            else if(key == "special")
+            {
+                ok = bool(in >> d->specialMode >> d->specialSituation >> d->specialChance >> d->specialDelay >> d->specialDamage >>
+                          d->specialError);
+                for(float v : {d->specialChance, d->specialDelay, d->specialDamage, d->specialError}) if(ok && !std::isfinite(v)) ok = false;
+                // A mode or situation Halo has no case for, or a negative delay, gives no special fire.
+                if(ok && (d->specialMode < 0 || d->specialMode > 2 || d->specialSituation < 0 || d->specialSituation > 3 || d->specialDelay < 0))
+                    d->specialMode = 0;
+            }
             else if(key == "end") d = nullptr;
             if(!ok)
             {
@@ -304,6 +355,12 @@ namespace
     {
         const unsigned f = a.def->actrFlags;
         return (f & ACTR_ALWAYS_CHARGE) || (a.posture == HALO_ATTACKING && (f & (ACTR_CHARGE_ATTACKING | ACTR_BERSERK_ATTACKING)));
+    }
+    // Halo's actor melee applies (meleeAttack, infectionContact): a variant with actors.txt's `melee`
+    // line that is not a Hunter (its smash stays the engine's own), a flyer or a passive actor.
+    bool haloMelee(const Actor &a)
+    {
+        return halo_actormelee && a.def->hasMelee && a.def->type != TYPE_HUNTER && !flyer(a) && !passive(a);
     }
 
     bool sees(const Actor &a, CBot *body, const playerent *t)
@@ -688,6 +745,61 @@ namespace
 
     // --- firing -----------------------------------------------------------
 
+    void specialTrace(const Actor &a, const char *event, int value, float extra)
+    {
+        // ACTOR_SPECIAL_FIRE <event> <name> variant=<index> mode=<1|2> value=<event's number> extra=<event's number> ms=<lastmillis>
+        //   roll: value 1 on success, extra the s to the next check; release: value the trigger, extra the hold in s;
+        //   burst: value 1 secondary, extra the damage factor
+        if(halo_damagetrace)
+            conoutf("ACTOR_SPECIAL_FIRE %s %s variant=%d mode=%d value=%d extra=%.3f ms=%d", event, a.bot->name, a.def->index,
+                    a.def->specialMode, value, extra, lastmillis);
+    }
+
+    // Halo's special fire situations for an actor on foot (actor_combat.c:307-338, 1051-1075):
+    // enemy visible, its target seen at this think (perceive) as Halo's prop with a clear line of
+    // sight; enemy out of sight, its living target unseen for 75 ticks or more (the engine fights a
+    // target until it is unseen for 4 s). Strafing needs a vehicle gunner, whose vehicle fires for it
+    // (halo_vehicle.cpp: the Banshee pilot's fuel rod), so never here; nor "never".
+    bool specialSituation(const Actor &a)
+    {
+        switch(a.def->specialSituation)
+        {
+            case 1: return a.target && a.lastSeen == lastmillis;
+            case 2: return a.target && alive(a.target) && lastmillis - a.lastSeen >= 2500;
+            default: return false;
+        }
+    }
+
+    // The special fire check (actor_combat.c:1765-1840), at every think outside a burst while the
+    // actor fights with a ranged weapon: once special_fire_delay has run out, the weapon supports the
+    // mode and the situation holds, the delay restarts at the tag's plus 0 to 1.5 s and the chance
+    // is rolled; a success overcharges the weapon (mode 1, holding the primary trigger until the next
+    // burst's first pull) or makes the next burst fire the secondary trigger (mode 2). Halo checks a
+    // weapon with any trigger for mode 1; the engine overcharges only a weapon that charges (its first
+    // trigger's charging time and a second trigger: the plasma pistol), as holding any other trigger
+    // would fire it (judgement call; no retail variant overcharges anything else). special_fire_delay
+    // and overcharge_chance on the level are never read after they are fetched (1776-1787): unscaled.
+    void specialFire(Actor &a, const HaloWeaponDef *w)
+    {
+        const HaloActorDef &d = *a.def;
+        if(!halo_specialfire || d.specialMode <= 0 || !w || lastmillis < a.burstUntil || lastmillis < a.specialReadyAt) return;
+        const HaloTriggerDef *primary = w->trigger(0), *secondary = w->trigger(1);
+        const bool supported = secondary && secondary->projectile.valid && (d.specialMode == 2 || (primary && primary->charge > 0));
+        if(!supported || !specialSituation(a)) return;
+        const float delay = d.specialDelay + frand(0, 1.5f);
+        a.specialReadyAt = lastmillis + millisFor(delay);
+        const bool success = halo_specialfire > 1 || rndscale(1.0f) < d.specialChance;
+        specialTrace(a, "roll", success ? 1 : 0, delay);
+        if(!success) return;
+        ++a.specials;
+        if(d.specialMode == 1)
+        {
+            if(!a.overcharging) a.chargeSince = lastmillis;
+            a.overcharging = true;
+        }
+        else a.nextSecondary = true;
+    }
+
     void fire(Actor &a, CBot *body)
     {
         botent *e = a.bot;
@@ -695,28 +807,40 @@ namespace
         e->attacking = false;
         // `botsshoot 0` holds every bot's fire, as it does for AssaultCube's own AI.
         if(!BotManager.BotsShoot()) return;
-        if(!t || !alive(t) || lastmillis < a.reactUntil || a.morale == PANICKED || a.awareness != COMBAT || passive(a)) return;
+        if(!t || !alive(t) || a.morale == PANICKED || a.awareness != COMBAT || passive(a)) return;
         // A gunner on a turret an EMP stunned holds its fire until the stun wears off.
         if(halovehicleriderstunned(e)) return;
         const HaloActorDef &d = *a.def;
         const float s = scale();
         const float distance = e->o.dist(t->o);
         const bool melee = e->weaponsel->type == GUN_KNIFE;
+        // Halo's melee (meleeAttack) strikes for a melee slot; the slot's knife never swings.
+        if(melee && haloMelee(a)) return;
+        // Special fire may begin during the reaction delay, which stands for Halo's first burst delay
+        // (the holding state, outside a burst); not from a seat whose vehicle fires for the actor.
+        const HaloWeaponDef *w = haloweapon(d.weapon);
+        if(!melee && !halovehiclearmedseat(e)) specialFire(a, w);
+        // An overheated weapon cannot begin charging (../Halo3DS items/weapons.c:2655-2658), so an
+        // overcharge's hold counts from when the weapon has cooled.
+        HaloWeaponState *held = nullptr;
+        if(a.overcharging && !melee && haloweaponof(e, e->weaponsel->type, &held) && held && held->overheated) a.chargeSince = lastmillis;
+        if(lastmillis < a.reactUntil) return;
         if(!melee && d.maxRange > 0 && distance > d.maxRange * s * 1.25f) return;
         // Difficulty (combatValues): error, lead gate, trigger and swing delays, burst separation.
         const CombatValues combat = combatValues(a);
         // Lead moving targets by the variant's lead fraction of the travel time.
-        const HaloWeaponDef *w = haloweapon(d.weapon);
         const HaloTriggerDef *trigger = w ? w->trigger() : nullptr;
         const float speed = trigger && trigger->projectile.valid ? max(1.0f, trigger->projectile.speed * s) : 1000.0f;
         vec aim = centreOf(t);
         if(combat.leads) aim.add(vec(t->vel).mul(d.lead * distance / speed));
         // A camouflaged player is hard to hit: the shots spread wider (the engine's own term,
-        // not scaled by difficulty).
+        // not scaled by difficulty). A special burst adds the variant's special projectile error
+        // (actor_combat.c:1346-1347; 0 in every retail variant).
         const float camoError = (t == player1 ? haloplayercamo() : haloactorcloak(t)) * 0.12f;
-        if(combat.error > 0 || camoError > 0)
+        const float error = combat.error + (a.specialBurst && lastmillis < a.burstUntil ? max(0.0f, d.specialError) : 0.0f);
+        if(error > 0 || camoError > 0)
         {
-            const float spread = tanf(combat.error + camoError) * distance;
+            const float spread = tanf(error + camoError) * distance;
             aim.add(vec(frand(-spread, spread), frand(-spread, spread), frand(-spread, spread) * 0.5f));
         }
         body->AimToVec(aim);
@@ -725,6 +849,13 @@ namespace
             a.burstUntil = lastmillis + millisFor(frand(d.burstMin, d.burstMax) * combat.duration);
             // actor_combat.c:599-605: the separation times burst_separation (and playfight's 1.7).
             a.nextBurst = a.burstUntil + millisFor(frand(d.separationMin, d.separationMax) * combat.separation);
+            // actor_start_burst (actor_combat.c:1207-1215, 1339-1348): the burst fires the secondary
+            // trigger when the special fire asked for it, and a burst begun so or while the weapon
+            // is overcharging takes the special damage modifier and error for its whole length.
+            a.burstSecondary = a.nextSecondary;
+            a.nextSecondary = false;
+            a.specialBurst = a.burstSecondary || a.overcharging;
+            if(a.specialBurst) specialTrace(a, "burst", a.burstSecondary ? 1 : 0, haloactorburstmodifier(e));
         }
         if(lastmillis >= a.burstUntil && !melee) return;
         // Fire only once roughly facing the target.
@@ -739,6 +870,19 @@ namespace
         // attackdelay for a bot): the variant's rate times rate_of_fire, or the swing delay.
         if(combat.fireDelay > 0) e->weaponsel->info.attackdelay = combat.fireDelay;
         else if(combat.meleeDelay > 0) e->weaponsel->info.attackdelay = combat.meleeDelay;
+        // The burst's first pull releases an overcharge (actor_combat.c:2377-2380, 2413-2425: the
+        // primary trigger was held since the check). Halo's weapon fires the second trigger's charged
+        // bolt when the trigger was held for its charging time (weapons.c:3070-3110, release_charge
+        // at 2724-2749), else the first trigger's own bolt (begin_firing); haloactorshottrigger hands
+        // gun::attack that trigger for the next shot. A plasma pistol's 45 s charged time ends in no
+        // overcharged action (trigger +76, +80), so a long hold stays charged.
+        if(a.overcharging && !melee)
+        {
+            a.overcharging = false;
+            const int held = lastmillis - a.chargeSince;
+            a.specialRelease = trigger && held >= millisFor(trigger->charge) ? 1 : 0;
+            specialTrace(a, "release", a.specialRelease, held / 1000.0f);
+        }
         e->attacking = true;
         shoot(e, aim);
     }
@@ -959,6 +1103,315 @@ namespace
     // Charge distance: inside it a Hunter closes in to smash instead of firing the cannon.
     float chargeDistance(const Actor &a) { return 1.6f * scale(); }
 
+    // --- melee ------------------------------------------------------------
+    //
+    // Halo's actor melee, from actors.txt's `melee` line (tools/halo_actors.py). Every non-swarm
+    // actor outside a vehicle may start a melee charge (../Halo3DS ai/actions.c:2534-2610), strikes
+    // once it is close and faces its target (ai/action_charge.c:269-706) and lands the blow at its
+    // melee animation's key frame (units/units.c:4185-4235, 9993-10005, 8542-8638). The infection
+    // forms, swarm actors that never charge, strike on contact (infectionContact). Hunters keep their
+    // smash (smash, above). Distances are Halo world units, horizontal, between the bodies' centres.
+
+    enum { MELEE_NONE = 0, MELEE_CHARGING = 1, MELEE_ATTACKING = 2 };
+    // meleeAttack and infectionContact: not handling the actor, handling its movement this think, or
+    // done thinking (a blow was dealt or the actor died: `a` may no longer be valid).
+    enum { MELEE_IDLE_THINK = 0, MELEE_MOVES = 1, MELEE_DONE = 2 };
+    const int tickMillis = 1000 / 30;
+
+    // actor_has_ranged_weapon (actors.c:1000-1052): a gun it may fire. Not a variant that cannot use
+    // ranged weapons (the sword Elites), nor a melee slot (the unarmed forms, infection forms, carriers).
+    bool rangedWeapon(const Actor &a) { return a.bot->weaponsel && a.bot->weaponsel->type != GUN_KNIFE && !a.def->meleeOnly(); }
+    bool swarmTarget(const playerent *t) { const Actor *o = find(t); return o && o->def->swarm(); }
+
+    // The blow's jpt!: the carried weapon's melee when its non_players_use_melee_damage flag is set (the
+    // energy sword: units.c:8597-8612), else the unit's melee (unitmelee and unitmeleematerials). Never
+    // the variant's damage modifier: Halo scales only damage flagged as from a weapon, which a melee is
+    // not (ai.c:654-675, units.c:8614-8633). False when the actor has none.
+    bool meleeSource(const Actor &a, HaloDamage &out, bool &weaponMelee)
+    {
+        const HaloActorDef &d = *a.def;
+        const HaloWeaponDef *w = d.meleeWeaponDamage ? haloweapon(d.weapon) : nullptr;
+        weaponMelee = w && w->melee.upperMax > 0;
+        if(weaponMelee) { out = w->melee; return true; }
+        if(!(d.unitMelee[2] > 0)) return false;
+        out = HaloDamage();
+        out.lower = d.unitMelee[0];
+        out.upperMin = d.unitMelee[1];
+        out.upperMax = d.unitMelee[2];
+        out.hasMaterials = d.hasUnitMeleeMaterials;
+        loopi(HALO_DAMAGE_MATERIALS) out.materials[i] = d.unitMeleeMaterials[i];
+        return true;
+    }
+
+    // Where the blow reaches (action_charge.c:524-645, setup at 994-1018): a non-suicidal actor strikes
+    // within melee_attack_range plus its melee_danger_range, the x offset its melee animation covers
+    // after the key frame (half the whole offset when the key frame is 0); a suicidal one within
+    // melee_attack_range; anyone within 0.8.
+    float meleeReach(const HaloActorDef &d)
+    {
+        if(d.suicidalMelee()) return max(0.8f, d.meleeAttackRange);
+        const float start = d.meleeKeyFrame > 0 ? d.meleeKeyX : d.meleeTotalX * 0.5f;
+        return max(0.8f, d.meleeAttackRange + max(0.0f, d.meleeTotalX - start));
+    }
+
+    // The key frame in ms after the attack begins (melee_ticks_until_dangerous: the key frame, half the
+    // frames when it is 0) and the attack's length (the animation's frames). An actor without the
+    // animation never begins a charge (meleeAttack), so the fallbacks only serve the QA probe.
+    int meleeKeyMillis(const HaloActorDef &d)
+    {
+        if(d.meleeFrames <= 0) return 0;
+        return (d.meleeKeyFrame > 0 ? d.meleeKeyFrame : d.meleeFrames / 2) * tickMillis;
+    }
+    int meleeLengthMillis(const HaloActorDef &d) { return d.meleeFrames > 0 ? d.meleeFrames * tickMillis : 1000; }
+
+    // The engine's bodies are wider than Halo's (a Halo unit's centre comes within 0.8 of another's;
+    // on a section at 2.75 engine units a world unit, the authored Crash Site's, two AssaultCube bodies
+    // stop 0.8 apart): bodies that touch count as within any reach (judgement call).
+    bool touching(const playerent *e, const playerent *t) { return vec(t->o).sub(e->o).magnitudexy() <= e->radius + t->radius + 0.1f * scale(); }
+
+    void meleeTrace(const Actor &a, const char *phase, const playerent *t, float distance, float extra = 0)
+    {
+        // ACTOR_MELEE <phase> <name> variant=<index> target=<player|name|-> distance=<world units> value=<phase's number>
+        if(halo_damagetrace)
+            conoutf("ACTOR_MELEE %s %s variant=%d target=%s distance=%.2f value=%.3f", phase, a.bot->name, a.def->index,
+                    t ? (t == player1 ? "player" : t->name) : "-", distance, extra);
+    }
+
+    // The blow at the key frame. Halo deals it as area damage at the unit's melee marker (units.c:
+    // 8542-8638); the engine strikes its target alone, when it still stands within the reach plus 0.5
+    // (the weapon melee jpt!s' radius) and within 60 degrees of where the actor faces (judgement calls).
+    // A full-strength roll, through halohit, so the difficulty, playfight and the target's material
+    // modifiers apply as for any hit; no side effect (lethal to the unsuspecting is the player's).
+    int meleeStrike(Actor &a)
+    {
+        botent *e = a.bot;
+        playerent *t = a.target;
+        const float s = scale();
+        if(!t || !alive(t)) { meleeTrace(a, "miss", t, -1); return MELEE_MOVES; }
+        vec dir = vec(t->o).sub(e->o);
+        const float distance = dir.magnitudexy() / s;
+        dir.z = 0;
+        const float yaw = e->yaw * RAD;
+        const float facing = dir.iszero() ? 1.0f : vec(dir).normalize().dot(vec(sinf(yaw), -cosf(yaw), 0));
+        HaloDamage source;
+        bool weaponMelee = false;
+        if((distance > meleeReach(*a.def) + 0.5f && !touching(e, t)) || fabsf(t->o.z - e->o.z) > max(e->eyeheight, t->eyeheight) ||
+           facing < 0.5f || !::IsVisible(e->o, centreOf(t), NULL) || !meleeSource(a, source, weaponMelee))
+        {
+            meleeTrace(a, "miss", t, distance);
+            return MELEE_MOVES;
+        }
+        if(dir.iszero()) dir = vec(0, 1, 0);
+        dir.normalize();
+        const float full = source.roll();
+        ++a.meleeHits;
+        e->lastattackweapon = e->weaponsel;
+        e->lastaction = lastmillis;
+        meleeTrace(a, weaponMelee ? "strike_weapon" : "strike_unit", t, distance, full);
+        // Last: the hit can kill the target and detach it, which moves `a` in the actor list.
+        halohit(full, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0, source.hasMaterials ? &source : nullptr);
+        return MELEE_DONE;
+    }
+
+    // The melee charge of a non-swarm actor with the `melee` line.
+    int meleeAttack(Actor &a, CBot *body)
+    {
+        botent *e = a.bot;
+        const HaloActorDef &d = *a.def;
+        playerent *t = a.target;
+        const float s = scale();
+        // An attack left behind while the brain did something else (a command list, a corpse) is over.
+        if(a.meleePhase == MELEE_ATTACKING && lastmillis > a.meleeBusyUntil + 500) { a.meleePhase = MELEE_NONE; a.meleeStrikeAt = 0; }
+        if(a.meleePhase == MELEE_ATTACKING)
+        {
+            // The attack under way: the actor stands and faces its target until the animation ends;
+            // the charge keeps refreshing last_melee_attack_time until then (action_charge.c:400-402).
+            a.meleeLast = lastmillis;
+            if(t && alive(t)) body->AimToVec(centreOf(t));
+            e->move = e->strafe = 0;
+            if(a.meleeStrikeAt && lastmillis >= a.meleeStrikeAt)
+            {
+                a.meleeStrikeAt = 0;
+                if(lastmillis >= a.meleeBusyUntil) a.meleePhase = MELEE_NONE;
+                return meleeStrike(a) == MELEE_DONE ? MELEE_DONE : MELEE_MOVES;
+            }
+            if(lastmillis < a.meleeBusyUntil || a.meleeStrikeAt) return MELEE_MOVES;
+            a.meleePhase = MELEE_NONE;
+        }
+        if(!haloMelee(a) || d.swarm()) { a.meleePhase = MELEE_NONE; return MELEE_IDLE_THINK; }
+        HaloDamage source;
+        bool weaponMelee = false;
+        const bool able = t && alive(t) && a.awareness == COMBAT && a.morale != PANICKED && lastmillis >= a.reactUntil &&
+                          BotManager.BotsShoot() && !halovehicleinside(e) && !haloscenariocarried(e) &&
+                          (d.meleeFatal() || meleeSource(a, source, weaponMelee));
+        const float distance = t ? vec(t->o).sub(e->o).magnitudexy() / s : 0;
+        const bool level = t && fabsf(t->o.z - e->o.z) <= max(e->eyeheight, t->eyeheight);
+        // The target's receding speed (world units a second) for the suicide sensing below.
+        float receding = 0;
+        if(t && t == a.meleePrevTarget && a.meleePrevDistance >= 0 && lastmillis > a.meleePrevAt)
+            receding = (distance - a.meleePrevDistance) * 1000.0f / float(lastmillis - a.meleePrevAt);
+        a.meleePrevDistance = t ? distance : -1;
+        a.meleePrevTarget = t;
+        a.meleePrevAt = lastmillis;
+        if(!able)
+        {
+            if(a.meleePhase == MELEE_CHARGING) meleeTrace(a, "abort_lost", t, distance);
+            a.meleePhase = MELEE_NONE;
+            return MELEE_IDLE_THINK;
+        }
+        const bool ranged = rangedWeapon(a), berserk = a.morale == BERSERK;
+        if(a.meleePhase == MELEE_NONE)
+        {
+            // actions.c:2534-2545: an armed actor leaves a target in a vehicle or a swarm alone; nobody
+            // begins a charge mid-burst; a new check waits 10 ticks after the last charge began.
+            if(ranged && (halovehicleinside(t) || swarmTarget(t))) return MELEE_IDLE_THINK;
+            if(ranged && lastmillis < a.burstUntil) return MELEE_IDLE_THINK;
+            if(a.meleeCheck >= 0 && a.meleeCheck + 10 * tickMillis >= lastmillis) return MELEE_IDLE_THINK;
+            // Without a melee animation for its weapon the charge setup fails (unit_get_melee_range_and_ticks
+            // false: _charge_melee_no_animation, action_charge.c:996-1003, 1057-1060): the Flood elite
+            // form with a sniper rifle never melees.
+            if(d.meleeFrames <= 0) return MELEE_IDLE_THINK;
+            // The berserk range while berserk, or without a ranged weapon unless stalking (the carrier,
+            // the stealth sword Elite), else melee_range (actions.c:2556-2575).
+            const bool berserkRange = berserk || (!ranged && !d.stalking());
+            const float range = berserkRange ? d.berserkMeleeRange : d.meleeRange;
+            if(!(range > 0) || distance > range || !level) return MELEE_IDLE_THINK;
+            // melee_delay_scale x the actr's melee_attack_delay_timer (0 while berserk) + melee_delay_base
+            // since last_melee_attack_time (actions.c:2563-2568, 2593-2601).
+            const float timer = berserk ? 0.0f : max(d.meleeDelayTimer, 0.0f);
+            const float delay = halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_SCALE) * timer +
+                                halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_BASE);
+            if(a.meleeLast >= 0 && a.meleeLast <= lastmillis && float(a.meleeLast) + delay * 1000.0f >= float(lastmillis))
+                return MELEE_IDLE_THINK;
+            a.meleeCheck = lastmillis;
+            a.meleePhase = MELEE_CHARGING;
+            a.meleeChargeStart = lastmillis;
+            ++a.melees;
+            meleeTrace(a, "charge", t, distance, range);
+        }
+        // action_charge.c:269-313: a berserk or unarmed actor gives up beyond its berserk melee abort
+        // range (an armed one never on distance), anyone after the actr's charge timer (746-759).
+        if((berserk || !ranged) && distance > d.berserkMeleeAbort)
+        {
+            meleeTrace(a, "abort_range", t, distance, d.berserkMeleeAbort);
+            a.meleePhase = MELEE_NONE;
+            return MELEE_IDLE_THINK;
+        }
+        if(d.meleeChargeTimer > 0 && lastmillis >= a.meleeChargeStart + int(d.meleeChargeTimer * 1000))
+        {
+            meleeTrace(a, "abort_timer", t, distance, d.meleeChargeTimer);
+            a.meleePhase = MELEE_NONE;
+            return MELEE_IDLE_THINK;
+        }
+        a.meleeLast = lastmillis;
+        // The strike (action_charge.c:524-669): within 0.8, or within the reach; a suicidal actor (the
+        // carrier) within its attack range, or within its suicide sensing distance while the target pulls
+        // away faster than 0.7 world units a second (0.0233 a tick); any other must face within 30
+        // degrees (682-699). No lead on a moving target (judgement call).
+        const float reach = meleeReach(d);
+        bool strike = level && (distance < reach || touching(e, t));
+        if(!strike && level && d.suicidalMelee() && distance < d.suicideSensing && receding > 0.7f) strike = true;
+        vec toward = vec(t->o).sub(e->o);
+        toward.z = 0;
+        if(strike && !d.suicidalMelee() && !toward.iszero())
+        {
+            const float yaw = e->yaw * RAD;
+            if(vec(toward).normalize().dot(vec(sinf(yaw), -cosf(yaw), 0)) < 0.8660254f) strike = false;
+        }
+        // Nothing solid between them (Halo's blow is an area at the melee marker beside the body).
+        if(strike && !::IsVisible(e->o, centreOf(t), NULL)) strike = false;
+        body->AimToVec(centreOf(t));
+        if(!strike)
+        {
+            // Close in (actor_move_to_prop, keeping on past the destination: action_charge.c:776-790).
+            walkTo(a, body, t->o, max(e->radius + t->radius + 0.1f, reach * s * 0.5f), false);
+            return MELEE_MOVES;
+        }
+        if(d.meleeFatal())
+        {
+            // _unit_melee_attack_is_fatal_bit (units.c:4209-4217): the attack puts the unit (the carrier)
+            // in its dying state, so its key frame deals no melee (9993-10005), and with
+            // _unit_is_destroyed_after_dying_bit it is destroyed when the melee animation ends
+            // (10020-10045): 40 ticks for the carrier. think (meleeBurst) stands it there and then
+            // kills it, setting off its body destroyed blast and released forms (halokilled).
+            meleeTrace(a, "suicide", t, distance, receding);
+            a.meleePhase = MELEE_ATTACKING;
+            a.meleeStrikeAt = 0;
+            a.meleeBusyUntil = lastmillis + meleeLengthMillis(d);
+            e->move = e->strafe = 0;
+            return MELEE_MOVES;
+        }
+        a.meleePhase = MELEE_ATTACKING;
+        a.meleeStrikeAt = lastmillis + max(1, meleeKeyMillis(d));
+        a.meleeBusyUntil = lastmillis + meleeLengthMillis(d);
+        e->move = e->strafe = 0;
+        meleeTrace(a, "attack", t, distance, reach);
+        if(meleeKeyMillis(d) <= 0)
+        {
+            a.meleeStrikeAt = 0;
+            return meleeStrike(a) == MELEE_DONE ? MELEE_DONE : MELEE_MOVES;
+        }
+        return MELEE_MOVES;
+    }
+
+    // A fatal melee under way (the carrier's, meleeAttack): the unit is dying whatever its brain would do
+    // next, so it stands until the animation ends and is then destroyed. True while it holds the actor
+    // (after the kill `a` may no longer be valid).
+    bool meleeBurst(Actor &a)
+    {
+        if(a.meleePhase != MELEE_ATTACKING || !a.def->meleeFatal()) return false;
+        botent *e = a.bot;
+        e->move = e->strafe = 0;
+        if(lastmillis < a.meleeBusyUntil) return true;
+        a.meleePhase = MELEE_NONE;
+        meleeTrace(a, "burst", a.target, -1);
+        dodamage(INT_MAX, e, e, GUN_KNIFE);
+        return true;
+    }
+
+    // An infection form's blow on contact (the swarm's impact melee, bipeds.c:4060-4120, units.c:
+    // 4416-4512). On a biped whose shield is up and whose unit has shields_fry_infection_forms (the
+    // player's cyborg, the Elites) it deals its unit melee jpt! once (0.2, 3 to 3) and is deleted:
+    // object_deplete_body and object_delete, so no pop and no body (its body depleted effect has no
+    // jpt!). Otherwise it attaches and deals the jpt! every tick at scale 1/30, (1 - 1/30) x 0.2 + 3 / 30
+    // = 0.293 a tick, 8.8 a second (units.c:11336-11428, damage.c:1374-1383); the engine deals ten ticks'
+    // worth every ten ticks while the form touches its target, and does not carry the form along
+    // (judgement call: no attachment). Contact is the bodies touching, horizontally.
+    int infectionContact(Actor &a)
+    {
+        botent *e = a.bot;
+        const HaloActorDef &d = *a.def;
+        playerent *t = a.target;
+        if(!haloMelee(a) || !d.swarm() || !(d.meleeDiesOnShield() || d.meleeAttaches()) || !t || !alive(t) ||
+           a.awareness != COMBAT || !BotManager.BotsShoot() || lastmillis < a.nextContact || halovehicleinside(t))
+            return MELEE_IDLE_THINK;
+        const float s = scale();
+        vec dir = vec(t->o).sub(e->o);
+        const float distance = dir.magnitudexy();
+        if(distance > e->radius + t->radius + 0.25f * s || fabsf(t->o.z - e->o.z) > max(e->eyeheight, t->eyeheight)) return MELEE_IDLE_THINK;
+        HaloDamage source;
+        bool weaponMelee = false;
+        if(!meleeSource(a, source, weaponMelee)) return MELEE_IDLE_THINK;
+        dir.z = 0;
+        if(dir.iszero()) dir = vec(0, 1, 0);
+        dir.normalize();
+        ++a.meleeHits;
+        if(d.meleeDiesOnShield() && halounitshielded(t) && halounitfriesinfection(t))
+        {
+            const float full = source.roll();
+            meleeTrace(a, "contact_fried", t, distance / s, full);
+            halohit(full, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0, source.hasMaterials ? &source : nullptr);
+            haloactorspend(e);
+            return MELEE_DONE;
+        }
+        if(!d.meleeAttaches()) return MELEE_IDLE_THINK;
+        a.nextContact = lastmillis + 10 * tickMillis;
+        const float perTick = (1 - 1 / 30.0f) * source.lower + source.roll() / 30.0f;
+        meleeTrace(a, "contact_attached", t, distance / s, perTick * 10);
+        halohit(perTick * 10, HALO_SIDE_EFFECT_NONE, t, e, dir, GUN_KNIFE, false, 0, source.hasMaterials ? &source : nullptr);
+        return MELEE_DONE;
+    }
+
     // Hunters pair off with the nearest unpartnered Hunter of their team.
     void pairHunter(Actor &a)
     {
@@ -1009,6 +1462,8 @@ namespace
         botent *e = a.bot;
         e->move = e->strafe = 0;
         e->attacking = false;
+        // A carrier's fatal melee ends in its burst whatever else happens (meleeBurst).
+        if(meleeBurst(a)) return;
         // Flyers keep their hover height unless something below asks for another one.
         if(flyer(a)) holdAltitude(a, floorUnder(a) + a.hoverHeight * scale() * 0.5f);
         if(a.flags & HALO_AI_BRAINDEAD) return;
@@ -1069,10 +1524,27 @@ namespace
                 fire(a, body);
                 return;
             }
+            // Halo's melee: an infection form's blow on contact, else the melee charge. Either can
+            // kill (the target, or a carrier itself), after which `a` may be gone: stop thinking.
+            if(infectionContact(a) == MELEE_DONE) return;
+            const int meleeing = meleeAttack(a, body);
+            if(meleeing == MELEE_DONE) return;
+            if(meleeing == MELEE_MOVES)
+            {
+                // A charging actor keeps shooting with a ranged weapon (action_charge_control's
+                // shoot_at_target, action_charge.c:330); none during the attack itself.
+                if(a.meleePhase == MELEE_CHARGING && rangedWeapon(a)) fire(a, body);
+                return;
+            }
             if(a.morale == BERSERK || charges(a) || e->weaponsel->type == GUN_KNIFE)
             {
-                // Charge into melee range.
-                walkTo(a, body, a.target->o, max(a.def->meleeRange * s, 3.0f), false);
+                // Charge into melee range. Under Halo's melee an actor without a ranged weapon closes
+                // to 1.5 world units (actor_move_to_prop's least range, action_charge.c:776-780, as
+                // its close-range charge advances, 470-473) and an infection form to contact.
+                float stop = max(a.def->meleeRange * s, 3.0f);
+                if(haloMelee(a) && !rangedWeapon(a))
+                    stop = a.def->swarm() ? e->radius + a.target->radius : max(1.5f * s, e->radius + a.target->radius + 0.1f);
+                walkTo(a, body, a.target->o, stop, false);
                 body->AimToVec(centreOf(a.target));
             }
             else if(lastmillis >= a.positionUntil || !a.hasDestination)
@@ -1091,6 +1563,9 @@ namespace
             throwGrenade(a, body);
             return;
         }
+        // Out of combat a melee charge or attack under way ends without its blow.
+        a.meleePhase = MELEE_NONE;
+        a.meleeStrikeAt = 0;
         if(passive(a) && a.awareness == COMBAT)
         {
             // An Engineer that lost its threat drifts back to calm.
@@ -1165,7 +1640,46 @@ int haloactordefcount() { haloactorsload(); return int(definitions.size()); }
 namespace
 {
     HaloActorDef playerUnit;
-    bool playerAttempted = false, playerLoaded = false;
+    HaloFallingDef playerFalling;
+    bool playerAttempted = false, playerLoaded = false, fallingLoaded = false;
+
+    // player.txt's `falling` line (tools/halo_actors.py PLAYER_FIELDS): usable with positive,
+    // increasing distance bounds, a minimum damage velocity under the maximum, a positive maximum
+    // falling velocity and the jpt!s' upper bounds at or over their minimums. A line that fails
+    // this leaves the engine without falling damage (logged), the rest of the file still loads.
+    bool parseFalling(std::istringstream &in, HaloFallingDef &f)
+    {
+        HaloFallingDef d;
+        if(!(in >> d.lowerDistance >> d.upperDistance >> d.maximumDistance >> d.maximumFallingVelocity >> d.minimumDamageVelocity >>
+             d.maximumDamageVelocity >> d.falling[0] >> d.falling[1] >> d.falling[2] >> d.distance[0] >> d.distance[1] >> d.distance[2]))
+            return false;
+        // The categories and flags are optional fields (absent: falling, none).
+        d.fallingCategory = d.distanceCategory = 1;
+        if(in >> d.fallingCategory) { in >> d.distanceCategory; in >> d.fallingFlags; in >> d.distanceFlags; }
+        auto finite = [](float v) { return std::isfinite(v); };
+        if(!finite(d.lowerDistance) || !finite(d.upperDistance) || !finite(d.maximumDistance) || !finite(d.maximumFallingVelocity) ||
+           !finite(d.minimumDamageVelocity) || !finite(d.maximumDamageVelocity) || !(d.lowerDistance > 0) ||
+           !(d.upperDistance > d.lowerDistance) || !(d.maximumFallingVelocity > 0) || !(d.minimumDamageVelocity > 0) ||
+           !(d.maximumDamageVelocity > d.minimumDamageVelocity))
+            return false;
+        for(int i = 0; i < 3; ++i) if(!finite(d.falling[i]) || !finite(d.distance[i]) || d.falling[i] < 0 || d.distance[i] < 0) return false;
+        if(d.falling[2] < d.falling[1] || d.distance[2] < d.distance[1]) return false;
+        d.hasFallingMaterials = f.hasFallingMaterials;
+        d.hasDistanceMaterials = f.hasDistanceMaterials;
+        memcpy(d.fallingMaterials, f.fallingMaterials, sizeof(d.fallingMaterials));
+        memcpy(d.distanceMaterials, f.distanceMaterials, sizeof(d.distanceMaterials));
+        f = d;
+        return true;
+    }
+
+    bool parseFallingMaterials(std::istringstream &in, float *values, bool &has)
+    {
+        float v[33];
+        for(int i = 0; i < 33; ++i) if(!(in >> v[i]) || !std::isfinite(v[i]) || v[i] < 0) return false;
+        memcpy(values, v, sizeof(v));
+        has = true;
+        return true;
+    }
 
     // packages/halo/player.txt (tools/halo_actors.py PLAYER_FIELDS): `format 1`, then `player <unit
     // tag>`, its `material`, `resistance` and `shieldtime` lines and `end`. Keys it does not know are
@@ -1176,8 +1690,9 @@ namespace
     {
         std::istringstream lines(text);
         std::string line;
-        bool versioned = false, open = false, closed = false;
+        bool versioned = false, open = false, closed = false, falling = false, fallingBad = false;
         HaloActorDef d;
+        HaloFallingDef fall;
         while(std::getline(lines, line))
         {
             if(line.empty() || line[0] == '#') continue;
@@ -1189,6 +1704,22 @@ namespace
             else if(key == "player") { ok = !open && !closed; open = true; std::getline(in >> std::ws, d.path); }
             else if(key == "end") { ok = open; open = false; closed = true; }
             else if(open && (key == "material" || key == "resistance" || key == "shieldtime")) ok = parseColl(key, in, d);
+            // The unit's flags (shields fry infection forms, bit 22); optional, a file without it
+            // leaves hasUnitFlags false.
+            else if(open && key == "unit") ok = d.hasUnitFlags = bool(in >> d.unitFlags >> d.bipedFlags);
+            // The globals' falling damage (optional): a bad line turns falling damage off and is
+            // reported, without making the coll unusable.
+            else if(open && (key == "falling" || key == "fallingmaterials" || key == "distancematerials"))
+            {
+                const bool good = key == "falling" ? (falling = parseFalling(in, fall)) :
+                                  key == "fallingmaterials" ? parseFallingMaterials(in, fall.fallingMaterials, fall.hasFallingMaterials) :
+                                  parseFallingMaterials(in, fall.distanceMaterials, fall.hasDistanceMaterials);
+                if(!good)
+                {
+                    conoutf("\f3Halo player: invalid falling damage line in packages/halo/player.txt (no falling damage): %s", line.c_str());
+                    fallingBad = true;
+                }
+            }
             if(!ok) { conoutf("\f3Halo player: invalid line in packages/halo/player.txt: %s", line.c_str()); return false; }
         }
         if(!versioned || open || !closed || d.materials.empty() || !d.hasResistance || d.shieldMaterial < 0 || d.shieldMaterial >= 33 ||
@@ -1196,6 +1727,8 @@ namespace
             return false;
         for(const HaloActorDef::Material &m : d.materials) if(m.type < 0 || m.type >= 33) return false;
         playerUnit = d;
+        fallingLoaded = falling && !fallingBad;
+        if(fallingLoaded) playerFalling = fall;
         return true;
     }
 }
@@ -1216,6 +1749,11 @@ const HaloActorDef *haloplayerunit()
         }
     }
     return playerLoaded ? &playerUnit : nullptr;
+}
+
+const HaloFallingDef *haloplayerfalling()
+{
+    return haloplayerunit() && fallingLoaded ? &playerFalling : nullptr;
 }
 
 float halodifficultyvalue(int type, int level, float fallback)
@@ -1649,6 +2187,12 @@ void haloactorcommand(const playerent *bot, const HaloCommandProgram *program)
     a->goal = nullptr;
 }
 
+bool haloactornofallingdamage(const playerent *bot)
+{
+    const Actor *a = find(bot);
+    return a && a->program && a->commandStatus == 1 && (a->program->flags & COMMAND_DISABLE_FALLING_DAMAGE);
+}
+
 // 0 no list, 1 running, 2 finished or waiting at a loop for the script to advance it.
 int haloactorcommandstatus(const playerent *bot)
 {
@@ -1762,6 +2306,37 @@ float haloactordamagefactor(const playerent *attacker)
     // A dead actor's record is gone, so its grenades still in flight count in full: Halo's dead
     // unit has no actor either (actor_detach_from_unit).
     return haloactorflags(attacker) & HALO_AI_PLAYFIGHT ? .3f : 1.0f;
+}
+
+int haloactorshottrigger(const playerent *bot, const HaloWeaponDef &def)
+{
+    Actor *a = find(bot);
+    if(!a || bot == player1) return 0;
+    const HaloTriggerDef *secondary = def.trigger(1);
+    const bool hasSecondary = secondary && secondary->projectile.valid;
+    if(a->specialRelease >= 0)
+    {
+        const int trigger = a->specialRelease == 1 && hasSecondary ? 1 : 0;
+        a->specialRelease = -1;
+        if(trigger == 1) ++a->chargedShots;
+        return trigger;
+    }
+    // A secondary burst holds the secondary trigger for its length (actor_combat.c:2327-2330, 2408-2420).
+    if(a->burstSecondary && lastmillis < a->burstUntil && hasSecondary) { ++a->secondaryShots; return 1; }
+    return 0;
+}
+
+float haloactorburstmodifier(const playerent *bot)
+{
+    // actor_combat.c:1339-1345: a special burst multiplies burst_damage_modifier by the variant's
+    // special_damage_modifier when it is above 0. That modifier only applies when it is above 0
+    // (ai_adjust_damage, ai.c:664-669): the variant's weapon_damage_modifier here (the spawn's
+    // damageScale); a variant without one (Halo's damage_per_second rule, which the engine does not
+    // model) is not scaled. Taken at the shot, where Halo reads it at the hit (judgement call).
+    const Actor *a = find(bot);
+    if(!a || !a->specialBurst || lastmillis >= a->burstUntil) return 1.0f;
+    const HaloActorDef &d = *a->def;
+    return d.specialDamage > 0 && d.damageScale > 0 ? d.specialDamage : 1.0f;
 }
 
 int haloactorgrenadetype(const playerent *bot)
@@ -1933,6 +2508,12 @@ void haloactordump(const char *label)
         const float angle = acosf(clamp(vec(delta.x, delta.y, 0).normalize().dot(vec(sinf(yaw), -cosf(yaw), 0)), -1.0f, 1.0f)) / RAD;
         conoutf("ACTOR_VIEW %s cn=%d name=%s yaw=%.0f angle=%.0f distance=%.1f range=%.1f visible=%d thinks=%d", label, e->clientnum, e->name, e->yaw,
                 angle, delta.magnitude(), a.def->visionDistance * scale(), ::IsVisible(e->o, centreOf(player1), NULL), a.thinks);
+        // ACTOR_MELEE_QA <label> cn= model=<Halo's melee applies 0|1> knife=<melee slot 0|1> ranged=<0|1>
+        //   phase=<0 none, 1 charging, 2 attacking> charges= hits= reach= range= berserk_range= key_ms= length_ms= delay_timer=
+        conoutf("ACTOR_MELEE_QA %s cn=%d model=%d knife=%d ranged=%d phase=%d charges=%d hits=%d reach=%.3f range=%.2f berserk_range=%.2f "
+                "key_ms=%d length_ms=%d delay_timer=%.2f", label, e->clientnum, haloMelee(a), e->weaponsel && e->weaponsel->type == GUN_KNIFE,
+                rangedWeapon(a), a.meleePhase, a.melees, a.meleeHits, meleeReach(*a.def), a.def->meleeRange, a.def->berserkMeleeRange,
+                meleeKeyMillis(*a.def), meleeLengthMillis(*a.def), a.def->meleeDelayTimer);
     }
     fflush(stdout);
 }
@@ -1974,12 +2555,23 @@ void haloactorcombatdump(const char *label)
         // ACTOR_TIMERS <label> cn= variant= berserk=<0|1> swarm=<0|1> melee_timer=<actr s, -1 none>
         //   grenade_timeout=<actv s, -1 none> encounter=<index, -1 none> grenade_wait=<scaled ms>
         //   grenade_left=<ms of the encounter's timeout left> playfight=<0|1> burst=<min>,<max> (s, scaled)
+        //   special_left=<ms to the next special fire check, -1 no special fire>
         int wait = 0, encounter = -1;
         const int left = grenadeTimeoutLeft(a, v.scale.grenadeTimer, wait, encounter);
         conoutf("ACTOR_TIMERS %s cn=%d variant=%d berserk=%d swarm=%d melee_timer=%.3f grenade_timeout=%.3f encounter=%d "
-                "grenade_wait=%d grenade_left=%d playfight=%d burst=%.3f,%.3f", label, e->clientnum, d.index, a.morale == BERSERK ? 1 : 0,
-                d.swarm() ? 1 : 0, d.meleeDelayTimer, d.grenadeTimeout, encounter, wait, left, (a.flags & HALO_AI_PLAYFIGHT) ? 1 : 0,
-                d.burstMin * v.duration, d.burstMax * v.duration);
+                "grenade_wait=%d grenade_left=%d playfight=%d burst=%.3f,%.3f special_left=%d", label, e->clientnum, d.index,
+                a.morale == BERSERK ? 1 : 0, d.swarm() ? 1 : 0, d.meleeDelayTimer, d.grenadeTimeout, encounter, wait, left,
+                (a.flags & HALO_AI_PLAYFIGHT) ? 1 : 0, d.burstMin * v.duration, d.burstMax * v.duration,
+                d.specialMode > 0 ? max(0, a.specialReadyAt - lastmillis) : -1);
+        // ACTOR_SPECIAL <label> cn= variant= mode= situation= chance= delay=<s> modifier= error=<rad>
+        //   overcharging=<0|1> held=<ms, -1 not overcharging> secondary=<0|1 next burst> special_burst=<0|1>
+        //   specials=<successful rolls> charged=<charged bolts released> secondary_shots=
+        if(d.specialMode > 0)
+            conoutf("ACTOR_SPECIAL %s cn=%d variant=%d mode=%d situation=%d chance=%.3f delay=%.3f modifier=%.3f error=%.4f overcharging=%d "
+                    "held=%d secondary=%d special_burst=%d specials=%d charged=%d secondary_shots=%d", label, e->clientnum, d.index,
+                    d.specialMode, d.specialSituation, d.specialChance, d.specialDelay, d.specialDamage, d.specialError,
+                    a.overcharging ? 1 : 0, a.overcharging ? lastmillis - a.chargeSince : -1, a.nextSecondary ? 1 : 0,
+                    a.specialBurst && lastmillis < a.burstUntil ? 1 : 0, a.specials, a.chargedShots, a.secondaryShots);
     }
     fflush(stdout);
 }

@@ -424,17 +424,62 @@
         }
 
         // --- Damage ------------------------------------------------------------
-        // The retail damage effects are jpt tags this engine does not carry by name. Effects that
-        // are guaranteed to kill (names with guaranteed, doom, plummet, death) kill; the rest hurt a fixed amount.
+        // Nobody's damage (an ownerless scope): Halo's hs_damage_object and hs_damage_new deal it
+        // with owner NONE (../Halo3DS hs/hs_library_external.c:765-806), so a kill is no one's.
+        // With the jpt! in effects.txt (a `jpt` record, halofxjpt; halo_scriptjpt, on by default)
+        // they follow the port:
+        //   damage_object: object_cause_damage on the unit (:784-806) at scale 1, multiplier 1 and no
+        //   owner team (damage_data_new, objects/damage.c:483-497): the full-strength roll (upper
+        //   min to max, 1375-1383), no difficulty factor (1416-1421), the coll's indirect material,
+        //   no push; halodamage takes the jpt!'s material modifiers and its only-hurts-shields and
+        //   skips-shields flags (1667-1694). c40's pulse generator (500, 0x40, 0.5 on the cyborg
+        //   shield) empties the player's shield and leaves the health; d40's oven heat is 30 a call.
+        //   damage_new: area_of_effect_cause_damage at the flag (:765-782, damage.c:1778-1810):
+        //   haloareablast with the jpt!'s own radii (full inside the falloff radius, the lower bound
+        //   at the cutoff; flat for a jpt! that does not scale by distance), so a10's zapper (0
+        //   damage) deals nothing; a jpt! with no cutoff radius reaches nothing (an engine judgement;
+        //   no retail call has one).
+        // Without the record (an older effects.txt, a tag the table lacks, halo_scriptjpt 0) the old
+        // rule: names with guaranteed, doom, plummet or death kill, anything else hurts 40, and
+        // damage_new strikes within 4 world units of the flag.
         if(is("damage_object") || is("damage_new"))
         {
             if(scene) return handled();
             const std::string effect = text(0);
+            HaloScriptDamage scripted(true);
+            HaloEffectDamage jpt;
+            if(halo_scriptjpt && halofxjpt(effect.c_str(), jpt))
+            {
+                if(is("damage_object"))
+                    eachUnit(index(1), [&](playerent *unit)
+                    {
+                        if(!unit || unit->state != CS_ALIVE) return;
+                        const float amount = jpt.damage.roll();
+                        if(halo_scripttrace || halo_damagetrace)
+                            conoutf("SCRIPT_DAMAGE %s target=%s amount=%.2f flags=0x%x category=%d", effect.c_str(),
+                                    unit == player1 ? "player" : unit->name, amount, jpt.damage.flags, jpt.damage.category);
+                        // In the player's name (the stock hit path needs an attacker) inside the
+                        // ownerless scope; no push (a zero direction), no gibs; the knife for the
+                        // player only to keep the grenade's deafening off, as the falling damage.
+                        halohit(amount, jpt.sideEffect, unit, player1, vec(0, 0, 0), unit == player1 ? GUN_KNIFE : GUN_GRENADE, false, 0,
+                                &jpt.damage);
+                    });
+                else if(const Flag *flag = at(program.flags, index(1)))
+                {
+                    if(projection)
+                    {
+                        const vec centre = toWorld(*projection, flag->pose.position);
+                        const float inner = jpt.effectFlags & HALO_JPT_DONT_SCALE_BY_DISTANCE ? jpt.outer : jpt.inner;
+                        if(halo_scripttrace || halo_damagetrace)
+                            conoutf("SCRIPT_DAMAGE %s flag=%d inner=%.2f outer=%.2f upper=%.2f", effect.c_str(), index(1), inner, jpt.outer,
+                                    jpt.damage.upperMax);
+                        haloareablast(centre, jpt.damage, inner, jpt.outer, jpt.sideEffect, nullptr);
+                    }
+                }
+                return handled();
+            }
             auto lethal = [&](const char *word) { return effect.find(word) != std::string::npos; };
             const int damage = lethal("guaranteed") || lethal("doom") || lethal("plummet") || lethal("death") ? INT_MAX : 40;
-            // Nobody's damage (an ownerless scope): Halo's hs_damage_object and hs_damage_new
-            // deal it with owner NONE (../Halo3DS hs/hs_library_external.c), so a kill is no one's.
-            HaloScriptDamage scripted(true);
             auto hurt =[&](playerent *unit) { if(unit && unit->state == CS_ALIVE) dodamage(damage, unit, unit == player1 ? unit : player1, GUN_GRENADE); };
             if(is("damage_object")) eachUnit(index(1), hurt);
             else

@@ -11,6 +11,7 @@
 #include <vector>
 
 class CBot;
+struct HaloWeaponDef;
 
 // Engine teams. Covenant and human keep their old values (0 and 1: the QA hooks and saved
 // squads use them); HALO_TEAM_OTHER stands for the retail teams 6 to 9, hostile to everyone.
@@ -100,7 +101,33 @@ struct HaloActorDef
     // spawned actors. The carrier's blast (characters\floodcarrier\effects\body destroyed), the
     // Sentinels' death explosion and the Engineer's. Empty for none.
     std::string destroyedEffect;
+    // The optional `melee` line (tools/halo_actors.py; older engines skip it, and without it the
+    // actor keeps the engine's former melee): the actv's melee_range, melee_abort_range,
+    // berserk_melee_range and berserk_melee_abort_range (../Halo3DS ai/actor_definitions.h:352-357),
+    // the actr's melee_attack_range, melee_attack_charge_timer and suicide_sensing_distance (:223-233;
+    // 0 without an actr), whether the carried weapon's melee jpt! replaces the unit's (its
+    // non_players_use_melee_damage flag, units/units.c:8597-8612: the energy sword) and the unit's
+    // melee animation for that weapon: frames, key frame and x offsets at the key frame and at the
+    // end (unit_get_melee_range_and_ticks, units.c:1391-1459; 0 without one). `unit` also marks
+    // whether the `unit` line was read (the flags below are known).
+    bool hasMelee = false, hasUnitFlags = false, meleeWeaponDamage = false;
+    float meleeAbort = 0, berserkMeleeRange = 0, berserkMeleeAbort = 0, meleeAttackRange = 0, meleeChargeTimer = 0,
+          suicideSensing = 0, meleeKeyX = 0, meleeTotalX = 0;
+    int meleeFrames = 0, meleeKeyFrame = 0;
+    // The optional `special` line (tools/halo_actors.py, written for mode > 0; older engines skip it):
+    // the actv's special fire (../Halo3DS ai/actor_definitions.h:340-351; actor_combat.c:1765-1840):
+    // the mode (0 none, 1 overcharge, 2 secondary trigger), the situation (0 never, 1 enemy visible,
+    // 2 enemy out of sight, 3 strafing), the chance, the delay (s), the damage modifier on a special
+    // burst (0 none) and the error added to it (radians, actor_combat.c:1339-1348).
+    int specialMode = 0, specialSituation = 0;
+    float specialChance = 0, specialDelay = 0, specialDamage = 0, specialError = 0;
     bool inconsequential() const { return (unitFlags >> 19) & 1; }     // _unit_is_inconsequential_bit
+    bool meleeFatal() const { return (unitFlags >> 8) & 1; }           // _unit_melee_attack_is_fatal_bit (the carrier)
+    bool meleeAttaches() const { return (unitFlags >> 12) & 1; }       // _unit_impact_melee_attaches_bit
+    bool meleeDiesOnShield() const { return (unitFlags >> 13) & 1; }   // _unit_impact_melee_die_on_shield_bit
+    bool shieldsFryInfection() const { return (unitFlags >> 22) & 1; } // _unit_shields_fry_infection_forms_bit
+    bool stalking() const { return (actrFlags >> 17) & 1; }            // _actor_definition_stalking_behavior_bit
+    bool suicidalMelee() const { return (actrFlags >> 27) & 1; }       // _actor_definition_suicidal_melee_attack_bit
     // _actor_definition_swarm_actor_bit (../Halo3DS ai/actor_definitions.h:54): the infection forms.
     // Halo keeps up to 16 bodies of one variant and squad in one swarm actor (ai/actors.c:2539-2555).
     bool swarm() const { return (actrFlags >> 26) & 1; }
@@ -154,6 +181,23 @@ const HaloActorDef *haloactordef(int index);
 // `shieldtime`, in a HaloActorDef (only those fields are set). Null without the file or with an
 // unusable one: halodamage's player branch then keeps the engine's built-in rule.
 const HaloActorDef *haloplayerunit();
+// The globals' falling damage block (matg falling_damage, ../Halo3DS units/bipeds.c:368-385), from
+// player.txt's optional `falling`, `fallingmaterials` and `distancematerials` lines
+// (tools/halo_actors.py): the distance bounds and maximum distance (world units), the runtime
+// velocities (units a tick, sqrt(2 g d) of those distances) and the falling and maximum distance
+// jpt!s' damage (minimum, lower, upper), categories, flags and material modifiers. Null without the
+// line (an older player.txt) or without a usable player.txt: the engine deals no falling damage.
+struct HaloFallingDef
+{
+    float lowerDistance = 0, upperDistance = 0, maximumDistance = 0;
+    float maximumFallingVelocity = 0, minimumDamageVelocity = 0, maximumDamageVelocity = 0;
+    float falling[3] = {0, 0, 0}, distance[3] = {0, 0, 0};
+    int fallingCategory = -1, distanceCategory = -1;
+    unsigned fallingFlags = 0, distanceFlags = 0;
+    bool hasFallingMaterials = false, hasDistanceMaterials = false;
+    float fallingMaterials[33] = {}, distanceMaterials[33] = {};
+};
+const HaloFallingDef *haloplayerfalling();
 // The variant to use when only an actor family and weapon are known (wave sections, scripts).
 const HaloActorDef *haloactordefault(int kind, int weaponIndex);
 // The variant whose actv tag path is `path` (case-insensitive), or null: the vehicle variants
@@ -254,7 +298,8 @@ float haloguidancevsplayer();
 // QA (tests/test_actor_ai.py): COMBAT_DIFFICULTY and _MORE lines per team, then one ACTOR_COMBAT line per
 // living actor with the effective values its brain uses.
 // Also one ACTOR_TIMERS line per living actor: its actr melee delay and actv encounter grenade timeout,
-// its encounter and that encounter's scaled timeout and the time left of it.
+// its encounter and that encounter's scaled timeout and the time left of it, and one ACTOR_SPECIAL
+// line per living actor whose variant has special fire (its tag values and special fire state).
 void haloactorcombatdump(const char *label);
 // QA (tests/test_actor_ai.py item 6): the first living actor with an encounter and a positive grenade
 // timeout starts that encounter's timeout now, as its throw would; prints GRENADE_NOTE.
@@ -287,6 +332,10 @@ void haloactorsetstate(const playerent *bot, int state);
 void haloactorsetflag(const playerent *bot, int flag, bool on);
 void haloactorcommand(const playerent *bot, const HaloCommandProgram *program);
 int haloactorcommandstatus(const playerent *bot);
+// The actor runs a command list with the disable falling damage flag (bit 4,
+// ../Halo3DS ai/ai_scenario_definitions.h:127): Halo sets the unit's no falling damage bit while it
+// obeys the list (ai/action_obey.c:1508-1513, cleared at 1554), which biped_falling_damage honours.
+bool haloactornofallingdamage(const playerent *bot);
 void haloactorcommandadvance(const playerent *bot);
 // ai_status scale: 0 gone, 1 asleep, 2 idle, 4 alert, 6 in combat.
 int haloactorstatus(const playerent *bot);
@@ -325,6 +374,13 @@ int haloactorflags(const playerent *bot);
 // What ai_adjust_damage multiplies damage owned by `attacker` by: 0.3 while it plays at fighting
 // (ai_playfight), else 1 (anything that is not an actor, a dead actor's projectiles included).
 float haloactordamagefactor(const playerent *attacker);
+// Halo's infantry special fire (actors.txt `special`; halo_specialfire 0 switches it off), for
+// gun::attack (weapon.cpp): the trigger of `def` an actor's shot pulls now, 1 for the charged bolt
+// an overcharge releases (consumed by the call) and for every shot of a secondary-trigger burst,
+// else 0 (anything that is not an actor too); and the factor on its weapon damage while its burst
+// is special, the variant's special damage modifier (actor_combat.c:1339-1345), else 1.
+int haloactorshottrigger(const playerent *bot, const HaloWeaponDef &def);
+float haloactorburstmodifier(const playerent *bot);
 // The grenade type the actor throws (and drops when killed), or -1 for anything that is not an actor.
 int haloactorgrenadetype(const playerent *bot);
 // ai_grenades: whether any actor may throw grenades (on by default; the scenario resets it per section).
@@ -390,6 +446,13 @@ const HaloActorDef *haloactorvariant(const playerent *p);
 // Callbacks the scenario provides.
 void haloscenariowakescript(int script);
 float haloenemyshieldfraction(const playerent *p);
+// halo.cpp, for the actors' melee (halo_ai.cpp): whether a living unit's shield is up (the player's,
+// its overshield included, or an actor's), whether its unit tag has shields_fry_infection_forms
+// (../Halo3DS units/unit_definitions.h:44; the player's cyborg from player.txt's `unit` line, assumed
+// without it), and deleting an actor as an infection form spent on a body is (no pop, no corpse).
+bool halounitshielded(const playerent *p);
+bool halounitfriesinfection(const playerent *p);
+void haloactorspend(playerent *p);
 // How strongly an actor's active camouflage hides it (0 none, 1 fully cloaked; it weakens while
 // the actor fires or is hit). halo.cpp; the renderer draws the actor that translucent.
 float haloactorcloak(const playerent *p);

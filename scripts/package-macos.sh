@@ -31,7 +31,9 @@ for asset in ('maps/halo_a30.cgz', 'maps/halo_a30.cfg', 'maps/halo_a30.mesh') + 
     if not (packages / asset).is_file():
         missing.append(asset)
 if not partial:
-    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'vehicles.txt', 'effects.txt'):
+    # player.txt (tools/halo_actors.py) carries the player's materials, shield and falling damage:
+    # without it the engine silently falls back to its built-in player rules.
+    for table in ('weapons.txt', 'equipment.txt', 'actors.txt', 'player.txt', 'vehicles.txt', 'effects.txt'):
         if not (packages / 'halo' / table).is_file():
             missing.append(f'halo/{table}')
     for mission in MISSIONS:

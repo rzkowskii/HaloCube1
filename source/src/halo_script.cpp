@@ -40,6 +40,11 @@ VAR(halo_scriptseatmax, 0, 180, 3600);
 // found the projected blasts where Halo sets them off (docs/macos-build.md, Script effects); 0 is
 // the old visual-only behaviour.
 VAR(halo_effectdamage, 0, 1, 1);
+// damage_object and damage_new deal the jpt! they name (effects.txt `jpt` records, halofxjpt) as
+// Halo does (halo_script_ai.inc); 0, or without the record, keeps the flat 40 and the name-based kills.
+// halo_scripttrace or halo_damagetrace 1 logs SCRIPT_DAMAGE <jpt!> target=<name> amount= flags= category=
+// for damage_object and SCRIPT_DAMAGE <jpt!> flag=<index> inner= outer= upper= for damage_new.
+VAR(halo_scriptjpt, 0, 1, 1);
 // QA hold (tests/test_ai_attach.py item 12): 1 keeps the attached actors carried in from the
 // section before from spawning (Scenario::spawnCarried), so a script's commands can reach their
 // pending entries; 0, the default, lets them come along on the section's first live ticks.
@@ -6571,6 +6576,11 @@ float haloscenarioscale()
     // Without a loaded program: 2.75, the authored Crash Site's horizontal scale (tools/import_halo_a30.py);
     // the retail Crash Site's scale (4.1, CRASH_SITE in tools/import_halo_campaign.py) is in a30.hscb.
     return scenario.loaded && scenario.projection ? scenario.projection->xy : 2.75f;
+}
+
+float haloscenarioverticalscale()
+{
+    return scenario.loaded && scenario.projection && scenario.projection->z > 0 ? scenario.projection->z : 2.0f;
 }
 
 bool haloscenarioexitpoint(vec &point)

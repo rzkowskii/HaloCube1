@@ -347,6 +347,8 @@ static bool retailmove(physent *d, vec delta, float gravity)
             break;
         }
         collided = true;
+        // Read only: the falling damage's view of the contact (halo.cpp updateFalling).
+        if(actor && !grounded) halofallcontact(d, hit.normal, hit.normal.z >= retailSlope);
         if(debug) conoutf("RDBG it=%d delta=%.4f,%.4f,%.4f hit=%d frac=%.4f n=%.3f,%.3f,%.3f", i, delta.x, delta.y, delta.z, hit.surface, hit.fraction, hit.normal.x, hit.normal.y, hit.normal.z);
         if(i == 0 && actor && grounded && !rising && hit.normal.z < retailSlope &&
            delta.sqrxy() > 1e-8f && retailstepup(d, feet, delta))
@@ -376,6 +378,7 @@ static bool retailmove(physent *d, vec delta, float gravity)
         {
             retailadvance(feet, down, hit);
             floor = true;
+            if(!grounded) halofallcontact(d, hit.normal, true);
         }
         else if(grounded)
         {

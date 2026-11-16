@@ -63,6 +63,14 @@ namespace
     };
 
     std::vector<EffectDef> effects;
+    // The jpt!s the mission scripts name (`jpt` records: damage_object, damage_new).
+    struct JptDef
+    {
+        std::string path;
+        bool valid = false;
+        HaloEffectDamage damage;
+    };
+    std::vector<JptDef> jpts;
     bool effectsTried = false, effectsLoaded = false;
     // The cyborg's flashlight light (tools/halo_effects.py): world units and radians.
     float flashRadius = 6, flashFalloff = .349f, flashCutoff = .785f;
@@ -142,6 +150,7 @@ namespace
         delete[] text;
         std::string line;
         EffectDef *def = nullptr;
+        JptDef *jpt = nullptr;
         bool versioned = false;
         while(std::getline(lines, line))
         {
@@ -171,7 +180,51 @@ namespace
                 classLines[cache] = rest;
                 continue;
             }
-            if(key == "effect") { effects.emplace_back(); def = &effects.back(); continue; }
+            if(key == "effect") { effects.emplace_back(); def = &effects.back(); jpt = nullptr; continue; }
+            // A `jpt` record (after every effect: older games skip its lines, having no effect open):
+            // path, then `jptdamage <inner> <outer> <lower> <upper min> <upper max> <side effect>
+            // <category> <core> <damage flags> <effect flags>` (world units, points; zero damage
+            // kept), then `materials`.
+            if(key == "jpt") { jpts.emplace_back(); jpt = &jpts.back(); def = nullptr; continue; }
+            if(jpt)
+            {
+                if(key == "path") std::getline(in >> std::ws, jpt->path);
+                else if(key == "jptdamage")
+                {
+                    HaloEffectDamage &d = jpt->damage;
+                    float lower, low, high, core;
+                    unsigned long long flags = 0, effectFlags = 0;
+                    if(in >> d.inner >> d.outer >> lower >> low >> high >> d.sideEffect >> d.category >> core >> flags >> effectFlags &&
+                       std::isfinite(d.inner) && std::isfinite(d.outer) && std::isfinite(lower) && std::isfinite(low) &&
+                       std::isfinite(high) && std::isfinite(core) && d.outer >= 0 && d.outer < 1000 && high >= 0 && high < 100000 &&
+                       flags <= 0xffffffffull && effectFlags <= 0xffffffffull)
+                    {
+                        d.inner = clamp(d.inner, 0.0f, d.outer);
+                        d.damage.upperMax = high;
+                        d.damage.upperMin = clamp(low, 0.0f, high);
+                        d.damage.lower = clamp(lower, 0.0f, high);
+                        d.damage.core = clamp(core, 0.0f, d.outer);
+                        d.damage.category = d.category;
+                        d.damage.flags = unsigned(flags);
+                        d.effectFlags = unsigned(effectFlags);
+                        jpt->valid = true;
+                    }
+                }
+                else if(key == "materials")
+                {
+                    HaloDamage &d = jpt->damage.damage;
+                    int read = 0;
+                    while(read < HALO_DAMAGE_MATERIALS && in >> d.materials[read])
+                    {
+                        if(!std::isfinite(d.materials[read])) break;
+                        d.materials[read] = clamp(d.materials[read], 0.0f, 100.0f);
+                        ++read;
+                    }
+                    d.hasMaterials = read == HALO_DAMAGE_MATERIALS;
+                }
+                else if(key == "end") jpt = nullptr;
+                continue;
+            }
             if(!def) continue;
             if(key == "path") std::getline(in >> std::ws, def->path);
             else if(key == "kind")
@@ -233,11 +286,13 @@ namespace
         {
             conoutf("\f3Halo effects: packages/halo/effects.txt is not format %d; re-run tools/halo_effects.py", formatVersion);
             effects.clear();
+            jpts.clear();
             classLines.clear();
             return false;
         }
         effectsLoaded = true;
-        conoutf("Halo effects: %d script effects, sound classes for %d caches", int(effects.size()), int(classLines.size()));
+        conoutf("Halo effects: %d script effects, %d script jpt!s, sound classes for %d caches", int(effects.size()), int(jpts.size()),
+                int(classLines.size()));
         return true;
     }
 
@@ -441,6 +496,16 @@ bool halofxeffectdamage(const char *tag, HaloEffectDamage &out)
     if(!def || !def->hasDamage) return false;
     out = def->damage;
     return true;
+}
+
+bool halofxjpt(const char *tag, HaloEffectDamage &out)
+{
+    if(!tag || !*tag || !loadEffects()) return false;
+    std::string wanted(tag);
+    for(char &c : wanted) if(c == '/') c = '\\';
+    for(const JptDef &j : jpts)
+        if(j.valid && !strcasecmp(j.path.c_str(), wanted.c_str())) { out = j.damage; return true; }
+    return false;
 }
 
 void halofxblast(const vec &point, float radius)

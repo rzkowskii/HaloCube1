@@ -43,6 +43,9 @@ bool halocartographertarget(vec &point, bool &mapped);
 bool haloscenarioexitpoint(vec &point);
 // AssaultCube units per Halo world unit for the current section.
 float haloscenarioscale();
+// The same up and down (the projection's z scale: equal to the horizontal one in every retail
+// section; the authored Crash Site's 2.0 without a loaded program).
+float haloscenarioverticalscale();
 // Places every squad of a named encounter; returns how many actors spawned, or -1.
 int haloscenarioplace(const char *encounter);
 void haloscenarioqapad(int count);

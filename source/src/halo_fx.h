@@ -34,8 +34,14 @@ struct HaloEffectDamage
     HaloDamage damage;
     float inner = 0, outer = 0;
     int sideEffect = 0, category = 0;
+    unsigned effectFlags = 0;               // a `jpt` record's jpt! flags (HALO_JPT_*); 0 for an effect's part
 };
 bool halofxeffectdamage(const char *tag, HaloEffectDamage &out);
+// A jpt! a mission script names (damage_object, damage_new): effects.txt's optional `jpt` records
+// (tools/halo_effects.py), its radii (world units), damage, side effect, category, damage flags
+// (damage.flags, HALO_DAMAGE_*), effect flags and material modifiers. Zero damage is kept (a10's
+// zapper). Matched by tag path, case-insensitively, `/` as `\`; false for a tag the table lacks.
+bool halofxjpt(const char *tag, HaloEffectDamage &out);
 
 // player_effect_*: the scripts' camera shake (translation in world units, rotation in degrees,
 // rumble 0..1 standing in for the controller's motors: a fine shake). `what`: 0 translation,

@@ -19,6 +19,13 @@ source/src/halo_fx.cpp:
   scripts' effect_new (haloeffectblast in source/src/weapon.cpp; tools/halo_effect_reach.py lists
   where the scripts set them off against the planned routes). The format stays 1: older
   games skip the new lines.
+- every `jpt!` a mission script names (the damage constants of damage_object and damage_new: a10's
+  shield-tutorial zapper, a30's shock explosion, c40's pulse generator, d40's oven heat and the
+  guaranteed kills), as optional `jpt` records after the effects: radii, damage, side effect,
+  category, AOE core, damage flags (0x40 only hurts shields), the effect's own flags and the 33
+  material modifiers. The engine deals them as Halo's hs_damage_object and hs_damage_new do
+  (source/src/halo_script_ai.inc); older games skip the records and keep the flat 40 and the
+  name-based kills.
 - the player's flashlight (`characters\\cyborg\\flashlight_cyborg`): radius and cone angles.
 - the sound class of every `snd!` tag in each cache (the `classes` lines), which
   sound_class_set_gain fades.
@@ -30,7 +37,7 @@ import mmap
 from pathlib import Path
 
 from import_halo_a30 import HaloMap
-from halo_weapons import CAMPAIGN, EFFECT_EVENTS, EVENT_STRIDE, EVENT_PARTS, PART_STRIDE, PART_TYPE, \
+from halo_weapons import CAMPAIGN, EFFECT_EVENTS, EVENT_STRIDE, EVENT_PARTS, JPT_FLAGS, PART_STRIDE, PART_TYPE, \
     effect_sound, jpt_damage, jpt_materials, materials_line, number
 
 FORMAT = 1
@@ -40,6 +47,7 @@ EVENT_PARTICLES, PARTICLE_STRIDE = 56, 232     # an effect event's particles blo
 LIGHT_RADIUS, LIGHT_FALLOFF, LIGHT_CUTOFF, LIGHT_COLOR, LIGHT_DURATION = 4, 16, 20, 72, 244
 SOUND_CLASS = 4                                # snd!: the class (16-bit) before the sample rate
 HS_EFFECT = 25                                 # HaloScript value type of an effect constant
+HS_DAMAGE = 26                                 # ... and of a damage (jpt!) constant (../Halo3DS hs/hs.h:40-41)
 FLASHLIGHT = r'characters\cyborg\flashlight_cyborg'
 
 FIELDS = '''# flashlight <radius> <falloff angle> <cutoff angle> <r> <g> <b>   world units, radians
@@ -54,6 +62,13 @@ FIELDS = '''# flashlight <radius> <falloff angle> <cutoff angle> <r> <g> <b>   w
 #   materials <33 modifiers>              that part's damage modifier per retail material type
 #   particles <systems> <particles>       particle system and particle parts it carries
 #   sound play <snd! tag>                 the first sound part
+#   end
+# jpt <index>                            a jpt! a mission script names (damage_object, damage_new)
+#   path <jpt! tag>
+#   jptdamage <inner> <outer> <lower> <upper min> <upper max> <side effect> <category> <core> <damage flags> <effect flags>
+#                                         world units, points; damage flags 0x40 only hurts shields,
+#                                         0x200 skips shields; effect flag 0x1 don't scale by distance
+#   materials <33 modifiers>              its damage modifier per retail material type
 #   end
 # classes <cache> <tag index>:<class> ...  every snd! of the cache; class 32 music, 33-35 ambient,
 #                                          23 vehicle engine, 4 weapon fire, 19 unit dialog, ...
@@ -74,6 +89,29 @@ def script_effects(halo):
             if index < len(halo.directory) and halo.directory[index].group == 'effe':
                 found.add(halo.directory[index].name)
     return found
+
+
+def script_damage(halo):
+    """jpt! tag names named by the scenario's script constants (op 26 nodes: the damage argument of
+    damage_object and damage_new)."""
+    from import_halo_scripts import Program
+    try:
+        program = Program(halo)
+    except ValueError:
+        return set()
+    found = set()
+    for salt, op, ty, flags, _, _, data in program.nodes:
+        if salt and flags & 1 and op == HS_DAMAGE and data != 0xffffffff:
+            index = data & 0xffff
+            if index < len(halo.directory) and halo.directory[index].group == 'jpt!':
+                found.add(halo.directory[index].name)
+    return found
+
+
+def jpt_record(halo, tag):
+    d = jpt_damage(halo, tag)
+    effect_flags, = halo.tags.read('I', tag.address + JPT_FLAGS)
+    return {'damage': d, 'effect_flags': effect_flags, 'materials': jpt_materials(halo, tag)}
 
 
 def light_values(halo, tag):
@@ -157,7 +195,7 @@ def main():
     parser.add_argument('maps', type=Path, help='Directory with the expanded Xbox campaign caches')
     parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parent.parent)
     args = parser.parse_args()
-    effects, flashlight, classes = {}, None, []
+    effects, jpts, flashlight, classes = {}, {}, None, []
     for cache in CAMPAIGN:
         source = args.maps / f'{cache}.map'
         if not source.is_file():
@@ -165,9 +203,12 @@ def main():
         with source.open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
             halo = HaloMap(data)
             wanted = script_effects(halo) | vehicle_effects(halo) | unit_effects(halo)
+            damage = script_damage(halo)
             for tag in halo.directory:
                 if tag.group == 'effe' and tag.name in wanted and tag.name not in effects:
                     effects[tag.name] = effect_record(halo, tag)
+                elif tag.group == 'jpt!' and tag.name in damage and tag.name not in jpts:
+                    jpts[tag.name] = jpt_record(halo, tag)
                 elif tag.group == 'ligh' and tag.name == FLASHLIGHT and flashlight is None:
                     radius, r, g, b, _ = light_values(halo, tag)
                     falloff, cutoff = halo.tags.read('2f', tag.address + LIGHT_FALLOFF)
@@ -195,11 +236,21 @@ def main():
         if e['sound']:
             lines.append(f'sound play {e["sound"]}')
         lines.append('end')
+    # After every effect's `end`, so an older game, with no effect open, skips each line.
+    for index, name in enumerate(sorted(jpts)):
+        j = jpts[name]
+        d = j['damage']
+        lines += [f'jpt {index}', f'path {name}',
+                  'jptdamage ' + ' '.join(map(number, (d.inner, d.outer, d.lower, d.upper_min, d.upper_max))) +
+                  f' {d.side_effect} {d.category} {number(d.core)} {d.flags} {j["effect_flags"]}']
+        if j['materials']:
+            lines.append(materials_line(j['materials']))
+        lines.append('end')
     lines += classes
     target = args.output / 'packages/halo/effects.txt'
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text('\n'.join(lines) + '\n', encoding='ascii')
-    print(f'{len(effects)} script effects, flashlight {"found" if flashlight else "missing"}, '
+    print(f'{len(effects)} script effects, {len(jpts)} script jpt!s, flashlight {"found" if flashlight else "missing"}, '
           f'sound classes for {len(classes)} caches -> {target}')
 
 

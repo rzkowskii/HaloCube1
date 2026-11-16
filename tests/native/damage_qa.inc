@@ -425,3 +425,78 @@ COMMANDF(qa_damage_shot, "iifs", (int *weapon, int *trigger, float *amount, cons
     halohit(*amount, HALO_SIDE_EFFECT_NONE, player1, attacker, vec(0, 0, 1), *trigger < 0 ? GUN_KNIFE : GUN_SUBGUN, false, 0, source, &at);
     qaDamageVitals(label);
 });
+
+// Falling damage (halo.cpp updateFalling; tests/test_falling_damage.py):
+// qa_fall_def: FALL_DEF loaded= enabled= lower= upper= maximum= max_falling= min_damage= max_damage=
+//              falling=<min>/<lower>/<upper> distance=<min>/<lower>/<upper> categories= shield22= armor21= scale=
+// qa_fall HEIGHT LABEL: lifts the player HEIGHT Halo units (times the section's vertical scale)
+//              straight up from where they stand, stopped, and starts their fall there afresh (as a
+//              walk off a ledge that high); FALL_QA <label> player from= to= height= units=, or
+//              FALL_QA <label> blocked when the structure is in the way. The fall plays out in the game.
+// qa_fall_actor HEIGHT LABEL: the same for the nearest living hostile actor, its fall armed
+//              (FALL_QA <label> actor name= ...); an actor's fall otherwise counts only once it has
+//              stood on a floor since its placement.
+// qa_fall_state LABEL: FALL_STATE <label> airborne= armed= apex= velocity= hp= shield= alive=
+static void qaFallDef()
+{
+    const HaloFallingDef *d = haloplayerfalling();
+    if(!d) { conoutf("FALL_DEF loaded=0 enabled=%d", halo_fallingdamage); fflush(stdout); return; }
+    conoutf("FALL_DEF loaded=1 enabled=%d lower=%.3f upper=%.3f maximum=%.3f max_falling=%.5f min_damage=%.5f max_damage=%.5f "
+            "falling=%.1f/%.1f/%.1f distance=%.1f/%.1f/%.1f categories=%d/%d shield22=%.2f armor21=%.2f scale=%.4f",
+            halo_fallingdamage, d->lowerDistance, d->upperDistance, d->maximumDistance, d->maximumFallingVelocity, d->minimumDamageVelocity,
+            d->maximumDamageVelocity, d->falling[0], d->falling[1], d->falling[2], d->distance[0], d->distance[1], d->distance[2],
+            d->fallingCategory, d->distanceCategory, d->hasFallingMaterials ? d->fallingMaterials[22] : 1.0f,
+            d->hasFallingMaterials ? d->fallingMaterials[21] : 1.0f, haloscenarioverticalscale());
+    fflush(stdout);
+}
+COMMANDF(qa_fall_def, "", () { qaFallDef(); });
+
+static bool qaFallLift(playerent *body, float height, vec &from, vec &to)
+{
+    from = vec(body->o).sub(vec(0, 0, body->eyeheight));
+    to = vec(from).add(vec(0, 0, max(height, 0.0f) * haloscenarioverticalscale()));
+    if(halocollisionactive())
+    {
+        HaloCollisionHit hit;
+        const vec head = vec(to).add(vec(0, 0, body->eyeheight + body->aboveeye));
+        if(halocollisiontrace(vec(from).add(vec(0, 0, body->eyeheight)), head, hit)) return false;
+    }
+    body->o = vec(to).add(vec(0, 0, body->eyeheight));
+    body->newpos = to;
+    body->vel = vec(0, 0, 0);
+    body->timeinair = 0;
+    body->onfloor = false;
+    body->resetinterp();
+    return true;
+}
+
+COMMANDF(qa_fall, "fs", (float *height, const char *label)
+{
+    vec from;
+    vec to;
+    if(!qaFallLift(player1, *height, from, to)) { conoutf("FALL_QA %s blocked", label); fflush(stdout); return; }
+    resetFall(playerFall, player1, true);
+    conoutf("FALL_QA %s player from=%.2f to=%.2f height=%.3f units=%.3f", label, from.z, to.z, *height, to.z - from.z);
+    fflush(stdout);
+});
+
+COMMANDF(qa_fall_actor, "fs", (float *height, const char *label)
+{
+    HaloEnemy *e = qaDamageActor(false);
+    if(!e) { conoutf("FALL_QA %s no-actor", label); fflush(stdout); return; }
+    botent *bot = e->bot;
+    vec from;
+    vec to;
+    if(!qaFallLift(bot, *height, from, to)) { conoutf("FALL_QA %s blocked", label); fflush(stdout); return; }
+    resetFall(e->fall, bot, true);
+    conoutf("FALL_QA %s actor name=%s kind=%d from=%.2f to=%.2f height=%.3f health=%d shield=%.2f", label, bot->name, int(e->kind), from.z, to.z,
+            *height, bot->health, e->shield);
+    fflush(stdout);
+});
+
+COMMANDF(qa_fall_state, "s", (const char *label)
+{
+    conoutf("FALL_STATE %s airborne=%d armed=%d apex=%.2f velocity=%.4f hp=%d shield=%.3f alive=%d", label, int(playerFall.airborne),
+            int(playerFall.armed), playerFall.apex, -playerFall.velocity.z, player1->health, shield, player1->state == CS_ALIVE);
+    fflush(stdout);
+});

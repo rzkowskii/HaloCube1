@@ -1554,8 +1554,12 @@ bool gun::attack(vec &targ)
     hits.setsize(0);
     if(halodef && halostate)
     {
-        halofiretrigger(owner, *halodef, *halostate, 0, from, to);
-        attacksound();
+        // An actor's special fire may pull the second trigger: an overcharge's charged bolt, with the
+        // tag's charged sound, or a secondary burst's shot (haloactorshottrigger, halo_ai.cpp).
+        const int pulled = owner == player1 ? 0 : haloactorshottrigger(owner, *halodef);
+        halofiretrigger(owner, *halodef, *halostate, pulled, from, to);
+        if(const char *charged = pulled == 1 ? halodef->sound(HALO_SOUND_CHARGED) : NULL) haloplaysound(charged, info.sound, owner);
+        else attacksound();
         const HaloTriggerDef *trigger = halodef->trigger();
         gunwait = owner == player1 && trigger ? halostate->delay(*trigger) : info.attackdelay;
         if(!halodef->usesBattery()) mag--;
@@ -1976,12 +1980,13 @@ namespace
 
     // Rolls a shot's damage: the player's full-strength roll as it is; an actor's the same roll
     // (the jpt! upper bound) times the variant's modifier, kept exact instead of rounded per shot.
-    // `modifier` above 0 stands in for the actor's own (a vehicle gun's variant).
+    // `modifier` above 0 stands in for the actor's own (a vehicle gun's variant). An actor's own
+    // modifier is times its special burst's (haloactorburstmodifier: an overcharge or secondary burst).
     void rollshot(HaloShot &shot, const HaloProjectileDef &p, playerent *owner, float modifier)
     {
         shot.full = p.damage.roll();
         shot.lower = p.damage.lower;
-        shot.modifier = owner == player1 ? 1.0f : modifier > 0 ? modifier : haloactordamagescale(owner);
+        shot.modifier = owner == player1 ? 1.0f : modifier > 0 ? modifier : haloactordamagescale(owner) * haloactorburstmodifier(owner);
     }
 
     // What a shot deals at `scale` (1 full strength, 0 the weakest): from the full roll down to the
@@ -2138,7 +2143,17 @@ void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState
     if(!t || !t->projectile.valid) return;
     const HaloProjectileDef &p = t->projectile;
     const bool wasOverheated = state.overheated;
+    // Only a weapon the player owns ages (../Halo3DS items/weapons.c:2563-2570): an actor's battery
+    // never drains, so its overcharges (the charged bolt's 0.11 a shot) cannot empty it. Its heat
+    // stops at the overheat threshold (weapons.c:2554-2557), so a charged bolt's heat of 1 on a warm
+    // pistol overheats it for the same time as on a cold one.
+    const float battery = state.battery;
     const float cone = state.shoot(def, *t, lastmillis);
+    if(owner != player1)
+    {
+        state.battery = battery;
+        if(def.heatOverheat > 0) state.heat = min(state.heat, def.heatOverheat);
+    }
     if(state.overheated && !wasOverheated) haloplaysound(def.sound(HALO_SOUND_OVERHEAT), S_NULL, owner);
     vec aim = vec(to).sub(from);
     if(aim.iszero()) return;

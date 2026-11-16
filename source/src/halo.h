@@ -8,6 +8,10 @@ void halodrawhud();
 bool halotitleactive();
 void halodrawtitle();
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun);
+// Falling damage (halo.cpp updateFalling): physics.cpp's retailmove reports each surface an
+// airborne player or actor touches (`floor`: one it can stand on), read only to project the
+// Halo-equivalent fall velocity along a steep face it slides down and onto the floor it lands on.
+void halofallcontact(const physent *d, const vec &normal, bool floor);
 // Exact damage (weapon.cpp): deals `damage` (not rounded) with a jpt! side effect through hit();
 // halodamage applies the exact amount (shields, difficulty, the health fraction carried to the
 // next hit) and the side effect (3, EMP, drains the shield). halopendinghit is its hand-off.

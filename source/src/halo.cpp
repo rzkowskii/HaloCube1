@@ -20,6 +20,7 @@ extern void startgame(const char *name, int mode, int minutes, bool notify);
 extern int halo_scripttrace;     // halo_script.cpp: trace logging
 extern int halo_damagetrace;     // below: damage trace logging (the Flood pops and throws use it too)
 extern int halo_unitblast;       // below: an actor unit's body destroyed effect deals its damage
+extern int halo_actormelee;      // halo_ai.cpp: Halo's actor melee (the unarmed variants carry no gun)
 
 namespace
 {
@@ -119,6 +120,22 @@ namespace
         {"Engineer", "halo/engineer", 30, 0, 1000, 0, 2.4f, 1.0f, true},
     };
 
+    // A body's fall as Halo would see it (updateFalling): the Halo-equivalent velocity (Halo units a
+    // tick) built from the engine's own descent since the apex, the surfaces it touched since the
+    // last update (halofallcontact) and whether a landing may hurt (`armed`: an actor only once it
+    // has stood on a floor since its spawn or its last move that was not walking).
+    struct FallState
+    {
+        bool airborne = false, armed = false;
+        int seen = -1, distanceAt = 0;
+        vec feet = vec(0, 0, 0), velocity = vec(0, 0, 0);
+        float apex = 0;
+        bool floorSeen = false;
+        vec floorNormal = vec(0, 0, 1);
+        int slideCount = 0;
+        vec slides[4];
+    };
+
     struct HaloEnemy
     {
         botent *bot;
@@ -144,6 +161,7 @@ namespace
         // fraction of these (haloenemysetvitality).
         float vitalityBody = 0, vitalityShield = 0;
         bool vitalityScripted = false;
+        FallState fall;
     };
 
     // The hit weapon.cpp is dealing (halohit): its exact amount and jpt! side effect, which
@@ -604,7 +622,13 @@ namespace
         };
         const HaloActorDef *actor = haloactordef(actorIndex);
         if(actor && actor->weapon >= 0) weaponIndex = actor->weapon;
-        const HaloWeaponDef *def = profile.melee ? nullptr :
+        // A variant with no weapon that melees as Halo's do (actors.txt `melee` line and a unit melee
+        // jpt!: the unarmed Flood combat forms, 322 of c10's 585 combat-form starts) carries nothing,
+        // so it neither fires the body's usual gun nor drops it, and fights in melee (halo_ai.cpp
+        // meleeAttack). Halo gives such an actor no weapon (actors.c:1000-1052: actor_get_weapon NONE).
+        const bool unarmedMelee = halo_actormelee && !profile.melee && actor && actor->weapon < 0 && weaponIndex < 0 &&
+                                  actor->hasMelee && actor->unitMelee[2] > 0;
+        const HaloWeaponDef *def = profile.melee || unarmedMelee ? nullptr :
             weaponIndex >= 0 ? haloweapon(weaponIndex) : usual[kind] ? haloweaponfind(usual[kind]) : nullptr;
         if(!actor) actor = haloactordefault(kind, def ? def->index : -1);
         if(team < 0 || team >= HALO_TEAM_COUNT) team = haloactordefaultteam(actor, kindTeam(kind));
@@ -639,7 +663,7 @@ namespace
         entinmap(bot);
         bot->targetyaw = bot->yaw;
         // Variants that cannot use ranged weapons (the energy sword Elites) fight in melee.
-        const bool meleeOnly = profile.melee || (actor && actor->meleeOnly());
+        const bool meleeOnly = profile.melee || unarmedMelee || (actor && actor->meleeOnly());
         const int gun = meleeOnly ? GUN_KNIFE : GUN_SUBGUN;
         bot->setprimary(gun);
         bot->setnextprimary(gun);
@@ -662,8 +686,16 @@ namespace
         // engine's 0.5 stand in.
         const float damageScale = actor ? (actor->damageScale > 0 ? actor->damageScale : 1.0f) : aiDamageScale;
         enemies.last().damageScale = damageScale;
-        // A melee-only variant strikes with its weapon's melee jpt! (the sword's 151) times the modifier.
+        // A melee-only variant strikes with its weapon's melee jpt! (the sword's 151) times the modifier;
+        // a melee slot with no weapon behind it with the unit's melee jpt! (the infection form's 3, the
+        // carrier's 12, an unarmed combat form's 12 or 20; unmodified, as Halo's unit melee is, ai.c:664)
+        // for an actor spawned under Halo's melee with the `melee` line, not the body's 18 or 36. Halo's melee
+        // rolls its own damage and never swings the slot, so this shows only if halo_actormelee is turned
+        // off after the spawn; spawned under halo_actormelee 0, or from a table without the line, the slot
+        // keeps the former damage.
         const int damage = meleeOnly && def && def->melee.upperMin > 0 ? max(1, int(def->melee.upperMin * damageScale + .5f)) :
+                           halo_actormelee && meleeOnly && actor && actor->hasMelee && actor->unitMelee[2] > 0 ?
+                               max(1, int(actor->unitMelee[1] + .5f)) :
                            t && t->projectile.valid ? max(1, int(t->projectile.damage.upperMin * damageScale + .5f)) : profile.damage;
         int delay = actor && actor->rate > 0 ? int(1000 / actor->rate) :
                     t ? max(profile.delay, enemies.last().weapon.delay(*t)) : profile.delay;
@@ -2354,6 +2386,37 @@ float haloenemyshieldfraction(const playerent *p)
     return enemy && enemy->shieldMax > 0 ? enemy->shield / enemy->shieldMax : 0;
 }
 
+bool halounitshielded(const playerent *p)
+{
+    if(!p || p->state != CS_ALIVE) return false;
+    if(p == player1) return shield > 0 || overshield > 0;
+    const HaloEnemy *enemy = enemyState(p);
+    return enemy && enemy->shieldMax > 0 && enemy->shield > 0;
+}
+
+bool halounitfriesinfection(const playerent *p)
+{
+    if(!p) return false;
+    // The cyborg carries the flag in all ten caches (unit +380 bit 22); a player.txt without its
+    // `unit` line keeps that (judgement call).
+    if(p == player1)
+    {
+        const HaloActorDef *cyborg = haloplayerunit();
+        return !cyborg || !cyborg->hasUnitFlags || cyborg->shieldsFryInfection();
+    }
+    const HaloActorDef *v = haloactorvariant(p);
+    return v && v->hasUnitFlags && v->shieldsFryInfection();
+}
+
+void haloactorspend(playerent *p)
+{
+    if(!p || p->state != CS_ALIVE) return;
+    // As a form spent on a body (updateFlood): deleted, so no pop, no corpse and no burst.
+    floodSpending = true;
+    dodamage(INT_MAX, p, p, GUN_KNIFE);
+    floodSpending = false;
+}
+
 // A starting profile's weapon as a carried weapon state. Judgement call, not checked against the
 // retail executable: the profile's "rounds total" is the reserve beyond the magazine (a30's assault
 // rifle starts 60 + 120), clamped to the magazine's maximum; a battery weapon starts charged.
@@ -2561,6 +2624,22 @@ bool halorespawn()
     return true;
 }
 
+// The player's fall (updateFalling, below). Every move of the player that is not walking
+// (haloplayermoved, the recovery's placePlayer) starts it afresh where the player now stands.
+namespace
+{
+    FallState playerFall;
+
+    void resetFall(FallState &f, const physent *d, bool armed)
+    {
+        f = FallState();
+        f.armed = armed;
+        f.seen = lastmillis;
+        f.feet = vec(d->o).sub(vec(0, 0, d->eyeheight));
+        f.apex = f.feet.z;
+    }
+}
+
 // Recovery on retail collision. The retail structure has holes and seams the stock cube grid
 // never had: a body can fall out of the world below the section's mesh, or end up wedged where
 // no move gets it out (a door or a lift deck closing on it, a crease between two slopes too
@@ -2591,6 +2670,7 @@ namespace
         stoodSafe = false;
         movedAt = lastmillis;
         stalledAt = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
+        resetFall(playerFall, player1, true);
     }
 
     bool inMoveGrace() { return unsigned(lastmillis - movedAt) < unsigned(moveGrace); }
@@ -2626,6 +2706,7 @@ namespace
         player1->resetinterp();
         embeddedSince = stalledSince = 0;
         stalledAt = ground;
+        resetFall(playerFall, player1, true);
         conoutf("Halo recovery: %s, player put back at %.1f,%.1f,%.1f", why, ground.x, ground.y, ground.z);
     }
 
@@ -2757,6 +2838,187 @@ namespace
         const char *why = wedged ? "wedged in the collision" : "stuck in mid-air";
         if(!nudgePlayer(feet, why)) recoverPlayer(why, false);
     }
+}
+
+// Falling damage (biped_falling_damage, ../Halo3DS units/bipeds.c:792-845, called every tick from
+// biped physics at :4134 with the tick's landing velocity, the velocity into the ground plane of a
+// newly touched floor, :2884-2887). The globals' falling_damage block (player.txt `falling`,
+// haloplayerfalling): a landing faster than the runtime minimum damage velocity (0.1463 units a
+// tick, a 3-unit fall) deals globals\falling (10, upper 155) at scale (v - min) / (max - min) pinned
+// to 0..1 (0.2068: 6 units), with no owner; a biped falling faster than the maximum falling velocity
+// (0.3430: 16.5 units) that is not landing takes globals\distance (105) every tick until it dies,
+// unless the biped is flying. A biped tag immune to falling damage (bit 7) and a unit obeying a
+// command list that disables it (haloactornofallingdamage) take none. Falling damage to a unit on
+// the player team ignores difficulty (damage.c:820-825, 1142-1147; halodamage).
+//
+// The engine's movement is AssaultCube's, not Halo's ballistics, and stays as it is (a hard
+// requirement): a fall starts at 9.5 units a second and gains 33.3 a second squared (physics.cpp
+// moveplayer), 4 to 17 Halo units a second squared at the sections' scales (2 to 8) against Halo's
+// 3.2 (physics.c:279, 0.0035651792 a tick squared). Its landing speed would kill on drops a retail
+// player survives (tools/halo_fall_scan.py: five planned route drops and jumps, a30's, b40's, c40's
+// and d20's). So the engine follows Halo by distance: the body's descent since its apex, in Halo
+// units (haloscenarioverticalscale), adds to a Halo-equivalent velocity by Halo's gravity,
+// v^2 += 2 g dh, rising resets it (only the fall from the apex counts), and each steep face it
+// slides down removes the velocity into the face as Halo's collision does, so a slide lands at
+// Halo's speed rather than a free fall's. The landing velocity is that velocity into the floor it
+// lands on. A free fall of d units lands at sqrt(2 g d), which is how the tag's runtime velocities
+// were computed from its 3, 6 and 16.5 unit distances, so the thresholds are the tag's own.
+// halo_fallingdamage 0 turns it off; halo_damagetrace 1 logs each fall that deals damage:
+// FALL_DAMAGE target=<name> kind=<landing|distance> drop=<Halo units> velocity=<units a tick> scale=<0..1> amount=<dealt>
+VAR(halo_fallingdamage, 0, 1, 1);
+namespace
+{
+    const float haloGravity = 0.0035651792f;   // ../Halo3DS physics/physics.c:279, Halo units a tick squared
+    const int fallGap = 500;                    // ms without an update (paused, a scene, dead): start afresh
+    const int haloTick = 33;                    // the distance damage's cadence: every Halo tick (30 a second)
+
+    HaloDamage fallingJpt(const HaloFallingDef &def, bool distance)
+    {
+        HaloDamage d;
+        const float *v = distance ? def.distance : def.falling;
+        d.lower = v[0];
+        d.upperMin = v[1];
+        d.upperMax = max(v[1], v[2]);
+        d.category = distance ? def.distanceCategory : def.fallingCategory;
+        d.flags = distance ? def.distanceFlags : def.fallingFlags;
+        d.hasMaterials = distance ? def.hasDistanceMaterials : def.hasFallingMaterials;
+        if(d.hasMaterials) memcpy(d.materials, distance ? def.distanceMaterials : def.fallingMaterials, sizeof(d.materials));
+        return d;
+    }
+
+    // Dealt with no owner (object_cause_damage with NONE, bipeds.c:822 and 836): in the player's
+    // name inside an ownerless script-damage scope, as haloareablast's ownerless blasts (no
+    // betrayal, no killer for haloactordeath, no difficulty factor); no push, no gibs. The player's
+    // own is self-inflicted. A blast's indirect material (GUN_GRENADE) for an actor, Halo's for a hit
+    // with no struck material; the knife for the player only to keep the grenade's deafening off.
+    void dealFall(playerent *body, const HaloFallingDef &def, bool distance, float scale, float drop, float velocity)
+    {
+        const HaloDamage jpt = fallingJpt(def, distance);
+        const float amount = jpt.scaled(jpt.roll(), scale);
+        if(halo_damagetrace)
+            conoutf("FALL_DAMAGE target=%s kind=%s drop=%.3f velocity=%.4f scale=%.3f amount=%.2f", body == player1 ? "player" : body->name,
+                    distance ? "distance" : "landing", drop, velocity, scale, amount);
+        if(!(amount > 0)) return;
+        HaloScriptDamage ownerless(true);
+        halohit(amount, HALO_SIDE_EFFECT_NONE, body, player1, vec(0, 0, 0), body == player1 ? GUN_KNIFE : GUN_GRENADE, false, 0, &jpt);
+    }
+
+    // One body's fall since the last update. `exempt`: not falling under its own physics now (seated,
+    // carried, in water or on a ladder, immune, a scene, falling damage off): start afresh.
+    void updateFall(FallState &f, playerent *body, bool player, const HaloFallingDef *def, bool exempt, bool flying)
+    {
+        const vec feet = vec(body->o).sub(vec(0, 0, body->eyeheight));
+        const int since = lastmillis - f.seen;
+        // A move faster than any fall the engine makes in that time (250 units a second, reached
+        // only after ~7 s of falling) is a teleport, a respawn or a placement, not a fall.
+        const bool jumped = f.seen >= 0 && feet.dist(f.feet) > 4.0f + .25f * max(since, 0);
+        if(!def || exempt || body->state != CS_ALIVE || f.seen < 0 || since < 0 || since > fallGap || jumped)
+        {
+            // The player is always armed (Halo hurts a fall from wherever it starts); an actor once
+            // it stands on a floor again (judgement call: its spawn, a dropship's set-down and a
+            // scripted move are not falls Halo's own placement would make).
+            resetFall(f, body, player);
+            return;
+        }
+        const float dz = f.feet.z - feet.z, zscale = max(haloscenarioverticalscale(), 1e-3f);
+        f.seen = lastmillis;
+        f.feet = feet;
+        const bool airborne = !body->onfloor;
+        if(airborne || f.airborne)
+        {
+            if(dz < 0) f.velocity = vec(0, 0, 0);
+            else if(dz > 0)
+            {
+                const float h = dz / zscale;
+                f.velocity.z = -sqrtf(f.velocity.z * f.velocity.z + 2 * haloGravity * h);
+            }
+            loopi(f.slideCount)
+            {
+                const vec &n = f.slides[i];
+                const float into = f.velocity.dot(n);
+                if(into < 0) f.velocity.sub(vec(n).mul(into));
+            }
+        }
+        f.slideCount = 0;
+        // The damage is dealt last: a death may add actors (a carrier's forms) and move `f`.
+        if(!airborne)
+        {
+            // The landing (bipeds.c:809-823): the velocity into the floor touched.
+            const vec n = f.floorSeen && f.floorNormal.z > 0 ? f.floorNormal : vec(0, 0, 1);
+            const float v = -f.velocity.dot(n), drop = (f.apex - feet.z) / zscale;
+            const bool hurt = f.airborne && f.armed && v > def->minimumDamageVelocity;
+            // Standing on a floor arms an actor's next fall.
+            resetFall(f, body, true);
+            if(hurt)
+                dealFall(body, *def, false, clamp((v - def->minimumDamageVelocity) / (def->maximumDamageVelocity - def->minimumDamageVelocity), 0.0f, 1.0f),
+                         drop, v);
+            return;
+        }
+        // Leaving the floor: the apex starts at the take-off (the feet before this update's descent).
+        if(!f.airborne) f.apex = feet.z + max(dz, 0.0f);
+        f.airborne = true;
+        f.floorSeen = false;
+        f.apex = max(f.apex, feet.z);
+        // Falling too fast and not landing (bipeds.c:826-838): the distance jpt! every Halo tick
+        // until the body dies; not for a flying biped. Over nothing at all down to the recovery's
+        // depth (a hole the engine's mesh has and Halo's may not), the recovery puts the body back
+        // instead (judgement call: the engine cannot tell a seam from a bottomless pit).
+        if(f.armed && !flying && -f.velocity.z > def->maximumFallingVelocity && lastmillis >= f.distanceAt)
+        {
+            vec low, high;
+            HaloCollisionHit hit;
+            if(!halocollisionactive() || (halocollisionbounds(low, high) && haloscenariotrace(feet, vec(feet.x, feet.y, low.z - killDepth), hit)))
+            {
+                f.distanceAt = lastmillis + haloTick;
+                const float drop = (f.apex - feet.z) / zscale, v = -f.velocity.z;
+                dealFall(body, *def, true, 1, drop, v);
+            }
+        }
+    }
+
+    // The biped tag's flags (unit line of actors.txt or player.txt): 2 flying, 7 immune to falling
+    // damage (../Halo3DS units/biped_definitions.h:25-37).
+    bool fallImmune(const HaloActorDef *unit) { return unit && unit->hasUnitFlags && ((unit->bipedFlags >> 7) & 1); }
+    bool fallFlying(const HaloActorDef *unit) { return unit && unit->hasUnitFlags && ((unit->bipedFlags >> 2) & 1); }
+
+    void updateFalling()
+    {
+        const HaloFallingDef *def = halo_fallingdamage ? haloplayerfalling() : NULL;
+        const HaloActorDef *cyborg = haloplayerunit();
+        // Not falling under the biped's own physics: seated in a vehicle the engine drives, aboard
+        // or held in a scenario vehicle (a Pelican, a10's cryotube), in water or on a ladder.
+        const bool playerExempt = editmode || halodriving() || haloscenarioboarded() || haloscenarioscriptseated() ||
+                                  haloscenariocarried(player1) || player1->inwater || player1->onladder || player1->isspectating() ||
+                                  fallImmune(cyborg);
+        updateFall(playerFall, player1, true, def, playerExempt, fallFlying(cyborg));
+        loopv(enemies)
+        {
+            HaloEnemy &e = enemies[i];
+            botent *bot = e.bot;
+            if(!bot) continue;
+            // An actor needs its biped's flags (actors.txt `unit` line) to be known to fall: without
+            // them it takes none, as before (judgement call: an older table cannot tell a flyer).
+            const HaloActorDef *unit = haloactorvariant(bot);
+            const bool exempt = !unit || !unit->hasUnitFlags || fallImmune(unit) || halohovering(bot) || haloscenariocarried(bot) ||
+                                halovehicleinside(bot) || haloactornofallingdamage(bot) || bot->inwater || bot->onladder;
+            updateFall(e.fall, bot, false, def, exempt, fallFlying(unit));
+        }
+    }
+}
+
+void halofallcontact(const physent *d, const vec &normal, bool floor)
+{
+    if(!haloactive() || !d) return;
+    FallState *f = NULL;
+    if(d == player1) f = &playerFall;
+    else if(d->type == ENT_BOT)
+    {
+        HaloEnemy *e = enemyState((const playerent *)d);
+        if(e) f = &e->fall;
+    }
+    if(!f) return;
+    if(floor) { f->floorNormal = normal; f->floorSeen = true; }
+    else if(normal.z > -.2f && f->slideCount < 4) f->slides[f->slideCount++] = normal;
 }
 
 bool halorecoverplayer(const char *why)
@@ -3009,6 +3271,8 @@ void haloupdate(int elapsed)
         halovehicleensuretype("banshee", feetOf(player1), player1->yaw);
     }
     updateRecovery();
+    if(player1->state != CS_ALIVE) return;
+    updateFalling();
     if(player1->state != CS_ALIVE) return;
     if(escaping && lastmillis >= escapeDeadline)
     {
@@ -3354,6 +3618,15 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     pendingHit.target = NULL;
     pendingHit.source = NULL;
     const float given = amount;
+    // The jpt!'s only-hurts-shields and skips-shields flags (damage.c:1667-1694): the first leaves
+    // out the body step (nothing reaches the body, what breaks the shield and the leak included),
+    // the second the shield step (no shield damage, leak or stun; the whole hit on the body). Only
+    // the scripts' jpt!s carry them (c40's pulse generator: halo_script_ai.inc damage_object).
+    const unsigned jptFlags = exact && pendingSource ? pendingSource->flags : 0;
+    const bool onlyShields = (jptFlags & HALO_DAMAGE_ONLY_HURTS_SHIELDS) != 0, skipShields = (jptFlags & HALO_DAMAGE_SKIPS_SHIELDS) != 0;
+    if(halo_damagetrace && (onlyShields || skipShields))
+        conoutf("DAMAGE_JPTFLAGS target=%s only_shields=%d skips_shields=%d", target == player1 ? "player" : target->name, onlyShields,
+                skipShields);
     auto trace = [&](float shieldLeft, float carry)
     {
         if(halo_damagetrace)
@@ -3395,19 +3668,24 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         // friend_vitality (damage.c:441, 454: the player's unit is on the player team, players.c:1140
         // and 1321, which is friendly to itself, game_allegiance.c:171-180, so
         // game_difficulty_get_team_value answers the friend values, game_globals.c:213-221; no path
-        // excludes a player's unit except falling damage, damage.c:820-825 and 1142-1147, which the
-        // engine does not deal). The shield and health here count out of the Normal maximum (75),
-        // so the hit is divided by the scale instead: the same fraction Halo takes off.
+        // excludes a player's unit except falling damage, damage.c:820-825 and 1142-1147: a
+        // falling-category jpt! on a unit of the player team, updateFalling's). The shield and
+        // health here count out of the Normal maximum (75), so the hit is divided by the scale
+        // instead: the same fraction Halo takes off.
         float shieldVitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_SHIELD, HALO_TEAM_PLAYER),
               bodyVitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, HALO_TEAM_PLAYER);
         if(!(shieldVitality > 0)) shieldVitality = 1;
         if(!(bodyVitality > 0)) bodyVitality = 1;
+        if(exact && pendingSource && pendingSource->category == HALO_DAMAGE_CATEGORY_FALLING) shieldVitality = bodyVitality = 1;
         // In a Warthog the body takes some of the fire.
         if(halodriving()) amount = halovehicledamage(amount);
         // The shield stun (damage.c:978-982): the cyborg's minimum stun damage is 0, so every hit
-        // restarts it (playerShieldTiming).
-        shieldHit = lastmillis;
-        shieldRecharging = false;
+        // restarts it (playerShieldTiming); a hit that skips shields never reaches the shield step.
+        if(!skipShields)
+        {
+            shieldHit = lastmillis;
+            shieldRecharging = false;
+        }
         // The cyborg's coll (player.txt, haloplayerunit) and a hit that carries its jpt!'s material
         // modifiers: Halo's own rule. The shield step takes (1 - the struck material's leak) of the
         // hit (damage.c:842-843; the cyborg's leaks are 0) at the material's shield multiplier times
@@ -3428,7 +3706,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
             factor = pendingSource->material(cyborg->shieldMaterial) * max(struckAt->shield, 0.0f) / shieldVitality;
             bodyScale = max(struckAt->body, 0.0f) * pendingSource->material(struckAt->type);
             // The leak and the failure curve only while a shield is up (damage.c:828-857).
-            if(shield > 0 || overshield > 0)
+            if((shield > 0 || overshield > 0) && !skipShields)
             {
                 float share = 1 - max(struckAt->leak, 0.0f);
                 const float threshold = cyborg->shieldFailureThreshold;
@@ -3446,7 +3724,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         // The overshield's extra layers take the hit first. What they leave is the hit's share before
         // the factor, which the shield step below takes at the same factor (with the cyborg's coll the
         // overshield is the one shield vitality above 1, as in Halo, so the modifier applies once).
-        const bool layered = overshield > 0;
+        const bool layered = overshield > 0 && !skipShields;
         if(layered)
         {
             const float layer = min(overshield, amount * factor);
@@ -3463,7 +3741,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
                 return;
             }
         }
-        const bool hadShield = shield > 0;
+        const bool hadShield = shield > 0 && !skipShields;
         if(hadShield || layered)
         {
             const float absorbed = min(shield, amount * factor);
@@ -3476,6 +3754,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
                      factor > 0 ? max(0.0f, amount - absorbed / factor) : 0;
         }
         amount += leaked;
+        if(onlyShields) amount = 0;
         if(emp) { shield = 0; overshield = overshieldTarget = 0; }
         if(hadShield) haloplaysound(shield > 0 ? "shield-hit" : "shield-depleted", S_NULL);
         damage = wholeDamage(amount * bodyScale / bodyVitality, playerHealthCarry);
@@ -3558,7 +3837,7 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         particle_splash(PART_PLASMA, 6, 220, target->o);
     }
     const bool shieldUp = enemy->shieldMax > 0 && enemy->shield > 0;
-    if(enemy->shieldMax > 0)
+    if(enemy->shieldMax > 0 && !skipShields)
     {
         // The assault rifle's 0.7 on shields is its jpt! modifier for the elite energy shield; with
         // the general material model the shield takes the weapon's own modifier (generalMaterial).
@@ -3631,8 +3910,10 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     // head-flagged material. HALO_AI_NO_DAMAGE returned earlier (the cannot_take_damage test at
     // 1176). A special body takes its material on the whole hit before
     // the shield step; the Hunter, the one with a head material, has no shield.
+    // Only hurts shields: no body step, so no headshot either (object_damage_body holds that test).
+    if(onlyShields) amount = 0;
     bool headshot = false;
-    if(halo_headshots && exact && pendingSource && pendingSource->headshots())
+    if(halo_headshots && exact && pendingSource && pendingSource->headshots() && !onlyShields)
     {
         const HaloActorDef *variant = haloactorvariant(target);
         bool head = false;

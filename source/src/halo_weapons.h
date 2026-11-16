@@ -40,7 +40,14 @@ struct HaloSounds
 // edge of a blast) deals lower + (full - lower) * s.
 enum { HALO_DAMAGE_MATERIALS = 33 };
 // jpt! damage flags (damage.c:196-206 of ../Halo3DS objects: _damage_can_cause_headshots_bit is bit 1).
-enum { HALO_DAMAGE_CAN_CAUSE_HEADSHOTS = 1 << 1 };
+// Only hurts shields (bit 6: c40's pulse generator) leaves out the body step and skips shields
+// (bit 9) the shield step (damage.c:1667-1694; halodamage). No weapon or grenade jpt! has either.
+enum { HALO_DAMAGE_CAN_CAUSE_HEADSHOTS = 1 << 1, HALO_DAMAGE_ONLY_HURTS_SHIELDS = 1 << 6, HALO_DAMAGE_SKIPS_SHIELDS = 1 << 9 };
+// The damage effect's own flags (jpt! +12, damage_effect_definition flags): bit 0 don't scale
+// damage by distance (damage.c:2404-2409).
+enum { HALO_JPT_DONT_SCALE_BY_DISTANCE = 1 << 0 };
+// jpt! damage categories (../Halo3DS objects/damage.c:164-176): 1 falling.
+enum { HALO_DAMAGE_CATEGORY_FALLING = 1 };
 
 struct HaloDamage
 {
@@ -62,6 +69,10 @@ struct HaloDamage
     // halodamage, ../Halo3DS objects/damage.c:1178-1190).
     unsigned flags = 0;
     bool headshots() const { return (flags & HALO_DAMAGE_CAN_CAUSE_HEADSHOTS) != 0; }
+    // The jpt! damage category when the caller knows it (-1: not known; the weapon tables do not
+    // carry it): HALO_DAMAGE_CATEGORY_FALLING on the falling damage (halo.cpp updateFalling), which
+    // a unit on the player team takes without the difficulty scale (damage.c:820-825, 1142-1147).
+    int category = -1;
     // A full-strength hit.
     float roll() const;
     // [lower, upperMax]: what actors' grenades roll (the balance grenades had before the

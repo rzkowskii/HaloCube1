@@ -115,8 +115,9 @@ def read_hscb(path):
     (ACTORS kind, actors.txt index)) and object_flags (a byte per object; 1: a story figure drawn
     outside scenes); from version 7 squad_counts (per encounter, per squad: the Easy, Normal, Hard and
     Impossible start counts) and from version 10 squad_upgrades (per encounter, per squad: the
-    major_upgrade enum), and animations (the scene clips: object index, graph tag, clip name, model
-    path, ticks). Fails unless the file is read to its last byte."""
+    major_upgrade enum), animations (the scene clips: object index, graph tag, clip name, model
+    path, ticks) and projections (per section: bsp, origin x y z, xy and z scale, margin). Fails
+    unless the file is read to its last byte."""
     import struct as _struct
     data = Path(path).read_bytes()
     offset = 0
@@ -171,7 +172,7 @@ def read_hscb(path):
     rows(lambda: (take('HII'), text()))                              # sounds
     out['conversations'] = [c[0] for c in rows(lambda: (text(), rows(lambda: (take('H'), rows(lambda: take('H'))))))]
     out['loops'] = [loop[0][0] for loop in rows(lambda: (take('HB'), rows(lambda: take('f5i'))))]   # looping sound tag ids
-    rows(lambda: take('H6f'))                                        # projections
+    out['projections'] = rows(lambda: take('H6f'))                   # (bsp, origin x y z, xy scale, z scale, margin) per section
     rows(lambda: take('H'))                                          # worlds
     rows(lambda: (text(), text()))                                   # HUD messages
     rows(lambda: take('f'))                                          # device groups

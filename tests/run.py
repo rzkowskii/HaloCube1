@@ -46,7 +46,7 @@ QUICK = [
     'test_damage_targets.py',         # d40's manifold detectors: HSCB 8 targets, placed whole, damage rules, a real shot from the route
     'test_frag_throw.py',             # d40's s3 manifold: the importer's planned frag throws (2048 rows) thrown in the game destroy it
     'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine (shield leak, resistance, shieldtime)
-    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty, playfight, effect damage
+    'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty, playfight, effect damage, melee, special fire
     'test_factions.py',               # allegiance matrix and commands, betrayal, Hunters, stealth Elites, flyers, Monitor, Keyes
     'test_ai_attach.py',              # HSCB 9 story-figure flags; ai_attach makes a50's Keyes and marines actors (health, revert, destroy, carried into section 5, own start across checkpoints, spared the kill from behind)
     'test_starting_profiles.py',      # HSCB 9 starting profiles: a10 unarmed, player_add_equipment, a30/c20 loadouts, carry, empty slots saved
@@ -57,6 +57,8 @@ QUICK = [
     'test_script_coverage.py',        # every sleep_until/if condition command is bound; a10 tutorial, d40 timer
     'test_script_seats.py',           # a10's cryotube as a scripted seat (held, released by the script, guards), b40's Pelican ride, marker effects, the Monitor spared
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
+    'test_falling_damage.py',         # falling damage: player.txt's matg block, the planned-drop scan, the player's and an actor's falls on a30
+    'test_script_damage.py',          # damage_object/damage_new by their jpt!: effects.txt records, pulse generator only on the shield, oven, a10 zapper 0
     'test_major_upgrades.py',         # major upgrades at squad placement (chance table, error diffusion, revert, Continue), Halo's squad sizes
     'test_flood.py',                  # squad cap counts living actors; carrier burst from the tag, corpse infection, leap, pop, stagger; forms in the carrier's squad, blast
     'test_vehicles.py',               # vehicle table and placements, Warthog in/out/drive/flip/gunner, turret, seat commands

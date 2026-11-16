@@ -24,6 +24,11 @@ unit_impervious no longer protects (the unit-commands item): only object_cannot_
 The scripts' effect damage on actors (item 9, the effect-damage default change, not yet run): a10's
 containment_1 doom_crewman, set to 1 point as the script does, lives through the containment_1_flag_4
 plasma blast with halo_effectdamage 0 and dies to it, ownerless, by default.
+Halo's actor melee (item 10, the actor-melee work, not yet run): an armed Elite minor charges inside its
+melee_range and strikes with the unit's melee jpt! (30 to 35); the stealth sword Elite with the sword's 151.
+Special fire (item 11, the special-fire change, not yet run): actors.txt's `special` lines match the tags, a
+Jackal major rolls its special fire 5 to 6.5 s apart, releases the charged bolt after a 0.6 s hold and its
+charged bolt hits for 70 x 0.5 x 0.4; a Grunt has none, and halo_specialfire 0 turns it off.
 """
 import re
 import subprocess
@@ -631,3 +636,120 @@ dealt = [d for d in re.findall(r'HaloScript: (.+?) (deals its jpt! damage|has no
 assert dealt == [(PLASMA, 'deals its jpt! damage')], ('only the second blast deals damage', dealt)
 print(f'Effect damage: the doom crewman lives through the flag_4 blast with halo_effectdamage 0 and dies to it by default, '
       f'ownerless ({counts}).')
+
+
+# 10. Halo's melee on armed actors and the sword Elites (written while testing was on hold, NOT YET RUN).
+#     An Elite minor with a plasma rifle 1.2 world units off charges inside its melee_range (1.75), not in
+#     the middle of a burst, and strikes the player with its unit's melee jpt! (elite melee: 30 to 35; the
+#     plasma rifle's own melee is for players, units.c:8597-8612), unmodified by its 0.5 (ai.c:654-675).
+#     The stealth sword Elite (stalking, no ranged weapon: its melee_range, 4) strikes with the sword's
+#     jpt! (151: the sword's non_players_use_melee_damage flag), where the engine's slot gave 75.
+def melee_strikes(text, phase):
+    return [(m.group(1), float(m.group(2))) for m in re.finditer(rf'ACTOR_MELEE {phase} (.+?) variant=\d+ target=player distance=\S+ value=([\d.]+)', text)]
+
+
+for variant, phase, low, high in (('elite minor plasma rifle', 'strike_unit', 30, 35), ('stealth elite major energy sword', 'strike_weapon', 151, 151)):
+    text, log = run('melee-' + variant.split()[-1], 'halo_damagetrace 1; halo_difficulty 1; halo_preview', [
+        (0, f'qa_combat_protect 1; qa_variant_spawn "{variant}" 0 {1.2 if phase == "strike_unit" else 2} 0'),
+        (300, 'qa_actor_state armed'),
+        (8000, 'quit'),
+    ])
+    state = next((dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_MELEE_QA armed ')), None)
+    assert state and state['model'] == '1', ('Halo\'s melee applies', state, log)
+    assert state['ranged'] == ('1' if phase == 'strike_unit' else '0'), state
+    strikes = melee_strikes(text, phase)
+    assert strikes and all(low <= v <= high for _, v in strikes), (variant, strikes, log)
+    charge = re.search(r'ACTOR_MELEE charge .+? target=player distance=(\S+) value=(\S+)', text)
+    assert charge and float(charge.group(1)) <= float(charge.group(2)) + .01, ('a charge inside the range', charge and charge.group(0), log)
+    print(f'Melee: {variant} struck {len(strikes)} time(s) for {[round(v, 1) for _, v in strikes]}.')
+
+
+# 11. Special fire (the special-fire change; written while testing was on hold, NOT YET RUN). The
+#     actv's special fire (../Halo3DS ai/actor_combat.c:1765-1840): outside a burst, once its delay
+#     has run out and its situation holds, the delay restarts at the tag's plus 0 to 1.5 s and the
+#     chance is rolled; an overcharge (mode 1) holds the plasma pistol's trigger through the pause and
+#     the next burst's first pull releases it, the second trigger's charged bolt (EMP, side 3) when it
+#     was held 0.6 s (items/weapons.c:3070-3110). A special burst's damage takes the variant's 0.4
+#     (actor_combat.c:1339-1345) on top of its 0.5: the charged bolt (70 flat) deals 14.
+#     Static: actors.txt's `special` lines (actv +340/+342/+344/+348, +248/+252) are on the two
+#     Jackal plasma pistol variants and the Banshee pilot only, with the tag values; against the
+#     tag bytes too when HALO_SOURCE has the caches.
+specials, current = {}, None
+for entry in (root / 'packages/halo/actors.txt').read_text().splitlines():
+    key, _, rest = entry.partition(' ')
+    if key == 'path':
+        current = rest
+    elif key == 'special' and current:
+        specials[current] = [float(v) for v in rest.split()]
+expected = {r'characters\jackal\jackal major plasma pistol': [1, 1, .3, 5, .4, 0],
+            r'characters\jackal\jackal minor plasma pistol': [1, 1, .2, 5, .4, 0],
+            r'vehicles\banshee\banshee pilot': [2, 3, 1, 10, 0, 0]}
+assert set(specials) == set(expected), ('special lines on exactly these variants; rerun tools/halo_actors.py', sorted(specials))
+for path, values in expected.items():
+    assert all(abs(a - b) < 1e-4 for a, b in zip(specials[path], values)), (path, specials[path])
+if (HALO_SOURCE / 'a30.map').exists():
+    import mmap  # noqa: E402
+    sys.path.insert(0, str(root / 'tools'))
+    from import_halo_a30 import HaloMap  # noqa: E402
+    from halo_weapons import CAMPAIGN  # noqa: E402
+    seen = {}
+    for cache in CAMPAIGN:
+        with (HALO_SOURCE / f'{cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            halo = HaloMap(data)
+            for tag in halo.directory:
+                if tag.group == 'actv' and tag.name not in seen:
+                    t, a = halo.tags, tag.address
+                    mode, situation = t.read('2h', a + 340)
+                    seen[tag.name] = [mode, situation, *t.read('2f', a + 344), *t.read('2f', a + 248)]
+    for path, values in seen.items():
+        if values[0] > 0:
+            assert path in specials and all(abs(x - y) < 1e-4 for x, y in zip(specials[path], values)), (path, values, specials.get(path))
+        else:
+            assert path not in specials, path
+    print(f'Special fire: actors.txt matches the tag bytes ({sum(v[0] > 0 for v in seen.values())} variants with special fire).')
+
+
+def special_events(text, event):
+    return [(m.group(1), int(m.group(2)), float(m.group(3)), int(m.group(4))) for m in
+            re.finditer(rf'ACTOR_SPECIAL_FIRE {event} (.+?) variant=\d+ mode=\d value=(-?\d+) extra=(\S+) ms=(\d+)', text)]
+
+
+# On the preview at Normal, protected, a Jackal major 6 units off fights the player; halo_specialfire 2
+# makes every roll succeed, so the delays alone space the specials.
+for mode in (2, 0):
+    text, log = run(f'special-{mode}', f'halo_damagetrace 1; halo_difficulty 1; halo_specialfire {mode}; halo_preview', [
+        (0, 'qa_combat_protect 1; qa_variant_spawn "jackal major plasma pistol" -1 6 0; qa_variant_spawn "grunt major plasma pistol" -1 6 3'),
+        (30000, 'qa_actor_combat special'),
+        (30500, 'quit'),
+    ], timeout=120)
+    spawned = re.findall(r'^FACTION_SPAWN (.+?) kind=', text, re.M)
+    assert len(spawned) == 2 and '-' not in spawned, ('both variants spawned', spawned, log)
+    jackal, grunt = spawned
+    rolls = [e for e in special_events(text, 'roll') if e[0] == jackal]
+    releases = [e for e in special_events(text, 'release') if e[0] == jackal]
+    bursts = [e for e in special_events(text, 'burst') if e[0] == jackal]
+    charged_hits = [float(m.group(1)) for m in re.finditer(rf'DAMAGE_TRACE attacker={re.escape(jackal)} target=player exact=1 amount=(\S+) side=3 ', text)]
+    rows = {f['cn']: f for f in (dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_SPECIAL special '))}
+    timers = [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_TIMERS special ')]
+    if mode == 0:
+        assert 'ACTOR_SPECIAL_FIRE' not in text and not charged_hits, ('halo_specialfire 0: no special fire', log)
+        print('Special fire: off with halo_specialfire 0.')
+        continue
+    # The Grunt's variant has mode 0 (its chance is never read): no special fire, no ACTOR_SPECIAL row.
+    assert not any(e[0] == grunt for e in special_events(text, 'roll')), ('the Grunt has no special fire', log)
+    assert rows and all(r['variant'] != '-1' for r in rows.values()), ('an ACTOR_SPECIAL row for the Jackal', log)
+    row = next(iter(rows.values()))
+    assert (row['mode'], row['situation'], row['chance'], row['delay'], row['modifier']) == ('1', '1', '0.300', '5.000', '0.400'), row
+    assert len(rows) == 1, ('only the Jackal has an ACTOR_SPECIAL row', rows)
+    assert any(t['special_left'] != '-1' for t in timers) and any(t['special_left'] == '-1' for t in timers), timers
+    assert rolls and all(e[1] == 1 for e in rolls), ('the forced rolls succeed', rolls, log)
+    gaps = [b[3] - a[3] for a, b in zip(rolls, rolls[1:])]
+    assert all(g >= 5000 for g in gaps), ('no special roll within 5 s of another', gaps)
+    assert all(5 <= e[2] <= 6.5 for e in rolls), ('the delay is the tag\'s plus 0 to 1.5 s', rolls)
+    assert releases, ('an overcharge is released by a burst', log)
+    assert all((e[1] == 1) == (e[2] >= .6) for e in releases), ('the charged bolt only after a 0.6 s hold', releases)
+    assert bursts and all(e[1] == 0 and abs(e[2] - .4) < 1e-3 for e in bursts), ('a special burst takes the 0.4 (on the 0.5)', bursts)
+    assert all(abs(v - 14) < .01 for v in charged_hits), ('the charged bolt deals 70 x 0.2', charged_hits, log)
+    assert int(row['specials']) >= 1 and int(row['charged']) <= sum(e[1] == 1 for e in releases), row
+    print(f'Special fire: {len(rolls)} roll(s), {sum(e[1] == 1 for e in releases)} charged release(s), '
+          f'{len(charged_hits)} charged hit(s) of {sorted(set(charged_hits))}.')

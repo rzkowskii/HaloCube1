@@ -563,6 +563,21 @@ COMMANDF(qa_hs_cmd, "ss", (const char *command, const char *arguments)
     words.deletearrays();
     fflush(stdout);
 });
+// damage_object or damage_new with a jpt! path that holds spaces (tests/test_script_damage.py):
+// qa_hs_damage damage_object "effects/damage effects/pulsegenerator" player (`/` stands for `\`,
+// halofxjpt; the target is a qa_hs_cmd token: player, unit:NAME:N, flag:NAME). Prints HS_CMD.
+COMMANDF(qa_hs_damage, "sss", (const char *command, const char *jpt, const char *target)
+{
+    // (No braced lists: their commas would split the macro's argument.)
+    double values[2];
+    values[0] = 0;
+    values[1] = qaToken(target);
+    const char *texts[2];
+    texts[0] = jpt;
+    texts[1] = "";
+    conoutf("HS_CMD %s %.4f", command, haloscenariocallv(command, values, texts, 2));
+    fflush(stdout);
+});
 // qa_hs_object state obj:NAME prints the state the object commands set.
 COMMANDF(qa_hs_object, "ss", (const char *what, const char *name)
 {

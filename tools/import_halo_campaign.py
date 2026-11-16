@@ -589,8 +589,9 @@ JUMP_CLIMB, JUMP_DROP = 9, 16
 # Route costs, in steps: a jump, a crouched step, and a scripted door the walk must wait at.
 JUMP_COST, CROUCH_COST, SCRIPTED_COST = 25, 2, 400
 # Sections whose only way on is a walk off a ledge onto a floor further below than a jump
-# drops (JUMP_DROP), with the deepest drop allowed in retail units. AssaultCube has no fall
-# damage; Halo's harmless falls are a few units. The route steps off the ledge (route flag 8)
+# drops (JUMP_DROP), with the deepest drop allowed in retail units. Halo's falls do no harm under
+# 3 units (the globals' falling-damage block, which the engine follows by distance: halo.cpp
+# updateFalling); keep every drop under that and re-run tools/halo_fall_scan.py after a re-plan. The route steps off the ledge (route flag 8)
 # and lands two to four cells on, clear of the ledge face. Other sections never drop, so
 # their routes stay as they were walked.
 # d20 (Keyes): section 2 (BSP 1) climbs down from the channel at the landing pool (z -23) to

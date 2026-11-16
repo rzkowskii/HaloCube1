@@ -9,7 +9,8 @@ reads it; tools/import_halo_scripts.py stores record indices per squad start.
 The player's own unit (the globals' player_information unit, characters\\cyborg\\cyborg)
 goes to packages/halo/player.txt (PLAYER_FIELDS): its coll's materials, shield
 material type and shield stun and recharge, which halodamage's player branch takes
-in place of the engine's built-in rule when the file is there.
+in place of the engine's built-in rule when the file is there, and the globals'
+falling damage block (the `falling` lines), which the engine's falling damage reads.
 """
 import argparse
 import mmap
@@ -21,7 +22,7 @@ from halo_weapons import CAMPAIGN, weapon_index
 FORMAT = 3                        # 2: team, unitmelee and material lines; 3: major and difficulty lines
 # Format 3 also carries the optional unit, spawn, pop, destroyed, resistance and shieldtime lines and the
 # material lines' fifth field, the shield leak, the berserk line's fourth (the actr melee delay) and the
-# grenade line's seventh (the encounter grenade timeout; below) and the unitmeleematerials line. The format number stays 3:
+# grenade line's seventh (the encounter grenade timeout; below), the unitmeleematerials, melee and special lines. The format number stays 3:
 # an engine that predates them skips keys it does not know and fields past a line's last (halo_ai.cpp
 # parse), so a newer table still loads there, and an older table (without them) loads in a newer
 # engine, which keeps its built-in carrier burst, has no infection pop or speed stagger, puts
@@ -91,11 +92,52 @@ COLL_SHIELD_FAILURE, COLL_SHIELD_STUN, COLL_RECHARGE_VELOCITY = 236, 264, 448
 # padding around them is zero in every actv and actr of the ten caches). The optional last field of
 # the `berserk` (only for a variant with an actr) and `grenade` lines; older engines read the rest.
 ACTR_MELEE_DELAY, ACTV_GRENADE_TIMEOUT = 888, 424
+# The melee charge (the `melee` line; ../Halo3DS ai/actions.c:2534-2610, ai/action_charge.c:269-706).
+# actv ranged_combat (actor_definitions.h:352-357, ranged_combat at +100): melee_range and
+# melee_abort_range at +352 and +356, berserk_melee_range and berserk_melee_abort_range at +368 and
+# +372 (after the berserk firing range bounds at +360). actr berserk (+888, :220-236):
+# melee_attack_range +892, melee_attack_charge_timer +896, suicide_sensing_distance +932. The
+# carried weapon's flags (weapon section +0, items/weapon_definitions.h:41: bit 15
+# non_players_use_melee_damage, only the energy sword's) choose its melee jpt! over the unit's for an
+# actor's melee (units/units.c:8597-8612). The unit's melee animation (object +56, the antr): the
+# 'stand' seat (+12, 100 bytes) and the weapon class whose weapon types (+176, 60 bytes) hold the
+# weapon's label (weapon section +4; an empty type label for no weapon, units.c:7918-7921), its
+# animation slot 39 (melee_attack, units/units.h:274; class animations at +152), and that animation's
+# frame count (+34), key frame (+52), frame info type (+38) and frame info (+72): Halo's x offsets
+# at the key frame and at the end (models/model_animations.c:416-457; unit_get_melee_range_and_ticks,
+# units.c:1391-1459). Every offset checked against the cache bytes (padding zero in every actv).
+ACTV_MELEE_RANGE, ACTV_BERSERK_MELEE_RANGE = 352, 368
+ACTR_MELEE_ATTACK_RANGE, ACTR_MELEE_CHARGE_TIMER, ACTR_SUICIDE_SENSING = 892, 896, 932
+WEAPON_SECTION, WEAPON_NON_PLAYERS_USE_MELEE = 776, 1 << 15
+# Infantry special fire (the optional `special` line; ../Halo3DS ai/actor_combat.c:1765-1840, 1339-1348).
+# actv ranged_combat (+100, actor_definitions.h:318-358): special_damage_modifier and
+# special_projectile_error at +248 and +252 (after the 44-byte burst geometry at +204),
+# special_fire_mode and special_fire_situation (h, h) at +340 and +342, special_fire_chance and
+# special_fire_delay at +344 and +348 (just before melee_range at +352). Checked against the cache
+# bytes: the Jackals' plasma pistol variants mode 1 (overcharge), situation 1 (enemy visible), chance
+# 0.2 minor and 0.3 major, delay 5 s, modifier 0.4, error 0; the Banshee pilot mode 2 (secondary),
+# situation 3 (strafing), chance 1, delay 10; every other actv mode 0 (the Grunts' plasma pistol
+# variants carry a chance and delay with mode 0, which Halo never reads). Written only for mode > 0.
+ACTV_SPECIAL_DAMAGE, ACTV_SPECIAL_FIRE = 248, 340
+OBJECT_ANIMATION_GRAPH, ANTR_UNIT_SEATS, SEAT_STRIDE, SEAT_WEAPON_CLASSES = 56, 12, 100, 88
+CLASS_STRIDE, CLASS_ANIMATIONS, CLASS_WEAPON_TYPES, TYPE_STRIDE = 188, 152, 176, 60
+ANTR_ANIMATIONS, ANIMATION_STRIDE, MELEE_ATTACK_SLOT = 116, 180, 39
+FRAME_INFO_SIZES = {1: 8, 2: 12, 3: 16}         # dx dy, dx dy dyaw, dx dy dz dyaw (model_animations.c:428-441)
 # matg: player_information (../Halo3DS game/game_globals.h:253, the eleventh block after the
 # difficulty block at 284: 368), one 244-byte element (game_globals.h:143-174) whose first field
 # is the player_unit reference: the unit every player spawns as (characters\cyborg\cyborg in all
 # ten caches; checked against the cache bytes).
 GLOBALS_PLAYER_INFORMATION, PLAYER_INFORMATION_STRIDE = 368, 244
+# matg: falling_damage (game_globals.h:255, the block after first_person_interface at 380: 392), one
+# 152-byte element (../Halo3DS units/bipeds.c:368-385 and objects/damage.c:262-286, which asserts
+# the 0x98 size and the falling jpt!'s index at 0x1C): falling distance lower and upper bounds at
+# +8 and +12, the falling jpt! at +16, maximum distance at +40, the maximum distance jpt! at +44
+# and the runtime maximum falling, minimum damage and maximum damage velocities (units a tick) at
+# +0x8C. Checked against the cache bytes: 3, 6 and 16.5 units, 0.3430, 0.1463 and 0.2068 (the
+# sqrt(2 g d) of 16.5, 3 and 6 with physics.c:279's gravity), globals\falling (10, 155-155,
+# category 1 falling) and globals\distance (105-105, falling), the same in all ten caches.
+GLOBALS_FALLING, FALLING_STRIDE = 392, 152
+FALLING_BOUNDS, FALLING_JPT, FALLING_MAXIMUM, FALLING_DISTANCE_JPT, FALLING_RUNTIME = 8, 16, 40, 44, 0x8C
 PLAYER_FORMAT = 1
 
 FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible>   the globals (matg) difficulty table, before the actors
@@ -123,12 +165,24 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # spawn <actor index> <lower> <upper> <throw velocity>   the actors the unit releases when destroyed (absent: none), velocity in world units a second
 # pop <inner> <outer> <lower> <upper min> <upper max> <jpt flags>   the body destroyed effect's infection-form pop damage (absent: none)
 # destroyed <effe tag>              the body destroyed effect a unit destroyed after dying sets off, when it is not the pop (absent: none; effects.txt holds its damage)
+# melee <range> <abort> <berserk range> <berserk abort> <attack range> <charge timer s> <suicide sensing> <weapon melee 0|1> <frames> <key frame> <key x> <total x>
+#                                   the melee charge: the actv's ranges, the actr's attack range, charge timer and suicide sensing distance
+#                                   (0 without an actr), 1 when the carried weapon's melee jpt! replaces the unit's, and the unit's melee
+#                                   animation for that weapon (frames, key frame, x offsets in world units; 0 0 0 0 without one)
+# special <mode> <situation> <chance> <delay s> <damage modifier> <projectile error>
+#                                   the actv's special fire (mode 1 overcharge, 2 secondary trigger; situation 0 never,
+#                                   1 enemy visible, 2 enemy out of sight, 3 strafing), only for mode > 0; older engines skip it
 '''
 
 PLAYER_FIELDS = '''# player <unit tag>                 the globals' player_information unit (game_globals.h:143-145)
 # material, resistance, shieldtime   its coll, as in actors.txt (the cyborg: every material type 21,
 #                                    cyborg armor, leak 0; shield material type 22, cyborg energy shield;
 #                                    indirect material 1; stun 6 s, recharge 4 s)
+# unit <unit flags> <biped flags>    as in actors.txt (the cyborg's bit 22: shields fry infection forms)
+# falling <lower> <upper> <maximum distance> <max falling v> <min damage v> <max damage v> <falling min> <lower> <upper> <distance min> <lower> <upper> <falling category> <distance category> <falling jpt flags> <distance jpt flags>
+#                                    the globals' falling_damage block (distances in world units, velocities
+#                                    in units a tick) and its two jpt!s' damage (optional; older engines skip it)
+# fallingmaterials, distancematerials <33 modifiers>   those jpt!s' damage modifier per retail material type
 # end
 '''
 
@@ -150,7 +204,12 @@ def actor_record(halo, tag, weapons):
     major = halo.reference(t, a + MAJOR_REFERENCE)
     record['major'] = major.name if major and major.group == 'actv' else ''
     record['melee'] = t.read('f', a + 352)[0]
-    record.update(unit_record(halo, halo.reference(t, a + UNIT_REFERENCE)))
+    mode, situation = t.read('2h', a + ACTV_SPECIAL_FIRE)
+    if mode > 0:
+        record['special'] = (mode, situation, *t.read('2f', a + ACTV_SPECIAL_FIRE + 4), *t.read('2f', a + ACTV_SPECIAL_DAMAGE))
+    unit = halo.reference(t, a + UNIT_REFERENCE)
+    record.update(unit_record(halo, unit))
+    charge = (0.0, 0.0, 0.0)
     if actr and actr.group == 'actr':
         r = actr.address
         record['type'] = t.read('h', r + 20)[0]
@@ -160,10 +219,60 @@ def actor_record(halo, tag, weapons):
         record['morale'] = (t.read('h', r + 632)[0], t.read('f', r + 672)[0], t.read('f', r + 680)[0])
         record['berserk'] = (*t.read('2f', r + 920), record['melee'], t.read('f', r + ACTR_MELEE_DELAY)[0])
         record['positions'] = t.read('4f', r + 952)
+        charge = (*t.read('2f', r + ACTR_MELEE_ATTACK_RANGE), t.read('f', r + ACTR_SUICIDE_SENSING)[0])
     else:
         record.update(type=-1, actr_flags=0, vision=(0,) * 6, defense=(0,) * 3, morale=(0, 0.0, 0.0),
                       berserk=(0.0, 0.0, record['melee']), positions=(0,) * 4)
+    carried = weapon if weapon and weapon.group == 'weap' else None
+    weapon_flags = t.read('I', carried.address + WEAPON_SECTION)[0] if carried else 0
+    record['meleecharge'] = (*t.read('2f', a + ACTV_MELEE_RANGE), *t.read('2f', a + ACTV_BERSERK_MELEE_RANGE), *charge,
+                             1 if weapon_flags & WEAPON_NON_PLAYERS_USE_MELEE else 0,
+                             *melee_animation(halo, unit, carried))
     return record
+
+
+def melee_animation(halo, unit, weapon):
+    """The unit's melee attack animation for the carried weapon, as Halo's actors find it
+    (unit_get_melee_range_and_ticks, ../Halo3DS units/units.c:1391-1459): (frames, key frame, x
+    offset at the key frame, total x offset), the offsets in world units summed over the frame
+    info as animation_get_x_offsets does (models/model_animations.c:416-457); (0, 0, 0.0, 0.0)
+    without one. The seat is the antr's 'stand' (else its first), the weapon class the one whose
+    weapon types carry the weapon's label, an empty label for no weapon (units.c:7912-7921)."""
+    none = (0, 0, 0.0, 0.0)
+    t = halo.tags
+    if not unit or unit.group != 'bipd':
+        return none
+    antr = halo.reference(t, unit.address + OBJECT_ANIMATION_GRAPH)
+    if not antr or antr.group != 'antr':
+        return none
+    label = t.name(weapon.address + WEAPON_SECTION + 4, 32) if weapon else 'unarmed'
+    seats = t.block(antr.address + ANTR_UNIT_SEATS, SEAT_STRIDE)
+    seat = next((s for s in seats if t.name(s, 32) == 'stand'), seats[0] if seats else None)
+    if seat is None:
+        return none
+    for weapon_class in t.block(seat + SEAT_WEAPON_CLASSES, CLASS_STRIDE):
+        types = [t.name(w, 32) for w in t.block(weapon_class + CLASS_WEAPON_TYPES, TYPE_STRIDE)]
+        if not any((label == 'unarmed' and not name) or name.lower() == label.lower() for name in types):
+            continue
+        slots = t.block(weapon_class + CLASS_ANIMATIONS, 2)
+        index = t.read('h', slots[MELEE_ATTACK_SLOT])[0] if len(slots) > MELEE_ATTACK_SLOT else -1
+        animations = t.block(antr.address + ANTR_ANIMATIONS, ANIMATION_STRIDE)
+        if not 0 <= index < len(animations):
+            return none
+        clip = animations[index]
+        frames, = t.read('h', clip + 34)
+        info_type, = t.read('h', clip + 38)
+        key, = t.read('h', clip + 52)
+        size, _, _, pointer = t.read('4I', clip + 72)
+        stride = FRAME_INFO_SIZES.get(info_type, 0)
+        x = key_x = 0.0
+        for frame in range(max(0, frames)):
+            if stride and (frame + 1) * stride <= size:
+                x += t.read('f', pointer + frame * stride)[0]
+            if frame == key:
+                key_x = x
+        return max(0, frames), max(0, key), key_x, x
+    return none
 
 
 def unit_record(halo, unit):
@@ -297,6 +406,10 @@ def write(records, path, difficulty=None):
         for key in ('resistance', 'shieldtime'):
             if r.get(key):
                 lines.append(key + ' ' + ' '.join(map(number, r[key])))
+        if r.get('meleecharge'):
+            lines.append('melee ' + ' '.join(map(number, r['meleecharge'])))
+        if r.get('special'):
+            lines.append('special ' + ' '.join(map(number, r['special'])))
         lines.append('end')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('\n'.join(lines) + '\n')
@@ -315,7 +428,27 @@ def player_record(halo):
     record = unit_record(halo, unit)
     if not record.get('materials') or not record.get('resistance'):
         return None
-    return {'path': unit.name, **record}
+    return {'path': unit.name, **record, **falling_record(halo, matg)}
+
+
+def falling_record(halo, matg):
+    """The globals' falling_damage block (biped_falling_damage, ../Halo3DS units/bipeds.c:792-845)
+    as the player.txt `falling`, `fallingmaterials` and `distancematerials` values, or {} when the
+    cache has no element or either jpt! is missing."""
+    from halo_weapons import jpt_damage, jpt_materials
+    t = halo.tags
+    elements = t.block(matg.address + GLOBALS_FALLING, FALLING_STRIDE)
+    if not elements:
+        return {}
+    e = elements[0]
+    falling, distance = halo.reference(t, e + FALLING_JPT), halo.reference(t, e + FALLING_DISTANCE_JPT)
+    if not falling or falling.group != 'jpt!' or not distance or distance.group != 'jpt!':
+        return {}
+    f, d = jpt_damage(halo, falling), jpt_damage(halo, distance)
+    return {'falling': (*t.read('2f', e + FALLING_BOUNDS), t.read('f', e + FALLING_MAXIMUM)[0], *t.read('3f', e + FALLING_RUNTIME),
+                        f.lower, f.upper_min, f.upper_max, d.lower, d.upper_min, d.upper_max, f.category, d.category,
+                        f.flags, d.flags),
+            'fallingmaterials': jpt_materials(halo, falling), 'distancematerials': jpt_materials(halo, distance)}
 
 
 def write_player(record, path):
@@ -323,6 +456,11 @@ def write_player(record, path):
              PLAYER_FIELDS.rstrip(), f'player {record["path"]}']
     lines += ['material ' + ' '.join(map(number, m)) for m in record['materials']]
     for key in ('resistance', 'shieldtime'):
+        if record.get(key):
+            lines.append(key + ' ' + ' '.join(map(number, record[key])))
+    if 'unit' in record:
+        lines.append('unit ' + ' '.join(map(number, record['unit'])))
+    for key in ('falling', 'fallingmaterials', 'distancematerials'):
         if record.get(key):
             lines.append(key + ' ' + ' '.join(map(number, record[key])))
     lines.append('end')

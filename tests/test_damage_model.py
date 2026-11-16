@@ -26,7 +26,8 @@ throttle), and the Ghost drives again once the stun is over.
 a30 section 3 (Covenant): with halo_damagetrace, every shot an actor lands on the (protected)
 player is an exact hit within its weapon's [lower, upper max] times the variant's modifier
 (at least 1), some of them fractional; an actor's grenade blast deals at least the lower bound;
-the player's EMP hit drains an Elite's shield.
+the player's EMP hit drains an Elite's shield. Since the actor-melee work (not yet run) an actor's melee
+on the player (gun 0) is checked apart: 30 to 35 (elite melee) or the sword's 151.
 
 The modifier-0 work (written while testing was on hold, not yet run; docs "Damage fidelity", Enemy
 fire): on a30 section 2 the `elite commander energy sword` and `sentinel` variants (actv weapon
@@ -56,7 +57,7 @@ ACTORS = root / 'packages/halo/actors.txt'
 for path in (WEAPONS, EQUIPMENT, ACTORS):
     require(path, 'run python3 tools/halo_weapons.py and tools/halo_actors.py with the expanded caches')
 require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
-GUN_SUBGUN, GUN_GRENADE = 4, 7
+GUN_KNIFE, GUN_SUBGUN, GUN_GRENADE = 0, 4, 7
 
 
 def close(a, b, tolerance=1e-3):
@@ -368,7 +369,12 @@ for line in text.splitlines():
 # Actor names have a space ("Elite 3"): the trace's attacker field is the name up to it, so a
 # shot is checked against every actor whose name starts with it.
 trace = [fields(l) for l in text.splitlines() if l.startswith('DAMAGE_TRACE ') and ' target=player ' in l]
-shots = [t for t in trace if t['attacker'] not in ('player', '-') and t['exact'] == '1' and int(t['gun']) != GUN_GRENADE]
+shots = [t for t in trace if t['attacker'] not in ('player', '-') and t['exact'] == '1' and int(t['gun']) not in (GUN_GRENADE, GUN_KNIFE)]
+# Since the actor-melee work (not yet run) an Elite close to the player may melee it (GUN_KNIFE): its unit
+# melee jpt! (elite melee, 30 to 35) or a sword's 151, never times the variant's modifier.
+for t in trace:
+    if t['attacker'] not in ('player', '-') and t['exact'] == '1' and int(t['gun']) == GUN_KNIFE:
+        assert 30 - 1e-3 <= float(t['amount']) <= 35 + 1e-3 or abs(float(t['amount']) - 151) < 1e-3, ('an actor melee', t)
 assert shots, ('actors land shots on the protected player', log)
 fractional = 0
 for t in shots:
