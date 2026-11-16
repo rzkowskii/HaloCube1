@@ -34,6 +34,26 @@ Batch 5's critic, gap 11 and the melee review (written while testing was on hold
 7. The Hunter's belly window opens from its cannon fire only: a frontal hit at belly height just after
    a smash (qa_damage_hunter_act 0: lastaction set, as the smash does) lands on the shield arm (32);
    just after a cannon shot (qa_damage_hunter_act 1: haloactorfired) on the skin (13).
+
+Per-material shield leak and per-unit shield timing (written while testing was on hold, not yet run;
+docs "Factions and special enemies", Material damage, and "Difficulty", Shield recharge):
+8. The Jackal's hand-held shield (`jackal minor plasma pistol`, qa_variant_spawn, Normal: body 50,
+   shield 200; DAMAGE_SHIELD lines): a frontal plasma rifle hit of 10 lands on material 3 (type 16,
+   leak 0) and takes 10 off the shield, none off the body; the pistol's frontal 10 lands there too
+   and does nothing (its modifier for the jackal energy shield is 0); from behind (material 0,
+   leak 1), at the head from the front (material 1) and as a rocket blast (the indirect material,
+   0) the body loses 10 and the shield stays full; a frontal 250 empties the shield and leaves the
+   body whole (body multiplier 0); with the shield down (qa_damage_keep 1) a frontal pistol hit
+   reaches the body (material 0).
+9. Shield timing (qa_shield_timing): the Jackal stuns 15000 ms and recharges in 33, the Elite minor
+   12000 and 10000, the marine 8000 and 1000 (Normal's recharge values are 1), the crewman and
+   the stealth Elite have no shield (shield_max 0: an actv that sets a body vitality and no shield);
+   all on the Covenant team, so no one fights (Normal's enemy and friend recharge are both 1).
+   A Jackal shield hit for 50 is still 150 a second later and full 15.5 s after the hit.
+10. The marine's leak (marine assault rifle on the Covenant team, so the player's hits are hostile):
+   a pistol hit of 10 from behind at full shield has leak 0.2 and share 0.8 (8 to the shield, 2
+   passed); a second hit (qa_damage_keep 1) shares 0.8 x (0.8 x shield/shield_max + 0.2), the
+   failure curve (threshold 1, maximum 0.2).
 """
 import re
 import subprocess
@@ -249,3 +269,101 @@ for label, material in {'smashed': '32', 'fired': '13'}.items():
     got = r[label]['material_line']
     assert got['kind'] == '3' and got['material'] == material, (label, material, got)
 print('a30 section 2: the Hunter\'s belly is open after its cannon shot (skin), shut after its smash (shield arm).')
+
+# ---- 8-10. Per-material shield leak and per-unit shield timing
+ACTORS = root / 'packages/halo/actors.txt'
+require(ACTORS, 'run python3 tools/halo_actors.py with the expanded caches')
+variant = {}
+for line in ACTORS.read_text().splitlines():
+    key, _, rest = line.partition(' ')
+    if key == 'actor':
+        current = int(rest)
+    elif key == 'path':
+        variant[rest] = current
+assert any(l.startswith('shieldtime ') for l in ACTORS.read_text().splitlines()), 'rerun tools/halo_actors.py: no shieldtime lines'
+JACKAL = variant[r'characters\jackal\jackal minor plasma pistol']
+ELITE = variant[r'characters\elite\elite minor\elite minor plasma rifle']
+MARINE = variant[r'characters\marine\marine assault rifle']
+CREWMAN = variant[r'characters\crewman\crewman pistol']
+STEALTH = variant[r'characters\elite\elite stealth\stealth elite plasma rifle']
+pr, rl = index[weapon('plasma rifle')['path']], index[rocket['path']]
+
+
+def shielded(text):
+    """Each DAMAGE_REGION line by label, with the last DAMAGE_SHIELD line logged before it (or None)."""
+    out, shield = {}, None
+    for line in text.splitlines():
+        if line.startswith('DAMAGE_SHIELD '):
+            shield = fields(line)
+        elif line.startswith('DAMAGE_REGION '):
+            row = fields(line)
+            row['shield_line'] = shield
+            out.setdefault(line.split()[1], row)
+            shield = None
+    return out
+
+
+text, log = run('jackal', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_variant_spawn "jackal minor plasma pistol" 0 8 0'),
+    (1000, f'qa_damage_region 2 0 0.5 {pr} 10 front'),
+    (1300, f'qa_damage_region 2 0 0.5 {p} 10 frontpistol'),
+    (1600, f'qa_damage_region 2 180 0.5 {p} 10 back'),
+    (1900, f'qa_damage_region 2 0 0.9 {p} 10 head'),
+    (2200, f'qa_damage_blast 2 {rl} 10 blast'),
+    (2500, f'qa_damage_region 2 0 0.5 {pr} 250 break'),
+    (2800, f'qa_damage_keep 1; qa_damage_region 2 0 0.5 {p} 10 downed'),
+    (3100, 'qa_damage_keep 0; quit'),
+])
+r = shielded(text)
+want = {  # label: (material index, shield left, health left)
+    'front': ('3', 190, 50), 'frontpistol': ('3', 200, 50), 'back': ('0', 200, 40), 'head': ('1', 200, 40),
+    'blast': ('0', 200, 40), 'break': ('3', 0, 50), 'downed': ('0', 0, 40),
+}
+for label, (material, shield, health) in want.items():
+    assert label in r and 'name' in r[label], (label, log)
+    got = r[label]
+    assert got['shield_line'] and got['shield_line']['material'] == material, (label, material, got)
+    assert abs(float(got['shield']) - shield) < .01 and int(got['health']) == health, (label, shield, health, got)
+assert float(r['front']['shield_line']['leak']) == 0 and r['front']['shield_line']['type'] == '16', r['front']
+assert float(r['back']['shield_line']['leak']) == 1, r['back']
+print('a30 section 2: the Jackal\'s shield covers its hand-held shield only; body, head and blast hits reach its body.')
+
+text, log = run('shieldtime', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_variant_spawn "jackal minor plasma pistol" 0 8 0; qa_variant_spawn "elite minor plasma rifle" 0 10 6; '
+        'qa_variant_spawn "stealth elite plasma rifle" 0 10 -6'),
+    (400, 'qa_variant_spawn "marine\\marine assault rifle" 0 -4 3; qa_variant_spawn "crewman pistol" 0 -4 -3'),
+    (1000, 'qa_shield_timing'),
+    (1200, f'qa_damage_region 2 0 0.5 {pr} 50 hit'),
+    (2200, 'qa_damage_state 2 stunned'),
+    (16700, 'qa_damage_state 2 recharged'),
+    (16900, 'quit'),
+], timeout=180)
+timing = {int(f['variant']): f for f in (fields(l) for l in text.splitlines() if l.startswith('SHIELD_TIMING '))}
+for v, (delay, recharge) in {JACKAL: (15000, 33), ELITE: (12000, 10000), MARINE: (8000, 1000)}.items():
+    assert v in timing and timing[v]['timed'] == '1', (v, timing, log)
+    assert int(timing[v]['delay']) == delay and int(timing[v]['recharge']) == recharge and int(timing[v]['scaled']) == recharge, (v, timing[v])
+for v in (CREWMAN, STEALTH):
+    assert v in timing and float(timing[v]['shield_max']) == 0, ('no shield: the actv sets a body and no shield', v, timing.get(v))
+r = shielded(text)
+assert abs(float(r['hit']['shield']) - 150) < .01, r['hit']
+assert abs(float(r['stunned']['shield']) - 150) < .01, ('still stunned a second later', r['stunned'])
+assert abs(float(r['recharged']['shield']) - 200) < .01, ('full once the 15 s stun ends', r['recharged'])
+print('a30 section 2: shield stun and recharge from each coll (Jackal 15 s and a tick, Elite 12 s and 10 s, marine 8 s and 1 s).')
+
+text, log = run('marine', 'qa_campaign_resume 2 2', [
+    (100, 'botsshoot 0; qa_combat_protect 1'),
+    (300, 'qa_variant_spawn "marine\\marine assault rifle" 0 6 0'),
+    (1000, f'qa_damage_region 9 180 0.5 {p} 10 full'),
+    (1300, f'qa_damage_keep 1; qa_damage_region 9 180 0.5 {p} 4 half'),
+    (1600, 'qa_damage_keep 0; quit'),
+])
+r = shielded(text)
+full = r['full']['shield_line']
+assert full and abs(float(full['leak']) - .2) < 1e-3 and abs(float(full['share']) - .8) < 1e-3, r['full']
+assert abs(float(full['shield_part']) - 8) < 1e-2 and abs(float(full['passed']) - 2) < 1e-2, full
+fraction = float(r['full']['shield']) / float(r['full']['shield_max'])
+half = r['half']['shield_line']
+assert half and abs(float(half['share']) - .8 * (.8 * fraction + .2)) < 1e-3, (fraction, half)
+print(f'a30 section 2: a marine\'s shield leaks 0.2 at full strength and {1 - float(half["share"]):.2f} at {fraction:.2f}.')

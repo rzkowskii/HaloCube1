@@ -15,7 +15,17 @@ forms inside its jpt!'s cutoff (objects/damage.c:2343-2421): on Normal every one
 candidates), on Impossible one at most; c10's nopop forms have the random speed increase flag and,
 fighting a target on Impossible, move at infection_forms * (cn % 137) * 0.00729927 + 1 (bipeds.c:
 3580-3590), the ordinary forms at 1.
+
+The forms join the carrier's squad (written while testing was on hold, NOT YET RUN; items 7 to 11):
+actors.txt's `destroyed` lines and effects.txt's carrier blast equal the tags (static); on c20
+section 1 a killed carrier's forms join enc2_1/carriers (FLOOD_ADOPT), ai_living_count counts them,
+ai_nonswarm_count does not, ai_living_fraction counts one swarm actor for them (../Halo3DS
+ai/ai_script.c:4681-4725, ai/actors.c:2539-2555), ai_migrate takes them along and ai_erase deletes
+them with no pop and no burst (actors.c:3845-3886) where ai_kill pops them; a checkpoint, a revert
+and a Continue keep them (`s spawned`); the carrier's body destroyed effect deals its damage before
+the forms appear.
 """
+import shutil
 import mmap
 import re
 import subprocess
@@ -39,6 +49,8 @@ def actor_lines():
             records[rest] = current
         elif key in ('unit', 'spawn', 'pop') and current is not None:
             current[key] = rest.split()
+        elif key == 'destroyed' and current is not None:
+            current[key] = rest
     return records
 
 
@@ -211,3 +223,145 @@ for row in staggers:
     assert combat or not flag, ('the nopop form fights the player by now', row, log)
 assert sorted(int(r['flag']) for r in staggers) == [0, 1], staggers
 print(f'Stagger on Impossible: {[(r["flag"], r["combat"], r["scale"]) for r in staggers]}.')
+
+
+# 7. Static: actors.txt's `destroyed` lines (the body destroyed effect of a unit destroyed after
+#    dying, coll +188, unless it is the pop) equal the tags, and effects.txt holds the carrier's blast
+#    (characters\floodcarrier\bdoy destroyed: 1 to 2 world units, 40 to 70-85).
+destroyed = {p: r['destroyed'] for p, r in actors.items() if 'destroyed' in r}
+assert destroyed.get(r'characters\floodcarrier\floodcarrier') == r'characters\floodcarrier\effects\body destroyed', destroyed
+assert not any('flood_infection' in p for p in destroyed), ('the infection forms pop instead', destroyed)
+if (HALO_SOURCE / 'c20.map').exists():
+    from halo_actors import destroyed_effect  # noqa: E402
+    for cache in ('b30', 'c10', 'c20', 'd20', 'd40'):
+        with (HALO_SOURCE / f'{cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            halo = HaloMap(data)
+            for tag in halo.directory:
+                if tag.group != 'actv' or tag.name not in actors:
+                    continue
+                unit = halo.reference(halo.tags, tag.address + 20)
+                assert actors[tag.name].get('destroyed') == destroyed_effect(halo, unit), (cache, tag.name)
+effects_text = (root / 'packages/halo/effects.txt').read_text()
+blast = re.search(r'path characters\\floodcarrier\\effects\\body destroyed\n(?:(?!end\n).*\n)*?damage (.*)\n', effects_text)
+assert blast and blast.group(1).split()[:5] == ['1', '2', '40', '70', '85'], ('effects.txt: the carrier blast', blast and blast.group(1))
+print(f'Body destroyed effects: {len(destroyed)} variants, the carrier\'s blast 1 to 2 units, 40 to 70-85.')
+
+
+def squad_counts(text, label):
+    """SQUAD_COUNT rows of a label by squad name."""
+    found = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) > 2 and parts[0] == 'SQUAD_COUNT' and parts[1] == label:
+            found[parts[2]] = {k: float(v) for k, v in re.findall(r'(\w+)=(\S+)', line)}
+    return found
+
+
+def hs(text, command, name):
+    values = re.findall(rf'HS_AI {command} {re.escape(name)} (-?[\d.]+)', text)
+    return [float(v) for v in values]
+
+
+C20 = 'halo_difficulty 1; halo_damagetrace 1; halo_scripttrace 1; halo_unitblast 0; qa_campaign_resume 7 1'
+if not (root / 'packages/maps/halo_c20_01.cgz').exists():
+    print('SKIP squad membership: c20 section 1 is not imported.')
+else:
+    # 8. The forms join enc2_1/carriers: counted by ai_living_count, not by ai_nonswarm_count, once
+    #    as a swarm actor by ai_living_fraction; ai_migrate takes them along; ai_erase deletes them
+    #    (no FLOOD_POP), and the carriers it erases release nothing.
+    text, log = run('squad', C20, [
+        (0, 'botsshoot 0; qa_combat_protect 1; qa_actor_place enc2_1'),
+        (1500, 'qa_squad_counts before enc2_1; qa_hs_ai ai_living_count enc2_1/carriers 0'),
+        (1600, 'qa_squad_kill_one enc2_1/carriers'),
+        (2600, 'qa_squad_counts after enc2_1; qa_hs_ai ai_living_count enc2_1/carriers 0; '
+               'qa_hs_ai ai_nonswarm_count enc2_1/carriers 0; qa_hs_ai ai_living_fraction enc2_1/carriers 0'),
+        (2700, 'qa_hs_cmd ai_migrate "enc2_1/carriers enc2_1/combats"'),
+        (2800, 'qa_squad_counts migrated enc2_1'),
+        (2900, 'echo ERASE_MARK; qa_hs_ai ai_erase enc2_1/combats 0'),
+        (3400, 'qa_squad_counts erased enc2_1; qa_hs_ai ai_living_count enc2_1 0'),
+        (3500, 'quit'),
+    ], timeout=180)
+    before, after = squad_counts(text, 'before'), squad_counts(text, 'after')
+    assert 'enc2_1/carriers' in before and before['enc2_1/carriers']['living'] >= 1, ('enc2_1 placed its carriers', before, log)
+    spawn = re.search(r'FLOOD_SPAWN .*? count=(\d+) velocity=[\d.]+ squad=(-?\d+)/(-?\d+)', text)
+    assert spawn and spawn.group(2) != '-1', ('the burst names the carrier\'s squad', log)
+    adopted = re.findall(r'FLOOD_ADOPT .*? squad=enc2_1/carriers variant=(\d+) swarm=(\d+)', text)
+    assert 1 <= len(adopted) <= int(spawn.group(1)), ('the forms join the squad', adopted, log)
+    assert len({s for _, s in adopted}) == 1, ('fewer than 16 bodies: one swarm actor', adopted)
+    b, a = before['enc2_1/carriers'], after['enc2_1/carriers']
+    k = len(adopted)
+    assert a['spawned'] == k and a['spawned_living'] == k, ('every adopted form lives in the squad', a, k)
+    assert a['living'] == b['living'] - 1 + k, ('ai_living_count: the dead carrier out, its forms in', b, a, k)
+    assert hs(text, 'ai_living_count', 'enc2_1/carriers')[-1] == a['living'], log
+    assert a['nonswarm'] == b['nonswarm'] - 1 and hs(text, 'ai_nonswarm_count', 'enc2_1/carriers')[-1] == a['nonswarm'], (b, a)
+    # The original count: every carrier entry, dead or alive, and one swarm actor for the forms.
+    assert a['swarms'] == 1 and a['actors'] == a['members'] - k + 1, a
+    assert abs(hs(text, 'ai_living_fraction', 'enc2_1/carriers')[-1] - a['living'] / a['actors']) < 1e-3, (a, log)
+    migrated = squad_counts(text, 'migrated')
+    assert migrated['enc2_1/combats']['spawned_living'] == k and migrated.get('enc2_1/carriers', {'living': 0})['living'] == 0, migrated
+    tail = text[text.index('ERASE_MARK'):]
+    assert 'FLOOD_POP' not in tail and 'FLOOD_SPAWN' not in tail, ('ai_erase deletes: no pop, no burst', log)
+    assert 'ai_erase deletes' in tail, log
+    assert squad_counts(text, 'erased')['enc2_1/combats']['living'] == 0, log
+    print(f'Squad: the carrier\'s {k} forms joined enc2_1/carriers (living {b["living"]:.0f} -> {a["living"]:.0f}, '
+          f'fraction {a["fraction"]:.3f} over {a["actors"]:.0f} actors), migrated with it, and ai_erase deleted them without a pop.')
+
+    # 9. ai_kill kills them: the forms pop (FLOOD_POP) and the living carriers burst again into the squad.
+    text, log = run('squad-kill', C20, [
+        (0, 'botsshoot 0; qa_combat_protect 1; qa_actor_place enc2_1'),
+        (1500, 'qa_squad_kill_one enc2_1/carriers'),
+        (2500, 'echo KILL_MARK; qa_hs_ai ai_kill enc2_1/carriers 0'),
+        (3500, 'qa_squad_counts killed enc2_1'),
+        (3600, 'quit'),
+    ], timeout=180)
+    tail = text[text.index('KILL_MARK'):]
+    assert 'FLOOD_POP' in tail, ('ai_kill kills the forms: they pop', log)
+    assert re.search(r'FLOOD_ADOPT .*? squad=enc2_1/carriers', tail) or 'FLOOD_SPAWN' not in tail, ('a killed carrier\'s forms join', log)
+    print('Kill: ai_kill popped the forms and the killed carriers\' forms joined the squad again.')
+
+    # 10. The checkpoint keeps them (Halo's checkpoint is the whole game state): a revert and a
+    #     Continue bring the forms back as squad members, and the progress file holds `s spawned`.
+    def run_profile(name, script, profile=None, timeout=200):
+        profile = profile or scratch(f'flood-{name}-')
+        log = profile / f'{name}.log'
+        with log.open('w') as output:
+            subprocess.run([QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600', f'-e{script}'],
+                           cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, check=True)
+        return log.read_text(errors='replace'), profile
+
+    def spawned_rows(text, label):
+        return [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines()
+                if line.startswith(f'SQUAD_STOOD {label} ') and ' spawned=' in line and ' spawned=-1 ' not in line + ' ']
+
+    text, profile = run_profile('save', 'halo_difficulty 1; halo_damagetrace 1; halo_unitblast 0; qa_campaign_resume 7 1; '
+                                'qa_after_gameplay [botsshoot 0; qa_combat_protect 1; qa_actor_place enc2_1; '
+                                'sleep 1500 [qa_squad_kill_one enc2_1/carriers] 1; '
+                                'sleep 2500 [qa_squad_stood saved; qa_checkpoint_save] 1; '
+                                'sleep 2800 [qa_combat_protect 0; qa_halo_damage 100000] 1; sleep 4500 [qa_halo_revert] 1; '
+                                'sleep 4700 [qa_squad_stood reverted; qa_squad_counts reverted enc2_1] 1; sleep 5000 [quit] 1]')
+    saved, reverted = spawned_rows(text, 'saved'), spawned_rows(text, 'reverted')
+    assert saved and len(reverted) == len(saved), ('the revert brings the forms back as members', len(saved), len(reverted), text[-2000:])
+    assert all(r['spawned'] == saved[0]['spawned'] for r in reverted), reverted
+    records = [r.split() for r in read_progress(profile)['records']['s'] if r.startswith('spawned ')]
+    assert len(records) == len(saved) and all(r[2] == '=enc2_1' and r[4] == '=carriers' for r in records), records[:3]
+    copy = scratch('flood-continue-')
+    shutil.copytree(profile / 'config', copy / 'config')
+    text, _ = run_profile('continue', 'halo_title; sleep 300 [halo_continue] 1; qa_after_gameplay [botsshoot 0; '
+                          'qa_squad_stood continued; qa_squad_counts continued enc2_1; sleep 300 [quit] 1]', copy)
+    assert 'could not be restored' not in text, text[-2000:]
+    continued = spawned_rows(text, 'continued')
+    assert len(continued) == len(saved), ('a Continue brings them back', len(saved), len(continued), text[-2000:])
+    print(f'Checkpoint: {len(saved)} forms kept through a revert and a Continue ({len(records)} `s spawned` records).')
+
+    # 11. The carrier's blast: its body destroyed effect deals its damage (UNIT_BLAST dealt=1) before
+    #     its forms appear; with halo_unitblast 0 it deals none.
+    text, log = run('blast', C20.replace('halo_unitblast 0', 'halo_unitblast 1'), [
+        (0, 'botsshoot 0; qa_combat_protect 1; qa_actor_place enc2_1'),
+        (1500, 'qa_squad_kill_one enc2_1/carriers'),
+        (2500, 'quit'),
+    ], timeout=180)
+    blast_at = text.find('UNIT_BLAST variant=characters\\floodcarrier\\floodcarrier')
+    assert blast_at >= 0 and 'dealt=1' in text[blast_at:text.index('\n', blast_at)], ('the carrier blast deals damage', log)
+    first_adopt = text.find('FLOOD_ADOPT')
+    assert first_adopt < 0 or blast_at < first_adopt, ('the blast comes before the forms', log)
+    print('Blast: the carrier\'s body destroyed effect went off before its forms appeared.')

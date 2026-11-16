@@ -2,11 +2,13 @@
 """Bake Halo CE Xbox A30's first-person and biped art into AssaultCube MD3 models."""
 
 import argparse
+from array import array
 from bisect import bisect_right
 from dataclasses import dataclass
 import math
 import mmap
 from pathlib import Path
+import shutil
 import struct
 
 from halo_map_art import decode_bitmap, write_png
@@ -407,19 +409,34 @@ def md3_axes(vector):
     return -y, x, z
 
 
-def pack_vertex(point, normal):
+def normal_code(normal):
     x, y, z = md3_axes(normal)
     length = math.sqrt(x*x + y*y + z*z)
     azimuth = round(math.atan2(y, x) * 255/math.tau) & 255 if length else 0
     polar = round(math.acos(max(-1, min(1, z/length))) * 255/math.tau) & 255 if length else 0
-    return struct.pack('<3hH', *(round(coord*64) for coord in point), (azimuth << 8) | polar)
+    return (azimuth << 8) | polar
 
 
-def mesh_frames(model, mesh, frames, model_scale):
-    chunks = []
-    for pose, frame_bounds in frames:
+def pack_vertex(point, normal):
+    return struct.pack('<3hH', *(round(coord*64) for coord in point), normal_code(normal))
+
+
+# MD3 vertices are signed 16-bit in 1/64 units (pack_vertex). export keeps every packed coordinate
+# within MD3_LIMIT, a little under 32767/64 so rounding cannot reach the edge.
+MD3_LIMIT = 32700 / 64
+# The frame name that marks an MD3 frame whose local_origin the engine adds to the frame's vertices
+# at load (md3.h): export's per-frame origins for clips whose root motion leaves the 16-bit range.
+# Stock MD3s never use it, so they load as before.
+ORIGIN_FRAME = b'halo_origin'
+
+
+def posed_vertices(model, mesh, frames):
+    """Every frame's skinned vertex positions (MD3 axes, before the model scale; a flat array of
+    doubles, three per vertex) and packed normals, so export can pick the geometry scale from the
+    posed extent before packing anything."""
+    positions, normals = array('d'), array('H')
+    for pose, _ in frames:
         bones = [pose[name].compose(inverse) for name, inverse in model.nodes]
-        output = bytearray()
         for vertex, normal, _, influences in mesh.vertices:
             position = [0.0, 0.0, 0.0]
             direction = [0.0, 0.0, 0.0]
@@ -430,14 +447,49 @@ def mesh_frames(model, mesh, frames, model_scale):
                 for i in range(3):
                     position[i] += weight*p[i]
                     direction[i] += weight*n[i]
-            point = tuple(coord * model_scale for coord in md3_axes(position))
+            positions.extend(md3_axes(position))
+            normals.append(normal_code(direction))
+    return positions, normals
+
+
+def mesh_frames(posed, frames, model_scale, origins=None):
+    """Pack the posed vertices at model_scale. With per-frame `origins` (MD3 axes, before the scale),
+    each frame's vertices are packed relative to its origin, which the frame record carries
+    (ORIGIN_FRAME); the bounds stay those of the absolute positions."""
+    positions, normals = posed
+    output = bytearray()
+    count = len(normals) // max(1, len(frames))
+    for f, (_, frame_bounds) in enumerate(frames):
+        origin = origins[f] if origins else (0.0, 0.0, 0.0)
+        for i in range(f*count, (f+1)*count):
+            point = tuple(coord * model_scale for coord in positions[3*i:3*i+3])
             for axis, coordinate in enumerate(point):
                 frame_bounds[axis] = min(frame_bounds[axis], coordinate)
                 frame_bounds[axis+3] = max(frame_bounds[axis+3], coordinate)
             frame_bounds[6] = max(frame_bounds[6], math.sqrt(sum(v*v for v in point)))
-            output.extend(pack_vertex(point, direction))
-        chunks.append(output)
-    return b''.join(chunks)
+            if origins:
+                point = tuple((coord - o) * model_scale for coord, o in zip(positions[3*i:3*i+3], origin))
+            output.extend(struct.pack('<3hH', *(round(coord*64) for coord in point), normals[i]))
+    return bytes(output)
+
+
+def frame_origins(surfaces, count):
+    """Each frame's origin for ORIGIN_FRAME packing: the centre of the box round that frame's posed
+    vertices over every surface (MD3 axes, before the model scale), and the largest half extent of a
+    frame's box, which is what then has to fit the 16-bit range."""
+    origins, half = [], 0.0
+    for f in range(count):
+        low, high = [math.inf]*3, [-math.inf]*3
+        for _, (positions, normals) in surfaces:
+            n = len(normals) // count
+            frame = positions[3*n*f:3*n*(f+1)]
+            for axis in range(3):
+                values = frame[axis::3]
+                if values:
+                    low[axis], high[axis] = min(low[axis], min(values)), max(high[axis], max(values))
+        origins.append(tuple((a + b)/2 if a <= b else 0.0 for a, b in zip(low, high)))
+        half = max([half] + [(b - a)/2 for a, b in zip(low, high) if a <= b])
+    return origins, half
 
 
 def marker_frames(model, markers, frames, model_scale):
@@ -456,9 +508,21 @@ def marker_frames(model, markers, frames, model_scale):
     return b''.join(records)
 
 
-def export(halo, directory, name, models, graph, clips, scale, markers=(), muzzle_flash=None, *,
-           quiet=False, geometry_scale=100, default_pose=None, position_poses=()):
+def export(halo, directory, name, models, graph, clips, scale, markers=(), muzzle_flash=None, **options):
+    """Write directory/name/tris.md3, its md3.cfg and skins; the mdlscale it used (write_export).
+    An export that fails removes the directory it created, so no skins-only directory is left."""
     destination = directory / name
+    created = not destination.exists()
+    try:
+        return write_export(halo, destination, name, models, graph, clips, scale, markers, muzzle_flash, **options)
+    except Exception:
+        if created:
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def write_export(halo, destination, name, models, graph, clips, scale, markers, muzzle_flash, *,
+                 quiet=False, geometry_scale=100, default_pose=None, position_poses=()):
     destination.mkdir(parents=True, exist_ok=True)
     frames = []
     anims = []
@@ -477,7 +541,7 @@ def export(halo, directory, name, models, graph, clips, scale, markers=(), muzzl
         pose = models[0].bind_pose if default_pose is None else default_pose
         frames.append((pose, [math.inf]*3 + [-math.inf]*3 + [0.0]))
     count = len(frames)
-    mesh_data = []
+    surfaces = []
     skins = []
     skin_names = {}
     digits_written = False
@@ -501,21 +565,45 @@ def export(halo, directory, name, models, graph, clips, scale, markers=(), muzzl
             else:
                 skin_name = skin_names[key]
             skins.append(f'md3skin {mesh.name} {skin_name}')
-            triangles = b''.join(struct.pack('<3i', *row) for row in mesh.triangles)
-            uv = b''.join(struct.pack('<2f', *vertex[2]) for vertex in mesh.vertices)
-            vertices = mesh_frames(model, mesh, frames, scale*1600/geometry_scale)
-            ofs_uv = 108 + len(triangles)
-            ofs_vertices = ofs_uv + len(uv)
-            mesh_data.append(
-                struct.pack('<4s64s10i', b'IDP3', mesh.name.encode(), 0, count, 0,
-                            len(mesh.vertices), len(mesh.triangles), 108, ofs_uv, ofs_uv,
-                            ofs_vertices, ofs_vertices + len(vertices))
-                + triangles + uv + vertices
-            )
-    if not mesh_data:
+            surfaces.append((mesh, posed_vertices(model, mesh, frames)))
+    if not surfaces:
         raise ValueError(f'No supported mesh surfaces for {name}')
-    frame_data = b''.join(struct.pack('<10f16s', *bounds[:6], 0, 0, 0, bounds[6], b'')
-                          for _, bounds in frames)
+    # geometry_scale is the smallest mdlscale the caller wants. A clip whose posed frames reach past
+    # the MD3 range at that scale (root motion: c10's x50 Chief and marines, d20's jump down, a50's
+    # lift, a10's and a30's lifepods flying off) is packed per frame about the centre of that frame's
+    # box (frame_origins), which its frame record carries for the engine to add back at load
+    # (ORIGIN_FRAME, md3.h), so the vertex step stays that of the model's own size. Only when a
+    # single frame's box is still too big does the scale rise, to the smallest that fits; the cfg's
+    # mdlscale divides it back out, so the model draws the same size. Every export that fits packs
+    # byte for byte as before.
+    low = min((min(positions) for _, (positions, _) in surfaces if positions), default=0.0)
+    high = max((max(positions) for _, (positions, _) in surfaces if positions), default=0.0)
+    model_scale = scale*1600/geometry_scale
+    origins = None
+    if round(low*model_scale*64) < -32768 or round(high*model_scale*64) > 32767:
+        origins, half = frame_origins(surfaces, count)
+        if half * model_scale > MD3_LIMIT * 0.999:
+            geometry_scale = math.ceil(half * scale*1600 / (MD3_LIMIT * 0.999))
+            model_scale = scale*1600/geometry_scale
+    mesh_data = []
+    for mesh, posed in surfaces:
+        triangles = b''.join(struct.pack('<3i', *row) for row in mesh.triangles)
+        uv = b''.join(struct.pack('<2f', *vertex[2]) for vertex in mesh.vertices)
+        vertices = mesh_frames(posed, frames, model_scale, origins)
+        ofs_uv = 108 + len(triangles)
+        ofs_vertices = ofs_uv + len(uv)
+        mesh_data.append(
+            struct.pack('<4s64s10i', b'IDP3', mesh.name.encode(), 0, count, 0,
+                        len(mesh.vertices), len(mesh.triangles), 108, ofs_uv, ofs_uv,
+                        ofs_vertices, ofs_vertices + len(vertices))
+            + triangles + uv + vertices
+        )
+    if origins:
+        frame_data = b''.join(struct.pack('<10f16s', *bounds[:6], *(c * model_scale for c in origin), bounds[6], ORIGIN_FRAME)
+                              for (_, bounds), origin in zip(frames, origins))
+    else:
+        frame_data = b''.join(struct.pack('<10f16s', *bounds[:6], 0, 0, 0, bounds[6], b'')
+                              for _, bounds in frames)
     tags = marker_frames(models[0], markers, frames, scale*1600/geometry_scale)
     meshes = b''.join(mesh_data)
     ofs_tags = 108 + len(frame_data)
@@ -529,6 +617,7 @@ def export(halo, directory, name, models, graph, clips, scale, markers=(), muzzl
     (destination/'md3.cfg').write_text('\n'.join(commands) + '\n', encoding='ascii')
     if not quiet:
         print(f'{name}: {count} frames, {len(mesh_data)} surfaces, {len(header + frame_data + tags + meshes)} bytes')
+    return geometry_scale
 
 
 def convert(halo, directory):

@@ -32,7 +32,8 @@ QUICK = [
     'test_retail_assists.py',         # walking assists (ASSISTS, .hcol AST1): loaded, rays and grenades pass, bodies stand on them
     'test_retail_scenery.py',         # scenery collision (SCENERY_COLLISION, .hcol SCN1): trailer matches metrics, loaded, hit by rays, grenades, bodies
     'test_scenery_uses.py',          # the use-aware scenery rule: named scenery a script only reads stays baked (SCN1), intro_tree undrawn (caches, no game)
-    'test_scene_meshes.py',          # every halo_scene_*.mesh and its textures match a fresh export (--check-scenes; caches, no game)
+    'test_scene_meshes.py',          # every halo_scene_*.mesh and its textures match a fresh export, cast exports on disk and in the .hscb, no orphans (--check-scenes; caches, no game)
+    'test_md3_range.py',             # MD3 exports past the 16-bit range: per-frame origins (halo_origin), larger mdlscale, failed exports and orphans removed, restored clips in the .hscb (no game, no caches)
     'test_scenery_raster.py',         # the cube-raster stamp: scenery in the .cgz cube raster (metrics, route rows and entities clear of it), flood waypoints out of it
     'test_route_metrics.py',          # stub-route gate: importer metrics, the known-bad table may not grow (no game)
     'test_content_currency.py',       # map and scene-texture currency compare content (gunzipped .cgz, decoded PNG), write_png skips unchanged files, metrics carry cgz_raw_sha1 (no game, no caches)
@@ -41,10 +42,10 @@ QUICK = [
     'test_weapon_fire.py',            # rate, zoom, heat, charge, swap, revert, enemy weapons
     'test_combat_equipment.py',       # grenade types, sticky plasma, equipment pickups, overshield, camouflage, weapon sounds
     'test_damage_model.py',           # jpt! range and blast falloff, actor grenade rolls, exact actor shots, EMP, time to kill
-    'test_melee_materials.py',        # melee from behind (allies spared), Hunter head and belly (cannon-fire window), material model cvar, needle supercombine, AOE core
+    'test_melee_materials.py',        # melee from behind (allies spared), Hunter head and belly (cannon-fire window), material model cvar, needle supercombine, AOE core, shield leak and timing
     'test_damage_targets.py',         # d40's manifold detectors: HSCB 8 targets, placed whole, damage rules, a real shot from the route
     'test_frag_throw.py',             # d40's s3 manifold: the importer's planned frag throws (2048 rows) thrown in the game destroy it
-    'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine
+    'test_actor_tags.py',             # retail actor behaviour table imported and parsed by the engine (shield leak, resistance, shieldtime)
     'test_actor_ai.py',               # perception, bursts, marines, firing positions, script AI commands, combat by difficulty
     'test_factions.py',               # allegiance matrix and commands, betrayal, Hunters, stealth Elites, flyers, Monitor, Keyes
     'test_ai_attach.py',              # HSCB 9 story-figure flags; ai_attach makes a50's Keyes and marines actors (health, revert, destroy, carried into section 5, own start across checkpoints, spared the kill from behind)
@@ -57,7 +58,7 @@ QUICK = [
     'test_script_seats.py',           # a10's cryotube as a scripted seat (held, released by the script, guards), b40's Pelican ride, marker effects, the Monitor spared
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
     'test_major_upgrades.py',         # major upgrades at squad placement (chance table, error diffusion, revert, Continue), Halo's squad sizes
-    'test_flood.py',                  # squad cap counts living actors; carrier burst from the tag, corpse infection, leap, pop, stagger
+    'test_flood.py',                  # squad cap counts living actors; carrier burst from the tag, corpse infection, leap, pop, stagger; forms in the carrier's squad, blast
     'test_vehicles.py',               # vehicle table and placements, Warthog in/out/drive/flip/gunner, turret, seat commands
     'test_enemy_vehicles.py',         # Ghost, Wraith, Scorpion, flown Banshee, AI pilots, dropship cargo, Pelican boarding, c40 flown
     'test_vehicle_damage.py',         # vehicle body vitality: the Wraith destroyed with its pilot, occupied-only Ghost, vehicle gun variants, covered riders, death explosion, tilted hit box, wreck

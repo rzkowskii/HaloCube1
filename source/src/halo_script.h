@@ -167,5 +167,20 @@ bool haloscenarioqaattachmove(const char *object, float forward, float side);
 void haloscenarioaudiodump(const char *label);
 int haloscenarioconversationstatus(const char *name);
 void haloscenarioremovebot(const playerent *bot);
+// The squad `bot` is a member of (false, -1s, when it is in none): a dying carrier's, whose released
+// forms join it (halo.cpp halokilled).
+bool haloscenariosquadof(const playerent *bot, int &encounter, int &squad);
+// An actor a dying unit released (`variant`: its actors.txt index) joins that unit's encounter and
+// squad, as Halo's actors_spawn_from_unit puts it (../Halo3DS ai/actors.c:2855-2872, 2921-2931):
+// ai_living_count, ai_erase, ai_kill, the migrations and the switches reach it, and a checkpoint
+// keeps it (the `s spawned` record in a saved game).
+void haloscenarioadopt(playerent *bot, int encounter, int squad, int variant);
+// QA (tests/test_flood.py items 8 to 10): SQUAD_COUNT <label> <encounter>/<squad> per squad of the
+// named encounter that has entries: members= living= spawned= spawned_living= swarms= actors=
+// fraction= strength= nonswarm= (Halo's counts: actors is the squad's original_count).
+void haloscenarioqacounts(const char *label, const char *encounter);
+// QA: the player's fire kills the first living member of an "encounter" or "encounter/squad"
+// (SQUAD_KILL <name> <actor>); false when none lives.
+bool haloscenarioqakillone(const char *name);
 
 #endif

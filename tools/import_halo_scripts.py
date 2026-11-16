@@ -14,7 +14,7 @@ import unicodedata
 from halo_map_art import png_content, write_world_mesh
 from halo_actors import actor_index
 from halo_cast import cast_metadata, damage_target
-from halo_devices import device_rows
+from halo_devices import device_rows, device_slugs
 from halo_recordings import decode
 from import_halo_a30 import HaloMap, ORIGIN_X, ORIGIN_Y, SOURCE_FLOOR, HORIZONTAL_SCALE, VERTICAL_SCALE, MARGIN
 from import_halo_campaign import ACTORS, CRASH_SITE, CRASH_SITE_KEY, CRASH_SITE_MISSION, MISSIONS, section_layout
@@ -782,9 +782,32 @@ def stale_scene_meshes(halo, output):
 
 
 def check_scenes(job):
+    """stale_scene_meshes, and the cast check: the cast exports that are not on disk (export_cast with
+    check: a clip without its model is missing from the .hscb), the scene model directories nothing
+    owns (prune_scene_models without removing), and the scene models the mission's .hscb names
+    without a tris.md3 on disk or leaves out though they are on disk (a .hscb older than the models).
+    Writes nothing."""
     source, output, mission = job
     with (source / f'{mission.cache}.map').open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        return mission.cache, stale_scene_meshes(HaloMap(data), output)
+        halo = HaloMap(data)
+        stale = stale_scene_meshes(halo, output)
+        _, _, failures, owned, _ = export_cast(Program(halo), output, False, check=True)
+        directory = output / 'packages/models/halo/scene' / halo.name
+        owned |= {slug for slug in device_slugs(halo) if (directory / slug / 'tris.md3').is_file()}
+        orphans = prune_scene_models(directory, owned, remove=False)
+        prefix = f'halo/scene/{halo.name}/'
+        script = output / 'packages/halo' / f'{mission.cache}.hscb'
+        # Writer.text: a 16-bit length, then the ASCII; every model path the .hscb stores is one.
+        data = script.read_bytes() if script.is_file() else b''
+        named = set()
+        for match in re.finditer(re.escape(prefix.encode()), data):
+            length, = struct.unpack_from('<H', data, match.start() - 2) if match.start() >= 2 else (0,)
+            if length > len(prefix):
+                named.add(data[match.start() + len(prefix):match.start() + length].decode('ascii', 'replace'))
+        hscb = [f'{prefix}{slug} not in the .hscb' for slug in sorted(owned - named)]
+        hscb += [f'{prefix}{slug} named by the .hscb has no tris.md3' for slug in sorted(named)
+                 if not (directory / slug / 'tris.md3').is_file()]
+        return mission.cache, stale, failures, orphans, hscb
 
 
 def model_pack_scale(model, animated=False):
@@ -792,12 +815,27 @@ def model_pack_scale(model, animated=False):
     return max(100, math.ceil(extent * (48 if animated else 18)))
 
 
-def export_cast(program, output, rebuild):
+# What export_cast and device_rows write under packages/models/halo/scene/<map>/: an object's idle
+# pose (object_<mode tag>, _idle for a biped), a biped's gaits (_move-front, -back, -left), a script
+# clip (_clip_<animation row>), and a device's frames (device_<tag>). prune_scene_models removes only
+# directories named like these.
+SCENE_MODEL_NAME = re.compile(r'(object_\d+(_idle|_move-(front|back|left)|_clip_\d+)?|device_\d+)')
+EXPORT_ERRORS = (IndexError, KeyError, ValueError, struct.error, ZeroDivisionError, StopIteration)
+
+
+def export_cast(program, output, rebuild, check=False):
+    """The cast rows write_program stores, the clips that exported, the exports that failed, and the
+    scene model directories this cast owns (each with its tris.md3 on disk). A failed export is
+    reported (`failures`: the directory, what it is, and the error) instead of being dropped quietly:
+    the .hscb leaves out a clip without its model, and its scene plays without it. `absent` lists the
+    clips a script names that their graph does not have (retail plays nothing). With `check`,
+    nothing is written: an export that is not on disk is a failure (--check-scenes)."""
     from import_halo_models import AnimationGraph, Model, export
 
     halo, t = program.halo, program.halo.tags
     directory = output / 'packages/models/halo/scene' / halo.name
     model_cache, graph_cache, idle_cache, walk_cache = {}, {}, {}, {}
+    failures, owned, absent = [], set(), []
 
     def graph_for(graph_tag):
         if graph_tag.name not in graph_cache:
@@ -815,6 +853,24 @@ def export_cast(program, output, rebuild):
             idle_cache[graph_tag.name] = next(graph.poses(candidates[0])) if candidates else None
         idle = idle_cache[graph_tag.name]
         return idle if idle and all(node in idle for node, _ in model.nodes) else None
+
+    def produce(slug, what, write):
+        """Export `slug` with `write` unless it is on disk (and not rebuilding); whether its tris.md3
+        is there afterwards."""
+        target = directory / slug / 'tris.md3'
+        if rebuild or not target.is_file():
+            if check:
+                failures.append(f'{slug} ({what}): not exported')
+            else:
+                try:
+                    write()
+                except EXPORT_ERRORS as error:
+                    failures.append(f'{slug} ({what}): {type(error).__name__}: {error}')
+        if target.is_file():
+            owned.add(slug)
+            return True
+        return False
+
     objects, clips = [], []
     not_placed = list(object_not_placed(program))
     for obj, (name, tag, pose) in enumerate(named_objects(program)):
@@ -830,18 +886,18 @@ def export_cast(program, output, rebuild):
             idle_slug = f'{slug}_idle' if tag.group == 'bipd' else slug
             try:
                 model = get_model()
-                if rebuild or not (directory / idle_slug / 'tris.md3').is_file():
-                    if model.meshes:
+                if model.meshes:
+                    def write_idle():
                         default_pose = None
                         if tag.group == 'bipd':
                             try:
                                 default_pose = idle_pose(tag, model)
-                            except (IndexError, KeyError, ValueError, struct.error, ZeroDivisionError, StopIteration):
+                            except EXPORT_ERRORS:
                                 pass
                         export(halo, directory, idle_slug, [model], None, (), 4, quiet=True,
                                geometry_scale=model_pack_scale(model), default_pose=default_pose)
-                if (directory / idle_slug / 'tris.md3').is_file():
-                    path = f'halo/scene/{halo.name}/{idle_slug}'
+                    if produce(idle_slug, f'{name} idle pose', write_idle):
+                        path = f'halo/scene/{halo.name}/{idle_slug}'
                 if tag.group == 'bipd' and model.meshes:
                     graph_tag = halo.reference(t, tag.address + 56, 'antr')
                     key = (slug, graph_tag.name) if graph_tag else None
@@ -852,44 +908,61 @@ def export_cast(program, output, rebuild):
                             candidates = sorted((n for n in graph.animations if f' {gait}' in n.lower()),
                                                 key=lambda n: ('stand' not in n, 'unarmed' not in n, len(n), n))
                             motion_slug = f'{slug}_{gait}'
-                            motion_path = directory / motion_slug / 'tris.md3'
-                            if candidates and (rebuild or not motion_path.is_file()):
-                                try:
-                                    export(halo, directory, motion_slug, [model], graph, [('mapmodel', candidates[0])], 4,
-                                           quiet=True, geometry_scale=model_pack_scale(model, animated=True))
-                                except (IndexError, KeyError, ValueError, struct.error, ZeroDivisionError):
-                                    pass
-                            paths.append(f'halo/scene/{halo.name}/{motion_slug}' if motion_path.is_file() else '')
+                            ok = candidates and produce(motion_slug, f'{name} {gait}', lambda: export(
+                                halo, directory, motion_slug, [model], graph, [('mapmodel', candidates[0])], 4,
+                                quiet=True, geometry_scale=model_pack_scale(model, animated=True)))
+                            paths.append(f'halo/scene/{halo.name}/{motion_slug}' if ok else '')
                         walk_cache[key] = tuple(paths)
                     if key:
                         locomotion = walk_cache[key]
-            except (IndexError, KeyError, ValueError, struct.error, ZeroDivisionError, StopIteration):
-                pass
+            except EXPORT_ERRORS as error:
+                failures.append(f'{idle_slug} ({name} model or gaits): {type(error).__name__}: {error}')
             for i, (actor, graph_id, clip) in enumerate(program.animations):
                 if actor != obj or graph_id >= len(halo.directory):
                     continue
                 graph_tag = halo.directory[graph_id]
+                if graph_tag.group != 'antr':
+                    continue
+                animation = f'{slug}_clip_{i}'
                 try:
-                    if graph_tag.group != 'antr':
-                        continue
                     graph = graph_for(graph_tag)
-                    authored = next(n for n in graph.animations if n.lower() == clip.lower())
+                    authored = next((n for n in graph.animations if n.lower() == clip.lower()), None)
+                    if authored is None:
+                        # Not a failure: retail starts no animation for a name its graph lacks
+                        # (unit_start_user_animation, Halo3DS source/units/units.c:4033), as for c10's
+                        # keyes x50_4110captain.
+                        absent.append(f'{name} {clip}')
+                        continue
                     anim = graph.animations[authored]
                     ticks, = t.read('H', anim + 34)
-                    animation = f'{slug}_clip_{i}'
-                    if rebuild or not (directory / animation / 'tris.md3').is_file():
-                        model = get_model()
-                        if not model.meshes:
-                            continue
-                        export(halo, directory, animation, [model], graph, [('mapmodel', authored)], 4,
-                               quiet=True, geometry_scale=model_pack_scale(model, animated=True))
-                    clips.append((obj, graph_id, clip, f'halo/scene/{halo.name}/{animation}', ticks))
-                except (IndexError, KeyError, ValueError, struct.error, ZeroDivisionError, StopIteration):
+                    if (rebuild or not (directory / animation / 'tris.md3').is_file()) and not get_model().meshes:
+                        continue
+                except EXPORT_ERRORS as error:
+                    failures.append(f'{animation} ({name} {clip}): {type(error).__name__}: {error}')
                     continue
+                if produce(animation, f'{name} {clip}', lambda: export(
+                        halo, directory, animation, [get_model()], graph, [('mapmodel', authored)], 4,
+                        quiet=True, geometry_scale=model_pack_scale(get_model(), animated=True))):
+                    clips.append((obj, graph_id, clip, f'halo/scene/{halo.name}/{animation}', ticks))
         target = damage_target(halo, tag)
         objects.append((name, path, pose, cast_metadata(halo, tag, model), locomotion,
                         target and (*target, not not_placed[obj] & 1)))
-    return objects, clips
+    return objects, clips, failures, owned, absent
+
+
+def prune_scene_models(directory, owned, remove=True):
+    """The directories under packages/models/halo/scene/<map>/ named like the cast's and devices'
+    exports (SCENE_MODEL_NAME) that `owned` does not name: left by an older object numbering, an
+    export that failed before writing its tris.md3, or a clip the scripts no longer play. Removes
+    them unless `remove` is false (--check-scenes)."""
+    import shutil
+    orphans = sorted(child.name for child in directory.iterdir()
+                     if child.is_dir() and child.name not in owned and SCENE_MODEL_NAME.fullmatch(child.name)) \
+        if directory.is_dir() else []
+    if remove:
+        for orphan in orphans:
+            shutil.rmtree(directory / orphan)
+    return orphans
 
 
 def convert(job):
@@ -908,14 +981,20 @@ def convert(job):
         with ThreadPoolExecutor(max_workers=3) as pool:
             sounds = list(pool.map(lambda index: export_sound(halo, audio, index), sorted(program.sounds)))
         worlds = export_worlds(halo, output, rebuild)
-        objects, clips = export_cast(program, output, rebuild)
+        objects, clips, failures, owned, absent = export_cast(program, output, rebuild)
         devices = list(device_rows(halo, output, rebuild, model_pack_scale))
+        owned |= {row[-4].rsplit('/', 1)[-1] for row in devices if row[-4]}
+        pruned = prune_scene_models(output / 'packages/models/halo/scene' / halo.name, owned)
         figures = story_figures(program, cue_scripts([m.cache for m in MISSIONS].index(mission.cache)))
         write_program(program, mission, out, objects, clips, sounds, conversations, loops, worlds, devices, figures)
         print(f'{mission.cache}: {len(program.scripts)} scripts, {len(sounds)} sound tags, {len(conversations)} conversations, '
               f'{len(worlds)} BSPs, {len(clips)} animation clips, {len(devices)} devices, '
               f'{len(list(profile_rows(halo)))} starting profiles, story figures: '
-              f'{", ".join(sorted(objects[i][0] for i in figures)) or "none"}', flush=True)
+              f'{", ".join(sorted(objects[i][0] for i in figures)) or "none"}, '
+              f'{len(failures)} failed cast exports, {len(pruned)} orphan scene model directories removed, '
+              f'clips not in their graph (retail plays none): {", ".join(absent) or "none"}', flush=True)
+        for failure in failures:
+            print(f'{mission.cache}: WARNING: cast export failed, left out of the .hscb: {failure}', flush=True)
 
 
 def main():
@@ -926,17 +1005,26 @@ def main():
     parser.add_argument('--rebuild', action='store_true', help='regenerate BSP meshes and cinematic models')
     parser.add_argument('--check-scenes', action='store_true',
                         help='write nothing; list the halo_scene_*.mesh files and their textures that differ from a '
-                             'fresh export (stale_scene_meshes) and exit 1 if any do (about a minute for all ten)')
+                             'fresh export (stale_scene_meshes), the cast exports missing from disk, orphan scene model '
+                             'directories and .hscb model paths out of step with the disk (check_scenes), and exit 1 '
+                             'if there are any (a minute or two for all ten)')
     args = parser.parse_args()
     if args.check_scenes:
         jobs = [(args.maps, args.output, mission) for mission in MISSIONS if not args.mission or args.mission == mission.cache]
         with ProcessPoolExecutor(max_workers=min(len(jobs), 6)) as pool:
             results = list(pool.map(check_scenes, jobs))
-        stale = [path for _, paths in results for path in paths]
-        for cache, paths in results:
-            print(f'{cache}: ' + (f'{len(paths)} stale scene files: ' + ', '.join(paths) if paths else 'scene meshes current'),
-                  flush=True)
-        if stale:
+        bad = False
+        for cache, paths, failures, orphans, hscb in results:
+            print(f'{cache}: ' + (f'{len(paths)} stale scene files: ' + ', '.join(paths) if paths else 'scene meshes current')
+                  + ('' if failures or orphans or hscb else ', cast models on disk and in the .hscb'), flush=True)
+            for failure in failures:
+                print(f'{cache}: WARNING: cast export missing: {failure}', flush=True)
+            for problem in hscb:
+                print(f'{cache}: WARNING: {problem}', flush=True)
+            if orphans:
+                print(f'{cache}: WARNING: {len(orphans)} orphan scene model directories: ' + ', '.join(orphans), flush=True)
+            bad = bad or bool(paths or failures or orphans or hscb)
+        if bad:
             print('Regenerate them with tools/import_halo_scripts.py "$maps" --mission <cache> --rebuild', flush=True)
             raise SystemExit(1)
         return

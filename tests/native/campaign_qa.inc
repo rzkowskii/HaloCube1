@@ -403,6 +403,8 @@ COMMANDF(qa_actor_state, "s", (const char *label) { haloactordump(label); });
 // Combat by difficulty (the combat-scaling work): COMBAT_DIFFICULTY per team and ACTOR_COMBAT per
 // living actor, the effective values the brain fires with (halo_ai.cpp haloactorcombatdump).
 COMMANDF(qa_actor_combat, "s", (const char *label) { haloactorcombatdump(label); });
+// The encounter grenade timeout (actions.c:2350-2373): a throw recorded for the first actor with one (GRENADE_NOTE).
+COMMANDF(qa_actor_grenade_note, "s", (const char *label) { haloactorgrenadenote(label); });
 COMMANDF(qa_actor_place, "s", (const char *encounter)
 {
     conoutf("ACTOR_PLACE %s %d", encounter, haloscenarioplace(encounter));
@@ -416,6 +418,16 @@ static void qaKillActors(int kind)
             dodamage(INT_MAX, enemies[i].bot, player1, GUN_ASSAULT);
 }
 COMMANDF(qa_actor_kill, "i", (int *kind) { qaKillActors(*kind); });
+// Halo's counts per squad of an encounter (tests/test_flood.py items 8 to 10, written while testing
+// was on hold, NOT YET RUN): SQUAD_COUNT <label> <encounter>/<squad> members= living= spawned=
+// spawned_living= swarms= actors= fraction= strength= nonswarm= (haloscenarioqacounts).
+COMMANDF(qa_squad_counts, "ss", (const char *label, const char *encounter) { haloscenarioqacounts(label, encounter); });
+// qa_squad_kill_one <encounter or encounter/squad>: the player's fire kills its first living member.
+COMMANDF(qa_squad_kill_one, "s", (const char *name)
+{
+    if(!haloscenarioqakillone(name)) conoutf("SQUAD_KILL %s none", name);
+    fflush(stdout);
+});
 // Living actors per body: FLOOD_QA label infection=2 carrier=0 flood_human=1 ...
 COMMANDF(qa_actor_count, "s", (const char *label)
 {
@@ -567,6 +579,17 @@ COMMANDF(qa_actor_table, "", ()
     {
         const HaloActorDef *d = haloactordef(i);
         conoutf("ACTOR_TABLE %d %s %d %d %.3f %.3f %.3f", i, d->family.c_str(), d->kind, d->weapon, d->rate, d->burstMin, d->visionDistance);
+        // The coll's shield model as parsed (actors.txt `resistance`, `shieldtime` and the material
+        // leaks; tests/test_actor_tags.py): ACTOR_SHIELD <index> <resistance 0|1> <indirect>
+        // <coll shield> <shield type> <failure fn> <threshold> <maximum> <shieldtime 0|1> <stun min>
+        // <stun> <recharge> <velocity> <leaks, comma separated, - for none>
+        string leaks = "";
+        for(const HaloActorDef::Material &m : d->materials) concatformatstring(leaks, "%s%.3f", leaks[0] ? "," : "", m.leak);
+        conoutf("ACTOR_SHIELD %d %d %d %.3f %d %d %.3f %.3f %d %.3f %.3f %.3f %.6f %s", i, d->hasResistance, d->indirectMaterial, d->collShield,
+                d->shieldMaterial, d->shieldFailureFunction, d->shieldFailureThreshold, d->shieldFailureMaximum, d->hasShieldTime,
+                d->shieldStunDamage, d->shieldStunTime, d->shieldRechargeTime, d->shieldRechargeVelocity, leaks[0] ? leaks : "-");
+        // ACTOR_TIMER <index> <actr melee delay s> <actv encounter grenade timeout s> (-1: not in the table)
+        conoutf("ACTOR_TIMER %d %.3f %.3f", i, d->meleeDelayTimer, d->grenadeTimeout);
     }
     fflush(stdout);
 });

@@ -25,7 +25,9 @@ QA client, a50 section 4 (the cell block, started on its own, Normal):
 Gap 4 of batch 5's critic (written while testing was on hold, not yet run):
 6. Queued vitality: unit_set_current_vitality of captain_keyes in the same breath as its ai_attach (as
    c10 gives marine_suicidal) is queued ("vitality waits for its actor") and the actor spawns with it
-   (health 0.40).
+   (health 0.40). Since the script-vitality change the command takes Halo's points: 10 of the
+   captain's 25 (unit_scripting_commands.c:85-133); the "Keyes at 0.5" items below set 12.5 points,
+   which the engine's whole health points hold as 13 of 25 (0.52, hence the 0.03 tolerance).
 7. A Call scene's start finds an attached actor where it stands: during qa_hs_cue cutscene_rescue the
    scripted captain_keyes is visible (the scene's reset would leave it hidden at its placement) at the
    actor's feet (attachgap 0).
@@ -179,7 +181,7 @@ print('The jailed marines stayed posed figures until their animation stopped; ob
 # ---- Gap 4: queued unit commands, a scene's start, Keyes carried on into section 5 and saved there.
 text, log = run('queued', [
     (100, 'qa_hs_cmd object_create "obj:captain_keyes"; qa_hs_cmd ai_attach "obj:captain_keyes prison_captain"; '
-          'qa_hs_cmd unit_set_current_vitality "obj:captain_keyes 0.4 0"'),
+          'qa_hs_cmd unit_set_current_vitality "obj:captain_keyes 10 0"'),
     (700, 'qa_attach_state queued; qa_hs_cmd unit_get_health "obj:captain_keyes"'),
     (900, 'qa_hs_cue cutscene_rescue'),
     (1300, 'qa_hs_object visible obj:captain_keyes; qa_hs_object attachgap obj:captain_keyes'),
@@ -208,7 +210,7 @@ require(root / 'packages/maps/halo_a50_05.cgz', 'import the campaign (docs/macos
 text, profile, log = carried_run('carry', 'halo_scripttrace 1; halo_difficulty 1; qa_campaign_play 3 4; qa_after_gameplay [botsshoot 0; '
                                  'qa_hs_cmd object_create "obj:captain_keyes"; qa_hs_cmd ai_attach "obj:captain_keyes prison_captain"; '
                                  'qa_hs_cmd object_create "obj:free_marine_1"; qa_hs_cmd ai_attach "obj:free_marine_1 prison_marines"; '
-                                 'sleep 600 [qa_hs_cmd unit_set_current_vitality "obj:captain_keyes 0.5 0"; qa_attach_state before] 1; '
+                                 'sleep 600 [qa_hs_cmd unit_set_current_vitality "obj:captain_keyes 12.5 0"; qa_attach_state before] 1; '
                                  'sleep 900 [qa_halo_finale] 1; sleep 1400 [halo_next] 1; sleep 2400 [halo_next] 1; '
                                  'sleep 9000 [qa_attach_state carried; qa_hs_cmd unit_get_health "obj:captain_keyes"; qa_halo_where] 1; '
                                  'sleep 9500 [quit] 1]')
@@ -218,9 +220,9 @@ assert 'Halo: The Truth and Reconciliation, section 5' in text, ('section 5 load
 assert re.search(r'captain_keyes \(prison_captain\) comes along into section 5, health 0\.5', text), log
 assert 'captain_keyes came along with the player into section 5' in text and 'free_marine_1 came along with the player into section 5' in text, log
 state = attached(text, 'carried')
-assert state['captain_keyes']['alive'] == '1' and abs(float(state['captain_keyes']['health']) - 0.5) < 0.02, (state, log)
+assert state['captain_keyes']['alive'] == '1' and abs(float(state['captain_keyes']['health']) - 0.5) < 0.03, (state, log)
 assert state['free_marine_1']['alive'] == '1' and float(state['captain_keyes']['distance']) < 40, (state, log)
-assert abs(hs(text, 'unit_get_health')[-1] - 0.5) < 0.02, ('unit_get_health answers from the carried actor', log)
+assert abs(hs(text, 'unit_get_health')[-1] - 0.5) < 0.03, ('unit_get_health answers from the carried actor', log)
 saved = read_progress(profile)
 records = [r for r in saved['records']['s'] if r.startswith('attached ') and ' =captain_keyes ' in r]
 assert records, ('the section-start save (or a checkpoint since) keeps Keyes', [r for r in saved['records']['s'] if r.startswith('attached')])
@@ -228,14 +230,14 @@ fields = records[0].split()
 # attached <object> =<name> <encounter> =<name> <squad> =<name> suspended flags gone actor variant x y z yaw health shield
 # near, then (gap 11) the start x y z yaw.
 assert len(fields) == 23, ('the record ends with the start (gap 11)', records[0])
-assert abs(float(fields[16]) - 0.5) < 0.02 and fields[18] in ('0', '1'), ('the health field and the carried flag', records[0])
+assert abs(float(fields[16]) - 0.5) < 0.03 and fields[18] in ('0', '1'), ('the health field and the carried flag', records[0])
 near = fields[18] == '1'
 print(f'Keyes (0.5) and a freed marine came along into a50 section 5 behind the player; saved {"before" if near else "after"} he spawned.')
 text, profile, log = carried_run('carry-continue', 'halo_scripttrace 1; halo_title; sleep 300 [halo_continue] 1; '
                                  'qa_after_gameplay [sleep 1500 [qa_attach_state continued; qa_hs_cmd unit_get_health "obj:captain_keyes"] 1; '
                                  'sleep 1800 [quit] 1]', profile)
 state = attached(text, 'continued')
-assert state['captain_keyes']['alive'] == '1' and abs(float(state['captain_keyes']['health']) - 0.5) < 0.02, (state, log)
+assert state['captain_keyes']['alive'] == '1' and abs(float(state['captain_keyes']['health']) - 0.5) < 0.03, (state, log)
 if near:
     assert 'captain_keyes came along with the player into section 5' in text, ('a carried record spawns behind the player again', log)
 print('Continue in a50 section 5 brought the carried Keyes back at 0.5.')
@@ -294,7 +296,7 @@ print(f'captain_keyes struck from behind is spared the kill (alive={struck["aliv
 text, profile, log = carried_run('carry-migrate', 'halo_scripttrace 1; halo_difficulty 1; qa_campaign_play 3 4; qa_after_gameplay [botsshoot 0; '
                                  'qa_hs_cmd object_create "obj:captain_keyes"; qa_hs_cmd ai_attach "obj:captain_keyes prison_captain"; '
                                  'qa_hs_cmd object_create "obj:free_marine_1"; qa_hs_cmd ai_attach "obj:free_marine_1 prison_marines"; '
-                                 'sleep 600 [qa_hs_cmd unit_set_current_vitality "obj:captain_keyes 0.5 0"; qa_attach_state before; halo_carriedhold 1] 1; '
+                                 'sleep 600 [qa_hs_cmd unit_set_current_vitality "obj:captain_keyes 12.5 0"; qa_attach_state before; halo_carriedhold 1] 1; '
                                  'sleep 900 [qa_halo_finale] 1; sleep 1400 [halo_next] 1; sleep 2400 [halo_next] 1; '
                                  'sleep 9000 [qa_attach_state held; qa_hs_cmd ai_living_count "prison_captain"; qa_hs_cmd ai_strength "prison_captain"; '
                                  'qa_hs_cmd ai_migrate "prison_captain hangar_captain_halls/squad_switch"; '
@@ -309,9 +311,9 @@ assert before['captain_keyes']['alive'] == '1' and before['free_marine_1']['aliv
 assert 'Halo: The Truth and Reconciliation, section 5' in text, ('section 5 loaded', log)
 held = attached(text, 'held')
 assert 'carried' in held['captain_keyes'] and held['captain_keyes']['squad'].startswith('prison_captain/'), (held, log)
-assert abs(float(held['captain_keyes']['health']) - 0.5) < 0.02 and held['free_marine_1']['squad'].startswith('prison_marines/'), (held, log)
+assert abs(float(held['captain_keyes']['health']) - 0.5) < 0.03 and held['free_marine_1']['squad'].startswith('prison_marines/'), (held, log)
 counts = hs(text, 'ai_living_count')
-assert counts[0] == 1.0 and abs(hs(text, 'ai_strength')[0] - 0.5) < 0.02, ('a pending carried actor counts', counts, log)
+assert counts[0] == 1.0 and abs(hs(text, 'ai_strength')[0] - 0.5) < 0.03, ('a pending carried actor counts', counts, log)
 assert 'captain_keyes, carried in and not spawned yet, migrates to hangar_captain_halls/squad_switch' in text, log
 assert 'free_marine_1, carried in and not spawned yet, migrates to hangar_marines_halls/squad_switch' in text, log
 assert counts[1] == 0.0 and counts[2] == 1.0, ('the count moved with the migration', counts, log)
@@ -321,8 +323,8 @@ assert migrated['free_marine_1']['squad'] == 'hangar_marines_halls/squad_switch'
 assert 'captain_keyes came along with the player into section 5' in text and 'free_marine_1 came along with the player into section 5' in text, log
 spawned = attached(text, 'spawned')
 assert spawned['captain_keyes']['alive'] == '1' and spawned['captain_keyes']['squad'] == 'hangar_captain_halls/squad_switch', (spawned, log)
-assert abs(float(spawned['captain_keyes']['health']) - 0.5) < 0.02 and spawned['free_marine_1']['alive'] == '1', (spawned, log)
+assert abs(float(spawned['captain_keyes']['health']) - 0.5) < 0.03 and spawned['free_marine_1']['alive'] == '1', (spawned, log)
 assert spawned['free_marine_1']['squad'] == 'hangar_marines_halls/squad_switch', (spawned, log)
-assert abs(hs(text, 'unit_get_health')[-1] - 0.5) < 0.02 and counts[-1] == 1.0, (counts, log)
+assert abs(hs(text, 'unit_get_health')[-1] - 0.5) < 0.03 and counts[-1] == 1.0, (counts, log)
 print('Carried Keyes and a freed marine, held unspawned, counted in their squad, migrated, outlived the erase of the old '
       'squads and came along in the new ones.')

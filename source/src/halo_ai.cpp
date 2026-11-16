@@ -13,6 +13,7 @@
 #include "halo_vehicle.h"
 #include "halo_weapons.h"
 #include <algorithm>
+#include <map>
 #include <sstream>
 
 extern int halo_damagetrace;
@@ -98,6 +99,11 @@ namespace
         vec boardAt;
     };
     std::vector<Actor> actors;
+    // Halo's per-encounter last_grenade_throw_time (../Halo3DS ai/encounters.h:77, set when any member
+    // starts a throw, actions.c:3600-3607): lastmillis of the last throw, by the encounter index
+    // haloscenariosquadof gives. Cleared with the actors (a section start, or a revert, where Halo's
+    // checkpoint would restore it: the engine forgets it, judgement call).
+    std::map<int, int> encounterThrows;
 
     // Allegiances between engine teams over pairs a < b (15 pairs for 6 teams): allied and
     // broken bits, the checkpoint's copy, and the allies the player has killed per pair.
@@ -167,11 +173,23 @@ namespace
             else if(key == "vision") ok = bool(in >> d->visionDistance >> d->visionCentral >> d->visionMax >> d->peripheralAngle >> d->peripheralDistance >> d->hearing);
             else if(key == "fire") ok = bool(in >> d->maxRange >> d->rate >> d->error >> d->firstDelayMin >> d->firstDelayMax >> d->combatMin >> d->combatMax >> d->lead >> d->damageScale);
             else if(key == "burst") ok = bool(in >> d->burstMin >> d->burstMax >> d->separationMin >> d->separationMax);
-            else if(key == "grenade") ok = bool(in >> d->grenadeType >> d->grenadeChance >> d->grenadeRangeMin >> d->grenadeRangeMax >> d->grenadeMin >> d->grenadeMax);
+            else if(key == "grenade")
+            {
+                ok = bool(in >> d->grenadeType >> d->grenadeChance >> d->grenadeRangeMin >> d->grenadeRangeMax >> d->grenadeMin >> d->grenadeMax);
+                // The optional encounter grenade timeout (tools/halo_actors.py); without it -1.
+                float timeout = -1;
+                if(ok && (in >> timeout) && std::isfinite(timeout) && timeout >= 0) d->grenadeTimeout = timeout;
+            }
             else if(key == "vitality") ok = bool(in >> d->body >> d->shield);
             else if(key == "defense") ok = bool(in >> d->hideShield >> d->emergeAttack >> d->emergePursue);
             else if(key == "morale") ok = bool(in >> d->casualtyTrigger >> d->friendKilled >> d->leaderKilled);
-            else if(key == "berserk") ok = bool(in >> d->berserkAmount >> d->berserkThreshold >> d->meleeRange);
+            else if(key == "berserk")
+            {
+                ok = bool(in >> d->berserkAmount >> d->berserkThreshold >> d->meleeRange);
+                // The optional actr melee attack delay (tools/halo_actors.py); without it -1.
+                float timer = -1;
+                if(ok && (in >> timer) && std::isfinite(timer) && timer >= 0) d->meleeDelayTimer = timer;
+            }
             else if(key == "positions") ok = bool(in >> d->guardMin >> d->guardMax >> d->positionMin >> d->positionMax);
             else if(key == "team") ok = bool(in >> d->team);
             else if(key == "unitmelee") ok = bool(in >> d->unitMelee[0] >> d->unitMelee[1] >> d->unitMelee[2]);
@@ -179,7 +197,27 @@ namespace
             {
                 HaloActorDef::Material m{};
                 ok = bool(in >> m.type >> m.flags >> m.body >> m.shield);
+                // The optional shield leak (tools/halo_actors.py); a table without it leaves -1.
+                float leak = -1;
+                if(ok && (in >> leak) && std::isfinite(leak)) m.leak = clamp(leak, 0.0f, 1.0f);
                 if(ok) d->materials.push_back(m);
+            }
+            else if(key == "resistance")
+            {
+                // resistance <indirect material> <coll body> <coll shield> <shield material type>
+                //            <failure function> <failure threshold> <maximum failure>
+                ok = bool(in >> d->indirectMaterial >> d->collBody >> d->collShield >> d->shieldMaterial >> d->shieldFailureFunction >>
+                          d->shieldFailureThreshold >> d->shieldFailureMaximum);
+                for(float v : {d->collBody, d->collShield, d->shieldFailureThreshold, d->shieldFailureMaximum}) if(ok && !std::isfinite(v)) ok = false;
+                d->hasResistance = ok;
+            }
+            else if(key == "shieldtime")
+            {
+                // shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>
+                ok = bool(in >> d->shieldStunDamage >> d->shieldStunTime >> d->shieldRechargeTime >> d->shieldRechargeVelocity);
+                for(float v : {d->shieldStunDamage, d->shieldStunTime, d->shieldRechargeTime, d->shieldRechargeVelocity})
+                    if(ok && !(std::isfinite(v) && v >= 0)) ok = false;
+                d->hasShieldTime = ok;
             }
             else if(key == "major") std::getline(in >> std::ws, d->majorPath);
             // Optional format 3 lines (tools/halo_actors.py; older engines skip them).
@@ -198,6 +236,8 @@ namespace
                 ok = bool(in >> d->popInner >> d->popOuter >> d->popLower >> d->popUpperMin >> d->popUpperMax >> d->popFlags);
                 for(float v : {d->popInner, d->popOuter, d->popLower, d->popUpperMin, d->popUpperMax}) if(ok && !std::isfinite(v)) ok = false;
             }
+            // destroyed <effe tag>: the body destroyed effect set off when the unit is destroyed.
+            else if(key == "destroyed") std::getline(in >> std::ws, d->destroyedEffect);
             else if(key == "end") d = nullptr;
             if(!ok)
             {
@@ -550,6 +590,46 @@ namespace
         int meleeDelay = 0;     // ms between a melee-only actor's swings; 0: not melee-only
     };
 
+    // The wait in ms from one melee attack to the next, `attack` being the engine's own interval for
+    // the attack. Halo starts a melee charge once melee_delay_scale times the actr's
+    // melee_attack_delay_timer (0 while berserk) plus melee_delay_base seconds have passed since
+    // last_melee_attack_time (actions.c:2563-2568, 2593-2601), which the charge refreshes on every
+    // tick until its attack ends (action_charge.c:400-402): the delay follows the attack. The engine
+    // plays no melee animation, so `attack` stands for the attack itself (the Hunter's 1.6 to 2.2 s
+    // against its 61-frame, 2.03 s `stand unarmed melee`; a sword swing's 1.2 s against the Elite's
+    // 28 and 35-frame sword melees) and is not scaled (judgement call). Halo's rule skips swarm actors
+    // (actions.c:2541, the infection forms), and an older actors.txt has no timer: both keep the
+    // engine's former rule, the whole interval scaled (halomeleedelay).
+    int meleeInterval(const Actor &a, int attack)
+    {
+        const HaloActorDef &d = *a.def;
+        if(d.meleeDelayTimer < 0 || d.swarm()) return halomeleedelay(attack);
+        const float timer = a.morale == BERSERK ? 0.0f : d.meleeDelayTimer;
+        const float delay = halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_SCALE) * timer +
+                            halodifficultyget(HALO_DIFFICULTY_MELEE_DELAY_BASE);
+        return max(1, attack + max(0, int(delay * 1000 + .5f)));
+    }
+
+    // Halo's encounter grenade timeout for `a` (actions.c:2350-2373): the variant's
+    // encounter_grenade_timeout times grenade_timer_scale on its team (the encounter's, which the
+    // engine's actors share), in whole ticks (throw_delay_ticks), counted from the encounter's last
+    // throw. `wait` gets the scaled timeout in ms and `encounter` the actor's encounter (-1 none);
+    // returns the ms left (0: no wait). An actor outside any encounter, or a table without the
+    // timeout, has none (Halo skips the test for encounter_index NONE).
+    int grenadeTimeoutLeft(const Actor &a, float timerScale, int &wait, int &encounter)
+    {
+        wait = 0;
+        encounter = -1;
+        int squad = -1;
+        if(a.def->grenadeTimeout < 0 || !haloscenariosquadof(a.bot, encounter, squad)) { encounter = -1; return 0; }
+        const long ticks = long(a.def->grenadeTimeout * timerScale * 30);
+        wait = int(ticks * 1000 / 30);
+        const auto last = encounterThrows.find(encounter);
+        // A throw time ahead of now (the clock went back) counts as long past.
+        if(last == encounterThrows.end() || last->second > lastmillis) return 0;
+        return max(0, last->second + wait - lastmillis);
+    }
+
     CombatValues combatValues(const Actor &a)
     {
         CombatValues v;
@@ -571,10 +651,9 @@ namespace
         // formula with the factor, floored at two ticks (66 ms: no exported rate reaches it on Normal).
         // Both delays are kept within the slot's short attackdelay (guninfo, weapon.h).
         if(!melee && d.rate > 0) v.fireDelay = clamp(int(1000 / max(d.rate * v.scale.rateOfFire, 1e-3f)), 66, 32767);
-        // actions.c:2563-2568: the wait between melee charges is melee_delay_scale times the
-        // actr's melee_attack_delay_timer plus melee_delay_base seconds. The actr timer is not
-        // exported; the engine's own swing cadence (the slot delay, at least 1.2 s) stands for it.
-        if(melee && a.baseDelay > 0) v.meleeDelay = min(halomeleedelay(a.baseDelay), 32767);
+        // actions.c:2563-2568: the swing (the slot delay, at least 1.2 s for a sword) then the
+        // actr's melee delay on the level (meleeInterval).
+        if(melee && a.baseDelay > 0) v.meleeDelay = min(meleeInterval(a, a.baseDelay), 32767);
         return v;
     }
 
@@ -647,13 +726,17 @@ namespace
         const float distance = e->o.dist(a.target->o), s = scale();
         if(distance < max(d.grenadeRangeMin, 2.0f) * s || distance > max(d.grenadeRangeMax, 8.0f) * s) return;
         // Difficulty on the actor's current team: the throw chance times grenade_chance_scale
-        // (actions.c:3642-3647), and the wait after a throw times grenade_timer_scale. Halo scales
-        // the encounter's timeout after any member's throw (actions.c:2350-2368, the actv's
-        // encounter_grenade_timeout, not exported); the engine's per-actor wait after its own
-        // throw stands for it, and the wait after a check that does not throw stays as it was.
+        // (actions.c:3642-3647), then Halo's encounter-wide timeout times grenade_timer_scale after
+        // any member's throw (actions.c:2350-2373, grenadeTimeoutLeft). The 4 to 8 s between checks
+        // stays the engine's own and unscaled: it stands for Halo's throw_grenade_delay between
+        // chance rolls (actions.c:3636-3641) together with the target and trajectory tests the
+        // engine does not make (judgement call). Without the actv timeout (an older actors.txt) the
+        // engine's former stand-in: its per-actor wait after its own throw times grenade_timer_scale.
         const HaloCombatScaling scaling = halocombatscaling(a.team);
         if(rndscale(1.0f) > d.grenadeChance * scaling.grenadeChance) return;
-        a.nextGrenade = lastmillis + max(1, int(wait * scaling.grenadeTimer + .5f));
+        int timeout = 0, encounter = -1;
+        if(d.grenadeTimeout < 0) a.nextGrenade = lastmillis + max(1, int(wait * scaling.grenadeTimer + .5f));
+        else if(grenadeTimeoutLeft(a, scaling.grenadeTimer, timeout, encounter) > 0) return;
         vec direction = vec(a.target->o).sub(e->o);
         const float flight = clamp(direction.magnitude() / 60.0f, 0.4f, 1.6f);
         direction.normalize().mul(1.6f);
@@ -669,6 +752,8 @@ namespace
             g->_throw(g->o, direction);
         }
         --e->mag[GUN_GRENADE];
+        // The throw starts the encounter's timeout for every member (actions.c:3604-3607).
+        if(encounter >= 0) encounterThrows[encounter] = lastmillis;
     }
 
     // --- morale and defence -----------------------------------------------
@@ -790,7 +875,7 @@ namespace
     // --- Hunters ----------------------------------------------------------
 
     // A Hunter's smash: the unit's melee jpt! (35 to 45 with a strong shove) against whatever it
-    // fights once it stands within reach and roughly faces it, every 1.6 to 2.2 s.
+    // fights once it stands within reach and roughly faces it, every 1.6 to 2.2 s plus its melee delay.
     void smash(Actor &a)
     {
         botent *e = a.bot;
@@ -802,9 +887,11 @@ namespace
         const float yawError = fabsf(e->targetyaw - e->yaw);
         if(min(yawError, 360 - yawError) > 40) return;
         // The wait between smashes on the selected difficulty, for every team alike (actions.c:
-        // 2563-2568, game_difficulty_get_value): melee_delay_scale times the engine's 1.6 to 2.2 s
-        // (standing for the actr's melee_attack_delay_timer, not exported) plus melee_delay_base.
-        a.nextSmash = lastmillis + halomeleedelay(1600 + rnd(600));
+        // 2563-2568, game_difficulty_get_value): the engine's 1.6 to 2.2 s for the smash itself,
+        // then melee_delay_scale times the actr's melee_attack_delay_timer (the Hunters' 0.1 s; 0
+        // while berserk) plus melee_delay_base (meleeInterval; without the timer the whole 1.6 to
+        // 2.2 s scaled, as before).
+        a.nextSmash = lastmillis + meleeInterval(a, 1600 + rnd(600));
         const float *m = a.def->unitMelee;
         const float full = m[2] > 0 ? frand(m[1], m[2]) : 40.0f;
         vec dir = vec(t->o).sub(e->o);
@@ -1244,7 +1331,7 @@ void haloactordetach(const playerent *bot)
     preferred.erase(std::remove(preferred.begin(), preferred.end(), bot), preferred.end());
 }
 
-void haloactorsclear() { actors.clear(); noises.clear(); }
+void haloactorsclear() { actors.clear(); noises.clear(); encounterThrows.clear(); }
 bool haloisactor(const playerent *p) { return find(p) != nullptr; }
 
 int haloactorteam(const playerent *p)
@@ -1362,6 +1449,13 @@ float HaloActorDef::bodyMultiplier(int materialType) const
     return -1;
 }
 
+bool HaloActorDef::hasLeaks() const
+{
+    if(materials.empty() || !hasResistance) return false;
+    for(const Material &m : materials) if(m.leak < 0) return false;
+    return true;
+}
+
 bool halohovering(const playerent *p)
 {
     if(!p || p->state != CS_ALIVE || !haloactive()) return false;
@@ -1394,6 +1488,7 @@ void haloactorscriptdamage(bool on, bool ownerless)
     scriptDamage = max(0, scriptDamage + (on ? 1 : -1));
     if(ownerless) ownerlessDamage = max(0, ownerlessDamage + (on ? 1 : -1));
 }
+bool haloactorownerlessdamage() { return ownerlessDamage > 0; }
 const HaloActorDef *haloactorvariant(const playerent *p) { const Actor *a = find(p); return a ? a->def : nullptr; }
 
 bool haloactorthink(CBot *body)
@@ -1595,6 +1690,16 @@ void haloactorsethealthfraction(playerent *bot, float fraction)
     bot->health = max(1, int(clamp(fraction, 0.0f, 1.0f) * a->startHealth + .5f));
 }
 
+// unit_set_maximum_vitality (haloenemysetmaximumvitality): a new full health, which health
+// fractions, unit_get_health and ai_renew then count against.
+void haloactorsetstarthealth(playerent *bot, int health)
+{
+    Actor *a = find(bot);
+    if(!a || !alive(bot) || health <= 0) return;
+    a->startHealth = health;
+    bot->health = health;
+}
+
 void haloactornoise(const playerent *source)
 {
     if(!source) return;
@@ -1728,7 +1833,8 @@ void haloactorcombatdump(const char *label)
     }
     // ACTOR_COMBAT <label> cn= variant= team= rate=<actv> delay=<ms, 0 weapon's own> slot=<ms now>
     //   error=<actv> scaled_error= lead=<actv> leads=<0|1> separation=<min>,<max> (scaled s)
-    //   grenade=<actv chance> grenade_scaled= melee=<ms, 0 not melee-only> smash=<min>,<max> (ms)
+    //   grenade=<actv chance> grenade_scaled= melee=<ms, 0 not melee-only> smash=<min>,<max> (ms: the
+    //   interval meleeInterval gives this actor after a 1.6 and a 2.199 s smash)
     for(const Actor &a : actors)
     {
         const botent *e = a.bot;
@@ -1739,7 +1845,35 @@ void haloactorcombatdump(const char *label)
                 "separation=%.3f,%.3f grenade=%.3f grenade_scaled=%.3f melee=%d smash=%d,%d", label, e->clientnum, d.index,
                 haloteamname(a.team), d.rate, v.fireDelay, e->weaponsel ? int(e->weaponsel->info.attackdelay) : -1, d.error, v.error,
                 d.lead, v.leads, d.separationMin * v.scale.burstSeparation, d.separationMax * v.scale.burstSeparation, d.grenadeChance,
-                d.grenadeChance * v.scale.grenadeChance, v.meleeDelay, halomeleedelay(1600), halomeleedelay(2199));
+                d.grenadeChance * v.scale.grenadeChance, v.meleeDelay, meleeInterval(a, 1600), meleeInterval(a, 2199));
+        // ACTOR_TIMERS <label> cn= variant= berserk=<0|1> swarm=<0|1> melee_timer=<actr s, -1 none>
+        //   grenade_timeout=<actv s, -1 none> encounter=<index, -1 none> grenade_wait=<scaled ms>
+        //   grenade_left=<ms of the encounter's timeout left>
+        int wait = 0, encounter = -1;
+        const int left = grenadeTimeoutLeft(a, v.scale.grenadeTimer, wait, encounter);
+        conoutf("ACTOR_TIMERS %s cn=%d variant=%d berserk=%d swarm=%d melee_timer=%.3f grenade_timeout=%.3f encounter=%d "
+                "grenade_wait=%d grenade_left=%d", label, e->clientnum, d.index, a.morale == BERSERK ? 1 : 0, d.swarm() ? 1 : 0,
+                d.meleeDelayTimer, d.grenadeTimeout, encounter, wait, left);
     }
+    fflush(stdout);
+}
+
+void haloactorgrenadenote(const char *label)
+{
+    // As throwGrenade records a throw: the first living actor with an encounter and a positive
+    // timeout starts its encounter's timeout now.
+    for(const Actor &a : actors)
+    {
+        if(!alive(a.bot) || a.def->grenadeTimeout <= 0) continue;
+        int wait = 0, encounter = -1;
+        grenadeTimeoutLeft(a, halocombatscaling(a.team).grenadeTimer, wait, encounter);
+        if(encounter < 0) continue;
+        encounterThrows[encounter] = lastmillis;
+        conoutf("GRENADE_NOTE %s cn=%d variant=%d encounter=%d timeout=%.3f wait=%d", label, a.bot->clientnum, a.def->index,
+                encounter, a.def->grenadeTimeout, wait);
+        fflush(stdout);
+        return;
+    }
+    conoutf("GRENADE_NOTE %s none", label);
     fflush(stdout);
 }

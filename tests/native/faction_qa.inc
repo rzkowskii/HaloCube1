@@ -147,6 +147,23 @@ COMMANDF(qa_actor_kill_one, "i", (int *kind)
     fflush(stdout);
 });
 
+// qa_actor_vitality LABEL (tests/test_actor_ai.py item 7): per living actor its health, full health,
+// shield and the stored maxima the scripts' vitality commands count in (Halo's points, before the
+// difficulty scale), and whether a script set them. ACTOR_VITALITY <label> cn= name= kind= team=
+// health= start= shield= shield_max= body_points= shield_points= scripted=
+COMMANDF(qa_actor_vitality, "s", (const char *label)
+{
+    loopv(enemies)
+    {
+        const HaloEnemy &e = enemies[i];
+        if(!e.bot || e.bot->state != CS_ALIVE) continue;
+        conoutf("ACTOR_VITALITY %s cn=%d name=%s kind=%d team=%d health=%d start=%d shield=%.3f shield_max=%.3f body_points=%.3f "
+                "shield_points=%.3f scripted=%d", label, e.bot->clientnum, e.bot->name, int(e.kind), haloactorteam(e.bot), e.bot->health,
+                haloactorstarthealth(e.bot), e.shield, e.shieldMax, e.vitalityBody, e.vitalityShield, e.vitalityScripted ? 1 : 0);
+    }
+    fflush(stdout);
+});
+
 // ATTACH_QA (tests/test_ai_attach.py): the actors ai_attach made of scripted bipeds, and those waiting.
 COMMANDF(qa_attach_state, "s", (const char *label) { haloscenarioattachdump(label); });
 // qa_attach_move OBJECT FORWARD SIDE: the actor attached to OBJECT put that far (world units, by its

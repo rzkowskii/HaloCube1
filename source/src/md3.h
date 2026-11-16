@@ -22,6 +22,17 @@ struct md3triangle
     int vertexindices[3];
 };
 
+// Halo exports (tools/import_halo_models.py, ORIGIN_FRAME) name a frame "halo_origin" when its
+// vertices are packed relative to its local origin, so a clip with long root motion keeps the
+// 16-bit vertex step of the model's own size; load adds the origin back. Stock MD3s never use the
+// name, and their frames' origins are left alone as before.
+struct md3frame
+{
+    vec bbmin, bbmax, origin;
+    float radius;
+    char name[16];
+};
+
 struct md3header
 {
     char id[4];
@@ -139,6 +150,23 @@ struct md3 : vertmodel
                 }
 
                 mesh_offset += mheader.meshsize;
+            }
+            if(header.ofs_frames > 0 && numframes > 0 && f->seek(header.ofs_frames, SEEK_SET))
+            {
+                loopi(numframes)
+                {
+                    md3frame frame;
+                    if(f->read(&frame, sizeof(md3frame)) != (int)sizeof(md3frame)) break;
+                    if(strncmp(frame.name, "halo_origin", sizeof(frame.name))) continue;
+                    lilswap(&frame.origin.x, 3);
+                    const vec o(frame.origin.y, frame.origin.x, frame.origin.z); // the vertices' x/y swap
+                    if(!(fabs(o.x) < 1e9f && fabs(o.y) < 1e9f && fabs(o.z) < 1e9f)) continue; // NaN or damaged
+                    loopvj(meshes)
+                    {
+                        mesh &m = *meshes[j];
+                        loopk(m.numverts) m.verts[i*m.numverts + k].add(o);
+                    }
+                }
             }
             delete f;
 

@@ -14,6 +14,9 @@ Combat by difficulty (item 6, the combat-scaling work, not yet run): on each
 level the Covenant fire with the globals table's rate_of_fire, projectile_error,
 burst_separation, grenade_chance_scale and the lead gate, the marines with
 Normal's, and the melee delays and guidance_vs_player follow the level for all.
+Script vitality in Halo's points (item 7, the script-vitality change, not yet run):
+unit_set_current_vitality counts points of the stored maximum, unit_set_maximum_vitality
+sets new maxima at full vitality that ai_renew and a revert keep, and 0 points kill.
 """
 import re
 import subprocess
@@ -132,11 +135,12 @@ text, log = run('unitcmds', 'qa_campaign_resume 2 2', [
              ('ai_link_activation', 'lz_search first_marine'), ('ai_automatic_migration_target', 'lz_search true'),
              ('ai_dialogue_triggers', 'false'), ('ai_allow_dormant', 'first_marine false'))),
     (600, 'qa_actor_state flags'),
-    # Damage: the immune actors keep their health, the rest lose some; vitality sets fractions; renew refills.
+    # Damage: the immune actors keep their health, the rest lose some; vitality sets Halo's points of
+    # the stored maximum (the script-vitality change); renew refills.
     (800, hs(('damage_object', 's:shock unit:lz_search:0'), ('damage_object', 's:shock unit:lz_search:1'), ('damage_object', 's:shock unit:lz_search:6'))),
     (900, 'qa_actor_state hurt'),
-    (1000, hs(('units_set_current_vitality', 'unit:lz_search:3 0.5 0'), ('unit_set_current_vitality', 'unit:lz_search:4 0.25 0'))),
-    (1100, 'qa_actor_state vital'),
+    (1000, hs(('units_set_current_vitality', 'unit:lz_search:3 10 0'), ('unit_set_current_vitality', 'unit:lz_search:4 0.25 0'))),
+    (1100, 'qa_actor_state vital; qa_actor_vitality vital'),
     (1200, hs(('ai_renew', 'lz_search'))),
     (1300, 'qa_actor_state renewed'),
     # Berserk and the other switches clear again.
@@ -224,9 +228,13 @@ assert names[6] not in hurt or int(hurt[names[6]]['health']) < int(base[names[6]
 assert float(hurt[names[0]]['shield']) == float(flags[names[0]]['shield']), 'protected actors keep their shield'
 
 vital = by_name('vital')
-for n, fraction in ((names[3], 0.5), (names[4], 0.25)):
+points = {f['cn']: f for f in (dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith('ACTOR_VITALITY vital '))}
+for n, given in ((names[3], 10), (names[4], 0.25)):
+    # Points over the stored (unscaled) maximum, capped at 1, of the full health; 0.25 point keeps 1.
+    fraction = min(1, given / float(points[n]['body_points']))
     expected = max(1, int(int(base[n]['health']) * fraction + .5))
-    assert int(vital[n]['health']) == expected, ('unit_set_current_vitality sets a fraction of the starting health', fraction, base[n], vital[n])
+    assert int(vital[n]['health']) == expected, ('unit_set_current_vitality sets points of the stored maximum', given, base[n], vital[n], points[n])
+    assert float(points[n]['shield']) == 0, ('0 shield points empty the shield', points[n])
 renewed = by_name('renewed')
 for n in names[3:5]:
     assert int(renewed[n]['health']) == int(base[n]['health']), ('ai_renew restores full health', renewed[n])
@@ -305,6 +313,12 @@ print('Doors: object_set_permutation door_off removes the cell door.')
 #    qa_actor_combat prints the team factors (COMBAT_DIFFICULTY and _MORE) and, per living actor, the values
 #    its brain fires with (ACTOR_COMBAT); they must follow actors.txt's `difficulty` lines and the
 #    variant's own `fire`, `burst` and `grenade` lines.
+#    Since the melee-delay and grenade-timeout export (NOT YET RUN): the smash interval is the engine's
+#    attack (1.6 or 2.199 s) plus scale x the `berserk` line's actr melee_attack_delay_timer (0 while
+#    berserk) plus base (actions.c:2563-2568), or the whole interval scaled for a swarm actor or a table
+#    without the timer; ACTOR_TIMERS carries the `grenade` line's encounter timeout, and after
+#    qa_actor_grenade_note every member of the noted encounter has its scaled timeout left in full
+#    (timeout x grenade_timer_scale in whole ticks, actions.c:2350-2373).
 table, variants, current = {}, {}, None
 for entry in (root / 'packages/halo/actors.txt').read_text().splitlines():
     key, _, rest = entry.partition(' ')
@@ -313,8 +327,10 @@ for entry in (root / 'packages/halo/actors.txt').read_text().splitlines():
         table[name] = [float(v) for v in values]
     elif key == 'actor':
         current = variants.setdefault(int(rest), {})
-    elif current is not None and key in ('fire', 'burst', 'grenade'):
+    elif current is not None and key in ('fire', 'burst', 'grenade', 'berserk'):
         current[key] = [float(v) for v in rest.split()]
+    elif current is not None and key == 'family':
+        current['actr_flags'] = int(rest.split()[3])
 for name in ('rate_of_fire', 'projectile_error', 'burst_separation', 'target_leading', 'grenade_chance_scale',
              'grenade_timer_scale', 'melee_delay_scale', 'melee_delay_base', 'guidance_vs_player'):
     assert name in table, ('actors.txt has no difficulty table (format 3); rerun tools/halo_actors.py', name)
@@ -337,7 +353,7 @@ for d in range(4):
     text, log = run(f'combat-{d}', f'halo_difficulty {d}; qa_campaign_resume 2 2', [
         (0, 'qa_actor_place lz_search; qa_actor_place first_marine'),
         (300, 'qa_hs_ai ai_magically_see_players lz_search 0'),
-        (5000, 'qa_actor_state combat; qa_actor_combat combat'),
+        (5000, 'qa_actor_state combat; qa_actor_combat combat; qa_actor_grenade_note note; qa_actor_combat noted'),
         (5300, 'quit'),
     ], timeout=150)
     teams = {}
@@ -357,6 +373,7 @@ for d in range(4):
             assert near(float(fields[field]), table[name][d]), ('every team reads the level', d, team, field, fields[field])
     shots = {a['cn']: int(a['shots']) for a in actors(text, 'combat')}
     rows = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines() if line.startswith('ACTOR_COMBAT combat ')]
+    timer_rows = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines() if line.startswith('ACTOR_TIMERS combat ')]
     covenant = [r for r in rows if r['team'] == 'covenant']
     marines = [r for r in rows if r['team'] == 'human']
     assert covenant and marines, ('lz_search and first_marine are placed and alive', len(covenant), len(marines), log)
@@ -380,8 +397,86 @@ for d in range(4):
             if r['team'] not in ('human', 'player') and shots.get(r['cn'], 0) > 0 and int(r['slot']) == int(r['delay']):
                 written += 1
         smash = [int(x) for x in r['smash'].split(',')]
+        timers = next(t for t in timer_rows if t['cn'] == r['cn'])
+        berserk = v.get('berserk', [])
+        timer = berserk[3] if len(berserk) > 3 else -1
+        assert near(float(timers['melee_timer']), timer), ('the actr melee delay', d, timers, berserk)
+        swarm = (v.get('actr_flags', 0) >> 26) & 1
+        assert int(timers['swarm']) == swarm, ('swarm bit', d, timers)
         for base, got in zip((1600, 2199), smash):
-            assert abs(got - round(base * table['melee_delay_scale'][d] + table['melee_delay_base'][d] * 1000)) <= 1, ('melee delay', d, r)
+            if timer < 0 or swarm:
+                want = round(base * table['melee_delay_scale'][d] + table['melee_delay_base'][d] * 1000)
+            else:
+                held = 0 if timers['berserk'] == '1' else timer
+                want = base + round((table['melee_delay_scale'][d] * held + table['melee_delay_base'][d]) * 1000)
+            assert abs(got - want) <= 1, ('melee delay', d, r, timers, want)
+        grenade = v['grenade']
+        assert near(float(timers['grenade_timeout']), grenade[6] if len(grenade) > 6 else -1), ('the actv grenade timeout', d, timers)
     assert written, ('at least one Covenant actor fired at its scaled delay', d, shots, log)
+    # The encounter timeout after a (noted) throw, for every member of that encounter.
+    note = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines() if line.startswith('GRENADE_NOTE note ')]
+    assert note and 'encounter' in note[0], ('an lz_search actor has an encounter and a grenade timeout', note, log)
+    noted = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in text.splitlines() if line.startswith('ACTOR_TIMERS noted ')]
+    team_of = {r['cn']: r['team'] for r in rows}
+    members = [t for t in noted if t['encounter'] == note[0]['encounter'] and float(t['grenade_timeout']) >= 0]
+    assert members, ('the noted encounter has members', note, noted)
+    for t in members:
+        level = 1 if team_of.get(t['cn']) in ('human', 'player') else d
+        want = int(float(t['grenade_timeout']) * table['grenade_timer_scale'][level] * 30) * 1000 // 30
+        assert abs(int(t['grenade_wait']) - want) <= 34, ('grenade_timer_scale on the encounter timeout', d, t, want)
+        assert int(t['grenade_left']) == int(t['grenade_wait']), ('the whole timeout is left right after the throw', d, t)
     summary.append((d, round(float(covenant[0]['scaled_error']), 4), covenant[0]['delay'], marines[0]['scaled_error']))
 print(f'Combat scaling: per level (level, a Covenant actor\'s error and delay, a marine\'s error) {summary}.')
+
+
+# 7. Script vitality in Halo's points (the script-vitality change; written while testing was on hold,
+#    NOT YET RUN). unit_set_current_vitality makes its points a fraction of the unit's stored maximum,
+#    capped at 1 (../Halo3DS units/unit_scripting_commands.c:85-133); unit_set_maximum_vitality
+#    re-initialises the maxima at full vitality (:54-65 with objects/damage.c:398-427), which ai_renew
+#    then refills to and a checkpoint keeps (the `s squad` record's optional ` max <body> <shield>`);
+#    a body set to 0 dies even under object_cannot_take_damage (object_deplete_body, :127-128).
+text, log = run('vitality', 'halo_difficulty 1; qa_campaign_play 2 2', [
+    (0, 'botsshoot 0; qa_actor_place lz_search; qa_actor_place first_marine'),
+    (300, hs(('ai_braindead', 'lz_search true'), ('ai_braindead', 'first_marine true')) + '; qa_actor_vitality base'),
+    (400, hs(('unit_set_maximum_vitality', 'unit:lz_search:0 1 0')) + '; qa_actor_vitality max'),
+    (500, hs(('unit_set_maximum_vitality', 'unit:lz_search:1 40 0'), ('unit_set_current_vitality', 'unit:lz_search:1 10 0')) +
+          '; qa_actor_vitality quarter'),
+    (600, hs(('unit_set_current_vitality', 'unit:lz_search:2 100000 100000')) + '; qa_actor_vitality full'),
+    (700, hs(('ai_renew', 'lz_search')) + '; qa_actor_vitality renewed'),
+    (800, 'qa_hs_ai ai_living_count lz_search 0; ' +
+          hs(('object_cannot_take_damage', 'unit:lz_search:3'), ('unit_set_current_vitality', 'unit:lz_search:3 0 0'))),
+    (900, 'qa_hs_ai ai_living_count lz_search 0; qa_actor_vitality depleted; qa_checkpoint_save'),
+    (1200, 'qa_halo_damage 100000'),
+    (3000, 'qa_halo_revert'),
+    (3300, 'qa_actor_vitality reverted'),
+    (3400, 'quit'),
+], timeout=200)
+
+
+def vitality_rows(label):
+    return [dict(re.findall(r'(\w+)=(\S+)', l)) for l in text.splitlines() if l.startswith(f'ACTOR_VITALITY {label} ')]
+
+
+def scripted(label):
+    return sorted((r for r in vitality_rows(label) if r['scripted'] == '1'), key=lambda r: float(r['body_points']))
+
+
+one = scripted('max')
+assert len(one) == 1 and float(one[0]['body_points']) == 1 and float(one[0]['shield_points']) == 0, ('maximum 1 0', one, log)
+assert one[0]['health'] == '1' and one[0]['start'] == '1' and float(one[0]['shield_max']) == 0, ('one point, no shield', one)
+pair = scripted('quarter')
+assert len(pair) == 2 and float(pair[1]['body_points']) == 40, ('maximum 40 0 on a second actor', pair, log)
+assert pair[1]['start'] == '40' and pair[1]['health'] == '10', ('10 of 40 points on Normal is a quarter of 40 health', pair[1])
+covenant_full = [r for r in vitality_rows('full') if r['team'] == '0' and r['scripted'] == '0']   # HALO_TEAM_COVENANT
+assert covenant_full and all(r['health'] == r['start'] for r in covenant_full), ('points above the maximum cap at full', covenant_full)
+renewed = scripted('renewed')
+assert [r['health'] for r in renewed] == ['1', '40'], ('ai_renew refills to the script-set maxima', renewed)
+counts = [float(v) for c, enc, v in probes(text, 'HS_AI') if c == 'ai_living_count' and enc == 'lz_search']
+assert len(counts) >= 2 and counts[1] == counts[0] - 1, ('0 body points kill a protected actor', counts, log)
+reverted = scripted('reverted')
+assert [(float(r['body_points']), r['start'], r['health']) for r in reverted] == [(1.0, '1', '1'), (40.0, '40', '40')], \
+    ('a revert keeps the script-set maxima', reverted, log)
+saved = read_progress(log.parent)
+maxima = sorted(r.split()[-2:] for r in saved['records']['s'] if r.startswith('squad ') and ' max ' in r)
+assert maxima == [['1', '0'], ['40', '0']], ('the checkpoint records end with the maxima', maxima)
+print('Script vitality: points of the stored maximum, a script maximum kept by ai_renew and a revert, depletion kills.')

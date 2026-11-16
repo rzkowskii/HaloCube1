@@ -15,10 +15,14 @@ from import_halo_a30 import HaloMap
 from halo_weapons import CAMPAIGN, weapon_index
 
 FORMAT = 3                        # 2: team, unitmelee and material lines; 3: major and difficulty lines
-# Format 3 also carries the optional unit, spawn and pop lines (below). The format number stays 3:
-# an engine that predates them skips keys it does not know (halo_ai.cpp parse), so a newer table
-# still loads there, and an older table (without them) loads in a newer engine, which keeps its
-# built-in carrier burst and has no infection pop or speed stagger.
+# Format 3 also carries the optional unit, spawn, pop, destroyed, resistance and shieldtime lines and the
+# material lines' fifth field, the shield leak, the berserk line's fourth (the actr melee delay) and the
+# grenade line's seventh (the encounter grenade timeout; below). The format number stays 3:
+# an engine that predates them skips keys it does not know and fields past a line's last (halo_ai.cpp
+# parse), so a newer table still loads there, and an older table (without them) loads in a newer
+# engine, which keeps its built-in carrier burst, has no infection pop or speed stagger, puts
+# every shield over the whole body and recharges it on the Elite's 12 s stun and 10 s recharge, and
+# scales its own melee and grenade waits.
 # Actor families the engine has bodies for, matching ActorKind in halo.cpp (monitor and engineer
 # fly and never fight).
 KINDS = {'grunt': 0, 'elite': 1, 'jackal': 2, 'hunter': 3, 'floodcombat elite': 4,
@@ -63,9 +67,26 @@ BIPED_FLAGS = 756
 # depleted effects); the infection forms' is the effe whose jpt! pops its neighbours.
 COLL_BODY_DESTROYED_EFFECT = 188
 JPT_INFECTION_FORM_POP = 1 << 12  # jpt! damage flag _damage_infection_form_pop_bit (objects/damage.c:207-209)
-# coll materials: name[32], flags u32 (1 head), material type h, pad, shield leak f,
-# shield damage multiplier f at 44, body damage multiplier f at 60.
+UNIT_DESTROYED_AFTER_DYING = 1 << 1  # unit flag _unit_is_destroyed_after_dying_bit (units/unit_definitions.h:24)
+# coll materials: name[32], flags u32 (1 head), material type h, pad, shield leak f at 40,
+# shield damage multiplier f at 44, body damage multiplier f at 60 (../Halo3DS
+# objects/damage_resistances.h:21-41, which asserts the 0x48 size and the 0x28 and 0x3C offsets).
 COLL_MATERIALS, MATERIAL_STRIDE = 564, 72
+# coll damage_resistance (damage_resistances.h:43-87): the indirect damage material index (h) at 4,
+# maximum body vitality at 8, maximum shield vitality at 204, the shield material type (h) at 210,
+# the shield failure function (h) at 236, threshold and maximum failure at 240 and 244, the minimum
+# shield stun damage, stun time and recharge time (seconds) at 264, 268 and 272 and the runtime
+# shield recharge velocity (a fraction of the shield per tick) at 448.
+COLL_INDIRECT_MATERIAL, COLL_BODY_VITALITY, COLL_SHIELD_VITALITY, COLL_SHIELD_MATERIAL = 4, 8, 204, 210
+COLL_SHIELD_FAILURE, COLL_SHIELD_STUN, COLL_RECHARGE_VELOCITY = 236, 264, 448
+# actr: berserk.melee_attack_delay_timer (../Halo3DS ai/actor_definitions.h:222), the first field of
+# actor_berserk_properties at +888 (defensive at +720, 108 bytes; pursuit at +828, 60), whose ninth,
+# damage_berserk_amount, is the +920 read below. actv: grenade_combat.encounter_grenade_timeout
+# (:375) at +424 (grenade_combat at +384: four shorts, then six floats to the throw chance at +416,
+# throw_grenade_delay at +420; items follow at +448). Both checked against the cache bytes (the
+# padding around them is zero in every actv and actr of the ten caches). The optional last field of
+# the `berserk` (only for a variant with an actr) and `grenade` lines; older engines read the rest.
+ACTR_MELEE_DELAY, ACTV_GRENADE_TIMEOUT = 888, 424
 
 FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible>   the globals (matg) difficulty table, before the actors
 # actor <index>
@@ -75,19 +96,22 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # vision <distance> <central angle> <max angle> <peripheral angle> <peripheral distance> <hearing>
 # fire <max range> <rate> <error> <first delay min> <max> <combat range min> <max> <lead> <damage scale>
 # burst <duration min> <max> <separation min> <max>
-# grenade <type> <chance> <range min> <max> <count min> <max>
+# grenade <type> <chance> <range min> <max> <count min> <max> <encounter timeout s>   older engines read the first six
 # vitality <body> <shield>
 # defense <hide shield fraction> <emerge to attack> <emerge to pursue>
 # morale <casualty trigger> <friend killed chance> <leader killed chance>
-# berserk <damage amount> <threshold> <melee range>
+# berserk <damage amount> <threshold> <melee range> <melee attack delay s>   the last only with an actr; older engines read three
 # positions <guard min> <max> <combat min> <max>
 # team <unit default team>          retail numbering: 0 default, 1 player, 2 human, 3 covenant, 4 flood, 5 sentinel
 # unitmelee <lower> <upper min> <upper max>   the unit's own melee jpt! (a Hunter's smash)
-# material <type> <flags> <body multiplier> <shield multiplier>   each collision material (flags 1: head)
+# material <type> <flags> <body multiplier> <shield multiplier> <shield leak>   each collision material (flags 1: head); older engines read the first four
+# resistance <indirect material> <coll body> <coll shield> <shield material type> <failure function> <failure threshold> <maximum failure>   the coll's (absent: none)
+# shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>   the coll's shield stun and recharge, velocity per tick (absent: none)
 # major <actv tag>                  the variant a major upgrade places instead (absent: none)
 # unit <unit flags> <biped flags>   the unit tag's flags (bit 19: inconsequential) and a biped's (bit 11: random speed increase; 0 for a vehicle)
 # spawn <actor index> <lower> <upper> <throw velocity>   the actors the unit releases when destroyed (absent: none), velocity in world units a second
 # pop <inner> <outer> <lower> <upper min> <upper max> <jpt flags>   the body destroyed effect's infection-form pop damage (absent: none)
+# destroyed <effe tag>              the body destroyed effect a unit destroyed after dying sets off, when it is not the pop (absent: none; effects.txt holds its damage)
 '''
 
 
@@ -103,7 +127,7 @@ def actor_record(halo, tag, weapons):
                       *t.read('2f', a + 192))
     record['burst'] = (*t.read('2f', a + 224), *t.read('2f', a + 232))
     record['grenade'] = (t.read('h', a + 384)[0], t.read('f', a + 416)[0], *t.read('2f', a + 404),
-                         *t.read('2h', a + 464))
+                         *t.read('2h', a + 464), t.read('f', a + ACTV_GRENADE_TIMEOUT)[0])
     record['vitality'] = t.read('2f', a + 512)
     major = halo.reference(t, a + MAJOR_REFERENCE)
     record['major'] = major.name if major and major.group == 'actv' else ''
@@ -116,7 +140,7 @@ def actor_record(halo, tag, weapons):
         record['vision'] = (*t.read('3f', r + 24), *t.read('2f', r + 40), t.read('f', r + 76)[0])
         record['defense'] = t.read('3f', r + 732)
         record['morale'] = (t.read('h', r + 632)[0], t.read('f', r + 672)[0], t.read('f', r + 680)[0])
-        record['berserk'] = (*t.read('2f', r + 920), record['melee'])
+        record['berserk'] = (*t.read('2f', r + 920), record['melee'], t.read('f', r + ACTR_MELEE_DELAY)[0])
         record['positions'] = t.read('4f', r + 952)
     else:
         record.update(type=-1, actr_flags=0, vision=(0,) * 6, defense=(0,) * 3, morale=(0, 0.0, 0.0),
@@ -147,12 +171,21 @@ def unit_record(halo, unit):
         record['unitmelee'] = (d.lower, d.upper_min, d.upper_max)
     coll = halo.reference(t, unit.address + UNIT_COLLISION)
     if coll and coll.group == 'coll':
-        for m in t.block(coll.address + COLL_MATERIALS, MATERIAL_STRIDE):
+        c = coll.address
+        for m in t.block(c + COLL_MATERIALS, MATERIAL_STRIDE):
             flags, = t.read('I', m + 32)
             kind, = t.read('h', m + 36)
-            shield, = t.read('f', m + 44)
+            leak, shield = t.read('2f', m + 40)
             body, = t.read('f', m + 60)
-            record['materials'].append((kind, flags, body, shield))
+            record['materials'].append((kind, flags, body, shield, leak))
+        # Halo's shield step (objects/damage.c:800-988): the hit's material leaks that fraction past
+        # the shield (842-843), the failure curve lets more through below the threshold (844-857),
+        # the coll's shield material type picks the jpt! modifier (898-899), and a blast lands on the
+        # indirect material (1623-1630); the stun and recharge (978-982, 1925-1932) follow.
+        record['resistance'] = (t.read('h', c + COLL_INDIRECT_MATERIAL)[0], t.read('f', c + COLL_BODY_VITALITY)[0],
+                                t.read('f', c + COLL_SHIELD_VITALITY)[0], t.read('h', c + COLL_SHIELD_MATERIAL)[0],
+                                t.read('h', c + COLL_SHIELD_FAILURE)[0], *t.read('2f', c + COLL_SHIELD_FAILURE + 4))
+        record['shieldtime'] = (*t.read('3f', c + COLL_SHIELD_STUN), t.read('f', c + COLL_RECHARGE_VELOCITY)[0])
         # The infection forms' body destroyed effect (characters\flood_infection\body destroyed):
         # its jpt! carries the pop flag, which only hurts inconsequential units (damage.c:2343-2375).
         effect = halo.reference(t, coll.address + COLL_BODY_DESTROYED_EFFECT)
@@ -161,7 +194,35 @@ def unit_record(halo, unit):
             d = jpt_damage(halo, pop)
             if d.flags & JPT_INFECTION_FORM_POP:
                 record['pop'] = (d.inner, d.outer, d.lower, d.upper_min, d.upper_max, d.flags)
+        destroyed = destroyed_effect(halo, unit)
+        if destroyed:
+            record['destroyed'] = destroyed
     return record
+
+
+def destroyed_effect(halo, unit):
+    """The effe tag a unit sets off when it is destroyed, or None: its coll's body destroyed effect
+    (coll +188) when the unit is destroyed after dying (unit +380 bit 1) and the effect is not the
+    infection-form pop (written as the `pop` line instead). Halo's unit_destroy (../Halo3DS
+    units/units.c:2711-2716), reached at the end of dying for such a unit (:6679, :10043), calls
+    object_destroy, which creates the coll's body destroyed effect on the object (objects/damage.c:
+    606-632), then releases the unit's spawned actors. In the ten caches: the carrier's
+    (characters\\floodcarrier\\effects\\body destroyed), the Sentinel's and the Engineer's."""
+    from halo_weapons import jpt_damage, referenced
+    t = halo.tags
+    if not unit or unit.group not in ('bipd', 'vehi'):
+        return None
+    flags, = t.read('I', unit.address + UNIT_FLAGS)
+    coll = halo.reference(t, unit.address + UNIT_COLLISION)
+    if not flags & UNIT_DESTROYED_AFTER_DYING or not coll or coll.group != 'coll':
+        return None
+    effect = halo.reference(t, coll.address + COLL_BODY_DESTROYED_EFFECT)
+    if not effect or effect.group != 'effe':
+        return None
+    damage = referenced(halo, effect, 'jpt!')
+    if damage and jpt_damage(halo, damage).flags & JPT_INFECTION_FORM_POP:
+        return None
+    return effect.name
 
 
 def number(value):
@@ -210,6 +271,11 @@ def write(records, path, difficulty=None):
             lines.append('spawn ' + ' '.join(map(number, (index_of[spawn[0]], *spawn[1:]))))
         if r.get('pop'):
             lines.append('pop ' + ' '.join(map(number, r['pop'])))
+        if r.get('destroyed'):
+            lines.append(f'destroyed {r["destroyed"]}')
+        for key in ('resistance', 'shieldtime'):
+            if r.get(key):
+                lines.append(key + ' ' + ' '.join(map(number, r[key])))
         lines.append('end')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('\n'.join(lines) + '\n')
@@ -260,8 +326,10 @@ def main():
     majors = sum(bool(r.get('major')) for r in ordered)
     spawns = sum(bool(r.get('spawn')) for r in ordered)
     pops = sum(bool(r.get('pop')) for r in ordered)
+    blasts = sum(bool(r.get('destroyed')) for r in ordered)
     print(f'{len(ordered)} actor variants ({bodies} with engine bodies, {majors} with a major upgrade, '
-          f'{spawns} releasing actors, {pops} popping), {len(difficulty or ())} difficulty values -> {target}')
+          f'{spawns} releasing actors, {pops} popping, {blasts} with a body destroyed effect), '
+          f'{len(difficulty or ())} difficulty values -> {target}')
 
 
 if __name__ == '__main__':

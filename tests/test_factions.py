@@ -61,7 +61,8 @@ def actor_table():
         elif key == 'unitmelee':
             current['unitmelee'] = [float(x) for x in rest.split()]
         elif key == 'material':
-            kind, flags, body, shield = rest.split()
+            # The optional fifth field (the shield leak) is checked by test_actor_tags.py.
+            kind, flags, body, shield = rest.split()[:4]
             current['materials'].append((int(kind), int(flags), float(body), float(shield)))
     return actors
 

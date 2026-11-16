@@ -43,13 +43,34 @@ struct HaloActorDef
     int casualtyTrigger = 0;
     float friendKilled = 0, leaderKilled = 0;
     float berserkAmount = 0, berserkThreshold = 0, meleeRange = 0;
+    // Optional last fields of the `berserk` and `grenade` lines (seconds; -1 when the table has
+    // none): the actr's melee_attack_delay_timer (../Halo3DS ai/actor_definitions.h:222; the wait
+    // after a melee attack, actions.c:2563-2568) and the actv's encounter_grenade_timeout (:375;
+    // the encounter-wide wait after any member's throw, actions.c:2350-2368).
+    float meleeDelayTimer = -1, grenadeTimeout = -1;
     float guardMin = 0, guardMax = 0, positionMin = 0, positionMax = 0;
     // actors.txt format 2: the unit's default team (retail numbering, -1 unknown), its melee
     // jpt! (lower, upper min, upper max) and its collision materials.
     int team = -1;
     float unitMelee[3] = {0, 0, 0};
-    struct Material { int type; unsigned flags; float body, shield; };
+    // `leak`: the material's shield_leak_fraction (../Halo3DS objects/damage_resistances.h:27), the
+    // optional fifth field of the `material` line; -1 when the table has none.
+    struct Material { int type; unsigned flags; float body, shield; float leak = -1; };
     std::vector<Material> materials;
+    // Optional format 3 lines from the unit's coll (damage_resistances.h:43-87). `resistance`: the
+    // indirect damage material (index into materials, -1 none: a blast's material, damage.c:
+    // 1623-1630), the coll's maximum body and shield vitality (what actor_customize_unit keeps when
+    // the actv sets neither, ai/actors.c:2397-2404), the shield material type (the jpt! modifier the
+    // shield takes, damage.c:898-899) and the shield failure function, threshold and maximum
+    // failure (damage.c:844-857). `shieldtime`: the minimum shield stun damage, stun time and
+    // recharge time (seconds) and the runtime recharge velocity (shield fraction a tick; damage.c:
+    // 978-982, 1925-1932).
+    bool hasResistance = false, hasShieldTime = false;
+    int indirectMaterial = -1, shieldMaterial = -1, shieldFailureFunction = 0;
+    float collBody = 0, collShield = 0, shieldFailureThreshold = 0, shieldFailureMaximum = 0;
+    float shieldStunDamage = 0, shieldStunTime = 0, shieldRechargeTime = 0, shieldRechargeVelocity = 0;
+    // Whether every material carries its leak (the shield step's leak model applies).
+    bool hasLeaks() const;
     // actors.txt format 3: the actv's major upgrade reference (../Halo3DS actor_definitions.h:408),
     // the variant a squad places instead when its major upgrade roll succeeds (encounters.c:3040,
     // actors.c:2687): its path and its index here, -1 when it has none or it is not in the table.
@@ -68,7 +89,17 @@ struct HaloActorDef
     float spawnVelocity = 0;
     float popInner = 0, popOuter = 0, popLower = 0, popUpperMin = 0, popUpperMax = 0;
     unsigned popFlags = 0;
+    // `destroyed`: the effe tag of the unit coll's body destroyed effect (coll +188), written for a
+    // unit destroyed after dying (unit flags bit 1) whose effect is not the infection-form pop: Halo
+    // sets it off from object_destroy (../Halo3DS objects/damage.c:606-632) when unit_destroy runs
+    // (units/units.c:2711-2716, at the end of dying, :6679 and :10043), before the unit releases its
+    // spawned actors. The carrier's blast (characters\floodcarrier\effects\body destroyed), the
+    // Sentinels' death explosion and the Engineer's. Empty for none.
+    std::string destroyedEffect;
     bool inconsequential() const { return (unitFlags >> 19) & 1; }     // _unit_is_inconsequential_bit
+    // _actor_definition_swarm_actor_bit (../Halo3DS ai/actor_definitions.h:54): the infection forms.
+    // Halo keeps up to 16 bodies of one variant and squad in one swarm actor (ai/actors.c:2539-2555).
+    bool swarm() const { return (actrFlags >> 26) & 1; }
     bool randomSpeedIncrease() const { return (bipedFlags >> 11) & 1; } // _biped_random_speed_increase_bit
     bool pops() const { return popOuter > 0 && ((popFlags >> 12) & 1); } // _damage_infection_form_pop_bit
     bool popHitsOne() const { return (popFlags >> 10) & 1; }          // _damage_does_not_hurt_infection_forms_bit
@@ -213,7 +244,12 @@ int halomeleedelay(int millis);
 float haloguidancevsplayer();
 // QA (tests/test_actor_ai.py): COMBAT_DIFFICULTY and _MORE lines per team, then one ACTOR_COMBAT line per
 // living actor with the effective values its brain uses.
+// Also one ACTOR_TIMERS line per living actor: its actr melee delay and actv encounter grenade timeout,
+// its encounter and that encounter's scaled timeout and the time left of it.
 void haloactorcombatdump(const char *label);
+// QA (tests/test_actor_ai.py item 6): the first living actor with an encounter and a positive grenade
+// timeout starts that encounter's timeout now, as its throw would; prints GRENADE_NOTE.
+void haloactorgrenadenote(const char *label);
 
 // Halo's major upgrade of a squad's actors at placement (../Halo3DS ai/ai.c:615
 // ai_get_major_upgrade_chance): from the squad's major_upgrade enum (0 normal, 1 few, 2 many,
@@ -287,9 +323,11 @@ void haloactorfollowdistance(const playerent *bot, float distance);
 const playerent *haloactorfollowing(const playerent *bot);
 // ai_prefer_target: actors weigh preferred units as closer when choosing whom to fight.
 void haloactorprefer(const playerent *target, bool on);
-// Sets health to a fraction of what the actor spawned with.
+// Sets health to a fraction of the actor's full health (what it spawned with, or what
+// unit_set_maximum_vitality made it: haloactorsetstarthealth, which also refills to it).
 void haloactorsethealthfraction(playerent *bot, float fraction);
 int haloactorstarthealth(const playerent *bot);
+void haloactorsetstarthealth(playerent *bot, int health);
 // ai_renew: full health, shield and the actor's grenade allowance.
 void haloactorrenew(playerent *bot);
 
@@ -300,6 +338,8 @@ void haloactorrenew(playerent *bot);
 // damage_object and damage_new, which Halo deals with no owner) also makes its kills nobody's:
 // haloactordeath gets no killer, so no hostile neighbour is alerted to the player.
 void haloactorscriptdamage(bool on, bool ownerless = false);
+// Whether an ownerless scope is open (halo.cpp's hitMaterial: a scripted kill is no direct hit).
+bool haloactorownerlessdamage();
 struct HaloScriptDamage
 {
     explicit HaloScriptDamage(bool ownerless = false) : ownerless(ownerless) { haloactorscriptdamage(true, ownerless); }

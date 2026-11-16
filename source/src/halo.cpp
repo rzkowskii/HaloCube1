@@ -19,6 +19,7 @@
 extern void startgame(const char *name, int mode, int minutes, bool notify);
 extern int halo_scripttrace;     // halo_script.cpp: trace logging
 extern int halo_damagetrace;     // below: damage trace logging (the Flood pops and throws use it too)
+extern int halo_unitblast;       // below: an actor unit's body destroyed effect deals its damage
 
 namespace
 {
@@ -135,6 +136,14 @@ namespace
         // When it last fired its weapon (haloactorfired, from halofiretrigger): a Hunter's belly
         // window opens after its own cannon shot, not after its smash (which sets lastaction too).
         int firedAt = -100000;
+        // The maximum body and shield vitality Halo keeps on the unit, in its points and before the
+        // difficulty scale (object.maximum_*_vitality: set by object_initialize_vitality, ../Halo3DS
+        // objects/damage.c:398-427, and scaled only when read, :433-456): the variant's at spawn
+        // (actor_customize_unit, ai/actors.c:2397-2405; variantVitality), or what
+        // unit_set_maximum_vitality last set (`scripted`). The scripts' current vitality is a
+        // fraction of these (haloenemysetvitality).
+        float vitalityBody = 0, vitalityShield = 0;
+        bool vitalityScripted = false;
     };
 
     // The hit weapon.cpp is dealing (halohit): its exact amount and jpt! side effect, which
@@ -191,20 +200,32 @@ namespace
     // reaching a marine or Elite body turn it into a combat form after a delay.
     struct Corpse { vec o; float yaw; ActorKind kind; int expires; };
     // A burst or a rising body: `actor` is the variant (actors.txt index, -1 the kind's default),
-    // `throwSpeed` the spawn throw in Halo world units a tick (0: none).
-    struct FloodSpawn { vec o; float yaw; ActorKind kind; int count; int at; int actor = -1; int team = HALO_TEAM_FLOOD; float throwSpeed = 0; };
+    // `throwSpeed` the spawn throw in Halo world units a tick (0: none). `encounter` and `squad`: the
+    // dying unit's squad, which the released actors join (../Halo3DS ai/actors.c:2855-2872 and
+    // 2921-2931; -1 when it had none: they stay outside every squad, as the engine's burst always was).
+    struct FloodSpawn
+    {
+        vec o; float yaw; ActorKind kind; int count; int at; int actor = -1; int team = HALO_TEAM_FLOOD; float throwSpeed = 0;
+        int encounter = -1, squad = -1;
+    };
     // An infection form's pop (its body destroyed effect's jpt!, actors.txt `pop`): where it went
     // off and the variant whose jpt! it is.
     struct FloodPop { vec centre; const HaloActorDef *def; };
+    // A unit's body destroyed effect (actors.txt `destroyed`: the carrier's blast, a Sentinel's
+    // death explosion): where, whose variant, and the dead unit (its damage owner, as Halo's
+    // effect_new_from_object owns the effect's damage by the object, effects/effects.c:920-947 and
+    // 1762-1772; checked to still exist before use).
+    struct UnitBlast { vec centre; const HaloActorDef *def; const playerent *owner; };
     vector<Corpse> corpses;
     vector<FloodSpawn> floodSpawns;
     vector<FloodPop> floodPops;
+    vector<UnitBlast> unitBlasts;
     const int corpseLife = 90000, infectionDelay = 2500;
     const float infectionReach = 4.0f;
     // An infection form spent on a body (updateFlood) is removed, not destroyed: no pop.
     bool floodSpending = false;
 
-    void clearFlood() { corpses.setsize(0); floodSpawns.setsize(0); floodPops.setsize(0); }
+    void clearFlood() { corpses.setsize(0); floodSpawns.setsize(0); floodPops.setsize(0); unitBlasts.setsize(0); }
     // The player carries two retail weapons, each bound to an AssaultCube slot.
     HaloWeaponState carried[2], checkpointCarried[2];
     int carriedGun[2] = {GUN_ASSAULT, GUN_PISTOL}, currentCarried = 0, checkpointCurrent = 0;
@@ -548,6 +569,27 @@ namespace
         }
     }
 
+    // A variant's maximum body and shield vitality in Halo's points, before the difficulty scale.
+    // With the coll's vitality (actors.txt `resistance`), Halo's rule: an actv that sets either
+    // vitality sets both, so one with a body and no shield has none (ai/actors.c:2397-2404 with
+    // objects/damage.c:398-429: the crewmen, the captain, the wounded and suicidal marines, the
+    // stealth Elites), and one that sets neither keeps the coll's. Without it, the actv's where
+    // set, else the body's built-in profile, as before. The body is only the base the scripts'
+    // vitality commands count in (spawnEnemy's health still rounds the actv's body or takes the
+    // profile's, as before).
+    void variantVitality(ActorKind kind, const HaloActorDef *actor, float &body, float &shield)
+    {
+        const ActorProfile &profile = profiles[kind];
+        shield = actor && actor->shield > 0 ? actor->shield : float(profile.shield);
+        body = actor && actor->body > 0 ? actor->body : float(profile.health);
+        if(actor && actor->hasResistance)
+        {
+            const bool own = actor->body > 0 || actor->shield > 0;
+            shield = own ? actor->shield : max(actor->collShield, 0.0f);
+            body = own ? max(actor->body, 0.0f) : actor->collBody > 0 ? actor->collBody : float(profile.health);
+        }
+    }
+
     // team HALO_TEAM_DEFAULT: the variant's unit team (actors.txt), else the body's.
     botent *spawnEnemy(ActorKind kind, const vec &origin, float yaw, int weaponIndex = -1, int actorIndex = -1,
                        int team = HALO_TEAM_DEFAULT)
@@ -579,8 +621,13 @@ namespace
         // for an actor whose side changes later).
         const float vitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, team),
                     shieldVitality = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_SHIELD, team);
-        const float shieldMax = (actor && actor->shield > 0 ? actor->shield : float(profile.shield)) * shieldVitality;
+        // The variant's maxima (variantVitality), kept unscaled for the scripts' vitality commands.
+        float baseBody, baseShield;
+        variantVitality(kind, actor, baseBody, baseShield);
+        const float shieldMax = baseShield * shieldVitality;
         enemies.add(HaloEnemy{bot, kind, shieldMax, lastmillis, HaloWeaponState(), team, shieldMax});
+        enemies.last().vitalityBody = baseBody;
+        enemies.last().vitalityShield = baseShield;
         enemies.last().weapon.reset(def);
         bot->health = max(1, int((actor && actor->body > 0 ? int(actor->body + .5f) : profile.health) * vitality + .5f));
         bot->maxeyeheight = bot->eyeheight = profile.eyeheight;
@@ -776,8 +823,11 @@ namespace
     }
 
     // Spawns `count` actors of a kind (variant `actor`, -1 its default) in a ring around a point,
-    // as many as fit, each thrown outwards along its ring angle when `throwSpeed` is set.
-    int spawnRing(ActorKind kind, const vec &feet, float yaw, int count, int team, int actor = -1, float throwSpeed = 0)
+    // as many as fit, each thrown outwards along its ring angle when `throwSpeed` is set. With an
+    // `encounter` and `squad` each joins that squad (haloscenarioadopt: a carrier's forms join the
+    // carrier's, ../Halo3DS ai/actors.c:2855-2872 and 2921-2931).
+    int spawnRing(ActorKind kind, const vec &feet, float yaw, int count, int team, int actor = -1, float throwSpeed = 0,
+                  int encounter = -1, int squad = -1)
     {
         int placed = 0;
         for(int attempt = 0; attempt < count * 4 && placed < count; ++attempt)
@@ -787,10 +837,38 @@ namespace
             if(playerent *bot = spawnNear(kind, at, yaw + rnd(360), team, actor))
             {
                 ++placed;
+                if(encounter >= 0) haloscenarioadopt(bot, encounter, squad, actor);
                 throwSpawned(bot, angle, throwSpeed);
             }
         }
         return placed;
+    }
+
+    bool playerExists(const playerent *p)
+    {
+        if(!p) return false;
+        loopv(players) if(players[i] == p) return true;
+        return false;
+    }
+
+    // A unit's body destroyed effect where it was destroyed: drawn and heard (halofxeffect), and its
+    // jpt! area damage (effects.txt's `damage` line, haloeffectblast) owned by the dead unit, so it
+    // counts as its team's fire (the difficulty's enemy_damage on the player, no betrayal; a blast
+    // whose unit is gone by then is ownerless). The carrier's (1 to 2 world units, 40 to 70-85)
+    // hurts everything in reach, the player, the forms near it and other carriers included; the
+    // forms it releases come after it (unit_destroy: object_destroy, then unit_test_spawning), so
+    // the blast never reaches them. halo_unitblast 0 leaves the damage out.
+    void setOffUnitBlast(const UnitBlast &blast)
+    {
+        const char *effect = blast.def->destroyedEffect.c_str();
+        halofxeffect(effect, blast.centre, !halocinematic());
+        // Still the dead unit: a living one at that address is a new bot that reused a freed one's memory.
+        playerent *owner = playerExists(blast.owner) && blast.owner->state != CS_ALIVE ? const_cast<playerent *>(blast.owner) : nullptr;
+        const bool dealt = halo_unitblast && !halocinematic() && haloeffectblast(effect, blast.centre, owner);
+        // UNIT_BLAST variant=<actv> effect=<effe> dealt=<0|1> owner=<name|->
+        if(halo_damagetrace)
+            conoutf("UNIT_BLAST variant=%s effect=%s dealt=%d owner=%s", blast.def->path.c_str(), effect, dealt ? 1 : 0,
+                    owner ? owner->name : "-");
     }
 
     // ../Halo3DS objects/damage.c:2343-2421, the area damage of a jpt! with the infection-form pop
@@ -888,11 +966,21 @@ namespace
             }
         }
         loopvrev(corpses) if(lastmillis >= corpses[i].expires) corpses.remove(i);
+        // The body destroyed effects queued since the last frame, before the bursts they precede
+        // (units.c:2711-2716); the deaths they cause queue theirs for the next frame.
+        const int blasts = unitBlasts.length();
+        for(int i = 0; i < blasts && i < unitBlasts.length(); ++i)
+        {
+            const UnitBlast blast = unitBlasts[i];
+            setOffUnitBlast(blast);
+        }
+        unitBlasts.remove(0, min(blasts, unitBlasts.length()));
         loopvrev(floodSpawns)
         {
-            if(lastmillis < floodSpawns[i].at) continue;
+            if(!floodSpawns.inrange(i) || lastmillis < floodSpawns[i].at) continue;
             const FloodSpawn spawn = floodSpawns.remove(i);
-            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, spawn.team, spawn.actor, spawn.throwSpeed);
+            const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, spawn.team, spawn.actor, spawn.throwSpeed,
+                                         spawn.encounter, spawn.squad);
             if(placed) conoutf("Halo: flood %s rises", profiles[spawn.kind].name);
         }
         // The pops queued last frame; the deaths they cause queue the next ring.
@@ -1878,6 +1966,23 @@ namespace
         return scale > 0 ? max(1, int(base / scale + .5f)) : 0;
     }
 
+    // An actor's shield stun and full-recharge time (ms) before the difficulty scale, from its
+    // variant's coll (actors.txt `shieldtime`): Halo stuns the shield for (short)(shield_stun_time
+    // x 30) ticks (../Halo3DS objects/damage.c:978-982) and then adds runtime_shield_recharge_velocity
+    // of the shield a tick (1925-1932), so a full recharge takes 1 / (velocity x 30) s: the Elites'
+    // 12 s and 10 s, the marines' 8 s and 1 s, the Jackals' 15 s and one tick (their recharge time 0
+    // gives velocity 1). recharge 0: the shield never recharges (velocity 0). Without the line (an
+    // older actors.txt), the Elite's 12 s and 10 s for every actor, as before.
+    void enemyShieldTiming(const HaloEnemy &enemy, int &delay, int &recharge)
+    {
+        delay = eliteDelay;
+        recharge = eliteRecharge;
+        const HaloActorDef *def = enemy.bot ? haloactorvariant(enemy.bot) : NULL;
+        if(!def || !def->hasShieldTime) return;
+        delay = int(min(def->shieldStunTime * 30, 32767.0f)) * 1000 / 30;
+        recharge = def->shieldRechargeVelocity > 0 ? max(1, int(1000 / (def->shieldRechargeVelocity * 30) + .5f)) : 0;
+    }
+
     void shieldTick(float &value, float capacity, int hit, int delay, int recharge, int elapsed)
     {
         if(recharge <= 0) return;
@@ -2318,6 +2423,73 @@ bool haloplayerprotected() { return playerProtected; }
 void haloenemysetshield(const playerent *p, float fraction)
 {
     if(HaloEnemy *enemy = enemyState(p)) enemy->shield = clamp(fraction, 0.0f, 1.0f) * enemy->shieldMax;
+}
+
+// unit_set_current_vitality and units_set_current_vitality on an actor (../Halo3DS
+// units/unit_scripting_commands.c:85-133): the body and shield in Halo's points, each made a
+// fraction of the unit's stored maximum (HaloEnemy::vitalityBody and vitalityShield), capped at 1
+// and 0 where that maximum is 0; a dead unit is left alone (:94). The fractions apply to the
+// engine's maxima (spawn health and shieldMax, which carry the difficulty scale), as Halo scales
+// the stored maximum when it reads it (damage.c:433-456). Returns true when a living body is set to
+// nothing (object_deplete_body, :127-128), which the caller turns into a death. Non-finite values
+// leave the vitality alone (judgement call). The body keeps at least one health point otherwise
+// (the engine counts health in whole points: a10's crew and c10's bay_a marines end at 1).
+bool haloenemysetvitality(playerent *p, float body, float shieldPoints)
+{
+    HaloEnemy *enemy = enemyState(p);
+    if(!enemy || p->state != CS_ALIVE || !std::isfinite(body) || !std::isfinite(shieldPoints)) return false;
+    enemy->shield = enemy->vitalityShield > 0 ? clamp(shieldPoints / enemy->vitalityShield, 0.0f, 1.0f) * enemy->shieldMax : 0.0f;
+    // With no maximum body the fraction is 0, but a body already at 0 is not depleted again (:111-113, :127).
+    if(!(enemy->vitalityBody > 0)) return false;
+    const float fraction = min(body / enemy->vitalityBody, 1.0f);
+    if(fraction <= 0) return true;
+    haloactorsethealthfraction(p, fraction);
+    return false;
+}
+
+// unit_set_maximum_vitality on an actor (unit_scripting_commands.c:54-65): object_initialize_vitality
+// with the given points (damage.c:398-427): they become the stored maxima, and the unit is at full
+// vitality (a maximum of 0 leaves none). The engine's maxima take the team's difficulty scale as at
+// spawn (spawnEnemy); its health keeps at least one point (c10's marine_suicidal: 1 0, one point and
+// no shield). ai_renew then refills to these maxima.
+void haloenemysetmaximumvitality(playerent *p, float body, float shieldPoints)
+{
+    HaloEnemy *enemy = enemyState(p);
+    if(!enemy || p->state != CS_ALIVE || !std::isfinite(body) || !std::isfinite(shieldPoints)) return;
+    enemy->vitalityBody = clamp(body, 0.0f, 1e6f);
+    enemy->vitalityShield = clamp(shieldPoints, 0.0f, 1e6f);
+    enemy->vitalityScripted = true;
+    const float bodyScale = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_VITALITY, enemy->team),
+                shieldScale = halodifficultyteamvalue(HALO_DIFFICULTY_ENEMY_SHIELD, enemy->team);
+    enemy->shieldMax = enemy->vitalityShield * shieldScale;
+    enemy->shield = enemy->shieldMax;
+    haloactorsetstarthealth(p, max(1, int(enemy->vitalityBody * bodyScale + .5f)));
+}
+
+// The maxima a script set on an actor (unit_set_maximum_vitality), which a checkpoint and a walk
+// into the next section keep; false when it has the variant's own.
+bool haloenemyscriptmaximum(const playerent *p, float &body, float &shieldPoints)
+{
+    const HaloEnemy *enemy = enemyState(p);
+    if(!enemy || !enemy->vitalityScripted) return false;
+    body = enemy->vitalityBody;
+    shieldPoints = enemy->vitalityShield;
+    return true;
+}
+
+// The stored maxima a body of `kind` placed as actors.txt variant `variant` would spawn with
+// (variantVitality): an attached actor carried in from the section before that has not spawned
+// yet has no actor state to ask (Scenario's carried path).
+void haloenemydefaultvitality(int kind, int variant, float &body, float &shieldPoints)
+{
+    body = 1;
+    shieldPoints = 0;
+    const HaloActorDef *actor = haloactordef(variant);
+    // A start with no kind takes its variant's, as haloscenariospawnenemy does.
+    if(actor && kind < 0) kind = actor->kind;
+    if(kind < 0 || kind >= ACTOR_COUNT) return;
+    if(!actor) actor = haloactordefault(kind, -1);
+    variantVitality(ActorKind(kind), actor, body, shieldPoints);
 }
 
 // Refills health, shield and grenades (ai_renew).
@@ -2847,7 +3019,11 @@ void haloupdate(int elapsed)
     {
         HaloEnemy &enemy = enemies[i];
         if(enemy.shieldMax > 0 && enemy.bot && enemy.bot->state == CS_ALIVE)
-            shieldTick(enemy.shield, enemy.shieldMax, enemy.hitTime, eliteDelay, rechargeTime(eliteRecharge, haloactorteam(enemy.bot)), elapsed);
+        {
+            int delay, recharge;
+            enemyShieldTiming(enemy, delay, recharge);
+            if(recharge > 0) shieldTick(enemy.shield, enemy.shieldMax, enemy.hitTime, delay, rechargeTime(recharge, haloactorteam(enemy.bot)), elapsed);
+        }
     }
     if(retailCartographer()) return;
     switch(stage)
@@ -2882,6 +3058,10 @@ VAR(halo_damagetrace, 0, 0, 1);
 // the kill from behind off. halo_damagetrace 1 logs each one:
 // DAMAGE_UNSUSPECTING target=<name> kind=<ActorKind> status=<ai_status> facing=<cosine> amount=<dealt>
 VAR(halo_meleeunsuspecting, 0, 1, 1);
+// An actor unit's body destroyed effect (actors.txt `destroyed`: the carrier's blast, a Sentinel's
+// death explosion) deals its jpt! damage where the unit dies (setOffUnitBlast); 0 only draws and
+// plays it. halo_damagetrace 1 logs UNIT_BLAST variant=<actv> effect=<effe> dealt=<0|1> owner=<name|->.
+VAR(halo_unitblast, 0, 1, 1);
 
 void halopendinghit(const playerent *target, float damage, int sideEffect, const HaloDamage *source, const vec *at)
 {
@@ -2934,23 +3114,63 @@ namespace
         return clamp((hit->at.z - feet) / height, 0.0f, 1.0f);
     }
 
+    // A hand-held shield material: not head-flagged, no body damage, a shield that takes the hit and
+    // a leak under 1 (the Jackal's `shield`: type 16, leak 0, shield multiplier 1, body multiplier 0).
+    bool handShield(const HaloActorDef::Material &m) { return !(m.flags & 1) && m.body <= 0 && m.shield > 0 && m.leak >= 0 && m.leak < 1; }
+
+    // The coll material a hit on an actor without a special body lands on, for the shield step (its
+    // leak and shield multiplier) and the general material model; null without the variant's leaks
+    // and `resistance` line (an older actors.txt: the old model). Halo takes the struck material of a
+    // direct hit and the coll's indirect damage material for anything else (../Halo3DS
+    // objects/damage.c:1614-1635). The engine has no coll regions, so:
+    //   a blast (GUN_GRENADE), a hit with no attacker (the scripts': ai_kill's dodamage names the
+    //   player but runs in an ownerless scope) or the actor's own takes the
+    //   indirect damage material (none, -1: null, as Halo's default material is not set in the port);
+    //   a direct hit from within 60 degrees of where the actor faces, below the top fifth of its body,
+    //   lands on a hand-held shield material while the shield holds (the Hunter shield arm's rule;
+    //   once the shield is down its region's permutation is swapped out, object_deplete_shield,
+    //   damage.c:636-658, so it falls to the body); else the head-flagged material in the top fifth, else the first other material.
+    const HaloActorDef::Material *hitMaterial(const HaloEnemy &enemy, const playerent *target, const playerent *attacker, int gun,
+                                              const PendingHit *hit)
+    {
+        const HaloActorDef *def = haloactorvariant(target);
+        if(!def || !def->hasLeaks()) return NULL;
+        if(gun == GUN_GRENADE || !attacker || attacker == target || haloactorownerlessdamage())
+            return def->indirectMaterial >= 0 && def->indirectMaterial < int(def->materials.size()) ? &def->materials[def->indirectMaterial] : NULL;
+        const bool head = hitHeight(target, hit) >= .8f;
+        if(!head && enemy.shield > 0)
+        {
+            vec delta = vec(attacker->o).sub(target->o);
+            delta.z = 0;
+            const float yaw = target->yaw * RAD;
+            if(!delta.iszero() && delta.normalize().dot(vec(sinf(yaw), -cosf(yaw), 0)) > cosf(60 * RAD))
+                for(const HaloActorDef::Material &m : def->materials) if(handShield(m)) return &m;
+        }
+        for(const HaloActorDef::Material &m : def->materials) if(((m.flags & 1) != 0) == head) return &m;
+        return &def->materials[0];
+    }
+
     // The retail material model for an actor that has no special body (halo_actormaterials 1): the
-    // hit material is the variant's head-flagged material for a hit at head height (the top fifth),
-    // else its first other material; the hit takes that material's body multiplier times the jpt!
-    // damage's modifier for its type. An Elite's energy shield takes the modifier for the elite
-    // energy shield (30) in `shieldScale` (in place of the assault rifle's 0.7). Without the
-    // weapon's `materials` line or the variant's `material` lines nothing changes.
+    // hit material is `chosen` (hitMaterial) or, without it, the variant's head-flagged material for
+    // a hit at head height (the top fifth), else its first other material; the hit takes that
+    // material's body multiplier times the jpt! damage's modifier for its type. The energy shield
+    // takes the modifier for the coll's shield material type (actors.txt `resistance`; the elite
+    // energy shield, 30, for an Elite without it) in `shieldScale` (in place of the assault rifle's
+    // 0.7). Without the weapon's `materials` line or the variant's `material` lines nothing changes.
     float generalMaterial(const HaloEnemy &enemy, const playerent *target, const HaloDamage *source, const PendingHit *hit,
-                          int &region, float &shieldScale)
+                          int &region, float &shieldScale, const HaloActorDef::Material *chosen)
     {
         region = -1;
         const HaloActorDef *def = haloactorvariant(target);
         if(!halo_actormaterials || !source || !source->hasMaterials || !def || def->materials.empty()) return 1;
-        if(enemy.kind == ELITE) shieldScale = source->material(30);
-        const bool head = hitHeight(target, hit) >= .8f;
-        const HaloActorDef::Material *chosen = NULL;
-        for(const HaloActorDef::Material &m : def->materials) if(((m.flags & 1) != 0) == head) { chosen = &m; break; }
-        if(!chosen) chosen = &def->materials[0];
+        if(def->hasResistance && def->shieldMaterial >= 0) shieldScale = source->material(def->shieldMaterial);
+        else if(enemy.kind == ELITE) shieldScale = source->material(30);
+        if(!chosen)
+        {
+            const bool head = hitHeight(target, hit) >= .8f;
+            for(const HaloActorDef::Material &m : def->materials) if(((m.flags & 1) != 0) == head) { chosen = &m; break; }
+            if(!chosen) chosen = &def->materials[0];
+        }
         region = chosen->type;
         return max(chosen->body, 0.0f) * source->material(chosen->type);
     }
@@ -2973,12 +3193,19 @@ namespace
     //   Sentinel, Monitor and Engineer have one material each (sentinel, monitor, engineer skin);
     //   the Monitor's body multiplier is 0, so nothing hurts it.
     // `region` returns the material type used (-1: none applies); `shieldScale` multiplies what an
-    // energy shield takes of the hit (generalMaterial).
+    // energy shield takes of the hit (generalMaterial; -1: the weapon's usual, the assault rifle's
+    // 0.7 and 1 for the rest); `hitAt` the coll material of a body without a special one (hitMaterial,
+    // null: none known). A hand-held shield always takes the jpt! modifier for the coll's shield
+    // material type (damage.c:898-899: the jackal energy shield, 16, is 0 for the assault rifle,
+    // pistol, shotgun and sniper rifle and 1 for the plasma weapons), with or without the general
+    // model, which batch 9 left off for the energy shields.
     float materialScale(const HaloEnemy &enemy, const playerent *target, const playerent *attacker, int gun,
-                        const HaloDamage *source, int &region, const PendingHit *hit, float &shieldScale)
+                        const HaloDamage *source, int &region, const PendingHit *hit, float &shieldScale,
+                        const HaloActorDef::Material *&hitAt)
     {
         region = -1;
-        shieldScale = 1;
+        shieldScale = -1;
+        hitAt = NULL;
         switch(enemy.kind)
         {
             case HUNTER:
@@ -3002,7 +3229,15 @@ namespace
             case SENTINEL: region = HALO_MATERIAL_SENTINEL; break;
             case MONITOR: region = HALO_MATERIAL_MONITOR; break;
             case ENGINEER: region = HALO_MATERIAL_ENGINEER_SKIN; break;
-            default: return generalMaterial(enemy, target, source, hit, region, shieldScale);
+            default:
+            {
+                hitAt = hitMaterial(enemy, target, attacker, gun, hit);
+                const float scale = generalMaterial(enemy, target, source, hit, region, shieldScale, hitAt);
+                const HaloActorDef *def = haloactorvariant(target);
+                if(hitAt && handShield(*hitAt) && source && source->hasMaterials && def && def->shieldMaterial >= 0)
+                    shieldScale = source->material(def->shieldMaterial);
+                return scale;
+            }
         }
         const HaloActorDef *def = haloactorvariant(target);
         float body = def ? def->bodyMultiplier(region) : -1;
@@ -3134,8 +3369,9 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     // (The actor's maximum vitality took its team's difficulty scale at spawn, spawnEnemy.)
     int region = -1;
     float shieldScale = 1;
+    const HaloActorDef::Material *hitAt = NULL;
     const float material = materialScale(*enemy, target, attacker, gun, exact ? pendingSource : NULL, region,
-                                         exact ? &pendingAt : NULL, shieldScale);
+                                         exact ? &pendingAt : NULL, shieldScale, hitAt);
     // The general material model's body multiplier (generalMaterial) is for the body: an energy
     // shield takes the hit at its own modifier (shieldScale), and only what passes it is scaled by
     // the body's. The special bodies (no shields) take theirs on the whole hit.
@@ -3147,6 +3383,9 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
         else bodyScale = material;
         if(halo_damagetrace) conoutf("DAMAGE_MATERIAL target=%s kind=%d material=%d scale=%.3f", target->name, int(enemy->kind), region, material);
     }
+    // A material with no body damage (a hand-held shield: body multiplier 0) passes nothing to the
+    // body, the shield's excess on the hit that breaks it included (damage.c:1129).
+    if(hitAt && hitAt->body <= 0) bodyScale = 0;
     // Lethal to the unsuspecting (side effect 2, every campaign weapon's melee): the player's melee
     // on an actor from behind (beyond 120 degrees of where it faces) that is not fighting the player
     // (not in combat, or fighting someone else) takes the actor's whole shield and health, whatever
@@ -3194,12 +3433,46 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     }
     if(enemy->shieldMax > 0)
     {
-        enemy->hitTime = lastmillis;
         // The assault rifle's 0.7 on shields is its jpt! modifier for the elite energy shield; with
         // the general material model the shield takes the weapon's own modifier (generalMaterial).
-        const float modifier = shieldScale != 1 ? shieldScale : gun == GUN_ASSAULT ? 0.7f : 1.0f;
+        float modifier = shieldScale >= 0 ? shieldScale : gun == GUN_ASSAULT ? 0.7f : 1.0f;
+        // The struck material's leak (actors.txt `material` fifth field; hitMaterial): Halo's shield
+        // takes (1 - shield_leak_fraction) of the hit (damage.c:842-843), less below the coll's
+        // failure threshold, (1 - maximum failure) x f(shield / threshold) + maximum failure
+        // (844-857; f is the failure function, linear for every retail unit with a threshold: the
+        // marines' 1.0 and 0.2; the engine evaluates every function as linear), at the material's
+        // shield multiplier (890-891). The rest passes to the body untouched: a Jackal's body takes
+        // a hit off its hand-held shield whole (leak 1), a marine's 20% or more of every hit.
+        // Without the leaks (an older actors.txt) the shield takes the whole hit, as before.
+        float leaked = 0, shieldPart = enemy->shield > 0 ? amount : 0;
+        const HaloActorDef *variant = haloactorvariant(target);
+        if(hitAt && enemy->shield > 0)
+        {
+            float share = 1 - hitAt->leak;
+            const float threshold = variant ? variant->shieldFailureThreshold : 0;
+            if(threshold > 0)
+            {
+                const float fraction = enemy->shield / enemy->shieldMax;
+                if(fraction <= threshold)
+                {
+                    const float failure = clamp(variant->shieldFailureMaximum, 0.0f, 1.0f);
+                    share *= (1 - failure) * clamp(fraction / threshold, 0.0f, 1.0f) + failure;
+                }
+            }
+            share = clamp(share, 0.0f, 1.0f);
+            shieldPart = amount * share;
+            leaked = amount - shieldPart;
+            amount = shieldPart;
+            modifier *= max(hitAt->shield, 0.0f);
+        }
+        // halo_damagetrace 1: DAMAGE_SHIELD target= kind= material=<index in the coll> type= leak= share=<of the
+        // hit the shield step took, 0 with the shield down> shield_part= passed= modifier=
+        if(hitAt && variant && halo_damagetrace)
+            conoutf("DAMAGE_SHIELD target=%s kind=%d material=%d type=%d leak=%.3f share=%.3f shield_part=%.3f passed=%.3f modifier=%.3f",
+                    target->name, int(enemy->kind), int(hitAt - variant->materials.data()), hitAt->type, hitAt->leak,
+                    shieldPart + leaked > 0 ? shieldPart / (shieldPart + leaked) : 0.0f, shieldPart, leaked, modifier);
         const float absorbed = modifier > 0 ? min(enemy->shield, amount * modifier) : 0;
-        if(absorbed > 0 || (emp && enemy->shield > 0) || (modifier <= 0 && enemy->shield > 0))
+        if((amount > 0 && enemy->shield > 0 && (absorbed > 0 || modifier <= 0)) || (emp && enemy->shield > 0))
         {
             enemy->shield -= absorbed;
             // A modifier of 0 (a weapon the shield is immune to): the shield stops the hit whole.
@@ -3208,9 +3481,15 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
             particle_splash(PART_PLASMA, emp ? 12 : 6, 220, target->o);
             // What passes a shield is divided once more on the owner's own side: Halo's shield
             // step divides by enemy_damage (damage.c:881-887) and passes the excess on to the
-            // body step, which divides it again (1159-1165).
+            // body step, which divides it again (1159-1165). The leaked part is divided once, in
+            // the body step, as here (difficultyFactor).
             if(difficultyDivisor != 1 && absorbed > 0 && amount > 0) amount /= difficultyDivisor;
         }
+        amount += leaked;
+        // The shield stun (damage.c:978-982): a hit whose shield damage (after the leak) reaches the
+        // coll's minimum stun damage, or one that leaves the shield empty, restarts the stun; every
+        // retail unit's minimum is 0, so every hit does, as before (also a hit on a Jackal's body).
+        if(!variant || !variant->hasShieldTime || shieldPart >= variant->shieldStunDamage || enemy->shield <= 0) enemy->hitTime = lastmillis;
     }
     amount *= bodyScale;
     if(unsuspecting) amount = max(amount, float(max(target->health, 0)) + 1);
@@ -4132,19 +4411,44 @@ void halokilled(playerent *victim, playerent *killer)
     // (characters\floodcarrier\floodcarrier, bipd +588/+604/+606/+608) releases 3 to 6 infection
     // forms at 3.0. Without actors.txt's spawn line (an older table) a carrier keeps the engine's
     // earlier burst: 4 to 8 infection forms of the kind's default variant, unthrown.
+    // Its body destroyed effect (actors.txt `destroyed`: the carrier's blast, a Sentinel's death
+    // explosion), set off where it died before anything it releases (unit_destroy: object_destroy
+    // creates the effect, ../Halo3DS objects/damage.c:606-632, then unit_test_spawning, units/units.c:
+    // 2711-2716). Queued, as the pops are: the dying unit still counts as alive here. Halo destroys
+    // the unit at the end of its dying (units.c:6679, 10043), a little after the death; the engine
+    // sets it off on the next frame (judgement call, as for the burst).
+    const bool blasts = variant && !variant->destroyedEffect.empty() && unitBlasts.length() < 64;
+    if(blasts) unitBlasts.add(UnitBlast{vec(victim->o).sub(vec(0, 0, victim->eyeheight * 0.5f)), variant, victim});
     const HaloActorDef *spawned = variant && variant->spawnVariant >= 0 ? haloactordef(variant->spawnVariant) : nullptr;
     if(spawned && spawned->kind >= 0 && spawned->kind < ACTOR_COUNT)
     {
         const int count = variant->spawnLower + rnd(variant->spawnUpper - variant->spawnLower + 1);
+        // The released actors join the dying unit's encounter and squad (actors.c:2855-2872, 2921-2931).
+        // Halo releases none from a unit with neither (2874); a carrier outside every squad here (the
+        // stock wave sections, qa_actor_spawn) still bursts into squadless forms (judgement call:
+        // the engine's Flood cycle there has no squads at all).
+        int encounter = -1, squad = -1;
+        haloscenariosquadof(victim, encounter, squad);
         if(count > 0)
-            floodSpawns.add(FloodSpawn{feet, victim->yaw, ActorKind(spawned->kind), count, lastmillis, spawned->index,
-                                       enemy->team, max(0.0f, variant->spawnVelocity) / 30.0f});
-        // FLOOD_SPAWN <dead unit> variant=<index> lower=<n> upper=<n> count=<n> velocity=<world units a second>
+        {
+            FloodSpawn spawn{feet, victim->yaw, ActorKind(spawned->kind), count, blasts ? lastmillis + 1 : lastmillis, spawned->index,
+                             enemy->team, max(0.0f, variant->spawnVelocity) / 30.0f};
+            spawn.encounter = encounter;
+            spawn.squad = squad;
+            floodSpawns.add(spawn);
+        }
+        // FLOOD_SPAWN <dead unit> variant=<index> lower=<n> upper=<n> count=<n> velocity=<world units a second> squad=<e>/<s>
         if(halo_damagetrace)
-            conoutf("FLOOD_SPAWN %s variant=%d lower=%d upper=%d count=%d velocity=%.3f", victim->name, spawned->index,
-                    variant->spawnLower, variant->spawnUpper, count, variant->spawnVelocity);
+            conoutf("FLOOD_SPAWN %s variant=%d lower=%d upper=%d count=%d velocity=%.3f squad=%d/%d", victim->name, spawned->index,
+                    variant->spawnLower, variant->spawnUpper, count, variant->spawnVelocity, encounter, squad);
     }
-    else if(enemy->kind == CARRIER) floodSpawns.add(FloodSpawn{feet, victim->yaw, INFECTION, 4 + rnd(5), lastmillis});
+    else if(enemy->kind == CARRIER)
+    {
+        // The older table's burst joins the carrier's squad too.
+        FloodSpawn spawn{feet, victim->yaw, INFECTION, 4 + rnd(5), lastmillis};
+        haloscenariosquadof(victim, spawn.encounter, spawn.squad);
+        floodSpawns.add(spawn);
+    }
     else if((enemy->kind == MARINE || enemy->kind == ELITE) && corpses.length() < 32)
         corpses.add(Corpse{feet, victim->yaw, enemy->kind, lastmillis + corpseLife});
     // unit_doesnt_drop_items leaves nothing behind. Actors drop the grenades they still

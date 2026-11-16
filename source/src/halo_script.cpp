@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <functional>
 #include <cmath>
+#include <deque>
+#include <map>
 #include <memory>
 #include <random>
 #include <set>
@@ -20,6 +22,7 @@
 #include <vector>
 
 VARP(halo_scripttrace, 0, 0, 1);
+extern int halo_damagetrace;     // halo.cpp: the Flood traces (FLOOD_ADOPT)
 // 0 Easy, 1 Normal, 2 Hard, 3 Impossible. Read when a section starts or restarts.
 VARP(halo_difficulty, 0, 1, 3);
 // A seat the script holds the player in (Scenario::seatPlayer): 0 leaves unit_enter_vehicle of the
@@ -588,9 +591,25 @@ namespace
         // or a Continue brings it back with them (a50's game_lost_script reads Keyes's health),
         // wherever it comes back.
         float health = 1, shield = 1;
+        // The maximum body and shield vitality a script set on it (unit_set_maximum_vitality,
+        // Halo's points; -1: the variant's own), put back before the fractions above.
+        float maxBody = -1, maxShield = -1;
         // Placed as its start variant's major upgrade (Scenario::chooseMajor): a revert or a
         // Continue respawns it as the same variant instead of choosing again.
         bool major = false;
+        // Released by a dying unit of the squad (a carrier's infection forms; Scenario::adoptSpawned,
+        // ../Halo3DS ai/actors.c:2855-2872 and 2921-2931): its actors.txt variant, -1 for a placed or
+        // attached member. Its start is its own (Scenario::spawnedStarts: that variant where it
+        // appeared, alert), which only a revert's fallback uses; ai_teleport_to_starting_location
+        // passes it over. Saved as the `s spawned` record.
+        int spawned = -1;
+        // The Halo swarm actor this member's body belongs to (Scenario::assignSwarm), -1 for one
+        // that is not a swarm actor's (every variant but the infection forms'). Halo keeps up to 16
+        // living bodies of one variant and squad in one swarm actor (ai/actors.c:2539-2555), which
+        // counts once in the squad's original count (encounter_attach_actor, ai/encounters.c:
+        // 2124-2125) while each living body counts in its current count (encounters.c:964-990):
+        // ai_living_fraction and ai_strength follow that (Scenario::countSquad).
+        int swarm = -1;
     };
 
     // An actor ai_attach made of a scripted object, alive when the player walked on into the next
@@ -602,6 +621,8 @@ namespace
         int object = -1, encounter = -1, squad = -1;
         SquadStart start{};
         float health = 1, shield = 1;
+        // A script-set maximum vitality (SquadBot::maxBody; -1 the variant's own).
+        float maxBody = -1, maxShield = -1;
         bool suspended = false;
         int scriptFlags = 0, retry = 0;
         // Why the last try placed no actor (spawnCarried logs it when it changes): 0 none yet,
@@ -702,6 +723,10 @@ namespace
         // block's `s attaching` record carries the waiting ones through a Continue.
         std::vector<SquadStart> objectStarts;
         std::vector<int> attachedAt, attachRetry, savedAttachedAt;
+        // The starts of the members dying units released (SquadBot::spawned): a deque, so that the
+        // squad entries and their checkpoint copies can point into it while it grows. Cleared with
+        // the squad lists when a section starts.
+        std::deque<SquadStart> spawnedStarts;
         // Attached actors carried in from the section before that have no actor here yet
         // (spawnCarried); savedCarried is the list at the checkpoint (the carried-in section's
         // checkpoint is usually taken before they spawn), restored by a revert.
@@ -710,10 +735,12 @@ namespace
         // walk into the next section carries. Kept as plain data, since the actors themselves are
         // gone (kickallbots) by the time the next section's script starts.
         std::vector<CarriedAttach> carryCandidates;
-        // Unit commands a script gave an attached object before its actor existed
-        // (unit_set_current_vitality: c10's marine_suicidal right after its ai_attach): the health
-        // and shield fractions, applied when the actor spawns (attachActors). Kept with the checkpoint.
-        struct QueuedVitality { float health, shield; };
+        // Unit commands a script gave an attached object before its actor existed (c10's
+        // marine_suicidal: unit_set_maximum_vitality 1 0, then unit_set_current_vitality 1 0, right
+        // after its ai_attach): the maximum and the current vitality, in Halo's points, applied in
+        // that order when the actor spawns (attachActors). A maximum set later drops a current
+        // queued before it (it refills to full). Kept with the checkpoint.
+        struct QueuedVitality { bool current = false, maximum = false; float health = 1, shield = 0, maxBody = 0, maxShield = 0; };
         std::unordered_map<int, QueuedVitality> attachVitality, savedAttachVitality;
         // A Call scene's gameplay music (gap 12): the looping sounds playing when it started,
         // restarted when it ends unless the scene stopped them.
@@ -840,6 +867,14 @@ namespace
         size_t livingBots() const;
         void eraseSquads(int reference, bool erase);
         int living(int reference, bool carried = false) const;
+        // A dying unit's released actor joins its squad (haloscenarioadopt); swarm membership and
+        // Halo's per-actor counts (SquadBot::swarm).
+        void adoptSpawned(playerent *bot, int encounter, int squad, int variant);
+        bool swarmMember(const SquadBot &bot) const;
+        void assignSwarm(size_t entry);
+        void countSquad(int reference, bool carried, int &actors, int &alive, float &strength, int *nonswarm = nullptr) const;
+        // ai_erase deletes this living member at once instead of killing it (no pop, no burst, no blast).
+        bool erasedWithoutDeath(const playerent *bot) const;
         void migrateCarried(CarriedAttach &c, int newGroup);
         void restoreSquads();
         // Where a living squad member stands and its vitality, onto its checkpoint copy (noteStood),
@@ -2351,7 +2386,9 @@ namespace
                 for(SquadBot &bot : squadBots)
                 {
                     if(!bot.bot || bot.bot->state != CS_ALIVE) continue;
-                    if(monitorBody(bot.bot)) haloerasebot(bot.bot);
+                    // The Monitor, and the Flood bodies whose death sets something off (an infection
+                    // form's pop, a carrier's blast and burst), go at once (erasedWithoutDeath).
+                    if(monitorBody(bot.bot) || erasedWithoutDeath(bot.bot)) haloerasebot(bot.bot);
                     else dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
                 }
                 haloclearflood();
@@ -2362,30 +2399,25 @@ namespace
         if(is("ai_actors")) return result(actorListFor(index(0)));
         if(is("ai_nonswarm_count"))
         {
-            // Infection forms swarm and are left out of this count.
-            int count = 0;
-            eachActor(index(0), [&](SquadBot &bot, int) { if(bot.start->actor != 6) ++count; });
-            return result(count);
+            // The living bodies that are not swarm actors' (current_count - current_swarm_count,
+            // ../Halo3DS ai/ai_script.c:4717-4718): the infection forms, placed or released by a
+            // carrier, are left out of this count.
+            int actors = 0, alive = 0, nonswarm = 0;
+            float strength = 0;
+            countSquad(index(0), !scene, actors, alive, strength, &nonswarm);
+            return result(nonswarm);
         }
         if(is("ai_living_fraction") || is("ai_strength"))
         {
-            int total = 0, alive = 0;
+            // Halo's: the living bodies over the original count (ai_script.c:2066-2080 with
+            // 4711-4725), the strength summed per actor over it (encounters.c:964-990, 1071-1091).
+            // Infection forms count each living body but once per swarm actor (SquadBot::swarm), so a
+            // swarm squad's fraction can pass 1, as in Halo.
+            int actors = 0, alive = 0;
             float strength = 0;
-            for(const SquadBot &bot : squadBots)
-            {
-                if(!matchesSquad(index(0), bot.encounter, bot.squad)) continue;
-                ++total;
-                if(!bot.bot || bot.bot->state != CS_ALIVE) continue;
-                ++alive;
-                strength += haloactorhealthfraction(bot.bot);
-            }
-            // Attached actors carried in that have not spawned yet stand for living members with
-            // the health they will spawn with (the fresh-start batch).
-            if(!scene)
-                for(const CarriedAttach &c : carriedAttached)
-                    if(matchesSquad(index(0), c.encounter, c.squad)) { ++total; ++alive; strength += c.health; }
-            if(is("ai_living_fraction")) return result(total ? float(alive) / total : 0.0f);
-            return result(total ? strength / total : 0.0f);
+            countSquad(index(0), !scene, actors, alive, strength);
+            if(is("ai_living_fraction")) return result(actors ? float(alive) / actors : 0.0f);
+            return result(actors ? strength / actors : 0.0f);
         }
         if(is("ai_status"))
         {
@@ -3122,6 +3154,37 @@ namespace
         return false;
     }
 
+    // A unit the scripts set to no body vitality (object_deplete_body, ../Halo3DS
+    // units/unit_scripting_commands.c:127-128) dies with no owner, as ai_kill's do (eraseSquads),
+    // whatever protects it (Halo's depletion does not ask object_cannot_take_damage). The death is
+    // dealt directly (dokill), not as a hit: halodamage would let object_cannot_take_damage,
+    // unit_impervious or a Jackal's hand-held shield stop it. The Monitor is spared, as by ai_kill.
+    void depleteBody(playerent *bot)
+    {
+        if(!bot || bot->state != CS_ALIVE || monitorBody(bot)) return;
+        HaloScriptDamage scripted(true);
+        bot->health = 0;
+        dokill(bot, player1, false, GUN_ASSAULT);
+    }
+
+    // A respawned actor's vitality as it was (a revert, a Continue, a walk into the next section):
+    // the maximum a script had set (maxBody >= 0; unit_set_maximum_vitality refills to full), then
+    // its health and shield fractions of the maxima.
+    void restoreVitality(playerent *bot, float maxBody, float maxShield, float health, float shield)
+    {
+        if(maxBody >= 0) haloenemysetmaximumvitality(bot, maxBody, max(maxShield, 0.0f));
+        if(health < 1) haloactorsethealthfraction(bot, health);
+        if(shield < 1) haloenemysetshield(bot, shield);
+    }
+
+    // The checkpoint's or carry's copy of a script-set maximum (-1 when the variant's own).
+    void noteMaximum(const playerent *bot, float &maxBody, float &maxShield)
+    {
+        maxBody = maxShield = -1;
+        float body, shield;
+        if(bot && haloenemyscriptmaximum(bot, body, shield)) { maxBody = body; maxShield = shield; }
+    }
+
 #include "halo_script_ai.inc"
 
     bool Scenario::matchesSquad(int reference, int encounter, int squad) const
@@ -3243,6 +3306,8 @@ namespace
                 {
                     squadBots.push_back({&start, bot, id, int(i)});
                     squadBots.back().major = major;
+                    // An infection form joins its squad's newest swarm actor with room (assignSwarm).
+                    assignSwarm(squadBots.size() - 1);
                     configureActor(bot, id, int(i), start);
                     ++count;
                     if(major) ++majors;
@@ -3303,16 +3368,14 @@ namespace
             const Encounter &encounter = program.encounters[e];
             for(size_t pl = 0; pl < encounter.platoons.size(); ++pl)
             {
+                // The platoon's original and current counts as Halo keeps them (countSquad: a swarm
+                // actor's bodies count once in the total, each living one in the living; a carrier's
+                // released forms are members, ../Halo3DS ai/encounters.c:3095-3115).
                 auto strength = [&](int platoon, int &total, int &living)
                 {
-                    total = living = 0;
-                    for(const SquadBot &bot : squadBots)
-                    {
-                        const Squad *squad = bot.encounter == int(e) ? at(encounter.squads, bot.squad) : nullptr;
-                        if(!squad || squad->platoon != platoon) continue;
-                        ++total;
-                        if(bot.bot && bot.bot->state == CS_ALIVE) ++living;
-                    }
+                    float unused = 0;
+                    const int reference = int((1u << 30) | (uint32_t(platoon & 0xff) << 16) | uint32_t(e & 0xffff));
+                    countSquad(reference, false, total, living, unused);
                 };
                 auto satisfied = [&](int rule, int platoon)
                 {
@@ -3510,15 +3573,18 @@ namespace
             // (object_cannot_take_damage, kept on the object) and its vitality (queued).
             if(a.cannotTakeDamage) setUnitFlag(bot, HALO_AI_NO_DAMAGE, true);
             const auto queued = attachVitality.find(int(i));
+            bool depleted = false;
             if(queued != attachVitality.end())
             {
-                haloactorsethealthfraction(bot, queued->second.health);
-                haloenemysetshield(bot, queued->second.shield);
-                if(halo_scripttrace) conoutf("HaloScript: %s takes the vitality queued for it (%.2f, %.2f)", o.name.c_str(),
-                                             queued->second.health, queued->second.shield);
+                const QueuedVitality q = queued->second;
                 attachVitality.erase(queued);
+                if(q.maximum) haloenemysetmaximumvitality(bot, q.maxBody, q.maxShield);
+                if(q.current) depleted = haloenemysetvitality(bot, q.health, q.shield);
+                if(halo_scripttrace) conoutf("HaloScript: %s takes the vitality queued for it (health %.2f, shield %.2f)", o.name.c_str(),
+                                             haloactorhealthfraction(bot), haloenemyshieldfraction(bot));
             }
             conoutf("HaloScript: %s attached to %s/%s is an actor now", o.name.c_str(), encounter->name.c_str(), member->name.c_str());
+            if(depleted) depleteBody(bot);
         }
     }
 
@@ -3596,6 +3662,8 @@ namespace
             entry.scriptFlags = c.scriptFlags;
             configureActor(bot, c.encounter, c.squad, start);
             for(int bit = 1; bit <= HALO_AI_NO_MANEUVER; bit <<= 1) if(c.scriptFlags & bit) haloactorsetflag(bot, bit, true);
+            // A script-set maximum first, then the fractions it had (restoreVitality).
+            if(c.maxBody >= 0) haloenemysetmaximumvitality(bot, c.maxBody, max(c.maxShield, 0.0f));
             haloactorsethealthfraction(bot, c.health);
             haloenemysetshield(bot, c.shield);
             haloactorfollow(bot, player1);
@@ -3621,6 +3689,7 @@ namespace
             c.start = *bot.start;
             c.health = haloactorhealthfraction(bot.bot);
             c.shield = haloenemyshieldfraction(bot.bot);
+            noteMaximum(bot.bot, c.maxBody, c.maxShield);
             c.suspended = bot.suspended;
             c.scriptFlags = bot.scriptFlags;
             carryCandidates.push_back(c);
@@ -3721,8 +3790,135 @@ namespace
                 if(erase) haloerasebot(bot.bot);
                 continue;
             }
+            if(erase && erasedWithoutDeath(bot.bot))
+            {
+                if(halo_scripttrace) conoutf("HaloScript: ai_erase deletes %s", bot.bot->name);
+                haloerasebot(bot.bot);
+                continue;
+            }
             dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
         }
+    }
+
+    // Halo's ai_erase deletes the actors' units (actor_erase, ../Halo3DS ai/actors.c:3845-3886:
+    // object_delete, which neither destroys the object nor sets off its body destroyed effect, and
+    // a swarm's units with it), where ai_kill kills them (actor_kill). The engine still lets most
+    // erased actors fall where they stand (unchanged), but deletes those whose death would set
+    // something off that Halo's erase never does: an infection form's pop, a carrier's blast and its
+    // burst of forms, a Sentinel's death explosion (actors.txt `pop`, `spawn` and `destroyed`).
+    bool Scenario::erasedWithoutDeath(const playerent *bot) const
+    {
+        const HaloActorDef *v = haloactorvariant(bot);
+        return v && (v->pops() || v->spawnVariant >= 0 || !v->destroyedEffect.empty());
+    }
+
+    bool Scenario::swarmMember(const SquadBot &bot) const
+    {
+        if(bot.swarm >= 0) return true;
+        const HaloActorDef *v = bot.bot ? haloactorvariant(bot.bot) : nullptr;
+        if(!v && bot.start) v = haloactordef(bot.spawned >= 0 ? bot.spawned : bot.start->variant);
+        // Without actors.txt the infection forms' body (kind 6) stands for the swarm flag.
+        return v ? v->swarm() : bot.start && bot.start->actor == 6;
+    }
+
+    // Halo's swarm actors (actor_create_for_unit, ../Halo3DS ai/actors.c:2539-2555): a new swarm
+    // body joins the encounter's first swarm actor of its variant in its squad that has fewer than
+    // 16 living bodies (MAXIMUM_UNIT_INDICES_PER_SWARM, actors.h:261; actors_spawn_from_unit and
+    // actor_place both pass allow_addition_to_other_squads FALSE, actors.c:2796-2802, 2921-2927),
+    // else it starts a new one. A swarm actor whose bodies have all died is gone (actor_swarm_unit_died,
+    // actors.c:3412-3422), so nobody joins it. squadBots[entry] gets that actor's id (SquadBot::swarm).
+    void Scenario::assignSwarm(size_t entry)
+    {
+        if(entry >= squadBots.size()) return;
+        SquadBot &self = squadBots[entry];
+        if(self.swarm >= 0 || !self.bot || !swarmMember(self)) return;
+        const HaloActorDef *variant = haloactorvariant(self.bot);
+        std::map<int, int> livingBodies;
+        int next = 0;
+        for(size_t i = 0; i < squadBots.size(); ++i)
+        {
+            const SquadBot &other = squadBots[i];
+            next = max(next, other.swarm + 1);
+            if(i == entry || other.swarm < 0 || other.encounter != self.encounter || other.squad != self.squad) continue;
+            if(!other.bot || other.bot->state != CS_ALIVE || haloactorvariant(other.bot) != variant) continue;
+            ++livingBodies[other.swarm];
+        }
+        // The first such actor in the encounter's list, which encounter_attach_actor heads with the
+        // newest (encounters.c:2077-2078): the highest id here.
+        for(auto it = livingBodies.rbegin(); it != livingBodies.rend(); ++it)
+            if(it->second < 16) { self.swarm = it->first; return; }
+        self.swarm = next;
+    }
+
+    // What Halo's encounter status counts for a script's ai reference (ai/encounters.c:925-990,
+    // 1071-1091; ai_script.c:4681-4800): `actors` is the original count (one per actor that joined
+    // and was not migrated away, dead or alive: every non-swarm entry, and one per swarm actor),
+    // `alive` the current count (living bodies), `strength` the summed strength (a living body's
+    // health, a swarm actor's living bodies over all it had) and `nonswarm` the living bodies that are
+    // not a swarm's. With `carried` the attached actors carried in that have not spawned yet stand
+    // for living members with the health they will spawn with (the fresh-start batch).
+    void Scenario::countSquad(int reference, bool carried, int &actors, int &alive, float &strength, int *nonswarm) const
+    {
+        actors = alive = 0;
+        strength = 0;
+        if(nonswarm) *nonswarm = 0;
+        std::map<int, std::pair<int, int>> swarms;   // id: bodies, living bodies
+        for(const SquadBot &bot : squadBots)
+        {
+            if(!matchesSquad(reference, bot.encounter, bot.squad)) continue;
+            const bool living = bot.bot && bot.bot->state == CS_ALIVE;
+            if(living) ++alive;
+            if(bot.swarm >= 0)
+            {
+                std::pair<int, int> &s = swarms[bot.swarm];
+                ++s.first;
+                if(living) ++s.second;
+                continue;
+            }
+            ++actors;
+            if(!living) continue;
+            // A body of a swarm variant without an id (none is expected) counts as a swarm's here too.
+            if(nonswarm && !swarmMember(bot)) ++*nonswarm;
+            strength += haloactorhealthfraction(bot.bot);
+        }
+        actors += int(swarms.size());
+        for(const auto &s : swarms) if(s.second.first > 0) strength += float(s.second.second) / s.second.first;
+        if(carried)
+            for(const CarriedAttach &c : carriedAttached)
+                if(matchesSquad(reference, c.encounter, c.squad))
+                {
+                    ++actors;
+                    ++alive;
+                    if(nonswarm) ++*nonswarm;
+                    strength += c.health;
+                }
+    }
+
+    // A dying unit's released actor (a carrier's infection form; halo.cpp spawnRing) joins its
+    // encounter and squad, as actors_spawn_from_unit does (../Halo3DS ai/actors.c:2855-2872,
+    // 2921-2931): alert (actor_default_state_alert, 2930), no command list, on the squad's combat
+    // positions and its platoon's posture (encounter_attach_actor, encounters.c:2128-2135).
+    void Scenario::adoptSpawned(playerent *bot, int encounter, int squad, int variant)
+    {
+        const Encounter *e = at(program.encounters, encounter);
+        if(!bot || !e || !at(e->squads, squad) || !projection) return;
+        const HaloActorDef *def = haloactorvariant(bot);
+        SquadStart start{};
+        start.actor = def && def->kind >= 0 ? def->kind : haloenemykind(bot);
+        start.variant = def ? def->index : variant;
+        start.point = fromWorld(*projection, vec(bot->o).sub(vec(0, 0, bot->eyeheight)));
+        start.yaw = (90 - bot->yaw) * RAD;
+        start.initial = 2;
+        spawnedStarts.push_back(start);
+        squadBots.push_back({&spawnedStarts.back(), bot, encounter, squad});
+        squadBots.back().spawned = start.variant;
+        assignSwarm(squadBots.size() - 1);
+        const int swarm = squadBots.back().swarm;
+        configureActor(bot, encounter, squad, spawnedStarts.back());
+        // FLOOD_ADOPT <name> squad=<encounter>/<squad> variant=<index> swarm=<id>
+        if(halo_damagetrace || halo_scripttrace)
+            conoutf("FLOOD_ADOPT %s squad=%s/%s variant=%d swarm=%d", bot->name, e->name.c_str(), e->squads[squad].name.c_str(),
+                    start.variant, swarm);
     }
 
     // Whether a squad member rides a vehicle: a seat of an engine vehicle (halovehicleinside) or a
@@ -3748,6 +3944,8 @@ namespace
         // keep it at full instead, as the restore always did before.
         copy.health = haloactorstarthealth(bot) > 0 ? haloactorhealthfraction(bot) : 1.0f;
         copy.shield = haloenemyshieldfraction(bot);
+        // And the maximum a script set on it (c10's marine_suicidal), which Halo's checkpoint keeps.
+        noteMaximum(bot, copy.maxBody, copy.maxShield);
         if(riding(bot)) return;
         const vec feet = fromWorld(*projection, vec(bot->o).sub(vec(0, 0, bot->eyeheight)));
         const float yaw = (90 - bot->yaw) * RAD;
@@ -3788,10 +3986,12 @@ namespace
         {
             // An attached object whose actor was dead at the checkpoint stays without one.
             if(saved.gone) { saved.bot = nullptr; squadBots.push_back(saved); continue; }
+            if(!saved.start) continue;
             const SquadStart &start = *saved.start;
             const Encounter *encounter = at(program.encounters, saved.encounter);
             const int team = encounter ? teamFor(*encounter, start) : HALO_TEAM_DEFAULT;
-            // As the variant it was placed as (a major stays a major; no new choice).
+            // As the variant it was placed as (a major stays a major; no new choice). A member a
+            // dying unit released (SquadBot::spawned) comes back as that variant: its own start's.
             int kind = start.actor;
             const int variant = startVariant(start, saved.major, kind);
             // Where it stood at the checkpoint when that spot passes the checks; otherwise, or for
@@ -3812,14 +4012,17 @@ namespace
             if(saved.bot)
             {
                 squadBots.push_back(saved);
+                // A swarm body keeps the swarm actor it was in at the checkpoint; one read from a
+                // saved game (no id there) joins one again as when it was placed (judgement call:
+                // the save keeps the bodies, not how Halo grouped them).
+                assignSwarm(squadBots.size() - 1);
                 configureActor(saved.bot, saved.encounter, saved.squad, start);
                 for(int bit = 1; bit <= HALO_AI_NO_MANEUVER; bit <<= 1)
                     if(saved.scriptFlags & bit) haloactorsetflag(saved.bot, bit, true);
                 // As hurt as it was at the checkpoint (a50's Keyes; every member since the
                 // stood-members change), wherever it came back. A record without the fractions
-                // leaves them at 1: full vitality, as before.
-                if(saved.health < 1) haloactorsethealthfraction(saved.bot, saved.health);
-                if(saved.shield < 1) haloenemysetshield(saved.bot, saved.shield);
+                // leaves them at 1: full vitality, as before. A script-set maximum comes back first.
+                restoreVitality(saved.bot, saved.maxBody, saved.maxShield, saved.health, saved.shield);
             }
         }
         if(restoreCounts[0] || restoreCounts[1])
@@ -3963,6 +4166,7 @@ namespace
                 conoutf("HaloScript: %s (%s) comes along into section %d, health %.2f", program.objects[c.object].name.c_str(),
                         program.encounters[c.encounter].name.c_str(), s + 1, c.health);
             squadBots.clear();
+            spawnedStarts.clear();
             // The upgrade errors and seed go on: in Halo the mission is one map, its BSP switches
             // do not reset them (only a new map does, ai.c:1929).
             if(upgrade.squads.size() != program.encounters.size()) resetUpgrade();
@@ -4008,6 +4212,7 @@ namespace
         savedActors.clear();
         savedSquadBots.clear();
         squadBots.clear();
+        spawnedStarts.clear();
         resetUpgrade();
         objectStarts.assign(program.objects.size(), SquadStart{});
         attachedAt.assign(program.objects.size(), -1);
@@ -4818,9 +5023,11 @@ void haloscenarioqasquads(const char *label)
         if(!sq) continue;
         const bool own = bot.start >= sq->starts.data() && bot.start < sq->starts.data() + sq->starts.size();
         const vec feet = vec(bot.bot->o).sub(vec(0, 0, bot.bot->eyeheight));
-        conoutf("SQUAD_STOOD %s %s/%s start=%d object=%d major=%d pos=%.2f,%.2f,%.2f health=%.3f shield=%.3f riding=%d", label,
-                e->name.c_str(), sq->name.c_str(), own ? int(bot.start - sq->starts.data()) : -1, bot.object, bot.major ? 1 : 0,
-                feet.x, feet.y, feet.z, haloactorhealthfraction(bot.bot), haloenemyshieldfraction(bot.bot), scenario.riding(bot.bot) ? 1 : 0);
+        // spawned: the variant a dying unit released it as (-1 placed or attached); swarm: its swarm actor (-1 none).
+        conoutf("SQUAD_STOOD %s %s/%s start=%d object=%d major=%d pos=%.2f,%.2f,%.2f health=%.3f shield=%.3f riding=%d spawned=%d swarm=%d",
+                label, e->name.c_str(), sq->name.c_str(), own ? int(bot.start - sq->starts.data()) : -1, bot.object, bot.major ? 1 : 0,
+                feet.x, feet.y, feet.z, haloactorhealthfraction(bot.bot), haloenemyshieldfraction(bot.bot), scenario.riding(bot.bot) ? 1 : 0,
+                bot.spawned, bot.swarm);
         ++living;
     }
     conoutf("SQUAD_STOOD_STATE %s living=%d stood=%d fallback=%d", label, living, scenario.restoreCounts[0], scenario.restoreCounts[1]);
@@ -5047,6 +5254,73 @@ void haloscenarioremovebot(const playerent *bot)
                                         [bot](const Scenario::Cargo &entry) { return entry.unit == bot; }), scenario.cargo.end());
 }
 
+bool haloscenariosquadof(const playerent *bot, int &encounter, int &squad)
+{
+    encounter = squad = -1;
+    if(!scenario.loaded || !bot) return false;
+    for(const SquadBot &member : scenario.squadBots)
+        if(member.bot == bot && member.encounter >= 0 && member.squad >= 0)
+        {
+            encounter = member.encounter;
+            squad = member.squad;
+            return true;
+        }
+    return false;
+}
+
+void haloscenarioadopt(playerent *bot, int encounter, int squad, int variant)
+{
+    if(scenario.loaded && !scenario.cue) scenario.adoptSpawned(bot, encounter, squad, variant);
+}
+
+void haloscenarioqacounts(const char *label, const char *encounter)
+{
+    if(!scenario.loaded) { conoutf("SQUAD_COUNT %s none", label); fflush(stdout); return; }
+    const Program &p = scenario.program;
+    const int e = named(p.encounters, encounter);
+    const Encounter *enc = at(p.encounters, e);
+    if(!enc) { conoutf("SQUAD_COUNT %s %s missing", label, encounter); fflush(stdout); return; }
+    for(size_t k = 0; k < enc->squads.size(); ++k)
+    {
+        int members = 0, living = 0, spawned = 0, spawnedLiving = 0;
+        std::set<int> swarms;
+        for(const SquadBot &bot : scenario.squadBots)
+        {
+            if(bot.encounter != e || bot.squad != int(k)) continue;
+            const bool alive = bot.bot && bot.bot->state == CS_ALIVE;
+            ++members;
+            living += alive;
+            if(bot.spawned >= 0) { ++spawned; spawnedLiving += alive; }
+            if(bot.swarm >= 0) swarms.insert(bot.swarm);
+        }
+        if(!members) continue;
+        // The squad's ai reference (kind 2 in bits 30 and 31, the squad in bits 16 to 23).
+        const int reference = int((2u << 30) | (uint32_t(k & 0xff) << 16) | uint32_t(e & 0xffff));
+        int actors = 0, alive = 0, nonswarm = 0;
+        float strength = 0;
+        scenario.countSquad(reference, true, actors, alive, strength, &nonswarm);
+        conoutf("SQUAD_COUNT %s %s/%s members=%d living=%d spawned=%d spawned_living=%d swarms=%d actors=%d fraction=%.4f "
+                "strength=%.4f nonswarm=%d", label, enc->name.c_str(), enc->squads[k].name.c_str(), members, living, spawned, spawnedLiving,
+                int(swarms.size()), actors, actors ? float(alive) / actors : 0.0f, actors ? strength / actors : 0.0f, nonswarm);
+    }
+    fflush(stdout);
+}
+
+bool haloscenarioqakillone(const char *name)
+{
+    if(!scenario.loaded) return false;
+    const int reference = haloscenarioencounter(name);
+    if(reference == -1) return false;
+    for(const SquadBot &bot : scenario.squadBots)
+    {
+        if(!bot.bot || bot.bot->state != CS_ALIVE || !scenario.matchesSquad(reference, bot.encounter, bot.squad)) continue;
+        conoutf("SQUAD_KILL %s %s", name, bot.bot->name);
+        dodamage(INT_MAX, bot.bot, player1, GUN_ASSAULT);
+        return true;
+    }
+    return false;
+}
+
 void haloscenariotick(int elapsed)
 {
     haloscenariopausestate(menuvisible() || ispaused);
@@ -5225,13 +5499,35 @@ namespace
         const Scenario::UpgradeState *upgrade = nullptr;
     };
 
+    // ` max <body> <shield>`: a maximum vitality a script set on the actor (unit_set_maximum_vitality,
+    // Halo's points), an optional trailing field of the `s squad` and `s attached` records. Without it
+    // (an older save, or the variant's own maxima) the member comes back with its variant's.
+    void writeMaximum(std::string &out, float maxBody, float maxShield)
+    {
+        if(maxBody >= 0 && std::isfinite(maxBody) && std::isfinite(maxShield))
+            halostatef(out, " max %.9g %.9g", maxBody, max(maxShield, 0.0f));
+    }
+
+    // Reads a writeMaximum field when the record's next field is one (false otherwise, nothing read).
+    bool readMaximum(HaloStateReader &r, float &maxBody, float &maxShield)
+    {
+        if(!r.ok || !r.key("max")) return false;
+        const float body = r.f(), shield = r.f();
+        if(!r.ok || !std::isfinite(body) || !std::isfinite(shield) || body < 0 || shield < 0) { r.ok = false; return true; }
+        maxBody = body;
+        maxShield = shield;
+        return true;
+    }
+
     // The optional `s attached` record: an actor ai_attach made of a scripted object, its squad,
     // its variant and where it stands, then (gap 4, optional on reading) its health and shield
     // fractions and whether it is one carried in from the section before that spawns behind the
     // player (its point unused), then (batch 5's critic, gap 11; optional on reading) its start,
-    // where it took over, which ai_teleport_to_starting_location goes back to.
+    // where it took over, which ai_teleport_to_starting_location goes back to; then (the
+    // script-vitality change) writeMaximum's field.
     void writeAttached(std::string &out, int object, int encounter, int squad, bool suspended, int flags, bool gone,
-                       const SquadStart &start, const vec &point, float yaw, float health, float shield, bool near)
+                       const SquadStart &start, const vec &point, float yaw, float health, float shield, bool near,
+                       float maxBody, float maxShield)
     {
         const Program &p = scenario.program;
         halostatef(out, "s attached %d", object);
@@ -5240,9 +5536,11 @@ namespace
         halostateword(out, p.encounters[encounter].name);
         halostatef(out, " %d", squad);
         halostateword(out, p.encounters[encounter].squads[squad].name);
-        halostatef(out, " %d %d %d %d %d %.9g %.9g %.9g %.9g %.6g %.6g %d %.9g %.9g %.9g %.9g\n", suspended, flags, gone, start.actor,
+        halostatef(out, " %d %d %d %d %d %.9g %.9g %.9g %.9g %.6g %.6g %d %.9g %.9g %.9g %.9g", suspended, flags, gone, start.actor,
                    start.variant, point.x, point.y, point.z, yaw, clamp(health, 0.0f, 1.0f), clamp(shield, 0.0f, 1.0f), near,
                    start.point.x, start.point.y, start.point.z, start.yaw);
+        if(!gone) writeMaximum(out, maxBody, maxShield);
+        out += '\n';
     }
 
     void writeValue(std::string &out, const Value &v)
@@ -5411,7 +5709,29 @@ namespace
                 const vec point = bot.stood ? bot.stoodPoint : start->point;
                 const float yaw = bot.stood ? bot.stoodYaw : start->yaw;
                 writeAttached(out, bot.object, bot.encounter, bot.squad, bot.suspended, bot.scriptFlags, bot.gone, *start, point, yaw,
-                              bot.health, bot.shield, false);
+                              bot.health, bot.shield, false, bot.maxBody, bot.maxShield);
+                continue;
+            }
+            // A member a dying unit released (a carrier's infection form; optional record, newer than
+            // the format, written only while one lives: an engine before it refuses such a save and
+            // restarts the section's script, as for any record it does not know). Halo's checkpoint
+            // is the whole game state (saved games/game_state.c:289-324), so it keeps them:
+            // s spawned <e> =<encounter> <s> =<squad> <variant> <kind> <suspended> <flags> <health>
+            //           <shield> <x> <y> <z> <yaw> (where it appeared) [<x> <y> <z> <yaw> (where it stood)] [max <body> <shield>]
+            if(bot.spawned >= 0)
+            {
+                if(!s || !bot.start) continue;
+                const SquadStart &start = *bot.start;
+                halostatef(out, "s spawned %d", bot.encounter);
+                halostateword(out, e->name);
+                halostatef(out, " %d", bot.squad);
+                halostateword(out, s->name);
+                halostatef(out, " %d %d %d %d %.6g %.6g %.9g %.9g %.9g %.9g", bot.spawned, start.actor, bot.suspended, bot.scriptFlags,
+                           clamp(bot.health, 0.0f, 1.0f), clamp(bot.shield, 0.0f, 1.0f), start.point.x, start.point.y, start.point.z,
+                           start.yaw);
+                if(bot.stood) halostatef(out, " %.9g %.9g %.9g %.9g", bot.stoodPoint.x, bot.stoodPoint.y, bot.stoodPoint.z, bot.stoodYaw);
+                writeMaximum(out, bot.maxBody, bot.maxShield);
+                out += '\n';
                 continue;
             }
             if(!s || s->starts.empty() || bot.start < s->starts.data() || bot.start >= s->starts.data() + s->starts.size()) continue;
@@ -5427,6 +5747,7 @@ namespace
             // a vehicle). A save without them brings the member back at its start at full vitality.
             halostatef(out, " %d %.6g %.6g", bot.major ? 1 : 0, clamp(bot.health, 0.0f, 1.0f), clamp(bot.shield, 0.0f, 1.0f));
             if(bot.stood) halostatef(out, " %.9g %.9g %.9g %.9g", bot.stoodPoint.x, bot.stoodPoint.y, bot.stoodPoint.z, bot.stoodYaw);
+            writeMaximum(out, bot.maxBody, bot.maxShield);
             out += '\n';
         }
         // Attached actors carried in from the section before that have not spawned yet (gap 4):
@@ -5436,7 +5757,7 @@ namespace
             {
                 if(!at(p.objects, c.object) || !at(p.encounters, c.encounter) || !at(p.encounters[c.encounter].squads, c.squad)) continue;
                 writeAttached(out, c.object, c.encounter, c.squad, c.suspended, c.scriptFlags, false, c.start, vec(0, 0, 0), 0, c.health,
-                              c.shield, true);
+                              c.shield, true, c.maxBody, c.maxShield);
             }
         for(size_t i = 0; i < v.groups->size(); ++i)
         {
@@ -5545,6 +5866,8 @@ namespace
         // Optional records: attached actors (with their starts), boardable script vehicles, the
         // vehicle the player is aboard, the sound class gains.
         std::vector<std::pair<SquadBot, SquadStart>> attached;
+        // Members dying units released (`s spawned`), with their own starts.
+        std::vector<std::pair<SquadBot, SquadStart>> spawned;
         std::vector<CarriedAttach> carried;
         std::vector<int> boardable, attaching;
         Scenario::Boarded boarded;
@@ -5671,7 +5994,9 @@ namespace
                     bot.health = r.ok ? clamp(bot.health, 0.0f, 1.0f) : 1.0f;
                     bot.shield = r.ok ? clamp(bot.shield, 0.0f, 1.0f) : 1.0f;
                 }
-                if(r.ok && r.more())
+                // Optional, last (writeMaximum): a script-set maximum vitality, after the stood point
+                // or in its place for a member riding a vehicle.
+                if(r.ok && r.more() && !readMaximum(r, bot.maxBody, bot.maxShield))
                 {
                     bot.stoodPoint.x = r.f(); bot.stoodPoint.y = r.f(); bot.stoodPoint.z = r.f();
                     bot.stoodYaw = r.f();
@@ -5679,6 +6004,7 @@ namespace
                                 !std::isfinite(bot.stoodYaw)))
                         r.ok = false;
                     bot.stood = r.ok;
+                    if(r.ok && r.more() && !readMaximum(r, bot.maxBody, bot.maxShield)) r.ok = false;
                 }
                 const Encounter *e = at(p.encounters, bot.encounter);
                 const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
@@ -5686,6 +6012,45 @@ namespace
                 bot.start = &sq->starts[start];
                 bot.bot = nullptr;
                 s.squads.push_back(bot);
+            }
+            else if(r.key("spawned"))
+            {
+                SquadBot bot{};
+                SquadStart start{};
+                bot.encounter = r.i();
+                const std::string encounter = r.word();
+                bot.squad = r.i();
+                const std::string squad = r.word();
+                bot.spawned = r.i();
+                start.actor = r.i();
+                bot.suspended = r.b();
+                bot.scriptFlags = r.i();
+                bot.health = r.f();
+                bot.shield = r.f();
+                start.point.x = r.f(); start.point.y = r.f(); start.point.z = r.f();
+                start.yaw = r.f();
+                start.variant = bot.spawned;
+                start.initial = 2;
+                // Optional: where it stood (left out for one riding a vehicle), then the maximum.
+                if(r.ok && r.more() && !readMaximum(r, bot.maxBody, bot.maxShield))
+                {
+                    bot.stoodPoint.x = r.f(); bot.stoodPoint.y = r.f(); bot.stoodPoint.z = r.f();
+                    bot.stoodYaw = r.f();
+                    bot.stood = r.ok;
+                    if(r.ok && r.more() && !readMaximum(r, bot.maxBody, bot.maxShield)) r.ok = false;
+                }
+                const Encounter *e = at(p.encounters, bot.encounter);
+                const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
+                const bool finite = std::isfinite(bot.health) && std::isfinite(bot.shield) && std::isfinite(start.point.x) &&
+                                    std::isfinite(start.point.y) && std::isfinite(start.point.z) && std::isfinite(start.yaw) &&
+                                    (!bot.stood || (std::isfinite(bot.stoodPoint.x) && std::isfinite(bot.stoodPoint.y) &&
+                                                    std::isfinite(bot.stoodPoint.z) && std::isfinite(bot.stoodYaw)));
+                if(!r.ok || !sq || e->name != encounter || sq->name != squad || bot.spawned < 0 || start.actor < 0 || !finite)
+                    return fail("unknown spawned actor", line);
+                bot.health = clamp(bot.health, 0.0f, 1.0f);
+                bot.shield = clamp(bot.shield, 0.0f, 1.0f);
+                bot.bot = nullptr;
+                s.spawned.emplace_back(bot, start);
             }
             else if(r.key("group"))
             {
@@ -5785,6 +6150,8 @@ namespace
                         start.yaw = originYaw;
                     }
                 }
+                // Optional (writeMaximum): a script-set maximum vitality.
+                if(r.ok && r.more() && !readMaximum(r, bot.maxBody, bot.maxShield)) r.ok = false;
                 const Encounter *e = at(p.encounters, bot.encounter);
                 const Squad *sq = e ? at(e->squads, bot.squad) : nullptr;
                 if(!r.ok || !at(p.objects, bot.object) || p.objects[bot.object].name != object || !sq || e->name != encounter ||
@@ -5801,6 +6168,8 @@ namespace
                     c.start = start;
                     c.health = bot.health;
                     c.shield = bot.shield;
+                    c.maxBody = bot.maxBody;
+                    c.maxShield = bot.maxShield;
                     c.suspended = bot.suspended;
                     c.scriptFlags = bot.scriptFlags;
                     s.carried.push_back(c);
@@ -5962,6 +6331,14 @@ bool haloscenariostaterestore(const std::vector<std::string> &records, bool comm
         // The scripted object is attached already: no second actor from attachActors.
         if(at(s.attachedAt, entry.first.object)) s.attachedAt[entry.first.object] = 0;
         if(at(s.savedAttachedAt, entry.first.object)) s.savedAttachedAt[entry.first.object] = 0;
+    }
+    // Members dying units released (`s spawned`): their starts join the deque (the entries in play
+    // still point into it until the revert that follows replaces them).
+    for(auto &entry : parsed.spawned)
+    {
+        s.spawnedStarts.push_back(entry.second);
+        entry.first.start = &s.spawnedStarts.back();
+        s.savedSquadBots.push_back(entry.first);
     }
     // Carried in from the section before and not spawned yet: they spawn behind the player after
     // the revert that follows (it copies savedCarried), as they did when the section began.

@@ -192,8 +192,14 @@ COMMANDF(qa_target_aim, "fff", (float *x, float *y, float *z)
 
 // ---- The fidelity gaps of batch 9 (tests/test_melee_materials.py)
 
+// qa_damage_keep 1: the hooks below leave the actor as it is instead of renewing it (a second hit
+// on a drained or half shield, tests/test_melee_materials.py items 8 and 10).
+static bool qaDamageKeep = false;
+COMMANDF(qa_damage_keep, "i", (int *on) { qaDamageKeep = *on != 0; });
+
 // The nearest living hostile actor of body kind `kind` (ActorKind; -1 any), renewed: full health
-// and shield, nothing carried. `friendly`: the nearest of the player's allies instead.
+// and shield, nothing carried (unless qa_damage_keep 1). `friendly`: the nearest of the player's
+// allies instead.
 static HaloEnemy *qaDamageRenewed(int kind, bool friendly = false)
 {
     HaloEnemy *found = NULL;
@@ -205,7 +211,7 @@ static HaloEnemy *qaDamageRenewed(int kind, bool friendly = false)
         const float d = player1->o.squareddist(e.bot->o);
         if(d < best) { best = d; found = &e; }
     }
-    if(found)
+    if(found && !qaDamageKeep)
     {
         haloactorrenew(found->bot);
         found->shield = found->shieldMax;
@@ -310,3 +316,71 @@ COMMANDF(qa_damage_needles, "is", (int *count, const char *label)
     conoutf("DAMAGE_NEEDLES %s needles=%d detonations=%d", label, *count, detonations);
     qaDamageReport(label, e);
 });
+
+// ---- Per-material shield leak and per-unit shield timing (tests/test_melee_materials.py items 8-10)
+
+// qa_damage_blast KIND WEAPON AMOUNT LABEL: the nearest hostile actor of body kind KIND (2 Jackal,
+// -1 any), renewed, takes the player's exact blast (GUN_GRENADE: the coll's indirect damage
+// material) of AMOUNT with weapons.txt weapon WEAPON's first projectile jpt!, struck at its middle.
+// With halo_damagetrace 1 the DAMAGE_SHIELD line names the material. DAMAGE_REGION <label> ...
+COMMANDF(qa_damage_blast, "iifs", (int *kind, int *weapon, float *amount, const char *label)
+{
+    HaloEnemy *e = qaDamageRenewed(*kind);
+    const HaloWeaponDef *w = haloweapon(*weapon);
+    const HaloTriggerDef *t = w ? w->trigger(0) : NULL;
+    if(!e || !t || !t->projectile.valid) { conoutf("DAMAGE_REGION %s no-actor-or-weapon", label); fflush(stdout); return; }
+    botent *bot = e->bot;
+    qaDamageStandBy(bot, 0, 3);
+    const vec at(bot->o.x, bot->o.y, bot->o.z - bot->eyeheight * .5f);
+    halohit(*amount, HALO_SIDE_EFFECT_NONE, bot, player1, vec(0, 0, 1), GUN_GRENADE, false, 0, &t->projectile.damage, &at);
+    qaDamageReport(label, e);
+});
+
+// qa_damage_state KIND LABEL: the nearest hostile actor of body kind KIND as it is now (not
+// renewed), for watching its shield come back. DAMAGE_REGION <label> ... then
+// DAMAGE_SHIELD_STATE <label> since_hit=<ms since the stun last restarted>
+COMMANDF(qa_damage_state, "is", (int *kind, const char *label)
+{
+    HaloEnemy *found = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        HaloEnemy &e = enemies[i];
+        if(!e.bot || e.bot->state != CS_ALIVE || haloteamfriendly(e.team) || (*kind >= 0 && int(e.kind) != *kind)) continue;
+        const float d = player1->o.squareddist(e.bot->o);
+        if(d < best) { best = d; found = &e; }
+    }
+    if(!found) { conoutf("DAMAGE_REGION %s no-actor", label); fflush(stdout); return; }
+    qaDamageReport(label, found);
+    conoutf("DAMAGE_SHIELD_STATE %s since_hit=%d", label, lastmillis - found->hitTime);
+    fflush(stdout);
+});
+
+// qa_shield_timing: one line per living actor (shield_max 0 for one without a shield), the stun and recharge it uses
+// (enemyShieldTiming, before and after its team's recharge scale) and its variant's coll values:
+// SHIELD_TIMING name= kind= team= variant= shield_max= delay= recharge= scaled= timed=<0|1>
+//               stun_min= stun= recharge_s= velocity= leaks=<per material, comma separated> indirect=
+//               shield_type= failure=<function>,<threshold>,<maximum>
+static void qaShieldTiming()
+{
+    loopv(enemies)
+    {
+        const HaloEnemy &e = enemies[i];
+        if(!e.bot || e.bot->state != CS_ALIVE) continue;
+        int delay = 0, recharge = 0;
+        enemyShieldTiming(e, delay, recharge);
+        const HaloActorDef *def = haloactorvariant(e.bot);
+        string leaks = "";
+        if(def) for(const HaloActorDef::Material &m : def->materials) concatformatstring(leaks, "%s%.3g", leaks[0] ? "," : "", m.leak);
+        conoutf("SHIELD_TIMING name=%s kind=%d team=%d variant=%d shield_max=%.3f delay=%d recharge=%d scaled=%d timed=%d stun_min=%.3f "
+                "stun=%.3f recharge_s=%.3f velocity=%.6f leaks=%s indirect=%d shield_type=%d failure=%d,%.3f,%.3f",
+                e.bot->name, int(e.kind), e.team, def ? def->index : -1, e.shieldMax, delay, recharge,
+                recharge > 0 ? rechargeTime(recharge, haloactorteam(e.bot)) : 0, def && def->hasShieldTime,
+                def ? def->shieldStunDamage : 0.0f, def ? def->shieldStunTime : 0.0f, def ? def->shieldRechargeTime : 0.0f,
+                def ? def->shieldRechargeVelocity : 0.0f, leaks[0] ? leaks : "-", def ? def->indirectMaterial : -1,
+                def ? def->shieldMaterial : -1, def ? def->shieldFailureFunction : 0, def ? def->shieldFailureThreshold : 0.0f,
+                def ? def->shieldFailureMaximum : 0.0f);
+    }
+    fflush(stdout);
+}
+COMMANDF(qa_shield_timing, "", () { qaShieldTiming(); });

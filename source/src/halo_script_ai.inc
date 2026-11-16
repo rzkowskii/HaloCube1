@@ -149,6 +149,11 @@
             const bool onlyUnsupported = is("ai_teleport_to_starting_location_if_unsupported");
             if(!scene && projection) eachActor(index(0), [&](SquadBot &bot, int)
             {
+                // Halo passes over a swarm actor (no unit of its own, ../Halo3DS ai/ai_script.c:
+                // 4175-4176): the infection forms, placed or released. A non-swarm actor a dying unit
+                // released would take any start of its squad there (4196-4199); none of the retail
+                // tags releases one, and it is passed over too (judgement call).
+                if(swarmMember(bot) || bot.spawned >= 0) return;
                 if(onlyUnsupported && bot.bot->onfloor) return;
                 if(haloenemymove(bot.bot, startPoint(*bot.start)))
                 {
@@ -306,34 +311,63 @@
             eachUnit(index(0), [&](playerent *unit) { setUnitFlag(unit, HALO_AI_NO_DROPS, true); });
             return handled();
         }
-        if(is("unit_set_current_vitality") || is("units_set_current_vitality") || is("unit_set_maximum_vitality"))
+        if(is("unit_set_current_vitality") || is("units_set_current_vitality") || is("unit_set_maximum_vitality") ||
+           is("units_set_maximum_vitality"))
         {
-            const bool maximum = is("unit_set_maximum_vitality");
+            // Halo's points (../Halo3DS units/unit_scripting_commands.c:54-133): the current
+            // vitality is a fraction of the unit's stored maximum, capped at 1 (a10's crew,
+            // `units_set_current_vitality ... 1 0`, keep 1 point of their 25; c10's bay_a marines 0.5
+            // of 12); the maximum re-initialises the maxima at full vitality (c10's marine_suicidal:
+            // 1 point, no shield). The plural forms walk their list with the same rule (:69-83, :136-150).
+            const bool maximum = is("unit_set_maximum_vitality") || is("units_set_maximum_vitality");
             const float health = float(value(1)), shield = float(value(2));
+            const bool finite = std::isfinite(health) && std::isfinite(shield);
             // An object ai_attach is about to make an actor (c10's marine_suicidal, given its vitality
             // right after its attach): queued, and applied when the actor spawns (attachActors, gap 4).
             const int id = index(0) >= 0 ? object(0) : -1;
-            if(!maximum && !scene && id >= 0 && !actorFromValue(id) && at(attachedAt, id) && attachedAt[id] >= 0 &&
-               at(actors, id) && actors[id].squadReference >= 0 && std::isfinite(health) && std::isfinite(shield))
+            if(!scene && finite && id >= 0 && !actorFromValue(id) && at(attachedAt, id) && attachedAt[id] >= 0 &&
+               at(actors, id) && actors[id].squadReference >= 0)
             {
-                attachVitality[id] = {clamp(health, 0.0f, 1.0f), clamp(shield, 0.0f, 1.0f)};
-                if(halo_scripttrace) conoutf("HaloScript: %s's vitality waits for its actor (%.2f, %.2f)", program.objects[id].name.c_str(), health, shield);
+                QueuedVitality &q = attachVitality[id];
+                if(maximum) { q.maximum = true; q.maxBody = max(health, 0.0f); q.maxShield = max(shield, 0.0f); q.current = false; }
+                else { q.current = true; q.health = health; q.shield = shield; }
+                if(halo_scripttrace) conoutf("HaloScript: %s's %s vitality waits for its actor (%.2f, %.2f)", program.objects[id].name.c_str(),
+                                             maximum ? "maximum" : "current", health, shield);
             }
             // One carried in from the section before that has not spawned behind the player yet
             // (spawnCarried): it spawns with this vitality, and unit_get_health answers it meanwhile.
-            if(!maximum && !scene && id >= 0 && std::isfinite(health) && std::isfinite(shield))
-                for(CarriedAttach &c : carriedAttached)
-                    if(c.object == id) { c.health = clamp(health, 0.0f, 1.0f); c.shield = clamp(shield, 0.0f, 1.0f); }
+            // Its maxima are the script's if one set them, else its variant's.
+            if(!scene && finite && id >= 0)
+                for(size_t k = 0; k < carriedAttached.size(); ++k)
+                {
+                    CarriedAttach &c = carriedAttached[k];
+                    if(c.object != id) continue;
+                    if(maximum) { c.maxBody = max(health, 0.0f); c.maxShield = max(shield, 0.0f); c.health = c.shield = 1; continue; }
+                    float body = c.maxBody, most = c.maxShield;
+                    if(body < 0) haloenemydefaultvitality(c.start.actor, c.start.variant, body, most);
+                    c.shield = most > 0 ? clamp(shield / most, 0.0f, 1.0f) : 0.0f;
+                    if(body > 0 && health / body <= 0)
+                    {
+                        // Depleted before it spawned: dead, as eraseSquads leaves one (unit_get_health -1).
+                        if(!at(objectStarts, c.object)) continue;
+                        objectStarts[c.object] = c.start;
+                        squadBots.push_back({&objectStarts[c.object], nullptr, c.encounter, c.squad});
+                        squadBots.back().object = c.object;
+                        squadBots.back().gone = true;
+                        carriedAttached.erase(carriedAttached.begin() + k);
+                        break;
+                    }
+                    if(body > 0) c.health = clamp(health / body, 0.0f, 1.0f);
+                }
+            std::vector<playerent *> depleted;
             eachUnit(index(0), [&](playerent *unit)
             {
                 if(unit == player1) haloplayersetvitality(health, shield, maximum);
-                // An actor's vitality is a fraction of what it spawned with; its maximum stays as authored.
-                else if(!maximum)
-                {
-                    haloactorsethealthfraction(unit, health);
-                    haloenemysetshield(unit, shield);
-                }
+                else if(maximum) haloenemysetmaximumvitality(unit, health, shield);
+                else if(haloenemysetvitality(unit, health, shield) && !scene) depleted.push_back(unit);
             });
+            // Killed after the list is walked (a death changes the squads it walks).
+            for(playerent *unit : depleted) depleteBody(unit);
             return handled();
         }
         if(is("unit_suspended"))

@@ -108,6 +108,14 @@ void haloplayersetvitality(float health, float shield, bool maximum);
 void haloplayerprotect(bool on);
 bool haloplayerprotected();
 void haloenemysetshield(const playerent *p, float fraction);
+// unit_set_current_vitality and unit_set_maximum_vitality on an actor, in Halo's points against
+// its stored maxima (halo.cpp); the first returns true when the body is set to nothing (the
+// caller kills it). The maxima a script set (false: the variant's own), and those of a variant
+// not spawned yet.
+bool haloenemysetvitality(playerent *p, float body, float shield);
+void haloenemysetmaximumvitality(playerent *p, float body, float shield);
+bool haloenemyscriptmaximum(const playerent *p, float &body, float &shield);
+void haloenemydefaultvitality(int kind, int variant, float &body, float &shield);
 void haloenemyrenew(playerent *p, int health, int grenades);
 bool haloenemymove(playerent *p, const vec &point);
 void halorendervehicle();

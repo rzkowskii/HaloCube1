@@ -115,6 +115,21 @@ def structure_leaves(region, address, point):
     return False
 
 
+def device_slugs(halo):
+    """The scene model directories device_rows may export (device_<tag>: every placed machine or
+    control whose tag has a model), without reading or writing any; --check-scenes' orphan check."""
+    tags, scenario = halo.tags, halo.scenario
+    slugs = set()
+    for placement_block, palette_block, group in ((660, 672, 'mach'), (684, 696, 'ctrl')):
+        palette = tags.block(scenario + palette_block, 48)
+        for placement in tags.block(scenario + placement_block, 64):
+            variant, = tags.read('h', placement)
+            tag = halo.reference(tags, palette[variant], group) if 0 <= variant < len(palette) else None
+            if tag and halo.reference(tags, tag.address + 40, 'mode'):
+                slugs.add(f'device_{halo.directory.index(tag)}')
+    return slugs
+
+
 def device_rows(halo, output, rebuild, geometry_scale):
     tags, scenario = halo.tags, halo.scenario
     directory = output / 'packages/models/halo/scene' / halo.name
