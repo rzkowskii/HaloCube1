@@ -1427,6 +1427,9 @@ int main(int argc, char **argv)
     applymenu = addmenu("apply", "apply changes now?", true, refreshapplymenu);
     downloaddemomenu = addmenu("Download demo", NULL, true);
 
+    // Halo: a driven section's generated map .cfg sets its jump governors (halo_vehicle.cpp
+    // halo_vehiclegovern); allowed in map configs before scontext.cfg seals the contexts.
+    execute("scriptcontext MAPCFG halo_vehiclegovern");
     exec("config/scontext.cfg");
     exec("config/keymap.cfg");
     execfile("config/mapmodelattributes.cfg");

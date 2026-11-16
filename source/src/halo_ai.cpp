@@ -1025,6 +1025,10 @@ bool haloallegiancebroken(int a, int b)
     return bit >= 0 && (brokenBits >> bit & 1);
 }
 
+// The player's kills of a team's allies counted towards a betrayal since the last reset (QA,
+// tests/test_vehicle_damage.py item 9).
+int halobetrayalcount(int team) { return team >= 0 && team < HALO_TEAM_COUNT ? betrayals[team] : 0; }
+
 void haloallegiancereset()
 {
     allianceBits = savedAllianceBits = defaultAlliances();

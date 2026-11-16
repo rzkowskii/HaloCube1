@@ -53,7 +53,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qa_common import *  # noqa: E402,F403
 sys.path.insert(0, str(root / 'tools'))
-from import_halo_campaign import CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, MISSIONS, VEHICLE_ROUTES  # noqa: E402
+from import_halo_campaign import (CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, MISSIONS, SCENERY_COLLISION,  # noqa: E402
+                                  STOCK_SECTIONS, VEHICLE_ROUTES)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('missions', nargs='*', help='mission cache names, e.g. a10 b30 c10')
@@ -115,6 +116,10 @@ PENDING_WALK = {
                    'x50 at control_lab_trigger, then out by the upper doorway once post_helmet_door_4 is powered; '
                    're-planned with its scenery collision (SCENERY_COLLISION: the channel crates, the hall D debris)',
     'halo_c10_04': 'rides lift_b down from lift_b_cont_a on its deck (deck row: send)',
+    'halo_c10_05': 'new on retail collision (after the final integration review): from the bottom of lift_b, drops to the '
+                   'lower storey, climbs the west bay debris pile over the walking assist (ASSISTS) onto the crate at its '
+                   'foot, hops 0.28 onto the rubble, walks up to the balcony, then the upper storey east without crossing '
+                   'bridge_c (UNCROSSED_BRIDGES) and drops by the lower BSP 3/4 doorway (bsp 3,4 #0)',
     'halo_c10_06': 'new on retail collision (scenery batch): from the lower BSP 4/3 doorway up the fallen debris over the two '
                    'walking assists (ASSISTS) to the upper storey, across bridge_e from brdige_e_cont_a, then calls lift_d and '
                    'rides it up from lift_d_cont_a (deck row: call, send)',
@@ -160,6 +165,16 @@ PENDING_WALK = {
                    "and 12, no seals) into pulse_1_trigger and back, flies down to the c bridge and walks through door_c1 "
                    "into bsp 2,10 (door_c1 powered by pulse_1_trigger; the walker has no door row there)",
 }
+# Since the batch after the c10 section 5 batch every section on retail collision carries its scenery's
+# collision (SCENERY_COLLISION: rocks, trees, crates, barricades, computer banks, the invisible
+# door_blast_collision planes and a50_nutblockers), and the walked routes were re-planned round and over
+# it (most moved a few rows; every one still ends in its exit). None has been walked with it, the a10
+# sections walked in earlier batches included: each is pending a walk with its scenery.
+# (SCENERY_COLLISION also lists d40 section 3, which stays on stock geometry: no .hcol, no walk.)
+for _key in SCENERY_COLLISION - STOCK_SECTIONS:
+    _name = CRASH_SITE_NAME if _key[1] == 'crash' else f'halo_{_key[0]}_{_key[1] + 1:02}'
+    PENDING_WALK.setdefault(_name, 're-planned round and over its scenery collision (SCENERY_COLLISION), '
+                                   'which bodies, shots, grenades and vehicles now collide with')
 
 
 def section_name(mission, number):
@@ -276,7 +291,9 @@ def walk_run(mission, walk):
     extra = sum(max(0, len(Path(route).read_text().splitlines()) - 3000) * .09 for route in routes if Path(route).is_file())
     # A drive planned below 0.9 of the car's top speed (its jumps need the slower take-off: d40
     # section 8's drop, `vehicle_route.drive.speed` in the metrics) is driven at that speed: the QA
-    # throttle is capped there (qa_vehicle_cruise; the walker itself still holds full throttle).
+    # throttle is capped there (qa_vehicle_cruise; the walker itself still holds full throttle). The
+    # section's jump governors (halo_vehiclegovern in its .cfg, halo_vehiclegovernor on by default) hold
+    # it at the same speed by the take-offs; tests/test_maw_drive.py item 3 drives it with them alone.
     cruise = ''
     for n in walk:
         name = section_name(mission, n)

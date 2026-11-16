@@ -8,11 +8,15 @@ QA client, campaign play with the mission script (qa_maw_route starts section 6)
    by the driver's door gets in. E gets out and back in. The HUD countdown runs.
 2. The QA autopilot drives at the route markers: section 6 hands over to section 7 with the
    player still at the wheel and the countdown carried over (not reset).
-3. Section 8 to the finale: the autopilot reaches grand_finale, the finale plays and the
-   campaign ending is reached before the deadline. Batch 10: section 8's drive (the pit room's
-   drop under the hanging bridge segment) is planned below full speed; the autopilot's throttle
-   is capped at the planned speed (`vehicle_route.drive.speed` in halo_d40_08.metrics.json,
-   qa_vehicle_cruise), as a player eases off there. Not yet run.
+3. Section 8 to the finale: the QA vehicle walker (qa_retail_start, tests/native/retail_qa.inc)
+   drives halo_d40_08.route's planned rows at full throttle and reaches grand_finale; the finale
+   plays and the campaign ending is reached before the deadline. Batch 10: section 8's drive (the
+   pit room's drop under the hanging bridge segment) is planned below full speed. The jump governor
+   batch: no QA cruise cap any more; the section's map .cfg holds the car at the planned speed by
+   each planned take-off (`halo_vehiclegovern`, halo_vehiclegovernor on by default), as it holds a
+   player at full throttle, and the run must log the governor holding (halo_vehicletrace). The
+   walker, not the autopilot: the autopilot steers straight at the objective marker and need not
+   take the planned drop. Not yet run.
 4. Killed at the wheel, the player reverts to the section start in a Warthog again.
 5. Slow keystroke run in the packaged app: E, then W held, exits cleanly (the old smoke test).
 6. The escape Warthog and the scenario's: on retail collision section 6 seats the player in one
@@ -22,6 +26,7 @@ QA client, campaign play with the mission script (qa_maw_route starts section 6)
    Added with the vehicle fixes; not yet run.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -34,14 +39,15 @@ from qa_common import *  # noqa: E402,F403
 require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
 
 
-def run(name, start, schedule, timeout=420):
+def run(name, start, schedule, timeout=420, env=None):
     profile = scratch(f'maw-{name}-')
     body = '; '.join(f'sleep {delay} [{action}] 1' for delay, action in schedule)
     log = profile / 'run.log'
     with log.open('w') as output:
         subprocess.run([QA_BIN, '--halo', f'--home={profile}', f'--mod={root}', '-t0', '-w800', '-h600',
                         f'-ehalo_vehicletrace 1; maxfps 120; {start}; qa_after_gameplay [{body}]'],
-                       cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, check=True)
+                       cwd=RUNTIME, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, check=True,
+                       env={**os.environ, **env} if env else None)
     return log.read_text(errors='replace'), log
 
 
@@ -94,15 +100,29 @@ assert escapes[first7]['seated'] == '1', ('the player arrives in section 7 at th
 assert int(escapes[first7]['remaining']) <= int(last6['remaining']) + 100, ('the countdown carries over', last6, escapes[first7], log)
 print(f'section 6 driven to section 7 with {int(escapes[first7]["remaining"]) / 1000:.0f} s left.')
 
-# 3. Section 8 to the finale, at the drive's planned speed when it is below full speed.
+# 3. Section 8 to the finale: the vehicle walker drives the planned rows at full throttle, and the
+#    jump governors of halo_d40_08.cfg (not a QA cruise cap) hold it at the planned speed by the
+#    take-offs (the drop needs it: `vehicle_route.drive.speed` in the metrics).
 metrics8 = root / 'packages/maps/halo_d40_08.metrics.json'
+route8 = root / 'packages/maps/halo_d40_08.route'
+require(route8, 'run tools/import_halo_campaign.py "$maps" --mission d40 --part 8')
 drive8 = ((json.loads(metrics8.read_text()).get('vehicle_route') or {}).get('drive') or {}) if metrics8.is_file() else {}
-cruise8 = f'qa_vehicle_cruise halo_d40_08 {drive8["speed"]}; ' if drive8.get('speed') else ''
-text, log = run('drive8', 'qa_campaign_play 10 8', [(500, f'{cruise8}qa_vehicle_autopilot 170'), (172000, 'quit')], timeout=300)
+governed8 = bool(drive8.get('governors'))
+text, log = run('drive8', 'halo_vehiclegovernor 1; sleep 600 [qa_retail_start 10 8] 1', [(500, 'qa_vehicle_governors'), (175000, 'quit')],
+                timeout=300, env={'HALOQA_RETAIL_ROUTE': str(route8), 'HALOQA_RETAIL_CHAIN': ''})
 assert 'escape Warthog at' in text, ('section 8 starts at the wheel', log)
-assert 'Halo ending reached' in text or 'cinematic_finale' in text, ('the run reaches the finale', log)
+if governed8:
+    count = re.search(r'VEHICLE_QA governors count=(\d+) enabled=1', text)
+    assert count and int(count.group(1)) == len(drive8['governors']), \
+        ('halo_d40_08.cfg\'s jump governors are loaded (re-import d40 section 8 if not)', count and count.group(0), log)
+    assert 'Halo vehicle: governor at' in text, ('the governor held the car at a planned take-off', log)
+# The walker stops the run once the finale's cue takes over at the route's end (RETAIL_QA PASS
+# exit-cue) or the section completes; a FAIL names where it stopped.
+assert re.search(r'RETAIL_QA PASS \S+ map=halo_d40_08\b', text) or 'Halo ending reached' in text or 'cinematic_finale' in text, \
+    ('the walker reaches grand_finale and the finale plays', re.findall(r'RETAIL_QA FAIL .*', text)[:1], log)
 assert 'cinematic_time_up' not in text, ('before the deadline', log)
-print('section 8 driven to the finale before the deadline.')
+print(f'section 8 driven along its planned route to the finale before the deadline'
+      f'{", held at " + str(drive8["speed"]) + " by the jump governors" if governed8 else ""}.')
 
 # 4. Killed at the wheel: revert into a Warthog at the start of the section.
 text, log = run('death', 'qa_campaign_play 10 7', [

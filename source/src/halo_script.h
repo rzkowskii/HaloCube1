@@ -50,7 +50,8 @@ void haloscenarioqapad(int count);
 int haloscenarioencountercount();
 const char *haloscenarioencountername(int index);
 int haloscenarioencounterstarts(int index);
-// QA probes: an encounter's script reference, and a script command called directly.
+// QA probes: an encounter's script reference ("encounter/squad" a squad's, negative; -1 when not found),
+// and a script command called directly.
 int haloscenarioencounter(const char *name);
 double haloscenariocall(const char *command, double first, double second);
 double haloscenariocallv(const char *command, const double *values, const char *const *texts, int count);
@@ -64,12 +65,17 @@ void haloscenarioqastate(int &tick, int &started, int &visible);
 // and a cutscene flag's place in the section's map (feet) and the player's yaw facing its way.
 bool haloscenarioqacue(const char *script);
 bool haloscenarioflagpoint(const char *flag, vec &feet, float &yaw);
+// QA: where to stand `distance` world units before a machine (`side` -1 behind it), facing it.
+bool haloscenarioqadevicefront(const char *name, float distance, int side, vec &feet, float &yaw);
 bool haloscenariocollide(physent *entity, float &hi, float &lo);
 // How far below a lift deck top `lo` (world units) a grounded body may step onto it; 0 if `lo` is not one.
 float haloscenarioliftboard(physent *entity, float lo);
 const char *haloscenarioblockingdevice(physent *entity);
 struct HaloCollisionHit;
 bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit);
+// A player's melee along this segment (world units) opens a machine placed "opened by melee attack"
+// that it meets first (a10's melee_door_2): Halo's machine_try_to_open_with_damage. True if it did.
+bool haloscenariomeleedevice(const vec &from, const vec &to);
 // Damage targets: scripted units with no AI the player hurts by shooting them (d40's manifold
 // detectors, which enc5_1_destroyed_poll reads with unit_get_health; tools/halo_cast.py damage_target).
 // The first target the segment passes through (its fraction along it in `fraction`), or -1; the

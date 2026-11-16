@@ -43,6 +43,10 @@ Reads packages/maps/<section>.route as tools/import_halo_campaign.py writes it a
     within 1.5 retail units of the ledge beside the extraction Pelican's ramp (its end marker),
   * with CRASH_SITE, the Crash Site (halo_a30) has an .hcol and a route of plain, crouch, jump and
     ledge-drop rows only (written while testing was on hold, not yet run),
+  * no route crosses a light bridge UNCROSSED_BRIDGES keeps it off (c10 section 5's bridge_c), and c10
+    section 5 is a walked route (written while testing was on hold, not yet run): only crouch, jump and
+    ledge-drop rows, two drops (off the landing at the bottom of lift_b, and by the lower BSP 3/4
+    doorway), at least one jump (the hop from the crate onto the rubble), ending in its exit (its metrics),
   * walking assists (ASSISTS in tools/import_halo_campaign.py, written while testing was on hold, not
     yet run): a section's .hcol has an AST1 trailer exactly when ASSISTS lists the section, naming
     its last len(ASSISTS[section]) surfaces, each two-sided (flag 1) and walkable (normal z 0.65 or
@@ -65,7 +69,7 @@ from qa_common import *  # noqa: E402,F403
 sys.path.insert(0, str(root / 'tools'))
 from import_halo_campaign import (ASSISTS, CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, EXTRA_BSPS, FLIGHT_CELL,  # noqa: E402
                                   FLOWN_SECTIONS, LIFT_RIDES, MISSIONS, ROUTE_BOARD, ROUTE_GET_OUT, ROUTE_VEHICLE, STOCK_SECTIONS,
-                                  VEHICLE_ROUTES)
+                                  UNCROSSED_BRIDGES, VEHICLE_ROUTES)
 
 maps = root / 'packages/maps'
 require(maps, 'run scripts/import-macos-assets.sh')
@@ -214,6 +218,8 @@ for mission in MISSIONS:
         for i, (_, flags, device, _) in enumerate(table):
             if flags & 128 and (not i or not table[i - 1][1] & 128) and (not i or table[i - 1][1] & 16):
                 problems.append(f'{name}: light bridge {device} starts at row {i} after a deck row')
+            if flags & 128 and device in UNCROSSED_BRIDGES.get((mission.cache, part), ()):
+                problems.append(f'{name}: row {i + 1} crosses {device}, which UNCROSSED_BRIDGES keeps the route off')
         uses = [device for _, flags, device, _ in table if flags & 256]
         shots = [device for _, flags, device, _ in table if flags & 512]
         waits = [device for _, flags, device, _ in table if flags & 1024]
@@ -295,6 +301,27 @@ for mission in MISSIONS:
                 problems.append(f'{name}: mode {m.get("mode")}, ends at the Pelican ledge {m.get("ends_in_exit")} '
                                 '(expected a walked route ending there; re-import b30 part 3)')
 
+
+# c10 section 5 (the batch after the final integration review, not yet run): a walked route on retail
+# collision from the bottom of lift_b to the lower BSP 3/4 doorway, round bridge_c (UNCROSSED_BRIDGES) by
+# the west bay's debris pile: plain steps, the landing's and the upper storey's ledge drops (two flag-8
+# rows) and jump rows only (the 0.28 hop from the crate onto the rubble), no lift, bridge or action
+# rows, ending in its exit (its metrics).
+name = 'halo_c10_05'
+if ('c10', 4) not in STOCK_SECTIONS and (maps / f'{name}.route').is_file():
+    table = rows(maps / f'{name}.route')
+    odd = sorted({flags for _, flags, _, _ in table if flags & ~(1 | 2 | 8)})
+    if odd:
+        problems.append(f'{name}: route flags {odd} (only crouch, jump and ledge-drop rows expected)')
+    drops = sum(1 for _, flags, _, _ in table if flags & 8)
+    if drops != 2:
+        problems.append(f'{name}: {drops} ledge-drop rows, expected 2 (off the landing, and by the lower doorway)')
+    if not any(flags & 2 for _, flags, _, _ in table):
+        problems.append(f'{name}: no jump row (the hop from the crate onto the rubble)')
+    m = json.loads((maps / f'{name}.metrics.json').read_text()) if (maps / f'{name}.metrics.json').is_file() else {}
+    if m.get('mode') != 'walked' or not m.get('ends_in_exit'):
+        problems.append(f'{name}: mode {m.get("mode")}, ends in its exit {m.get("ends_in_exit")} '
+                        '(expected a walked route ending in bsp 3,4 #0; re-import c10 part 5)')
 
 
 # The Crash Site (CRASH_SITE: imported from the retail BSP, the engine's first a30 section): an .hcol and

@@ -20,8 +20,9 @@ low share only means a big map window). The test fails when
   * a section has no metrics, metrics of another format, or a mode (walked, raster, driven,
     flown, stock) that the importer's tables (VALIDATED_COLLISION, STOCK_SECTIONS,
     DRIVEN_SECTIONS, FLOWN_SECTIONS) do not give it;
-  * the maps on disk are not what the importer writes (`cgz_current`, `route_current` false after
-    --metrics-only: re-import the section);
+  * the maps on disk are not what the importer writes (`cgz_current`, `route_current` or
+    `cfg_current` false after --metrics-only: re-import the section; `cfg_current`, the map .cfg with
+    a driven section's jump governors, is missing from metrics written before it and then not held);
   * a stub is not in KNOWN_STUBS below (the table must not grow), or a KNOWN_STUBS section is no
     longer a stub (remove it, so the table stays current).
 
@@ -66,10 +67,11 @@ from import_halo_campaign import (CRASH_SITE, CRASH_SITE_NAME, DRIVEN_SECTIONS, 
 # The route batch took out halo_c40_01 (gap 2 of batch 5's critic: the generator doorway was never narrower
 # than the body; BSP 12's seal across it, and BSP 2's, kept the walk out of the room, and are left
 # out now, held_bsps; the planned route ends in bsp 2,10 through door_c1).
-KNOWN_STUBS = {
-    'halo_c10_05': "stock geometry (STOCK_SECTIONS): bridge_c's flicker (its panels retract; no assist: a link Halo does not have); "
-                   "the raster route ends short of the exit",
-}
+# The batch after the final integration review took out halo_c10_05, the last one: it is walked on
+# retail collision now, up the west bay's debris pile over one walking assist (ASSISTS) instead of
+# across the flickering bridge_c (UNCROSSED_BRIDGES), and ends in the lower BSP 3/4 doorway (from the
+# importer's metrics, not run through this gate). The table is empty: any stub is a new one.
+KNOWN_STUBS = {}
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--table', action='store_true')
@@ -109,6 +111,8 @@ for name, cache, part in sections:
         problems.append(f'{name}: {name}.cgz on disk is not what the importer writes now (re-import the section)')
     if not m['route_current']:
         problems.append(f'{name}: {name}.route on disk is not what the importer writes now (re-import the section)')
+    if m.get('cfg_current') is False:
+        problems.append(f'{name}: {name}.cfg on disk is not what the importer writes now (its jump governors; re-import the section)')
     reasons = stub_reasons(m, (cache, part) in EXIT_FALLS)
     if reasons:
         stubs[name] = reasons

@@ -2,13 +2,20 @@
 
     python3 tests/test_retail_scenery.py
 
-For each section SCENERY_COLLISION lists that is on retail collision (the Crash Site and c10
-sections 3 and 6 today), it checks, without the game, that
+For each section SCENERY_COLLISION lists that is on retail collision (every section on retail
+collision since the batch after the c10 section 5 batch: the Crash Site and all 53 others, walked,
+driven and flown), it checks, without the game, that
   * the section's .hcol ends in an SCN1 trailer (after DEV1, before AST1) whose placements match the
     importer's metrics (`scenery` in packages/maps/<section>.metrics.json), whose surface ranges ascend
     without overlapping and fall inside the file's surfaces;
   * a section not in the table has no SCN1 trailer (its .hcol is what the importer wrote before);
-and then starts each as campaign play and checks that
+  * the Crash Site's mapmodel angles (import_halo_campaign.mapmodel_angles) draw a placement as Halo
+    turns it: over a sweep of yaw, pitch and roll, the rotation AssaultCube builds from the entity's
+    attr1, attr5 and attr6 (md3.h's quaternion path, re-implemented here) is within 0.6 degrees of
+    halo_collision.euler_rows seen in the campaign frame (y reflected), and attr6 fits its signed byte;
+and then starts each section with scenery placements (a section whose window holds none, b40
+sections 4 and 6, c40 section 5 and d40 section 6, has no SCN1 and is only checked statically) as
+campaign play and checks that
   * the engine loaded the .hcol with that many scenery objects ("Halo: loaded N retail collision
     surfaces for <map> (...), S scenery objects (K surfaces)");
   * for at least 90% of the placements (qa_retail_scenery in tests/native/retail_qa.inc), a ray down
@@ -16,10 +23,12 @@ and then starts each as campaign play and checks that
     scenery, as in Halo), so does a grenade's sweep and a body's capsule. A thin placement (a tree's
     trunk below its crown's bounds, a tilted plank) may miss the probe at its centre; every miss is
     listed.
-The Crash Site's and c10 sections 3 and 6's routes over and round the scenery are walked by
-tests/test_retail_collision.py (PENDING_WALK). Written while testing was on hold: not yet run.
+The routes over and round the scenery are walked by tests/test_retail_collision.py (every walk
+re-planned with scenery is pending). Written while testing was on hold: not yet run.
 """
 import json
+import math
+import random
 import re
 import struct
 import subprocess
@@ -29,7 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qa_common import *  # noqa: E402,F403
 sys.path.insert(0, str(root / 'tools'))
 from import_halo_campaign import (CRASH_SITE, CRASH_SITE_KEY, CRASH_SITE_NAME, MISSIONS, SCENERY_COLLISION,  # noqa: E402
-                                  STOCK_SECTIONS, VALIDATED_COLLISION)
+                                  STOCK_SECTIONS, VALIDATED_COLLISION, mapmodel_angles)
+from halo_collision import euler_rows  # noqa: E402
 
 maps = root / 'packages/maps'
 
@@ -60,7 +70,39 @@ def name_of(key):
     return CRASH_SITE_NAME if key == CRASH_SITE_KEY else f'halo_{key[0]}_{key[1] + 1:02}'
 
 
+def drawn_rotation(attr1, attr5, attr6):
+    """The rotation AssaultCube draws a mapmodel with, from its entity's attr1 (yaw, tenths), attr5
+    (pitch, tenths) and attr6 (roll, degrees): entities.cpp rendermapmodels, md3.h render's
+    quat(-yaw - 180, pitch).roll(roll), glmatrixf::fromquat and glMultMatrixf (column-major), as rows."""
+    yaw, pitch, roll = attr1 / 10, attr5 / 10, attr6
+    a, b = math.radians(-yaw - 180) / 2, math.radians(pitch) / 2
+    x, y, z, w = math.sin(b) * math.sin(a), math.sin(b) * math.cos(a), math.cos(b) * math.sin(a), math.cos(b) * math.cos(a)
+    if roll:
+        px, pw = math.sin(math.radians(roll) / 2), math.cos(math.radians(roll) / 2)
+        x, y, z, w = pw * x + px * w, pw * y - px * z, pw * z + px * y, pw * w - px * x
+    v = [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w), 0,
+         2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w), 0,
+         2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)]
+    return [[v[c * 4 + r] for c in range(3)] for r in range(3)]
+
+
 problems, sections = [], []
+# Static: the Crash Site's mapmodels turn as Halo turns their placements (mapmodel_angles).
+generator, worst = random.Random(7), 0.0
+for _ in range(5000):
+    angles = (generator.uniform(-math.pi, math.pi), generator.uniform(-1.55, 1.55), generator.uniform(-math.pi, math.pi))
+    attr1, attr5, attr6 = mapmodel_angles(*angles)
+    if not (0 <= attr1 < 3600 and -1800 <= attr5 < 1800 and -128 <= attr6 <= 127):
+        problems.append(f'mapmodel_angles{angles}: attributes {attr1}, {attr5}, {attr6} out of range')
+        break
+    halo = euler_rows(*angles)
+    want = [[halo[i][j] * (-1 if (i == 1) != (j == 1) else 1) for j in range(3)] for i in range(3)]
+    got = drawn_rotation(attr1, attr5, attr6)
+    trace = sum(got[i][k] * want[i][k] for i in range(3) for k in range(3))
+    worst = max(worst, math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1) / 2)))))
+if worst > 0.6:
+    problems.append(f'mapmodel_angles: a mapmodel drawn {worst:.2f} degrees from Halo\'s rotation (at most 0.6)')
+print(f'Crash Site mapmodel angles: at most {worst:.2f} degrees from Halo\'s rotation over 5000 placements.')
 # Static: the trailer and the metrics agree; sections outside the table have none.
 for hcol in sorted(maps.glob('*.hcol')):
     found, count = trailers(hcol)
@@ -94,6 +136,10 @@ for key in sorted(SCENERY_COLLISION, key=str):
 require(QA_BIN, 'run scripts/test-macos.sh, or build with -DHALO_BUILD_QA=ON')
 checked = 0
 for key, name, expected in sections:
+    if not expected:
+        # No placement in the section's window (no SCN1, so the load line has no scenery part).
+        print(f'{name}: no scenery placements (checked statically).')
+        continue
     cache = key[0]
     mission = next(i for i, m in enumerate(MISSIONS) if m.cache == cache) + 1
     # The engine's a30 has the Crash Site as its first section.

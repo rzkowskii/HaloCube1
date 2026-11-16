@@ -2738,6 +2738,16 @@ void halomelee()
             if(halo_meleetrace) conoutf("MELEE_QA lunge target=%s distance=%.2f", lunge->name, best);
         }
     }
+    // A blow that meets no actor and reaches a machine placed "opened by melee attack" (a10's
+    // melee_door_2 on Normal) opens it, as Halo's machine_try_to_open_with_damage does. Halo's
+    // blow tests a spread of rays, not one line; here the aim and a ray 0.15 Halo units to each
+    // side of it, so a blow at the seam between a door's leaves still meets one.
+    if(!target)
+    {
+        const vec reach = vec(direction).mul(4.0f), across = vec(cosf(yaw), sinf(yaw), 0).mul(.15f * haloscenarioscale());
+        const vec starts[3] = {from, vec(from).add(across), vec(from).sub(across)};
+        for(const vec &start : starts) if(haloscenariomeleedevice(start, vec(start).add(reach))) break;
+    }
     const HaloWeaponDef *def = haloweaponof(player1, player1->weaponsel->type);
     // Through halohit so the melee jpt!'s material modifiers reach Hunters and Sentinels, and its
     // side effect (2, lethal to the unsuspecting: halodamage kills an unaware actor from behind).

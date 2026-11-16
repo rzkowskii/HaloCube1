@@ -312,7 +312,11 @@ def bind_point(transforms, point, first, second, weight):
     return tuple(a * blend + b * (1 - blend) for a, b in zip(transform(first), transform(second)))
 
 
-def model_meshes(halo, model):
+def model_meshes(halo, model, environment=False):
+    # `environment`: also the parts drawn with an environment shader (senv: Halo's human props, the
+    # barricades, computer banks and gun racks), by their base map (+136, as world_material); only the
+    # baked scenery drawn in a section's mesh asks for them (write_world_mesh), so the Crash Site's
+    # mapmodels and the skies are as before.
     region = halo.tags
     scale_u, scale_v = region.read('2f', model.address + 48)
     transforms = bind_matrices(halo, model)
@@ -328,6 +332,8 @@ def model_meshes(halo, model):
             additive = False
             if shader.group == 'soso':
                 texture = halo.reference(region, shader.address + 164, 'bitm')
+            elif environment and shader.group == 'senv':
+                texture = halo.reference(region, shader.address + 136, 'bitm')
             elif shader.group in ('sotr', 'schi') and model.name.startswith('sky\\'):
                 chicago = shader.group == 'schi'
                 maps = region.block(shader.address + 84, 220 if chicago else 100)
@@ -537,8 +543,9 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
     # `extra_bsps`: other BSPs drawn in the same mesh (import_halo_campaign.EXTRA_BSPS: c40 section 1's
     # pulse generator room). `scenery`: scenery placements drawn in it, [(scen tag, (x, y, z, yaw, pitch,
     # roll))] in retail units (import_halo_campaign.SCENERY_COLLISION: those baked into the section's
-    # .hcol that no mapmodel draws), each in its render model's first permutation (model_meshes), opaque
-    # but for its alpha-tested soso parts (cutout), shaded with the BSP's lightmap colour round its origin.
+    # .hcol that no mapmodel draws), each in its render model's first permutation (model_meshes, its
+    # model and environment shader parts), opaque but for its alpha-tested parts (cutout), shaded with
+    # the BSP's lightmap colour round its origin.
     legacy = map_name == 'halo_a30'
     xmin, xmax, ymin, ymax = bounds
     flyby = map_name == 'halo_scene_a10_07'
@@ -598,7 +605,7 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
             if tag.address not in models:
                 model = halo.reference(halo.tags, tag.address + 40, 'mode')
                 try:
-                    models[tag.address] = list(model_meshes(halo, model)) if model else []
+                    models[tag.address] = list(model_meshes(halo, model, environment=True)) if model else []
                 except (ValueError, IndexError):
                     models[tag.address] = []
                 if model:
@@ -609,6 +616,12 @@ def write_world_mesh(halo, output, ac_xy, ac_z, bounds, *, map_name='halo_a30', 
                         shader = halo.reference(halo.tags, reference)
                         if shader and shader.group == 'soso' and not halo.tags.read('H', shader.address + 40)[0] & 4:
                             base = halo.reference(halo.tags, shader.address + 164, 'bitm')
+                            if base:
+                                cutouts.add(base.address)
+                        # An environment shader with its "alpha tested" flag (+40, bit 0; world_material's
+                        # cutout rule for the BSP) is alpha tested too.
+                        elif shader and shader.group == 'senv' and halo.tags.read('H', shader.address + 40)[0] & 1:
+                            base = halo.reference(halo.tags, shader.address + 136, 'bitm')
                             if base:
                                 cutouts.add(base.address)
             if not models[tag.address]:

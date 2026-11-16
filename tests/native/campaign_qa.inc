@@ -460,8 +460,9 @@ COMMANDF(qa_actor_spawn, "iiff", (int *kind, int *team, float *forward, float *s
 // Calls a script AI command on a named encounter: qa_hs_ai ai_status first_wave 0
 static void qaScriptAI(const char *command, const char *encounter, float second)
 {
+    // "encounter/squad" names a squad (a negative reference); -1 is not found.
     const int reference = haloscenarioencounter(encounter);
-    const double value = reference < 0 ? -999 : haloscenariocall(command, reference, second);
+    const double value = reference == -1 ? -999 : haloscenariocall(command, reference, second);
     conoutf("HS_AI %s %s %.4f", command, encounter, value);
     fflush(stdout);
 }
@@ -594,6 +595,26 @@ COMMANDF(qa_hs_cue, "s", (const char *script)
 COMMANDF(qa_scene_skip, "", ()
 {
     conoutf("QA_SKIP %d", halocinematicskip());
+    fflush(stdout);
+});
+// qa_device_melee melee_door_2 3 1 LABEL stands the player 3 world units before the machine (side
+// 1, or -1 behind it), level and facing it, and swings the melee (halomelee): a machine placed
+// "opened by melee attack" opens (Scenario::meleeDevice, the fresh-start batch).
+// DEVICE_QA melee <label> object=<name> placed=<0|1> position=<device_get_position after>
+COMMANDF(qa_device_melee, "sfis", (const char *name, float *distance, int *side, const char *label)
+{
+    vec feet;
+    float yaw;
+    const bool placed = haloscenarioqadevicefront(name, *distance, *side, feet, yaw);
+    if(placed)
+    {
+        qaPlaceFeet(feet);
+        player1->yaw = yaw;
+        player1->pitch = 0;
+        halomelee();
+    }
+    conoutf("DEVICE_QA melee %s object=%s placed=%d position=%.4f", label, name, placed,
+            haloscenariocall("device_get_position", haloscenarioobject(name), 0));
     fflush(stdout);
 });
 // qa_halo_flag river_hide_flag stands the player at a cutscene flag (unchecked, as a QA teleport).

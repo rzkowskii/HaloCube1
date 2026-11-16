@@ -34,6 +34,10 @@ VAR(halo_scriptseatmax, 0, 180, 3600);
 // 25 inside 1.5 world units and 5 at 2.5; their cinematic variants carry none. With it on, a
 // scripted explosion hurts what stands in it, which the planned routes were not made for.
 VAR(halo_effectdamage, 0, 0, 1);
+// QA hold (tests/test_ai_attach.py item 12): 1 keeps the attached actors carried in from the
+// section before from spawning (Scenario::spawnCarried), so a script's commands can reach their
+// pending entries; 0, the default, lets them come along on the section's first live ticks.
+VAR(halo_carriedhold, 0, 0, 1);
 
 int halodifficulty() { return clamp(int(halo_difficulty), 0, 3); }
 // Enemy damage and vitality relative to Normal, and the player's incoming damage.
@@ -581,6 +585,10 @@ namespace
         float health = 1, shield = 1;
         bool suspended = false;
         int scriptFlags = 0, retry = 0;
+        // Why the last try placed no actor (spawnCarried logs it when it changes): 0 none yet,
+        // 1 no floor at any spot it may stand, 2 every spot past a wall, door or ledge from the
+        // player, 3 some of each. Not saved.
+        int waiting = 0;
     };
 
     struct Playback
@@ -802,7 +810,8 @@ namespace
         void placeSquads(int reference, int limit, bool scaled = true);
         size_t livingBots() const;
         void eraseSquads(int reference, bool erase);
-        int living(int reference) const;
+        int living(int reference, bool carried = false) const;
+        void migrateCarried(CarriedAttach &c, int newGroup);
         void restoreSquads();
         bool matchesSquad(int reference, int encounter, int squad) const;
         void prepareAI();
@@ -858,6 +867,7 @@ namespace
         void snapshotAttached();
         void detachActor(int object);
         void fastForwardFresh();
+        bool resumeAfterWake(const char *spec);
         void finishTalking();
         void updatePlatoons();
         int actorListFor(int reference);
@@ -890,6 +900,7 @@ namespace
         void renderDevices() const;
         bool collideDevices(physent *entity, float &hi, float &lo, int *blocking = nullptr) const;
         bool traceDevices(const vec &from, const vec &to, HaloCollisionHit &hit) const;
+        bool meleeDevice(const vec &from, const vec &to);
         // Damage targets (Object::vitality): the first one a segment passes through, the ones a blast
         // reaches, and the damage the player deals them.
         int traceTargets(const vec &from, const vec &to, float &fraction) const;
@@ -1849,6 +1860,52 @@ namespace
         return found;
     }
 
+    // A player's melee that meets a machine placed "opened by melee attack" (scenario machine flag
+    // bit 3, Device::attributes; a10's melee_door_2, which tutorial_melee puts in on Normal) puts
+    // it fully open at once, powered or not, as Halo's machine_try_to_open_with_damage
+    // (device_set_actual_position 1.0) does when the blow's nearest object is that machine. The
+    // segment is the blow's reach from the eye; structure nearer than the machine stops it.
+    // The fresh-start batch, read from the Halo CE source port (../Halo3DS units.c, device_machines.c); not
+    // checked in the game.
+    bool Scenario::meleeDevice(const vec &from, const vec &to)
+    {
+        if(!loaded || !projection || cue || editmode) return false;
+        const Projection &p = *projection;
+        float nearest = 1;
+        int best = -1;
+        for(size_t i = 0; i < devices.size(); ++i)
+        {
+            if(!deviceActive(i) || halocollisionbaked(int(i))) continue;
+            const Device &d = program.devices[i];
+            if(d.control || d.panels.empty() || d.kind == 2) continue;
+            const vec local = deviceLocal(p, d, from);
+            const vec delta = deviceLocal(p, d, to).sub(local);
+            for(const DevicePanel &panel : d.panels)
+            {
+                if(panel.frames.empty()) continue;
+                vec normal;
+                float fraction = nearest;
+                if(tracePanel(panelBox(d, panel, devices[i]), local, delta, fraction, normal) && fraction < nearest)
+                {
+                    nearest = fraction;
+                    best = int(i);
+                }
+            }
+        }
+        if(best < 0 || !(program.devices[best].attributes & 8)) return false;
+        HaloCollisionHit hit;
+        if(halocollisionactive() && halocollisiontrace(from, to, hit) && hit.fraction < nearest) return false;
+        DeviceState &s = devices[best];
+        if(s.position >= 1) return false;
+        const Device &d = program.devices[best];
+        if(d.positionGroup >= 0) setGroup(d.positionGroup, 1, true);
+        s.position = s.desiredPosition = 1;
+        s.positionVelocity = 0;
+        const Object *opened = at(program.objects, d.object);
+        conoutf("Halo: a melee opened %s", opened ? opened->name.c_str() : "an unnamed machine");
+        return true;
+    }
+
     // A damage target's frame: a world point in retail units relative to the object, unrotated.
     vec targetLocal(const Projection &p, const Pose &pose, const vec &point)
     {
@@ -2257,7 +2314,7 @@ namespace
             }
             return {};
         }
-        if(is("ai_living_count")) return result(living(index(0)));
+        if(is("ai_living_count")) return result(living(index(0), !scene));
         if(is("ai_actors")) return result(actorListFor(index(0)));
         if(is("ai_nonswarm_count"))
         {
@@ -2278,6 +2335,11 @@ namespace
                 ++alive;
                 strength += haloactorhealthfraction(bot.bot);
             }
+            // Attached actors carried in that have not spawned yet stand for living members with
+            // the health they will spawn with (the fresh-start batch).
+            if(!scene)
+                for(const CarriedAttach &c : carriedAttached)
+                    if(matchesSquad(index(0), c.encounter, c.squad)) { ++total; ++alive; strength += c.health; }
             if(is("ai_living_fraction")) return result(total ? float(alive) / total : 0.0f);
             return result(total ? strength / total : 0.0f);
         }
@@ -2397,6 +2459,8 @@ namespace
             int oldGroup = index(0), newGroup = index(1);
             if(!scene && newGroup != -1) for(SquadBot &bot : squadBots)
                 if(bot.bot && matchesSquad(oldGroup, bot.encounter, bot.squad)) migrateBot(bot, newGroup);
+            if(!scene && newGroup != -1) for(CarriedAttach &c : carriedAttached)
+                if(matchesSquad(oldGroup, c.encounter, c.squad)) migrateCarried(c, newGroup);
             return {};
         }
         if(is("random_range") || is("real_random_range"))
@@ -3361,7 +3425,7 @@ namespace
     // second later; the object's own destruction (object_destroy, ai_erase) drops it.
     void Scenario::spawnCarried()
     {
-        if(carriedAttached.empty() || !projection) return;
+        if(carriedAttached.empty() || !projection || halo_carriedhold) return;
         const vec feet = vec(player1->o).sub(vec(0, 0, player1->eyeheight));
         const vec ahead(sinf(player1->yaw * RAD), -cosf(player1->yaw * RAD), 0), side(-ahead.y, ahead.x, 0);
         int slot = 0;
@@ -3388,13 +3452,33 @@ namespace
             // Only spots the player could walk to in a line: not past a wall, a closed door or a
             // ledge's lip between them (the spawn helper checks the floor alone; final review).
             const vec chest(0, 0, player1->eyeheight * .6f);
+            int unseen = 0, floorless = 0;
             for(const vec &point : tries)
             {
                 HaloCollisionHit hit;
-                if(halocollisionactive() && haloscenariotrace(vec(feet).add(chest), vec(point).add(chest), hit)) continue;
+                if(halocollisionactive() && haloscenariotrace(vec(feet).add(chest), vec(point).add(chest), hit)) { ++unseen; continue; }
                 if((bot = haloscenariospawnenemy(c.start.actor, point, player1->yaw, c.start.variant, teamFor(*encounter, c.start)))) { spot = point; break; }
+                ++floorless;
             }
-            if(!bot) { c.retry = tick + ticksPerSecond; ++k; continue; }
+            if(!bot)
+            {
+                // Say why it waits, once per change of reason (the critic's worry 5 of batch 6: a
+                // carried actor waiting in a cramped spot left nothing in the log but the absent
+                // "came along" line).
+                const int reason = unseen && floorless ? 3 : unseen ? 2 : 1;
+                if(reason != c.waiting)
+                {
+                    static const char *const why[] = {"", "no floor at any of the spots behind or beside the player",
+                                                      "a wall, a closed door or a ledge between the player and every spot",
+                                                      "no floor at some spots and a wall, door or ledge before the others"};
+                    conoutf("HaloScript: %s waits to come along into section %d: %s (%d of %d spots blocked from sight); trying again every second",
+                            program.objects[c.object].name.c_str(), section + 1, why[reason], unseen, int(sizeof(tries) / sizeof(tries[0])));
+                    c.waiting = reason;
+                }
+                c.retry = tick + ticksPerSecond;
+                ++k;
+                continue;
+            }
             SquadStart &start = objectStarts[c.object];
             start = c.start;
             start.point = fromWorld(*projection, vec(bot->o).sub(vec(0, 0, bot->eyeheight)));
@@ -3465,12 +3549,38 @@ namespace
         for(const Talking &entry : talking) if(at(conversationStatus, entry.id)) conversationStatus[entry.id] = 5;
     }
 
-    int Scenario::living(int reference) const
+    // With `carried`, the attached actors carried in from the section before that have not spawned
+    // yet count too (ai_living_count: they stand for living actors of their squad, the fresh-start batch);
+    // list_count of an ai_actors list leaves them out, as list_get cannot return them.
+    int Scenario::living(int reference, bool carried) const
     {
         int count = 0;
         for(const SquadBot &bot : squadBots)
             if(bot.bot && bot.bot->state == CS_ALIVE && matchesSquad(reference, bot.encounter, bot.squad)) ++count;
+        if(carried)
+            for(const CarriedAttach &c : carriedAttached)
+                if(matchesSquad(reference, c.encounter, c.squad)) ++count;
         return count;
+    }
+
+    // ai_migrate, ai_migrate_and_speak and ai_migrate_by_unit of an attached actor carried in from
+    // the section before that has not spawned yet: its entry moves to the new squad as a living
+    // actor's would (migrateBot), so it spawns there and a later ai_erase or ai_kill of the old
+    // squad no longer takes it (the fresh-start batch). Migrated to a whole encounter it keeps its squad index,
+    // or takes the encounter's first squad where that index has none (spawnCarried needs one).
+    void Scenario::migrateCarried(CarriedAttach &c, int newGroup)
+    {
+        const int encounter = newGroup & 0xffff;
+        const Encounter *target = at(program.encounters, encounter);
+        if(!target || target->squads.empty()) return;
+        int squad = c.squad;
+        if(uint32_t(newGroup) >> 30 == 2) squad = (uint32_t(newGroup) >> 16) & 0xff;
+        if(!at(target->squads, squad)) squad = 0;
+        c.encounter = encounter;
+        c.squad = squad;
+        if(halo_scripttrace)
+            conoutf("HaloScript: %s, carried in and not spawned yet, migrates to %s/%s", program.objects[c.object].name.c_str(),
+                    target->name.c_str(), target->squads[squad].name.c_str());
     }
 
     // ai_kill, ai_kill_silent and ai_erase: the squad's living actors die (the engine has no silent
@@ -3791,24 +3901,50 @@ namespace
     // carried in) runs its mission's startup script from the top, which waits for what play in
     // the earlier sections sets. Where a section's way on is opened only by a script that waits for
     // that play, the script is brought forward to where a walk from the mission's start would have
-    // it: these globals set, these threads passed over (as finished) and these woken. The
-    // counterpart of halo.cpp's FreshProfile (the loadout). Judgement call (gap 6), read
-    // statically from the decompiled a10 scripts, not checked in Halo; sections from..to, zero-based.
-    struct FreshScript { int mission, from, to; const char *globals, *done, *wake; };
+    // it: these globals set, these threads passed over (as finished) and these woken. `resume`
+    // ("script>woken", on `resumeDifficulty` only) starts a script the startup would have woken on
+    // that difficulty again at the statement after its own top-level (wake woken), where that walk
+    // has it. The counterpart of halo.cpp's FreshProfile (the loadout). Judgement calls (gap 6 of
+    // batch 5's critic for sections 5 and 6, the fresh-start batch for sections 2 to 4 and the tutorial resume),
+    // read statically from the decompiled a10 scripts, not checked in Halo; sections from..to,
+    // zero-based. A section not listed (a10 section 1, every other mission) starts plain.
+    struct FreshScript { int mission, from, to; const char *globals, *done, *wake, *resume; int resumeDifficulty; };
     const FreshScript freshScripts[] = {
-        // a10 sections 5 and 6. mission_a10 wakes mission_tunnel (which powers tunnel_door_2 in
-        // section 5) and cryo_search (which opens cryo_door_1 and _2 in section 6) only once
-        // mission_bridge has set mark_bridge_cutscene after cinematic_x20, at the end of section 2;
-        // before that it waits for the cryo exit (mark_fast_setup or mark_tutorial_setup). Started
-        // here the bridge and its flags never come. The cryo exit is section 1's: fast_setup and
-        // tutorial_setup would seat the player in cryotube_1, on section 1's map (on Normal for the
-        // minutes the tutorial takes), so both are passed over and mark_fast_setup set. The bridge
-        // flags (mark_bridge_cutscene_start and mark_bridge_cutscene, set by mission_bridge;
-        // mark_weapon and mark_shoot, by mission_shoot in section 3) let mission_a10 go on to its
-        // later wakes (a no-op for the two woken here). mission_bsp, woken as usual, closes the
-        // earlier BSPs' doors itself. a10 has no player_location_index.
+        // a10's cryo exit is section 1's: mission_a10 wakes fast_setup (tutorial_setup on Normal),
+        // which seats the player in cryotube_1, on section 1's map, far off any later section's (for
+        // the tutorial's minutes on Normal), and only then sets mark_fast_setup (mark_tutorial_setup)
+        // that mission_a10 waits for before it wakes the threads of sections 1 and 2 (main_setup, the
+        // cryo and containment threads, mission_crossfire, mission_bridge). So every later section
+        // passes both over and sets mark_fast_setup. On Normal tutorial_setup then goes on (after
+        // waking tutorial_first_contact, section 1's) to wait for mark_bridge_cutscene and wake the
+        // later lessons: tutorial_weapon (section 2's firing prompt), test_light (tutorial_light's
+        // flashlight prompt, section 5), tutorial_motiontracker and tutorial_melee (section 6: they
+        // power off motiontracker_door_2 and _3 and swap melee_door_1 for melee_door_2, which the
+        // player opens with a melee, Scenario::meleeDevice) and tutorial_grenade; the resume keeps
+        // those, as on a Normal walk from section 1. The other difficulties never run them.
+        // mission_bsp, woken as usual, closes the earlier BSPs' doors itself. a10 has no
+        // player_location_index.
+        // Section 2: mission_bridge sets the bridge flags itself after cinematic_x20 in this section.
+        {0, 1, 1, "mark_fast_setup", "fast_setup tutorial_setup", "", "tutorial_setup>tutorial_first_contact", 1},
+        // Sections 3 and 4 (mission_airlock_1, mission_flank, mission_loop, mission_airlock_2,
+        // mission_knot) and 5 and 6: mission_a10 wakes them only once mission_bridge has set
+        // mark_bridge_cutscene after cinematic_x20, in section 2. The bridge flags
+        // (mark_bridge_cutscene_start and mark_bridge_cutscene, set by mission_bridge; mark_weapon and
+        // mark_shoot, by mission_shoot in section 2) let mission_a10 go on to those wakes. The pistol
+        // mission_shoot gives is FreshProfile's. tutorial_weapon, section 2's lesson, is not resumed.
+        {0, 2, 3, "mark_fast_setup mark_bridge_cutscene_start mark_bridge_cutscene mark_weapon mark_shoot",
+         "fast_setup tutorial_setup", "", "tutorial_setup>tutorial_weapon", 1},
+        // Sections 5 and 6 also wake mission_tunnel (which powers tunnel_door_2 in section 5) and
+        // cryo_search (which opens cryo_door_1 and _2 in section 6) at once (a no-op when
+        // mission_a10 wakes them again).
         {0, 4, 5, "mark_fast_setup mark_bridge_cutscene_start mark_bridge_cutscene mark_weapon mark_shoot",
-         "fast_setup tutorial_setup", "mission_tunnel cryo_search"},
+         "fast_setup tutorial_setup", "mission_tunnel cryo_search", "tutorial_setup>tutorial_weapon", 1},
+        // Section 7: as sections 3 and 4, so mission_a10 wakes mission_final (section 7's
+        // encounters, final_door_1, x30 and game_won) and the player is not held in section 1's
+        // cryotube (for the tutorial's minutes on Normal). The section's exit plays x30 either way
+        // (finishSection's exit scene). The final integration review of the fresh-start batch.
+        {0, 6, 6, "mark_fast_setup mark_bridge_cutscene_start mark_bridge_cutscene mark_weapon mark_shoot",
+         "fast_setup tutorial_setup", "", "tutorial_setup>tutorial_weapon", 1},
     };
 
     void Scenario::fastForwardFresh()
@@ -3851,7 +3987,56 @@ namespace
             });
             conoutf("HaloScript: %s section %d started afresh: the script brought forward (%d globals set, %d threads passed over, %d woken)",
                     cache, section + 1, set, passed, woken);
+            if(f.resume && *f.resume && halodifficulty() == f.resumeDifficulty) resumeAfterWake(f.resume);
         }
+    }
+
+    // Starts `spec` ("script>woken") again at the statement after its top-level (wake woken), as
+    // though it had run that far: a begin frame past its earlier statements (Scenario::step's
+    // begin case reads the next statement from Frame::next once its phase is set).
+    bool Scenario::resumeAfterWake(const char *spec)
+    {
+        const char *split = strchr(spec, '>');
+        if(!split) return false;
+        const std::string scriptName(spec, split - spec), wokenName(split + 1);
+        const int s = named(program.scripts, scriptName.c_str()), target = named(program.scripts, wokenName.c_str());
+        const Script *script = at(program.scripts, s);
+        const Node *root = script ? program.node(script->root) : nullptr;
+        const Node *head = root && !(root->flags & 3) && root->opcode == 0 ? program.node(root->data) : nullptr;
+        uint32_t after = nil;
+        bool found = false;
+        int statement = 0;
+        if(head && at(threads, s) && target >= 0)
+            for(uint32_t it = head->next; const Node *part = program.node(it); it = part->next, ++statement)
+            {
+                if((part->flags & 3) || part->opcode != 21) continue;   // a call of wake
+                const Node *callee = program.node(part->data);
+                const Node *arg = callee ? program.node(callee->next) : nullptr;
+                if(!arg || !(arg->flags & 1)) continue;
+                if(strcmp(program.text(arg->text), wokenName.c_str()) && literal(*arg).integer() != target) continue;
+                after = part->next;
+                found = true;
+                break;
+            }
+        if(!found)
+        {
+            conoutf("HaloScript: the fresh start cannot resume %s after (wake %s) in %s", scriptName.c_str(), wokenName.c_str(), cache);
+            return false;
+        }
+        Thread &thread = threads[s];
+        thread = {};
+        thread.started = true;
+        thread.wake = tick;
+        if(after != nil)
+        {
+            thread.stack.emplace_back(script->root);
+            thread.stack.back().phase = 1;
+            thread.stack.back().next = after;
+        }
+        else thread.done = true;
+        conoutf("HaloScript: %s section %d started afresh on difficulty %d: %s resumed after its statement %d (wake %s)",
+                cache, section + 1, halodifficulty(), scriptName.c_str(), statement, wokenName.c_str());
+        return true;
     }
 
     // Whether the expression at `datum` calls script `target` (itself or inside its arguments).
@@ -4442,9 +4627,20 @@ int haloscenarioplace(const char *encounter)
 
 int haloscenarioencounter(const char *name)
 {
-    if(!scenario.loaded) return -1;
+    if(!scenario.loaded || !name) return -1;
+    // "encounter/squad" names one squad, as a compiled ai literal does (kind 2 in bits 30 and 31,
+    // the squad in bits 16 to 23, Scenario::matchesSquad); for the QA client's probes (the fresh-start batch).
+    const char *slash = strchr(name, '/');
+    const std::string encounter = slash ? std::string(name, slash - name) : std::string(name);
     for(size_t i = 0; i < scenario.program.encounters.size(); ++i)
-        if(scenario.program.encounters[i].name == name) return int(i);
+    {
+        const Encounter &e = scenario.program.encounters[i];
+        if(e.name != encounter) continue;
+        if(!slash) return int(i);
+        for(size_t k = 0; k < e.squads.size() && k < 256; ++k)
+            if(e.squads[k].name == slash + 1) return int32_t((2u << 30) | (uint32_t(k) << 16) | uint32_t(i));
+        return -1;
+    }
     return -1;
 }
 
@@ -4549,6 +4745,26 @@ bool haloscenarioflagpoint(const char *flag, vec &feet, float &yaw)
     if(!f) return false;
     feet = toWorld(*scenario.projection, f->pose.position);
     yaw = fmodf(450.0f - f->pose.yaw / RAD, 360.0f);
+    return true;
+}
+
+// QA (tests/test_starting_profiles.py item 8): where to stand `distance` world units in front of a
+// machine along its own x axis (`side` -1 for behind), at its base, and the yaw that faces it
+// square on; false if the object is not a machine of this section.
+bool haloscenarioqadevicefront(const char *name, float distance, int side, vec &feet, float &yaw)
+{
+    if(!scenario.loaded || !scenario.projection || !name) return false;
+    const int *device = at(scenario.objectDevices, named(scenario.program.objects, name));
+    if(!device || *device < 0) return false;
+    const Device &d = scenario.program.devices[*device];
+    // A fifth of a Halo unit off the machine's middle, square to it: not at the seam between a
+    // door's two leaves.
+    vec offset(side < 0 ? -distance / scenario.projection->xy : distance / scenario.projection->xy, .2f, 0), aim(0, .2f, 0);
+    offset.rotate_around_z(d.pose.yaw);
+    aim.rotate_around_z(d.pose.yaw);
+    feet = toWorld(*scenario.projection, vec(d.pose.position).add(offset));
+    const vec toward = toWorld(*scenario.projection, vec(d.pose.position).add(aim)).sub(feet);
+    yaw = atan2f(toward.x, -toward.y) / RAD;
     return true;
 }
 
@@ -5633,6 +5849,12 @@ bool haloscenariotrace(const vec &from, const vec &to, HaloCollisionHit &hit)
     return scenario.traceDevices(from, to, hit) || structure;
 }
 
+bool haloscenariomeleedevice(const vec &from, const vec &to)
+{
+    if(from == to || !std::isfinite(vec(to).sub(from).squaredlen()) || !std::isfinite(from.squaredlen())) return false;
+    return scenario.meleeDevice(from, to);
+}
+
 int haloscenariotargettrace(const vec &from, const vec &to, float &fraction)
 {
     fraction = 1;
@@ -5837,6 +6059,16 @@ void haloscenarioattachdump(const char *label)
         conoutf("ATTACH_QA %s pending=%s visible=%d posed=%d recording=%d riding=%d drawn=%d", label, sc.program.objects[i].name.c_str(),
                 a.visible, a.animation != nullptr, a.recording != nullptr, a.parent >= 0,
                 a.visible && storyFigure(sc.program, i, a, false));
+    }
+    // Carried in from the section before and not spawned yet (spawnCarried): its squad now (an
+    // ai_migrate retargets it), the health it will spawn with and why it last waited (the fresh-start batch).
+    for(const CarriedAttach &c : sc.carriedAttached)
+    {
+        const Encounter *e = at(sc.program.encounters, c.encounter);
+        const Squad *s = e ? at(e->squads, c.squad) : nullptr;
+        conoutf("ATTACH_QA %s carried=%s squad=%s/%s health=%.2f waiting=%d", label,
+                at(sc.program.objects, c.object) ? sc.program.objects[c.object].name.c_str() : "-",
+                e ? e->name.c_str() : "-", s ? s->name.c_str() : "-", c.health, c.waiting);
     }
     conoutf("ATTACH_QA %s count=%d figures=%d", label, count,
             int(std::count_if(sc.program.objectFlags.begin(), sc.program.objectFlags.end(), [](unsigned char f) { return (f & OBJECT_STORY_FIGURE) != 0; })));

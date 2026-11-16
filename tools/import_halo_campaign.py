@@ -15,7 +15,7 @@ import time
 
 from import_halo_a30 import HaloMap, ac_yaw, encode_map, entity, LIGHT, PLAYERSTART, AMMO, GRENADE, HEALTH, MAPMODEL
 from halo_collision import (CollisionTree, DoorBlocks, FlightSpace, GrenadeArcs, LightBridges, PolygonClearance, SightLines,
-                            VehicleGround, assist_surfaces, floor_samples, lift_ride, machine_boxes, overlap_seals,
+                            VehicleGround, assist_surfaces, euler_rows, floor_samples, lift_ride, machine_boxes, overlap_seals,
                             scenery_surfaces, static_device_surfaces, structure_surfaces, write_structure_collision)
 from halo_map_art import SCENERY_MODELS, write_scenery, write_world_mesh
 from halo_weapons import actor_weapon, equipment_index, weapon_index
@@ -123,6 +123,45 @@ def crash_site_scenery(halo, projection):
     return found
 
 
+def mapmodel_angles(yaw, pitch, roll):
+    """A MAPMODEL entity's (attr1, attr5, attr6) that draw a scenery placement's retail (yaw, pitch,
+    roll) (radians) as Halo turns it, in the campaign frame (y reflected).
+
+    Halo turns an object by halo_collision.euler_rows, R = Rx(roll) Ry(-pitch) Rz(yaw); seen in the
+    campaign frame (D = diag(1, -1, 1) on both sides, as the projection and the md3 export reflect y)
+    that is T = D R D = Rx(-roll) Ry(-pitch) Rz(-yaw). AssaultCube draws a mapmodel (entities.cpp
+    rendermapmodels, md3.h render: quat(-yaw - 180, pitch).roll(roll), fromquat, glMultMatrixf) with
+    Rz(attr1 / 10 + 180) Ry(-attr5 / 10) Rx(-attr6): the other order, so the angles are solved for
+    from T, not copied (the Crash Site batches copied them, which mirrored the yaw and put tilt on the
+    wrong axes for a placement both turned and tilted). attr6 is a signed byte of whole degrees: of
+    the two solutions the one whose roll fits (|roll| <= 127) is taken, and after rounding the roll the
+    yaw and pitch are solved again for it (left within about half a degree; attr1 and attr5 are
+    tenths)."""
+    rows = euler_rows(yaw, pitch, roll)
+    t = [[rows[i][j] * (-1 if (i == 1) != (j == 1) else 1) for j in range(3)] for i in range(3)]
+    # T = Rz(a) Ry(b) Rx(c): T[2][0] = -sin b, T[2][1] = cos b sin c, T[2][2] = cos b cos c,
+    # T[1][0] = sin a cos b, T[0][0] = cos a cos b.
+    b = -math.asin(max(-1.0, min(1.0, t[2][0])))
+    if math.cos(b) > 1e-6:
+        a, c = math.atan2(t[1][0], t[0][0]), math.atan2(t[2][1], t[2][2])
+    else:
+        a, c = math.atan2(-t[0][1], t[1][1]), 0.0
+    if abs(math.degrees(c)) > 127:
+        # The other solution: Rz(a + pi) Ry(pi - b) Rx(c - pi).
+        a, b, c = a + math.pi, math.pi - b, c - math.copysign(math.pi, c)
+    c = math.radians(round(math.degrees(c)))
+    # U = T Rx(-c) = Rz(a) Ry(b) for the rounded roll; keep the branch's sign of cos b.
+    cc, sc = math.cos(c), math.sin(c)
+    u = [[t[i][0], t[i][1] * cc + t[i][2] * sc, t[i][2] * cc - t[i][1] * sc] for i in range(3)]
+    sign = 1 if math.cos(b) >= 0 else -1
+    a = math.atan2(sign * u[1][0], sign * u[0][0])
+    b = math.atan2(-u[2][0], u[0][0] * math.cos(a) + u[1][0] * math.sin(a))
+    attr1 = round((math.degrees(a) - 180) * 10) % 3600
+    attr5 = round(-math.degrees(b) * 10)
+    attr5 = (attr5 + 1800) % 3600 - 1800
+    return attr1, attr5, -round(math.degrees(c))
+
+
 def scenery_drawn(halo, baked, as_models):
     """The baked scenery placements (scenery_surfaces' (index, count) pairs) that write_world_mesh
     draws: every one no mapmodel draws, [(scen tag, (x, y, z, yaw, pitch, roll))] in retail units."""
@@ -179,29 +218,33 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   and the lab, and after x50 out through the upper doorway (bsp 2,1 #1). Not walked in the game;
 #   to put it back on stock geometry add ('c10', 2) here and re-run
 #   `import_halo_campaign.py "$maps" --mission c10 --part 3`;
-# - section 5 (BSP 3, lift_b to the BSP 4 doorway): with the folded door leaves walkable
-#   (FLOOR_LEAVES) the lower BSP 3/4 doorway opens and a route exists (start on the landing at the
-#   bottom of lift_b, (-18.0, 23.4, -37.9), a 1.9-unit ledge drop, 490 steps), but it has to cross
-#   bridge_c. flicker_bridge (continuous, never stopped) moves bridge_c's position: (device_set_position
-#   bridge_c 0), (sleep (random_range 15 75)), (device_set_position bridge_c (real_random_range 0.5 1)),
-#   (sleep (random_range 15 75)), while BSP 3 is loaded. The deck is the machine's panels, which follow
-#   the position (the tag is "bridge fast": 0.0667 a tick), so its collision does not persist: from
-#   the start of an extension to the next retraction is at most 90 ticks (3 s), while the 8.5-unit
-#   crossing takes 3.8 s at Halo's run (2.25 a second) and 4.2 s at the engine's. Without the bridge
-#   the nearest floor on the far side is 5.6 units away. Halo's player can only make it riding the
-#   panels as they move (if Halo carries a biped on a moving machine, unconfirmed), which the engine
-#   does only on lift decks; an assist there would be a permanent bridge, a link Halo does not
-#   have, so the section stays stock. The upper doorway's bsp3_device_15 and _16 and the lower
-#   storey's bsp3_device_13 and _14 are off (placement flag 2) and nothing powers them. Looked at again
-#   with its scenery's collision (SCENERY_COLLISION): the crate stack in the lower storey's west bay
-#   (x -47 to -42, y 35 to 41: c_storage, c_storage_large and c_uplink crates, some tilted, and three
-#   invisible door_blast_collision planes) is Halo's way from the lower storey up to the upper storey
-#   beyond bridge_c (floor to crate top 0.72 to 0.84, then 0.38 to 0.50 to the balcony at -38.3:
-#   crouch jumps), so Halo's player need not cross bridge_c at all. The engine needs assists for those
-#   climbs too, on the stack's tilted crates and planes. The scenery batch left the section stock because
-#   the placement rotation was unconfirmed; the final integration review took halo_collision.euler_rows
-#   from Halo's own source (the tilted crates now rest on their floors), so assists on the stack can be
-#   authored statically, which has not been done yet. docs/macos-build.md has the figures;
+# - section 5 (BSP 3, lift_b to the BSP 4 doorway) is no longer stock (the batch after the final
+#   integration review): it starts on the landing at the bottom of lift_b (SECTION_ANCHORS; bsp 3,1 is
+#   near the top of the shaft), drops 1.9 units to the lower storey (LEDGE_DROPS), climbs the debris
+#   pile in its west bay to the upper storey's balcony over one walking assist (ASSISTS), walks the
+#   upper storey east and drops 1.9 units again by the lower BSP 3/4 doorway (bsp 3,4 #0, TRANSITIONS),
+#   where it ends. The lower storey's own way east, bsp3_device_13 and _14, and the upper doorway's
+#   bsp3_device_15 and _16 are off (placement flag 2) and nothing powers them. It does not cross
+#   bridge_c (UNCROSSED_BRIDGES): flicker_bridge (continuous, never stopped) moves bridge_c's position
+#   while BSP 3 is loaded, (device_set_position bridge_c 0), (sleep (random_range 15 75)),
+#   (device_set_position bridge_c (real_random_range 0.5 1)), (sleep (random_range 15 75)), and the
+#   deck is the machine's panels, which follow the position (the tag is "bridge fast": 0.0667 a tick),
+#   so from the start of an extension to the next retraction is at most 90 ticks (3 s), while the
+#   8.5-unit crossing takes 3.8 s at Halo's run (2.25 a second); an assist there would be a permanent
+#   bridge, a link Halo does not have. The debris pile (x -47 to -44, y 35 to 41) is BSP rubble, a b40
+#   metal sheet, tilted c_storage crates and three invisible door_blast_collision planes
+#   (SCENERY_COLLISION); with Halo's own placement rotation (halo_collision.euler_rows, since the final
+#   integration review) it is one walkable slope from the rubble's top (z -39.20, its north chamfer
+#   -39.30) up the metal sheet (-39.0) and the first plane (normal z 0.88, -38.98 to -38.29) onto the
+#   balcony (-38.31). Only the first climb, from the lower floor (-40.00), is beyond the engine's jump:
+#   0.72 onto the rubble's chamfer, or 0.46 onto the c_storage lying on its side at the pile's foot
+#   (top -39.54) and then 0.28 onto the chamfer. 0.46 is a standing jump in Halo (0.69); the assist is
+#   a ramp onto that crate, and the 0.28 hop is the engine's own jump (route flag 2). The second plane
+#   (normal z 0.70) is walkable too, unused; the third is too steep to stand on (a guard). The scenery
+#   batch's figures (0.72 to 0.84, then 0.38 to 0.50) were measured with the old rotation. Not walked
+#   in the game; to put it back on stock geometry add ('c10', 4) here and re-run
+#   `import_halo_campaign.py "$maps" --mission c10 --part 5` and `import_halo_scripts.py "$maps"
+#   --mission c10`. docs/macos-build.md has the details;
 # - section 6 (BSP 4, to lift_d) is no longer stock (gap 5 of batch 5, the scenery batch): it starts at
 #   the lower BSP 4/3 doorway (bsp 4,3 #0; TRANSITIONS), walks the lower storey and climbs to the
 #   upper one, where bridge_d, bridge_e (mission_int_b waits for it) and the lift_d room are, by the
@@ -253,7 +296,7 @@ VALIDATED_COLLISION = {'a10', 'a30', 'a50', 'b30', 'b40', 'c10', 'c20', 'c40', '
 #   scales (1.98, 3.23, 2.24) make the body 1.6 to 2.6 units tall, more than the Maw's corridors
 #   and the elevator landing hold (from section6 only 3 cells of BSP 5 are reachable at its
 #   scale). They are DRIVEN_SECTIONS instead: the player drives them in a Warthog.
-STOCK_SECTIONS = {('c10', 4), ('d40', 2)}
+STOCK_SECTIONS = {('d40', 2)}
 
 
 @dataclass(frozen=True)
@@ -268,6 +311,11 @@ class Assist:
 def ramp_y(x1, x2, y1, z1, y2, z2, why):
     """An Assist ramp across x1..x2 rising (or falling) along Y from (y1, z1) to (y2, z2)."""
     return Assist(((x1, y1, z1), (x2, y1, z1), (x2, y2, z2), (x1, y2, z2)), why)
+
+
+def ramp_x(y1, y2, x1, z1, x2, z2, why):
+    """An Assist ramp across y1..y2 rising (or falling) along X from (x1, z1) to (x2, z2)."""
+    return Assist(((x1, y1, z1), (x1, y2, z1), (x2, y2, z2), (x2, y1, z2)), why)
 
 
 # Walking assists (Assist), by section. The engine's jump is fixed (the movement constants are a hard
@@ -323,23 +371,41 @@ ASSISTS = {
         Assist(((7.35, 82.42, -39.194), (7.35, 82.85, -39.194), (6.35, 82.85, -38.494), (6.35, 82.42, -38.494)),
                'c10 BSP 4: debris up into the notch in the upper floor\'s broken edge (Halo crouch jump, 0.70)'),
     ),
-    # No assist for c10 section 5 or d40 section 3 (STOCK_SECTIONS, above): none of their missing
-    # links is one Halo's jump makes that an assist may stand in for (docs/macos-build.md, the notes on
-    # c10 and d40; batch 5 looked again with their scenery's collision).
+    # c10 section 5 (BSP 3): the lower storey reaches the upper one only up the debris pile in the west
+    # bay (STOCK_SECTIONS' notes: bridge_c never stays extended long enough to cross). The pile is one
+    # walkable slope from the BSP rubble's top up to the balcony; the lower floor (-40.00) meets it only
+    # 0.72 below the rubble's north chamfer, or 0.46 below the top of the c_storage lying on its side at
+    # its foot (scenery 1495: flat top -39.53 to -39.54, x -46.43 to -45.63, y 39.62 to 40.28, bevels out
+    # to x -45.47), from which the chamfer is 0.28 higher, 0.375 across (the engine's own jump). The ramp
+    # climbs 28 degrees west from the floor east of the crate onto its top (its upper corners on the
+    # crate's top and east bevel): a Halo standing jump (0.69), beyond the engine's 0.36.
+    ('c10', 4): (
+        ramp_x(39.70, 40.10, -44.85, -39.994, -45.72, -39.536,
+               'c10 BSP 3 west bay: lower floor up onto the lying c_storage crate at the foot of the debris pile (Halo standing jump, 0.46)'),
+    ),
+    # No assist for d40 section 3 (STOCK_SECTIONS, above): none of its missing links is one Halo's jump
+    # makes that an assist may stand in for (docs/macos-build.md, the notes on d40; batch 5 looked again
+    # with its scenery's collision).
 }
 # Sections whose .hcol carries their scenery's collision (halo_collision.scenery_surfaces, the SCN1
 # trailer): the scenario's scenery placements in the section's BSP and map window, each its coll tag's
 # polygons (the permutation its render model draws) at its placement, as ordinary static surfaces:
 # bodies, shots, grenades, the camera and vehicles collide with them, as with everything in Halo.
 # Scenery a script creates, destroys or moves, or that some difficulty does not place, is left out
-# (the .hcol is fixed). The planner walks on and round them like the static machines. They are drawn
-# too: the Crash Site's trees, boulders and lifepod by their mapmodels where those stand (whose
-# cylinders then no longer collide: halo_a30.cfg's zero heights), every other baked placement in the
-# section's .mesh (write_world_mesh's `scenery`). Only these sections, so every other section's .hcol,
-# .mesh, map and route stay byte for byte as they were until it is added and re-imported. Not seen in
-# the game. To take a section's scenery out, delete it here and re-run its import (for the Crash Site
-# also put halo_a30.cfg's mapmodel lines back to CRASH_SITE_MAPMODELS' sizes).
-SCENERY_COLLISION = {CRASH_SITE_KEY, ('c10', 2), ('c10', 4), ('c10', 5), ('d40', 2)}
+# (the .hcol is fixed). The planner walks on and round them like the static machines, and so do the
+# vehicle planners (VehicleGround's floors and walls, FlightSpace's sight lines). They are drawn too:
+# the Crash Site's trees, boulders and lifepod by their mapmodels where those stand (whose cylinders
+# then no longer collide: halo_a30.cfg's zero heights), every other baked placement in the section's
+# .mesh (write_world_mesh's `scenery`). The scenery batch started with the Crash Site and c10 sections
+# 3 and 6; the batch after the c10 section 5 batch added every other section on retail collision,
+# mission by mission, walked, driven and flown (each route still ends in its exit; the per-section
+# figures are in docs/macos-build.md, Scenery collision). A section on stock geometry (d40 section 3)
+# gets no .hcol, so its entry only matters should it leave STOCK_SECTIONS. Not seen in the game. To take
+# a section's scenery out, add its key to SCENERY_LEFT_OUT with the reason and re-run its import (for
+# the Crash Site also put halo_a30.cfg's mapmodel lines back to CRASH_SITE_MAPMODELS' sizes).
+SCENERY_LEFT_OUT = set()
+SCENERY_COLLISION = ({CRASH_SITE_KEY} | {(m.cache, part) for m in MISSIONS if m.cache in VALIDATED_COLLISION
+                                         for part in range(len(m.sections))}) - SCENERY_LEFT_OUT
 # Sections played in a vehicle (source/src/halo_vehicle.cpp), not walked: d40's Warthog run and
 # c40's Banshee flights. They get an .hcol, which the vehicle drives or flies on (its body is the
 # retail vehicle's size at the section's scale, so it fits where the walking body does not), but
@@ -435,6 +501,15 @@ VEHICLE_JUMP_DROP = 25.0
 # records its speed (`drive.speed` in the metrics), which the tests hold the car to
 # (qa_vehicle_cruise) and a player keeps to at its jumps.
 DRIVE_SPEEDS = (.9, .85, .8, .75, .7)
+# Jump governors (an engine accommodation; judgement call, docs/macos-build.md Planned vehicle
+# routes): for every jump of a drive leg planned slower than DRIVE_SPEEDS[0] (d40 section 8's pit
+# room drop clears the hanging bridge segment only below about 0.78 of top speed, and a player at
+# full throttle would meet it), the section's map .cfg gets `halo_vehiclegovern X Y Z RADIUS SPEED`:
+# the take-off row's point, a sphere of GOVERNOR_SECONDS of travel at the leg's speed (at least
+# GOVERNOR_RADIUS units) and the leg's speed. halo_vehicle.cpp holds the player's car at that speed
+# inside it (halo_vehiclegovernor, on by default): no throttle at it, the brakes above it. One second
+# at 27 units a second leaves the Warthog three times its braking distance from 36 (9.5 units).
+GOVERNOR_SECONDS, GOVERNOR_RADIUS = 1.0, 12.0
 # The engine's ground vehicles without a `physics` line in vehicles.txt (an older table) fall at
 # 40 units a second squared, as they always did (halo_vehicle.cpp legacyGravity).
 LEGACY_VEHICLE_GRAVITY = 40.0
@@ -474,7 +549,7 @@ JUMP_COST, CROUCH_COST, SCRIPTED_COST = 25, 2, 400
 # The Crash Site (CRASH_SITE_KEY) leaves the lifepod's valley by two steep rocky slopes, too steep to
 # stand on (2.1 units down over 1.5 at its north end, then 1.5 down into the marines' basin): a walk
 # down them in Halo (falls under 3 units do no harm), slides here (SLIDES).
-LEDGE_DROPS = {('c10', 1): 2.1, ('d20', 1): 3.0, ('d20', 2): 2.6, ('d40', 0): 2.1, CRASH_SITE_KEY: 3.0}
+LEDGE_DROPS = {('c10', 1): 2.1, ('c10', 4): 2.1, ('d20', 1): 3.0, ('d20', 2): 2.6, ('d40', 0): 2.1, CRASH_SITE_KEY: 3.0}
 DROP_COST = 300
 # Sections whose ledge drops may also go down slopes too steep to stand on (retail_route's `slide`):
 # the body slides down them (retailmove treats a face under 0.65 as a wall, and gravity takes it down
@@ -484,6 +559,9 @@ TRANSITIONS = {
     # c10 section 6 starts at the lower BSP 4/3 doorway (the first "bsp 4,3"): the upper doorway's doors
     # (bsp3_device_15 and _16, bsp4_device_13 and _15) are off and nothing powers them.
     ('c10', 4, 3): 'bsp4,3#0',
+    # c10 section 5 ends in the same doorway from BSP 3's side, the first "bsp 3,4" (z -40.85 to -38.13);
+    # the second is the upper doorway's (z -38.1 to -37.1), whose doors are off.
+    ('c10', 3, 4): 'bsp3,4#0',
     # mission_area5 puts the player on the gravity room pad (gravity_teleport0_flag) after the
     # lift. Starting at entr_safe, beside the hangar exit, skipped the gravity room and the
     # muster bay, and left that flag outside the section's projection.
@@ -524,6 +602,9 @@ SECTION_ANCHORS = {
     # coming down when the section starts); bsp 1,0 is half way up the shaft, where no floor is
     # (the route used to start on the top landing).
     ('c10', 1): ((-58.6, -6.3, 2.0), None),
+    # c10 section 5 (BSP 3) starts on the landing at the bottom of lift_b: bsp 3,1 is near the top of
+    # the shaft, 34 units up, where no floor is.
+    ('c10', 4): ((-18.0, 23.4, -37.9), None),
     # The control room (BSP 2) is entered by the lower of its two "bsp 2,1" doorways (#0, z -0.5):
     # the upper one's post_helmet_door_4 is off until ini_post_helmet_replace powers it after x50,
     # and it is the way out (SECTION_EXITS).
@@ -880,6 +961,12 @@ UNGROUPED_DOORS_SEALED = {'d40'}
 # engine lets bodies do the same (Scenario::collideDevices). The other missions' routes keep
 # treating every panel as solid, as they were planned and walked: switching one over needs a re-walk.
 FLOOR_LEAVES = {'c10'}
+# Light bridges (LightBridges) a section's route may not cross: their decks are left out of its floor.
+# c10 section 5's bridge_c is moved for ever by flicker_bridge (retracted, 0.5 to 2.5 s, extended to a
+# random 0.5 to 1, 0.5 to 2.5 s, and so on), so its deck never stays long enough to cross (3 s at most
+# from an extension to the next retraction, 3.8 s to cross at Halo's run); the route goes round by the
+# west bay's debris pile instead (ASSISTS). The engine still moves and collides with the bridge.
+UNCROSSED_BRIDGES = {('c10', 4): {'bridge_c'}}
 
 
 def cutscene_flag(halo, name):
@@ -1927,7 +2014,8 @@ def plan_vehicle_route(halo, mission, part, key, projection, size, bsp, surfaces
     markers, whether it ends inside the section's exit, the exit's campaign point, how many EXTRA_BSPS
     it planned over and the drive legs' totals ({'jumps', 'seconds', 'gravity', 'speed', 'top'}: the
     jumps planned, the time the drive takes at the planner's speed, the vehicle gravity, the speed the
-    drive is planned at (the slowest leg's) and the car's top speed); None when the section
+    drive is planned at (the slowest leg's), the car's top speed and 'governors', the jump governors
+    of the legs planned slower than DRIVE_SPEEDS[0], [x, y, z, radius, speed] each); None when the section
     has no plan or the vehicle table is missing."""
     legs = VEHICLE_ROUTES.get(key)
     table = vehicle_table(output)
@@ -2011,6 +2099,7 @@ def plan_vehicle_route(halo, mission, part, key, projection, size, bsp, surfaces
     ended = False
     goal = target_of(None)[1]
     drive_seconds, drive_jumps, drive_gravity, drive_speed, drive_top = 0.0, 0, None, None, None
+    drive_governors = []                      # [x, y, z, radius, speed] per governed take-off
     for number, leg in enumerate(legs):
         kind, target = leg
         last = number == len(legs) - 1
@@ -2184,6 +2273,12 @@ def plan_vehicle_route(halo, mission, part, key, projection, size, bsp, surfaces
             drive_seconds += seconds
             drive_jumps += jumps
             drive_gravity = gravity
+            if arrived and speed < DRIVE_SPEEDS[0] * top - 1e-6:
+                # The take-off of every jump of a leg that only arrives slower (GOVERNOR_SECONDS).
+                for a, b in zip(path, path[1:]):
+                    if math.hypot(b[0] - a[0], b[1] - a[1]) > 1.5:
+                        drive_governors.append([a[0], a[1], round(a[2] / 4, 2),
+                                                round(max(GOVERNOR_RADIUS, speed * GOVERNOR_SECONDS), 2), round(speed, 2)])
             print(f'{key}: drive to {target or exit_name}: {len(path)} cells, {len(ground.samples)} floor columns, '
                   f'{jumps} jumps, gravity {gravity:.1f}, about {seconds:.0f} s at {speed:.1f} units a second'
                   f'{"" if arrived else ", did not arrive"}', flush=True)
@@ -2199,7 +2294,8 @@ def plan_vehicle_route(halo, mission, part, key, projection, size, bsp, surfaces
                     f'{target or exit_name}', flush=True)
                 break
     drive = {'jumps': drive_jumps, 'seconds': round(drive_seconds, 1), 'gravity': round(drive_gravity, 2),
-             'speed': round(drive_speed, 2), 'top': round(drive_top, 2)} if drive_gravity is not None else None
+             'speed': round(drive_speed, 2), 'top': round(drive_top, 2),
+             'governors': drive_governors} if drive_gravity is not None else None
     return rows, cells, ended, goal, len(extras), drive
 
 
@@ -2306,7 +2402,7 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
             # its end for a script to extend it or using the control there (LightBridges).
             bridges = LightBridges(halo, projection, output, SCRIPTED_COST, bsp)
             bridgeless = {xy: list(levels) for xy, levels in crouching.items()}
-            bridges.add_floors(crouching, tree, size, walls)
+            bridges.add_floors(crouching, tree, size, walls, UNCROSSED_BRIDGES.get(key, ()))
             exit_name = exit_target(mission, part, key)
             box = volume_box(halo, exit_name) if isinstance(exit_name, str) else None
             test = (volume_test(box, projection) if box else
@@ -2579,23 +2675,46 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         phase = 1 if i < len(path)//4 else 2 if i < halfway-3 else 3
         entries.append(entity(xyz(path[i]), PLAYERSTART,0,100,phase))
     used = []
-    for wave, anchor in enumerate((path[len(path)//4],path[3*len(path)//4])):
-        eligible = []
-        for p, actor in actors:
-            point = projection.point(p)
-            if math.dist(point[:2],anchor) > 55:
-                continue
-            # Projection from an authored actor onto a nearby reachable cell.
-            close = [(x,y) for x in range(round(point[0])-6,round(point[0])+7)
-                           for y in range(round(point[1])-6,round(point[1])+7)
-                     if (x,y) in parents and not parked_at(x, y, floor[x,y])]
-            if not close:
-                continue
-            place = closest(close,floor,point)
-            if abs(floor[place]/4-point[2]) > 8 or math.dist(place,anchor)>35:
-                continue
-            eligible.append((math.dist(place,anchor),place,actor,p[3]))
-        for _, place, (kind, weapon), angle in sorted(eligible):
+    # Native actor spawns: two encounters, each the actors (at most four) whose retail position is
+    # within 55 units (2D) of an anchor on the route, placed on the nearest reachable raster cell
+    # within 35 of it; the anchors stand a quarter and three quarters along the route.
+    spots = []
+    for p, actor in actors:
+        point = projection.point(p)
+        # Projection from an authored actor onto a nearby reachable cell.
+        close = [(x,y) for x in range(round(point[0])-6,round(point[0])+7)
+                       for y in range(round(point[1])-6,round(point[1])+7)
+                 if (x,y) in parents and not parked_at(x, y, floor[x,y])]
+        if not close:
+            continue
+        place = closest(close,floor,point)
+        if abs(floor[place]/4-point[2]) > 8:
+            continue
+        spots.append((point, place, actor, p[3]))
+    def anchored(anchor):
+        return sorted((math.dist(place,anchor),place,actor,angle) for point, place, actor, angle in spots
+                      if math.dist(point[:2],anchor) <= 55 and math.dist(place,anchor) <= 35 and
+                      not any(math.dist(place,u) < 5 for u in used))
+    first_anchor = -1
+    for wave, at in enumerate((len(path)//4, 3*len(path)//4)):
+        eligible = anchored(path[at])
+        if not eligible and vehicle_plan and key not in FLOWN_SECTIONS:
+            # A driven section's anchor that finds nobody (d40 section 8's, after its drive grew to
+            # reach grand_finale) moves to the route cell nearest it from which actors not yet placed
+            # are in reach: the first encounter's within the route's first half, the second's past
+            # the first's anchor, so the encounters keep their order along the drive. The planned
+            # drive goes past the retail encounters, not through the raster's quarter points.
+            steps = range(0, len(path)//2) if wave == 0 else range(first_anchor + 1, len(path))
+            for i in sorted(steps, key=lambda i: (abs(i - at), i)):
+                eligible = anchored(path[i])
+                if eligible:
+                    print(f'{mission.cache} section {part+1}: encounter {wave+1} anchored at route step {i} '
+                          f'({path[i][0]},{path[i][1]}), not {at}: no actor in reach there', flush=True)
+                    at = i
+                    break
+        if wave == 0:
+            first_anchor = at
+        for _, place, (kind, weapon), angle in eligible:
             if any(math.dist(place,p) < 5 for p in used):
                 continue
             # attr5 holds the carried weapon's packages/halo/weapons.txt index + 1.
@@ -2685,8 +2804,9 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
             elevation = round((z - floor[cell] // 4) * 5)
             if not -5 <= elevation <= 255:
                 continue
-            entries.append(entity((cell[0], cell[1], z), MAPMODEL, round(math.degrees(yaw) * 10) + 1800, slot,
-                                  max(0, elevation), 0, round(math.degrees(pitch) * 10), round(math.degrees(roll))))
+            # Turned as Halo turns it (mapmodel_angles), as its collision is (scenery_surfaces).
+            attr1, attr5, attr6 = mapmodel_angles(yaw, pitch, roll)
+            entries.append(entity((cell[0], cell[1], z), MAPMODEL, attr1, slot, max(0, elevation), 0, attr5, attr6))
             modelled += 1
             as_models.add(index)
         print(f'{name}: {modelled} of {len(scenery)} scenery models placed', flush=True)
@@ -2704,6 +2824,19 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
     cgz = encode_map(native_cubes(floor,ceilings,size),entries,factor,title.encode())
     cgz_path = maps / f'{name}.cgz'
     cgz_current = cgz_path.is_file() and cgz_path.read_bytes() == cgz
+    # The section's map .cfg (git-ignored; halo_a30.cfg, the Crash Site's, is tracked and not written
+    # here): the fog, and a driven section's jump governors (GOVERNOR_SECONDS).
+    cfg_path, cfg_text = maps / f'{name}.cfg', None
+    if not crash_site:
+        cfg_text = 'fog 360\nfogcolour 0x617181\n'
+        governors = ((vehicle_plan[5] or {}).get('governors') or []) if vehicle_plan and driven else []
+        if governors:
+            cfg_text += ('// Jump governors (tools/import_halo_campaign.py GOVERNOR_SECONDS; halo_vehiclegovernor 0 turns them off):\n'
+                         '// take-off x y z, radius, speed (units, units a second)\n' +
+                         ''.join('halo_vehiclegovern %d %d %.2f %.2f %.2f\n' % tuple(g) for g in governors))
+            print(f'{name}: {len(governors)} jump governors at {governors[0][4]:.1f} units a second '
+                  f'(take-offs {", ".join(f"{g[0]},{g[1]},{g[2]:.2f}" for g in governors)})', flush=True)
+    cfg_current = cfg_text is None or (cfg_path.is_file() and cfg_path.read_text() == cfg_text)
     route_text = None
     if write:
         cgz_path.write_bytes(cgz)
@@ -2712,7 +2845,7 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
             # exported at this layout's scale, the same across and up.
             write_scenery(halo, output / 'models' / 'mapmodels' / 'halo_a30', scale, scale)
         else:
-            (maps / f'{name}.cfg').write_text('fog 360\nfogcolour 0x617181\n')
+            cfg_path.write_text(cfg_text)
         write_world_mesh(halo,output,projection.xy,projection.z,(xmin-8,xmax+8,ymin-8,ymax+8),
                          map_name=name,bsp=bsp,include_sky=not indoor,
                          extra_bsps=EXTRA_BSPS.get(key, ()) if retail else (),
@@ -2895,6 +3028,9 @@ def make_section(halo, mission, part, output, collision='validated', metrics_onl
         # Whether the files on disk are what this importer writes (always, after a real import;
         # with --metrics-only, false means the section needs re-importing).
         'cgz_current': True if write else cgz_current,
+        # The map .cfg likewise (the fog and a driven section's jump governors; the Crash Site's
+        # tracked halo_a30.cfg always counts as current).
+        'cfg_current': True if write else cfg_current,
         'route_current': (True if write else route_path.is_file() and route_path.read_text() == route_text)
                          if route_text is not None else (write or not route_path.exists()),
     }

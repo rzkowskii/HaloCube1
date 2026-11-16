@@ -217,6 +217,8 @@
             const int oldGroup = index(0), newGroup = index(1);
             if(!scene && newGroup != -1) for(SquadBot &bot : squadBots)
                 if(bot.bot && matchesSquad(oldGroup, bot.encounter, bot.squad)) migrateBot(bot, newGroup);
+            if(!scene && newGroup != -1) for(CarriedAttach &c : carriedAttached)
+                if(matchesSquad(oldGroup, c.encounter, c.squad)) migrateCarried(c, newGroup);
             return handled();
         }
         if(is("ai_migrate_by_unit") || is("ai_attach"))
@@ -233,6 +235,11 @@
                 unit->squadReference = target;
                 // In play, ai_attach turns the scripted biped into an actor of the squad (attachActors).
                 if(!scene && is("ai_attach") && at(attachedAt, object(0))) attachedAt[object(0)] = tick;
+                // ai_migrate_by_unit of an attached actor carried in that has not spawned yet (a50's
+                // mig_into_hangar names captain_keyes and the freed marines): its entry moves too.
+                if(!scene && is("ai_migrate_by_unit"))
+                    for(CarriedAttach &c : carriedAttached)
+                        if(c.object == object(0)) migrateCarried(c, target);
             }
             return handled();
         }

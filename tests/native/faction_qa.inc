@@ -43,6 +43,8 @@ COMMANDF(qa_allegiance_state, "s", (const char *label)
     loopi(HALO_TEAM_COUNT) for(int j = i + 1; j < HALO_TEAM_COUNT; ++j)
         conoutf("FACTION_ALLEGIANCE %s %s-%s allied=%d broken=%d", label, haloteamname(i), haloteamname(j),
                 !haloteamhostile(i, j), haloallegiancebroken(i, j));
+    // The kills counted towards each team's betrayal (the fresh-start batch, tests/test_vehicle_damage.py item 9).
+    loopi(HALO_TEAM_COUNT) conoutf("FACTION_BETRAYALS %s %s=%d", label, haloteamname(i), halobetrayalcount(i));
     fflush(stdout);
 });
 

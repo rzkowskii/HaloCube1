@@ -22,11 +22,27 @@ QA client (fresh profiles):
 5. a10 section 1 finished into section 2: the unarmed loadout is carried, not the profile again.
 6. A checkpoint saved unarmed writes `empty 0` and `empty 1` and no weapon line; Continue in a second
    launch is still unarmed.
-7. The fresh-start script (gap 6 of batch 5's critic, freshScripts in source/src/halo_script.cpp, not yet
-   run): a10 section 5 started on its own on Normal logs "a10 section 5 started afresh: the script brought
-   forward (5 globals set, 2 threads passed over, 2 woken)"; mission_tunnel and cryo_search have started,
-   mark_bridge_cutscene is true, the player is never seated in cryotube_1 (no "seats the player"), and
-   mission_a10 goes on to its later wakes (mission_boom started). Section 6 the same; section 4 not at all.
+7. The fresh-start script (freshScripts in source/src/halo_script.cpp: gap 6 of batch 5's critic for
+   sections 5 and 6, the fresh-start batch for sections 2 to 4 and the Normal tutorial resume; not yet run): each a10
+   section from 2 to 7 started on its own on Normal logs "a10 section N started afresh: the script brought
+   forward (G globals set, 2 threads passed over, W woken)" (section 2: 1 and 0; sections 3 and 4: 5 and 0;
+   sections 5 and 6: 5 and 2; section 7, since the final integration review of the fresh-start batch: 5
+   and 0) and "tutorial_setup resumed after its statement S (wake T)" (section 2: 63,
+   tutorial_first_contact; the others 65, tutorial_weapon); the player is never seated in cryotube_1 (no
+   "seats the player"); mark_fast_setup is set; the section's own mission threads have started (section 2
+   mission_crossfire and mission_bridge, with mission_shoot still waiting for the bridge scene and
+   mark_bridge_cutscene unset; section 3 mission_airlock_1, mission_flank, mission_loop and
+   mission_airlock_2; section 4 mission_knot and mission_stairs; sections 5 and 6 mission_tunnel,
+   cryo_search and mission_boom; section 7 mission_final); tutorial_setup is still waiting in section 2 (for the bridge flag) and has
+   finished in 3 to 7, where tutorial_motiontracker has started and tutorial_weapon has not. On Heroic
+   (section 3) the fresh start is the same but nothing resumes tutorial_setup (passed over, finished,
+   tutorial_motiontracker never started). Section 1 is untouched: no "started afresh" line, and on Normal
+   the tutorial seats the player in cryotube_1 as before.
+8. The melee door (the fresh-start batch, Scenario::meleeDevice; not yet run): a10 section 6 started on its own on
+   Normal: tutorial_melee has put in melee_door_2 (visible, at 0.8325, unpowered) and
+   tutorial_motiontracker powered off motiontracker_door_2; the player's melee square on to melee_door_2
+   (qa_device_melee) logs "Halo: a melee opened melee_door_2" and leaves it at 1.0; a second swing logs
+   nothing more. On Heroic melee_door_2 is never created and motiontracker_door_2 keeps its power.
 """
 import subprocess
 import sys
@@ -141,18 +157,98 @@ text, profile = run('continue', 'halo_title; sleep 300 [halo_continue] 1; qa_aft
 assert loadout(text, 'continued')['unarmed'] == '1', loadout(text, 'continued')
 print('A checkpoint saved unarmed kept the empty slots through Continue.')
 
-# 7. The fresh-start script fast-forward (gap 6): a10 sections 5 and 6 started on their own.
-for part in (5, 6):
-    text, _ = run(f'a10-{part}-fresh', f'halo_scripttrace 1; halo_difficulty 1; qa_campaign_resume 1 {part}; qa_after_gameplay ['
-                  'sleep 12000 [qa_hs_script mission_tunnel 1; qa_hs_script cryo_search 1; qa_hs_script mission_boom 1; '
-                  'qa_hs_global mark_bridge_cutscene; quit] 1]', timeout=150)
-    assert f'a10 section {part} started afresh: the script brought forward (5 globals set, 2 threads passed over, 2 woken)' in text, text[-2000:]
-    started = {line.split()[1]: line.split()[-1] for line in text.splitlines() if line.startswith('HS_SCRIPT ')}
-    assert started.get('mission_tunnel') == '1' and started.get('cryo_search') == '1', started
-    assert started.get('mission_boom') == '1', ('mission_a10 went on past its bridge wait', started)
-    assert [line for line in text.splitlines() if line.startswith('QA_HS_GLOBAL mark_bridge_cutscene')][-1].split()[-1] != '0.0000', text[-2000:]
-    assert 'the script seats the player in cryotube_1' not in text, ('the cryo exit is passed over', text[-2000:])
-    print(f'a10 section {part} on its own: mission_tunnel and cryo_search woken, the cryotube passed over.')
-text, _ = run('a10-4-fresh', 'halo_difficulty 1; qa_campaign_resume 1 4; qa_after_gameplay [sleep 300 [quit] 1]')
-assert 'started afresh: the script brought forward' not in text, text[-2000:]
-print('a10 section 4 on its own is not brought forward.')
+# 7. The fresh-start script fast-forward: a10 sections 2 to 7 started on their own (gap 6 of batch 5's
+# critic, the fresh-start batch). Per section: globals set, threads woken, the tutorial_setup statement resumed after
+# (and the script it woke), the mission threads that must have started, and whether tutorial_setup ends.
+FRESH = {
+    2: (1, 0, 63, 'tutorial_first_contact', ('mission_crossfire', 'mission_bridge'), False),
+    3: (5, 0, 65, 'tutorial_weapon', ('mission_airlock_1', 'mission_flank', 'mission_loop', 'mission_airlock_2'), True),
+    4: (5, 0, 65, 'tutorial_weapon', ('mission_knot', 'mission_stairs'), True),
+    5: (5, 2, 65, 'tutorial_weapon', ('mission_tunnel', 'cryo_search', 'mission_boom'), True),
+    6: (5, 2, 65, 'tutorial_weapon', ('mission_tunnel', 'cryo_search', 'mission_boom'), True),
+    7: (5, 0, 65, 'tutorial_weapon', ('mission_final',), True),
+}
+PROBED = ('tutorial_setup', 'tutorial_motiontracker', 'tutorial_weapon', 'mission_shoot')
+
+
+def scripts_state(text):
+    out = {}
+    for line in text.splitlines():
+        if line.startswith('HS_SCRIPT '):
+            _, name, action, value = line.split()[:4]
+            out[(name, action)] = value
+    return out
+
+
+def global_value(text, name):
+    found = [line.split()[-1] for line in text.splitlines() if line.startswith(f'QA_HS_GLOBAL {name} ')]
+    assert found, (name, text[-2000:])
+    return float(found[-1])
+
+
+def fresh_run(part, difficulty, names):
+    probes = '; '.join(f'qa_hs_script {n} 1; qa_hs_script {n} 2' for n in names)
+    return run(f'a10-{part}-fresh-{difficulty}', f'halo_scripttrace 1; halo_difficulty {difficulty}; qa_campaign_resume 1 {part}; '
+               f'qa_after_gameplay [sleep 12000 [{probes}; qa_hs_global mark_fast_setup; qa_hs_global mark_bridge_cutscene; quit] 1]',
+               timeout=150)[0]
+
+
+for part, (globals_set, woken, statement, after, threads, finished) in FRESH.items():
+    text = fresh_run(part, 1, PROBED + threads)
+    assert f'a10 section {part} started afresh: the script brought forward ({globals_set} globals set, 2 threads passed over, {woken} woken)' in text, \
+        (part, text[-2000:])
+    assert f'a10 section {part} started afresh on difficulty 1: tutorial_setup resumed after its statement {statement} (wake {after})' in text, \
+        (part, text[-2000:])
+    assert 'the script seats the player in cryotube_1' not in text, ('the cryo exit is passed over', part, text[-2000:])
+    state = scripts_state(text)
+    missing = [name for name in threads if state.get((name, '1')) != '1']
+    assert not missing, ('the section\'s own mission threads run', part, missing, state)
+    assert global_value(text, 'mark_fast_setup') != 0, (part, text[-2000:])
+    assert state.get(('tutorial_setup', '1')) == '1' and state.get(('tutorial_setup', '2')) == ('1' if finished else '0'), (part, state)
+    if part == 2:
+        assert global_value(text, 'mark_bridge_cutscene') == 0 and state.get(('mission_shoot', '1')) == '0', \
+            ('section 2 waits for its own bridge scene', state)
+        assert state.get(('tutorial_motiontracker', '1')) == '0', state
+    else:
+        assert global_value(text, 'mark_bridge_cutscene') != 0, (part, text[-2000:])
+        assert state.get(('tutorial_motiontracker', '1')) == '1' and state.get(('tutorial_weapon', '1')) == '0', \
+            ('the later lessons, not section 2\'s', part, state)
+    print(f'a10 section {part} on its own (Normal): brought forward, tutorial_setup resumed after (wake {after}), '
+          f'{", ".join(threads)} running, the cryotube passed over.')
+text = fresh_run(3, 2, PROBED + FRESH[3][4])
+assert 'a10 section 3 started afresh: the script brought forward (5 globals set, 2 threads passed over, 0 woken)' in text, text[-2000:]
+assert 'tutorial_setup resumed' not in text and 'the script seats the player in cryotube_1' not in text, text[-2000:]
+state = scripts_state(text)
+assert state.get(('tutorial_setup', '2')) == '1' and state.get(('tutorial_motiontracker', '1')) == '0', ('Heroic runs no tutorial', state)
+print('a10 section 3 on its own (Heroic): brought forward, no tutorial.')
+text, _ = run('a10-1-fresh', 'halo_scripttrace 1; halo_difficulty 1; qa_campaign_resume 1 1; qa_after_gameplay [sleep 3000 [quit] 1]', timeout=150)
+assert 'started afresh: the script brought forward' not in text and 'tutorial_setup resumed' not in text, text[-2000:]
+assert 'the script seats the player in cryotube_1' in text, ('section 1 keeps its cryo exit', text[-2000:])
+print('a10 section 1 on its own is untouched: the tutorial seats the player in the cryotube.')
+
+
+# 8. The melee door (the fresh-start batch): a10 section 6 on its own.
+def hs_value(text, command, index=-1):
+    found = [float(line.split()[-1]) for line in text.splitlines() if line.startswith(f'HS_CMD {command} ')]
+    assert found, (command, text[-2000:])
+    return found[index]
+
+
+text, _ = run('a10-6-melee', 'halo_scripttrace 1; halo_difficulty 1; qa_campaign_resume 1 6; qa_after_gameplay ['
+              'sleep 3000 [qa_hs_object visible obj:melee_door_2; qa_hs_cmd device_get_position "obj:melee_door_2"; '
+              'qa_hs_cmd device_get_power "obj:melee_door_2"; qa_hs_cmd device_get_power "obj:motiontracker_door_2"] 1; '
+              'sleep 3500 [qa_device_melee melee_door_2 3 1 first] 1; sleep 5000 [qa_device_melee melee_door_2 3 1 second] 1; '
+              'sleep 6000 [quit] 1]', timeout=150)
+objects = {line.split()[2]: line.split()[-1] for line in text.splitlines() if line.startswith('HS_OBJECT visible ')}
+assert objects.get('obj:melee_door_2') == '1', ('tutorial_melee put in the melee door', objects, text[-2000:])
+assert abs(hs_value(text, 'device_get_position', 0) - 0.8325) < 1e-3 and hs_value(text, 'device_get_power', 0) == 0, text[-2000:]
+assert hs_value(text, 'device_get_power', 1) == 0, ('tutorial_motiontracker powered off motiontracker_door_2', text[-2000:])
+struck = [line for line in text.splitlines() if line.startswith('DEVICE_QA melee ')]
+assert len(struck) == 2 and 'placed=1' in struck[0] and struck[0].endswith('position=1.0000'), struck
+assert text.count('Halo: a melee opened melee_door_2') == 1, ('one swing opens it, the second finds it open', text[-2000:])
+text, _ = run('a10-6-melee-heroic', 'halo_scripttrace 1; halo_difficulty 2; qa_campaign_resume 1 6; qa_after_gameplay ['
+              'sleep 3000 [qa_hs_object visible obj:melee_door_2; qa_hs_cmd device_get_power "obj:motiontracker_door_2"; quit] 1]',
+              timeout=150)
+objects = {line.split()[2]: line.split()[-1] for line in text.splitlines() if line.startswith('HS_OBJECT visible ')}
+assert objects.get('obj:melee_door_2') == '0' and hs_value(text, 'device_get_power') == 1, (objects, text[-2000:])
+print('a10 section 6 on Normal: the melee opened melee_door_2; on Heroic it is never put in.')

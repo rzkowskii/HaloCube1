@@ -38,6 +38,12 @@ Batch 5's critic, gaps 8 and 11 (written while testing was on hold, not yet run)
    leaves no wreck (wreck=0); with it on, a checkpoint, then the Wraith destroyed: its row has wreck=1,
    qa_vehicle_wrecks finds it and it stops the player's body; after a death and revert to the
    checkpoint the Wraith exists again and no wreck is left.
+
+Batch 7, the critic's worry 3 of batch 6 (written while testing was on hold, not yet run):
+9. The death explosion is nobody's: a marine on the human team (allied with the player at the start)
+   put beside the Wraith as in item 6 takes the explosion when the player destroys the Wraith (a
+   DAMAGE_TRACE naming it), and no kill counts towards a betrayal (FACTION_BETRAYALS ... human=0 after
+   it, no "the human turn on the player"), whether or not the marine survives it.
 """
 import re
 import subprocess
@@ -260,3 +266,20 @@ assert wrecks[1]['wreck'] == '0' and wrecks[1]['count'] == '0', ('the revert goe
 reverted = {int(r['vehicle']): r for r in rows(text, 'VEHICLE_QA', 'reverted')[1:]}
 assert reverted[wraith]['exists'] == '1', ('the Wraith is back after the revert', reverted[wraith])
 print('wreck: left where the Wraith blew up, solid, and gone after a revert to the checkpoint before it.')
+
+# 9. The death explosion is nobody's: no betrayal (the fresh-start batch, the critic's worry 3 of batch 6).
+text = run('explosion-ally', [
+    (300, 'qa_combat_protect 1; qa_allegiance_state before'), (400, f'qa_vehicle_approach {wraith} 0'), (500, 'qa_actor_spawn 9 1 3 0'),
+    (700, f'qa_vehicle_place_actor {wraith} 0 1.3'), (800, f'qa_vehicle_pilot {wraith} 1 0 driver'),
+    (1000, f'qa_vehicle_damage {wraith} 2000 1'), (1300, 'qa_allegiance_state after'), (1400, 'quit')])
+allied = [l for l in text.splitlines() if l.startswith('FACTION_ALLEGIANCE before ') and ' human-player ' in l + ' ']
+assert allied and 'allied=1' in allied[0], ('the marines start allied with the player', allied, text[-3000:])
+placed = re.search(r'VEHICLE_QA place actor vehicle=\d+ ok=1 name=(\S+) inside=-1', text)
+assert placed, ('a marine beside the Wraith, outside its box', text[-3000:])
+assert re.search(r"Halo vehicle: the Wraith's death explosion deals its damage", text), text[-3000:]
+hits = [fields(l) for l in text.splitlines() if l.startswith('DAMAGE_TRACE ') and f' target={placed.group(1)} ' in l + ' ']
+assert hits, ('the marine takes the explosion', text[-3000:])
+counted = [l for l in text.splitlines() if l.startswith('FACTION_BETRAYALS after human=')]
+assert counted == ['FACTION_BETRAYALS after human=0'], ('the explosion is nobody\'s: no betrayal', counted)
+assert 'Halo: the human turn on the player' not in text, text[-3000:]
+print(f'death explosion: the marine {placed.group(1)} beside the Wraith took {float(hits[0]["amount"]):.1f}; no betrayal counted.')

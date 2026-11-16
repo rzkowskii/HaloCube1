@@ -111,6 +111,7 @@ struct HaloVehicleStatus
     const char *name = "";
     int vehicleClass = HALO_VEHICLE_CAR, role = HALO_SEAT_DRIVER;
     float speed = 0;          // Halo world units per second
+    float governed = 0;       // a jump governor holds the car at this speed (Halo units/s; 0: none)
     float altitude = -1;      // a flying Banshee's height over the floor below, Halo units (-1: none in reach)
     bool flipped = false, airborne = false;
     bool driverFires = false; // the driver works the gun (Ghost, Banshee, Scorpion)
@@ -216,5 +217,9 @@ bool halovehicleqajump(const vec &feet, float yaw, float speed);
 // units/s while section map `map` is loaded ("*": any; an empty map clears every cap, speed 0 one).
 void halovehicleqacruise(const char *map, float speed);
 bool halovehicleqamotion(vec &pos, vec &vel, bool &grounded, bool &flipped, float &gravity, float &tangent);
+// The section's jump governors (halo_vehiclegovern from its map .cfg, halo_vehiclegovernor): how
+// many there are, and governor `index`'s take-off point, radius and speed (units, units/s).
+int halovehicleqagovernors();
+bool halovehicleqagovernor(int index, vec &at, float &radius, float &speed);
 
 #endif

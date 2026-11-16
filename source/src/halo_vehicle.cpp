@@ -49,6 +49,14 @@ VAR(halo_vehicleexplosion, 0, 1, 1);
 // with its model and smoking, until the section ends or a revert goes back past it (off by
 // default: an engine choice, untested against the planned routes, which do not expect it).
 VAR(halo_vehiclewreck, 0, 0, 1);
+// Jump governors (an engine accommodation, docs/macos-build.md Planned vehicle routes): the
+// importer writes `halo_vehiclegovern X Y Z RADIUS SPEED` into a driven section's map .cfg for
+// each jump its drive was planned below full speed for (d40 section 8's pit room drop clears the
+// hanging bridge segment only slower). Within RADIUS of the take-off point (X Y Z, the take-off
+// row), the player's car is held at SPEED: no throttle at it, the brakes above it. 0: off (the
+// player keeps to the speed themselves). `halo_vehiclegovernorhint`: a HUD line while it holds.
+VARP(halo_vehiclegovernor, 0, 1, 1);
+VARP(halo_vehiclegovernorhint, 0, 1, 1);
 
 namespace
 {
@@ -177,6 +185,13 @@ namespace
         for(const QaCruise &c : qaCruise) if(c.map == "*" || (map && c.map == map)) return c.speed;
         return 0;
     }
+    // Jump governors (halo_vehiclegovern, from the section's map .cfg): the cfg runs inside
+    // load_world, before startmap's halomapstart, so its commands fill `governorsLoading` and
+    // halovehiclesclear (halomapstart) makes them the section's `governors`.
+    struct Governor { vec at; float radius, speed; };
+    std::vector<Governor> governors, governorsLoading;
+    int governedAt = -100000;                   // when a governor last held the player's car
+    float governedSpeed = 0;
     // Bodies part way inside a vehicle that no push could get out (depenetrate): they collide
     // with every other vehicle but may walk out of this one. `retry`: when to try again.
     struct Trap { const physent *body; int vehicle, retry; };
@@ -2539,15 +2554,21 @@ namespace
         if(v.wreck && halo_vehicletrace) conoutf("Halo vehicle: the %s leaves its wreck at %.1f,%.1f,%.1f", d.displayName.c_str(), v.pos.x, v.pos.y, v.pos.z);
         // `v` is not used past here: the blast below runs other code (deaths, other vehicles).
         const int object = v.object;
-        // The death explosion's own damage, in the name of whoever destroyed it. The vehicle no
-        // longer exists, so it takes none of it; the tag's modifier for metal is 0, so other
-        // vehicles take none either (no chain of explosions, as in Halo); bodies near it do.
+        // The death explosion's own damage. The vehicle no longer exists, so it takes none of it;
+        // the tag's modifier for metal is 0, so other vehicles take none either (no chain of
+        // explosions, as in Halo); bodies near it do. The blast has no owner (haloeffectblast's null
+        // owner), so it is dealt as the scripts' blasts are: haloareablast hits in the player's name
+        // inside a script-damage scope, so no ally's death counts as a betrayal and the player's own
+        // hurt is not scaled by difficulty, whoever destroyed the vehicle (a kill is still the
+        // player's to haloactordeath, which alerts the dead actor's hostile neighbours to the
+        // player; Halo credits nobody). Halo's object_deplete_body creates the body depleted effect with the vehicle
+        // itself as its damage owner (damage_effect_new_on_object), and a scenario vehicle's
+        // owner_player_index is NONE (only the player's biped gets one, players.c), so its damage
+        // carries no player either (read from the Halo CE source port, ../Halo3DS damage.c and
+        // effects.c; the fresh-start batch, the critic's worry 3 of batch 6: it used to be in the destroyer's name).
         if(halo_vehicleexplosion && !halocinematic() && !d.destroyedEffect.empty())
         {
-            // Nobody living destroyed it (a rider's own mortar, the rider dead with it now; no
-            // attacker): the blast is nobody's (haloareablast's null owner: no betrayal).
-            playerent *owner = attacker && (attacker == player1 || aliveBot(attacker)) ? attacker : nullptr;
-            const bool dealt = haloeffectblast(d.destroyedEffect.c_str(), centre, owner);
+            const bool dealt = haloeffectblast(d.destroyedEffect.c_str(), centre, nullptr);
             if(halo_vehicletrace) conoutf("Halo vehicle: the %s's death explosion %s", d.displayName.c_str(), dealt ? "deals its damage" : "has no damage in effects.txt");
         }
         if(object >= 0) haloscenarioobjectdestroyed(object);
@@ -2569,7 +2590,20 @@ void halovehiclesclear()
     struck.clear();
     boardings.clear();
     thrownVehicle = thrownSeat = -1;
+    // The section's jump governors: what its map .cfg just gave (halo_vehiclegovern); none for a
+    // map without them.
+    governors.swap(governorsLoading);
+    governorsLoading.clear();
+    governedAt = -100000;
+    if(halo_vehicletrace && !governors.empty()) conoutf("Halo vehicle: %d jump governors", int(governors.size()));
 }
+
+// A jump governor for the map being loaded (its .cfg; scriptcontext MAPCFG in main.cpp lets a
+// map .cfg run it): the player's car is held at SPEED within RADIUS of X Y Z (halo_vehiclegovernor).
+COMMANDF(halo_vehiclegovern, "fffff", (float *x, float *y, float *z, float *radius, float *speed)
+{
+    if(*radius > 0 && *speed > 0) governorsLoading.push_back({vec(*x, *y, *z), *radius, *speed});
+});
 
 void halovehicleplace(const entity &e)
 {
@@ -2806,6 +2840,29 @@ const char *halovehicleprompt(float weaponDistance)
     return prompt;
 }
 
+namespace
+{
+    // The jump governors (halo_vehiclegovernor): within a governor's sphere the player's car gets
+    // no throttle at or above its speed and the brakes a little above it (so it does not hunt).
+    // Checked every 8 ms step, so the speed stays within about a step's braking or acceleration
+    // (0.25 and 0.1 units/s for the Warthog) of the cap at any frame rate. Reversing is left alone.
+    void govern(const Vehicle &v, Drive &in)
+    {
+        if(!halo_vehiclegovernor || governors.empty() || in.throttle < 0) return;
+        const float forward = v.vel.dot(forwardOf(v.yaw));
+        // The lowest speed of the spheres the car is in (they may overlap).
+        const Governor *held = nullptr;
+        for(const Governor &g : governors)
+            if(v.pos.dist(g.at) <= g.radius && (!held || g.speed < held->speed)) held = &g;
+        if(!held || forward < held->speed) return;
+        in.throttle = forward > held->speed + .25f ? -1 : 0;
+        if(halo_vehicletrace && lastmillis - governedAt > 1000)
+            conoutf("Halo vehicle: governor at %.0f,%.0f,%.1f holds %.1f (forward %.1f)", held->at.x, held->at.y, held->at.z, held->speed, forward);
+        governedAt = lastmillis;
+        governedSpeed = held->speed;
+    }
+}
+
 void halovehicledrive(int curtime)
 {
     if(!halovehicleseated() || curtime <= 0) return;
@@ -2870,11 +2927,19 @@ void halovehicledrive(int curtime)
     player1->jumpnext = false;
     player1->trycrouch = false;
     if(role != HALO_SEAT_DRIVER) { v.aimYaw = player1->yaw; v.aimPitch = player1->pitch; }
+    // The jump governors hold the player's own driving (keys or QA input; not a flyer, not an
+    // actor at the wheel, not while stunned, when the throttle is already out).
+    const bool governed = role == HALO_SEAT_DRIVER && !v.flipped && d.vehicleClass != HALO_VEHICLE_FLYER &&
+                          drivenClass(d.vehicleClass) && in.throttle >= 0 && lastmillis >= v.stunnedUntil;
     if(drivenClass(d.vehicleClass) || !v.grounded)
     {
         // Fixed 8 ms steps keep wall contacts and landings stable at any frame rate.
         for(int left = min(curtime, 100); left > 0; left -= 8)
-            simulate(v, playerVehicle, min(left, 8) / 1000.0f, in);
+        {
+            Drive step = in;
+            if(governed) govern(v, step);
+            simulate(v, playerVehicle, min(left, 8) / 1000.0f, step);
+        }
     }
     if(d.vehicleClass == HALO_VEHICLE_TURRET) v.yaw = v.aimYaw;
     // Falls, wedges and stalls; actors in the way were shoved or run down in simulate.
@@ -3302,6 +3367,9 @@ bool halovehiclestatus(HaloVehicleStatus &status)
     status.vehicleClass = d.vehicleClass;
     status.role = d.seats[playerSeat].role;
     status.speed = playerSpeed(v);
+    // A jump governor held the car in the last half second (halo_vehiclegovernorhint).
+    status.governed = halo_vehiclegovernor && halo_vehiclegovernorhint && lastmillis - governedAt < 500
+                      ? governedSpeed / max(.01f, vehicleScale()) : 0;
     status.flipped = v.flipped;
     status.airborne = !v.grounded && (d.vehicleClass == HALO_VEHICLE_CAR || d.vehicleClass == HALO_VEHICLE_HOVER || d.vehicleClass == HALO_VEHICLE_TANK);
     status.driverFires = driverFires(d);
@@ -3966,6 +4034,17 @@ void halovehicleqacruise(const char *map, float speed)
     if(!map || !*map) { qaCruise.clear(); return; }
     qaCruise.erase(std::remove_if(qaCruise.begin(), qaCruise.end(), [&](const QaCruise &c) { return c.map == map; }), qaCruise.end());
     if(speed > 0) qaCruise.push_back({map, speed});
+}
+
+int halovehicleqagovernors() { return int(governors.size()); }
+
+bool halovehicleqagovernor(int index, vec &at, float &radius, float &speed)
+{
+    if(index < 0 || index >= int(governors.size())) return false;
+    at = governors[index].at;
+    radius = governors[index].radius;
+    speed = governors[index].speed;
+    return true;
 }
 
 bool halovehicleqamotion(vec &pos, vec &vel, bool &grounded, bool &flipped, float &gravity, float &tangent)

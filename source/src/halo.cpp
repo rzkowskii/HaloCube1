@@ -468,9 +468,11 @@ namespace
 
     // Starting profiles a fresh start of a later section adds to the mission's profile 0, for what
     // its script gives the player in an earlier section and does not give again when started
-    // afresh there: a10's pistol at the bridge (mission_shoot, just past cinematic_x20 at the start
-    // of section 3). The mission script's counterpart is freshScripts in halo_script.cpp (a10
-    // sections 5 and 6: mission_tunnel and cryo_search woken, the bridge flags set).
+    // afresh there: a10's pistol at the bridge (mission_shoot, in section 2 just past cinematic_x20;
+    // its shoot_trigger_3 is in BSP 1), from section 3 on. The mission script's counterpart is
+    // freshScripts in halo_script.cpp (a10 sections 2 to 7: the cryo exit passed over, the bridge
+    // flags set for 3 to 7, mission_tunnel and cryo_search woken for 5 and 6, Normal's tutorial
+    // resumed).
     struct FreshProfile { int mission, section; const char *profile; };
     const FreshProfile freshProfiles[] = { {0, 2, "bridge0_profile"} };
 
@@ -1881,6 +1883,12 @@ namespace
             else if(st.airborne) copystring(extra, "  AIR");
             defformatstring(speed)("%s  %3d KM/H%s", seat, int(st.speed * 3.048f * 3.6f + .5f), extra);
             label(speed, right, VIRTH-173, 0.70f, true);
+            // A jump governor holds the car (halo_vehiclegovernor; halo_vehiclegovernorhint 0 hides it).
+            if(st.governed > 0)
+            {
+                defformatstring(hint)("Easing off for the jump  -  %d KM/H", int(st.governed * 3.048f * 3.6f + .5f));
+                label(hint, VIRTW/2-200, VIRTH/2+130, 0.55f);
+            }
         }
         else label(seat, right, VIRTH-173, 0.70f, true);
         if(st.weapon >= 0)

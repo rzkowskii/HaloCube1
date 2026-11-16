@@ -435,6 +435,10 @@ def scenery_surfaces(halo, bsp, projection, program=None, window=None, skip=()):
                 placed.reverse()
             # Campaign projection reflects Y: flip the normal's Y and reverse the winding.
             surfaces.append(((nx/length, -ny/length, nz/length), flags & 15, breakable, material, placed))
+        if len(surfaces) == before:
+            # The engine's loader refuses an SCN1 entry with no surfaces (and the whole .hcol with it).
+            leave('no collision model')
+            continue
         baked.append((index, len(surfaces) - before))
     return surfaces, baked, left_out
 
@@ -502,6 +506,19 @@ def write_structure_collision(halo, bsp, projection, destination, machines=((), 
     # walking assists: the engine collides bodies with them but rays (shots, sight, probes) and
     # grenades pass through, as there is nothing there in Halo. A file without SCN1 is byte for byte
     # what this writer wrote before scenery collision (SCENERY_COLLISION in import_halo_campaign.py).
+    # The engine's loader (halo_collision.cpp loadmesh) refuses the whole file, and the section falls
+    # back to stock geometry, past these limits: refuse to write such a file instead (scenery collision
+    # for every section, the batch after the c10 section 5 batch, brought d20 section 2 to about 70,000).
+    if not 0 < len(surfaces) <= 131072:
+        raise ValueError(f'{destination.name}: {len(surfaces)} collision surfaces (the engine loads 1 to 131072)')
+    for normal, flags, breakable, material, points in surfaces:
+        if not 3 <= len(points) <= 8 or flags & ~15 or not .98 <= sum(n * n for n in normal) <= 1.02:
+            raise ValueError(f'{destination.name}: a collision surface with {len(points)} points, flags {flags} and '
+                             f'normal {normal} (the engine loads 3 to 8 points, flags 0 to 15, unit normals)')
+    if (len(placements) > 65536 or len(baked) > 65536 or len(assists) > 65536
+            or any(index > 65535 or count < 1 for index, count in placements)):
+        raise ValueError(f'{destination.name}: a DEV1, SCN1 or AST1 trailer over 65536 entries, or a scenery '
+                         'placement with an index over 65535 or no surfaces')
     data = bytearray(struct.pack('<4sI', b'HCL1', len(surfaces)))
     for normal, flags, breakable, material, points in surfaces:
         data.extend(struct.pack('<3fBBhI', *normal, flags, breakable, material, len(points)))
@@ -522,6 +539,8 @@ def write_structure_collision(halo, bsp, projection, destination, machines=((), 
     if assists:
         indices = list(range(first_assist, len(surfaces)))
         data.extend(struct.pack(f'<4sI{len(indices)}I', b'AST1', len(indices), *indices))
+    if len(data) > 32 * 1024 * 1024:
+        raise ValueError(f'{destination.name}: {len(data)} bytes (the engine loads at most 32 MiB)')
 
     with tempfile.TemporaryDirectory(dir=destination.parent) as directory:
         temporary = Path(directory) / destination.name
@@ -931,9 +950,12 @@ class LightBridges:
                 quads.append(((0.0, 0.0, 1.0), 0, 0, -1, [projection.point(c) for c in corners[::-1]]))
             bridge['quads'] = quads
 
-    def add_floors(self, samples, tree, size, walls=None):
-        """Adds the extended decks to `samples` ({(x, y): levels}) and remembers their cells."""
+    def add_floors(self, samples, tree, size, walls=None, skip=()):
+        """Adds the extended decks to `samples` ({(x, y): levels}) and remembers their cells. Bridges
+        named in `skip` stay out (import_halo_campaign.UNCROSSED_BRIDGES: no route crosses them)."""
         for index, bridge in enumerate(self.bridges):
+            if bridge['name'] in skip:
+                continue
             for xy, levels in floor_samples(bridge['quads'], tree, size).items():
                 for z in levels:
                     if walls is not None and walls.blocked(xy[0], xy[1], z):

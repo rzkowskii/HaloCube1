@@ -56,7 +56,7 @@ QUICK = [
     'test_vehicles.py',               # vehicle table and placements, Warthog in/out/drive/flip/gunner, turret, seat commands
     'test_enemy_vehicles.py',         # Ghost, Wraith, Scorpion, flown Banshee, AI pilots, dropship cargo, Pelican boarding, c40 flown
     'test_vehicle_damage.py',         # vehicle body vitality: the Wraith destroyed with its pilot, occupied-only Ghost, vehicle gun variants, covered riders, death explosion, tilted hit box, wreck
-    'test_vehicle_jump.py',           # d40 section 8's planned Warthog jumps flown by the engine (launch along the ramp, retail-derived gravity)
+    'test_vehicle_jump.py',           # d40 section 8's planned Warthog jumps flown by the engine (launch along the ramp, retail-derived gravity), capped and governed
     'test_presentation.py',           # script effects, shake, screen effects, flashlight, damage indicator, class gains, lunge, engine loops, effect_new damage cvar
     'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
 ]
@@ -69,7 +69,7 @@ RELEASE = [
 SLOW = [
     'test_autumn_opening.py',         # four-minute Autumn opening at normal speed
     'test_package_input.py',          # real keystrokes into the packaged app
-    'test_maw_drive.py',              # Warthog escape driven by the QA autopilot to the finale, plus keystrokes
+    'test_maw_drive.py',              # Warthog escape driven by the QA autopilot (section 8: the vehicle walker, jump governors) to the finale, plus keystrokes
 ]
 
 parser = argparse.ArgumentParser()

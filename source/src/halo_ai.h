@@ -68,6 +68,7 @@ enum { HALO_MATERIAL_HUNTER_ARMOR = 12, HALO_MATERIAL_HUNTER_SKIN = 13, HALO_MAT
 bool haloteamhostile(int a, int b);
 void haloallegianceset(int a, int b, bool allied);
 bool haloallegiancebroken(int a, int b);
+int halobetrayalcount(int team);
 void haloallegiancereset();
 // The allegiance state as two bit masks over team pairs (for checkpoints and saved games): the
 // current one, or with `checkpoint` the copy the last checkpoint keeps for a revert.

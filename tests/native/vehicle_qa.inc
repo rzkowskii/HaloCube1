@@ -224,6 +224,23 @@ COMMANDF(qa_vehicle_cruise, "sf", (const char *map, float *speed)
     conoutf("VEHICLE_QA cruise map=%s speed=%.2f", map, *speed);
     fflush(stdout);
 });
+// The section's jump governors (halo_vehiclegovern lines of its map .cfg; tests/test_vehicle_jump.py):
+// `VEHICLE_QA governors count=N enabled=0|1`, then `VEHICLE_QA governor at=X,Y,Z radius=R speed=S`.
+static void qaVehicleGovernors()
+{
+    extern int halo_vehiclegovernor;
+    const int count = halovehicleqagovernors();
+    conoutf("VEHICLE_QA governors count=%d enabled=%d", count, halo_vehiclegovernor);
+    loopi(count)
+    {
+        vec at;
+        float radius = 0, speed = 0;
+        if(halovehicleqagovernor(i, at, radius, speed))
+            conoutf("VEHICLE_QA governor at=%.2f,%.2f,%.2f radius=%.2f speed=%.2f", at.x, at.y, at.z, radius, speed);
+    }
+    fflush(stdout);
+}
+COMMANDF(qa_vehicle_governors, "", () { qaVehicleGovernors(); });
 COMMANDF(qa_vehicle_jump, "ffffffi", (float *x, float *y, float *z, float *yaw, float *speed, int *ms)
 {
     const bool ok = halovehicleqajump(vec(*x, *y, *z), *yaw, *speed);
