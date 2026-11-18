@@ -222,7 +222,9 @@ namespace
     vector<HaloEnemy> enemies;
     // Flood life cycle: carriers burst into infection forms, infection forms
     // reaching a marine or Elite body turn it into a combat form after a delay.
-    struct Corpse { vec o; float yaw; ActorKind kind; int expires; };
+    // A body the infection forms can take: where it lies, and the dead unit it is (`died` its death's
+    // lastmillis, so a freed and reused bot is not taken for it; corpseBody).
+    struct Corpse { vec o; float yaw; ActorKind kind; int expires; const playerent *body = nullptr; int died = 0; };
     // A burst or a rising body: `actor` is the variant (actors.txt index, -1 the kind's default),
     // `throwSpeed` the spawn throw in Halo world units a tick (0: none). `encounter` and `squad`: the
     // dying unit's squad, which the released actors join (../Halo3DS ai/actors.c:2855-2872 and
@@ -231,6 +233,8 @@ namespace
     {
         vec o; float yaw; ActorKind kind; int count; int at; int actor = -1; int team = HALO_TEAM_FLOOD; float throwSpeed = 0;
         int encounter = -1, squad = -1;
+        // A rising body: the corpse it rises from, hidden when it rises (updateFlood).
+        Corpse from;
     };
     // An infection form's pop (its body destroyed effect's jpt!, actors.txt `pop`): where it went
     // off and the variant whose jpt! it is.
@@ -896,6 +900,25 @@ namespace
         return false;
     }
 
+    // The dead unit a corpse is, while its body is still there: not erased (ai_erase frees the bot),
+    // not a reused bot, not hidden. NULL otherwise.
+    playerent *corpseBody(const Corpse &c)
+    {
+        if(!playerExists(c.body) || c.body->state != CS_DEAD || c.body->lastdeath != c.died || c.body->nocorpse) return nullptr;
+        return const_cast<playerent *>(c.body);
+    }
+
+    // The corpses follow their bodies (the death push slides a body after its death) and go with
+    // them: the infection forms take only a body that is drawn.
+    void refreshCorpses()
+    {
+        loopvrev(corpses)
+        {
+            if(playerent *body = corpseBody(corpses[i])) corpses[i].o = feetOf(body);
+            else corpses.remove(i);
+        }
+    }
+
     // A unit's body destroyed effect where it was destroyed: drawn and heard (halofxeffect), and its
     // jpt! area damage (effects.txt's `damage` line, haloeffectblast) owned by the dead unit, so it
     // counts as its team's fire (the difficulty's enemy_damage on the player, no betrayal; a blast
@@ -993,6 +1016,7 @@ namespace
     void updateFlood()
     {
         // Infection forms touching a body convert it; the form is spent.
+        refreshCorpses();
         loopv(enemies)
         {
             botent *bot = enemies[i].bot;
@@ -1001,7 +1025,9 @@ namespace
             {
                 if(fabsf(corpses[j].o.z - feetOf(bot).z) > 4.0f || corpses[j].o.distxy(bot->o) > infectionReach) continue;
                 const Corpse &c = corpses[j];
-                floodSpawns.add(FloodSpawn{c.o, c.yaw, c.kind == ELITE ? FLOOD_ELITE : FLOOD_HUMAN, 1, lastmillis + infectionDelay});
+                FloodSpawn rising{c.o, c.yaw, c.kind == ELITE ? FLOOD_ELITE : FLOOD_HUMAN, 1, lastmillis + infectionDelay};
+                rising.from = c;
+                floodSpawns.add(rising);
                 conoutf("Halo: infection form takes a %s body", profiles[c.kind].name);
                 corpses.remove(j);
                 floodSpending = true;
@@ -1026,7 +1052,12 @@ namespace
             const FloodSpawn spawn = floodSpawns.remove(i);
             const int placed = spawnRing(spawn.kind, spawn.o, spawn.yaw, spawn.count, spawn.team, spawn.actor, spawn.throwSpeed,
                                          spawn.encounter, spawn.squad);
-            if(placed) conoutf("Halo: flood %s rises", profiles[spawn.kind].name);
+            if(!placed) continue;
+            conoutf("Halo: flood %s rises", profiles[spawn.kind].name);
+            // The body it rose from is the new form now: it no longer lies there (judgement call:
+            // the engine places a new actor, where Halo's infection takes over the body).
+            playerent *body = corpseBody(spawn.from);
+            if(body) body->nocorpse = true;
         }
         // The pops queued last frame; the deaths they cause queue the next ring.
         const int pops = floodPops.length();
@@ -3631,7 +3662,9 @@ float halomodelalpha(const playerent *p)
 
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
 {
-    if(damage <= 0 || damage == INT_MAX) return;
+    // A hit the damage model leaves alone (an INT_MAX kill, nothing dealt) has no report: one kept from
+    // an earlier hit on the target this millisecond would give its death the wrong line.
+    if(damage <= 0 || damage == INT_MAX) { haloforgethit(target); return; }
     // A hit from halohit carries its exact amount and side effect; any other is the whole number.
     const bool exact = pendingHit.target == target;
     float amount = exact ? pendingHit.damage : float(damage);
@@ -3665,7 +3698,11 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
                 skipShields);
     auto trace = [&](float shieldLeft, float carry)
     {
-        lastHit.report.shield = (target == player1 ? shield + overshield : reported ? reported->shield : 0) < shieldBefore - 1e-4f;
+        const float shieldAfter = target == player1 ? shield + overshield : reported ? reported->shield : 0;
+        lastHit.report.shield = shieldAfter < shieldBefore - 1e-4f;
+        // Halo's normalized shield damage (damage.c:950-969): what the hit took of the maximum shield.
+        const float shieldMaximum = target == player1 ? float(playerShield) : reported ? reported->shieldMax : 0;
+        lastHit.report.shieldDamage = lastHit.report.shield && shieldMaximum > 0 ? clamp((shieldBefore - shieldAfter) / shieldMaximum, 0.0f, 1.0f) : 0;
         if(halo_damagetrace)
             conoutf("DAMAGE_TRACE attacker=%s target=%s exact=%d amount=%.3f side=%d gun=%d health=%d shield=%.2f carry=%.3f",
                     attacker ? (attacker == player1 ? "player" : attacker->name) : "-", target == player1 ? "player" : target->name,
@@ -3696,6 +3733,11 @@ void halodamage(int &damage, playerent *target, playerent *attacker, int gun)
     const int ownerTeam = halodamageteam(attacker), targetTeam = haloactorteam(target);
     const float difficultyFactor = halodifficultydamagefactor(ownerTeam, targetTeam, &difficultyDivisor);
     amount *= difficultyFactor;
+    // Halo's total_damage for ai_handle_damage (units/units.c:6759: shield_damage plus body_damage, both
+    // in damage points before the vitality normalization, objects/damage.c:842, 1129, 1329, 1380-1384,
+    // 1415-1419): the hit as it reaches the shield step (judgement call: the body material's multiplier on
+    // the part that passes the shield is left out; it moves the 0.3-point test only for a near-zero hit).
+    lastHit.report.points = amount;
     if(halo_damagetrace && (difficultyFactor != 1 || difficultyDivisor != 1))
         conoutf("DAMAGE_DIFFICULTY owner=%s target=%s level=%d factor=%.3f divisor=%.3f", haloteamname(ownerTeam), haloteamname(targetTeam),
                 halodifficulty(), difficultyFactor, difficultyDivisor);
@@ -3988,6 +4030,11 @@ bool halohitreport(const playerent *target, HaloHitReport &out)
     if(!target || lastHit.target != target || lastHit.millis != lastmillis) return false;
     out = lastHit.report;
     return true;
+}
+
+void haloforgethit(const playerent *target)
+{
+    if(target && lastHit.target == target) lastHit = HitRecord();
 }
 
 bool halopickup(int index, playerent *p)
@@ -4911,6 +4958,17 @@ void halokilled(playerent *victim, playerent *killer)
     HaloEnemy *enemy = enemyState(victim);
     if(!enemy) return;
     const vec feet = feetOf(victim);
+    // A unit destroyed after dying (unit flags bit 1: the infection forms, the carrier, the Sentinels
+    // and the Engineer in the ten caches) is deleted at the end of its dying, or at once without a
+    // dying animation (../Halo3DS units/units.c:6675-6679, 10021-10043, unit_destroy at 2711-2716),
+    // its body destroyed effect standing in; the engine sets that effect off on the next frame and
+    // hides the body now (judgement call: the engine's death animation is not Halo's). Every other
+    // unit's body stays (Halo collects a dead unit only past 50 such objects and never while a player
+    // sees it, objects/objects.c:4070-4210; the engine keeps it lying for the corpse life,
+    // halocorpsemillis). Without the `unit` line, the kinds whose retail units carry the flag.
+    const bool destroyedAfterDying = variant && variant->hasUnitFlags ? variant->destroyedAfterDying() :
+        enemy->kind == INFECTION || enemy->kind == CARRIER || enemy->kind == SENTINEL || enemy->kind == ENGINEER;
+    if(destroyedAfterDying) victim->nocorpse = true;
     // An infection form's body destroyed effect pops its neighbours (popInfectionForms), unless it
     // was spent on a body (Halo deletes that form rather than destroying it).
     if(variant && variant->pops() && !floodSpending && floodPops.length() < 64)
@@ -4961,7 +5019,7 @@ void halokilled(playerent *victim, playerent *killer)
         floodSpawns.add(spawn);
     }
     else if((enemy->kind == MARINE || enemy->kind == ELITE) && corpses.length() < 32)
-        corpses.add(Corpse{feet, victim->yaw, enemy->kind, lastmillis + corpseLife});
+        corpses.add(Corpse{feet, victim->yaw, enemy->kind, lastmillis + corpseLife, victim, lastmillis});
     // unit_doesnt_drop_items leaves nothing behind. Actors drop the grenades they still
     // carry (at most two), beside the body, then their weapon.
     if(!keepsItems) return;
@@ -4998,6 +5056,22 @@ bool halonearestcorpse(const vec &from, float range, vec &body)
         if(d < best) { best = d; body = corpses[i].o; found = true; }
     }
     return found;
+}
+
+int halocorpsemillis(const playerent *p)
+{
+    // A Halo unit's body lies as long as the infection forms may take it (corpseLife), then sinks
+    // as AssaultCube's do; the player's and every body outside the campaign sink at once.
+    return p && p != player1 && haloactormodel(p) ? corpseLife : 0;
+}
+
+bool halostockblood(const playerent *p)
+{
+    // Halo's blood is the projectile's material effect for the struck material (each race its own),
+    // which the engine does not port: AssaultCube's red blood stays only on the human bodies.
+    if(!haloactive() || !p || p == player1) return true;
+    HaloEnemy *enemy = enemyState(p);
+    return !enemy || enemy->kind == MARINE;
 }
 
 void halorenderweapons()

@@ -3201,6 +3201,7 @@ namespace
         if(!bot || bot->state != CS_ALIVE || monitorBody(bot)) return;
         HaloScriptDamage scripted(true);
         bot->health = 0;
+        haloforgethit(bot);         // not a hit: no report from one this millisecond (halohitreport)
         dokill(bot, player1, false, GUN_ASSAULT);
     }
 

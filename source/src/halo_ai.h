@@ -94,6 +94,10 @@ struct HaloActorDef
     // (objects/damage.c:2343-2375): its falloff and cutoff radii (world units), damage bounds and
     // jpt! damage flags; popOuter 0 for none.
     unsigned unitFlags = 0, bipedFlags = 0;
+    // `accelscale`: the unit object's acceleration_scale (../Halo3DS objects/object_definitions.h:
+    // 141), which scales a jpt!'s instantaneous acceleration on it (objects/damage.c:1005-1016; the
+    // death push, weapon.cpp halohit). -1 without the line.
+    float accelerationScale = -1;
     int spawnVariant = -1, spawnLower = 0, spawnUpper = 0;
     float spawnVelocity = 0;
     float popInner = 0, popOuter = 0, popLower = 0, popUpperMin = 0, popUpperMax = 0;
@@ -141,6 +145,8 @@ struct HaloActorDef
     DiveAnimation dives[6];
     bool diveOffLedges() const { return (actrFlags >> 25) & 1; }   // _actor_definition_dive_off_ledges_bit
     bool inconsequential() const { return (unitFlags >> 19) & 1; }     // _unit_is_inconsequential_bit
+    bool specialUnit() const { return (unitFlags >> 20) & 1; }         // _unit_is_special_bit (no biped_accelerate)
+    bool destroyedAfterDying() const { return (unitFlags >> 1) & 1; }  // _unit_is_destroyed_after_dying_bit
     bool meleeFatal() const { return (unitFlags >> 8) & 1; }           // _unit_melee_attack_is_fatal_bit (the carrier)
     bool meleeAttaches() const { return (unitFlags >> 12) & 1; }       // _unit_impact_melee_attaches_bit
     bool meleeDiesOnShield() const { return (unitFlags >> 13) & 1; }   // _unit_impact_melee_die_on_shield_bit

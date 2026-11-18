@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <deque>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -210,9 +211,20 @@ namespace
         int decayTimer = -1;
         // unit_speech damage timers (unit_dialogue.c:831-842, 975-1000).
         int minorTimer = 0, majorTimer = 0, minorSounds = 0, minorDecay = 0;
+        // recent_shield_damage and shield_damage_decay_timer (damage.c:950-969, 1995-2006), as the body's.
+        float recentShield = 0;
+        int shieldDecayTimer = -1;
+        // unit delayed_damage_timer, _peak, last_damage_category and _attacker (units/units.c:5897-5915,
+        // 6812-6832): 45 ticks after the last hit, ai_handle_damage's delayed call on the peak.
+        int delayedTimer = 0, delayedCategory = 0;
+        float delayedPeak = 0;
+        playerent *delayedAttacker = nullptr;
         int lines = 0;                          // for the QA dump
     };
-    std::vector<Speaker> speakers;
+    // A deque: a Speaker reference stays valid while speaker(p, true) adds others (talkWeight and
+    // findActorToTalk do, inside an event); only an erase (a unit gone, a reset) moves them, and nothing
+    // holds one across an erase.
+    std::deque<Speaker> speakers;
     long long ticks = 0;                        // game time since the section (re)started
     int tickRemainder = 0, tickMillis = -1;
     bool triggersEnabled = true;                // ai_dialogue_triggers (ai_communication.c:6311-6319)
@@ -414,19 +426,57 @@ namespace
         {0, 2, 103, -1, 2, 1, 3, 1, 40.0f, 0.0f, 0, -1, 3, -1, -1, 56, -1},
         {0, 2, 104, -1, 2, 1, 3, 1, 40.0f, 0.0f, 0, -1, 3, -1, -1, 64, -1},
         {0, 5, 105, -1, 2, 6, 3, 6, 30.0f, 0.0f, 2, -1, 4, -1, -1, -1, -1},
+        /* damage */
+        {3, 3, 21, -1, 1, 1, 2, 1, 10.0f, 0.0f, 0, -1, 2, -1, -1, -1, -1},
+        {3, 3, 22, -1, 1, 1, 2, 1, 10.0f, 0.0f, 2, -1, 2, -1, 1, -1, -1},
+        {3, 3, 29, -1, 0, 5, 3, 1, 10.0f, 0.0f, 8, -1, 2, -1, -1, -1, -1},
+        {3, 3, 31, -1, 0, 6, 3, 1, 10.0f, 5.0f, 0, -1, 2, -1, -1, 1, -1},
+        /* hurt */
+        {2, 1, 23, -1, 1, 1, 0, 0, 10.0f, 10.0f, 0, -1, 3, -1, -1, -1, -1},
+        {2, 2, 32, -1, 0, 5, 0, 0, 10.0f, 10.0f, 0, -1, 3, -1, -1, -1, -1},
+        {2, 2, 35, -1, 0, 5, 0, 0, 10.0f, 10.0f, 0, -1, 3, -1, -1, -1, 2},
+        {2, 2, 36, -1, 0, 5, 0, 0, 10.0f, 10.0f, 0, -1, 3, -1, -1, -1, 11},
+        {2, 2, 37, -1, 0, 5, 0, 0, 10.0f, 10.0f, 0, -1, 3, -1, -1, -1, 10},
+        {2, 3, 38, -1, 0, 5, 0, 0, 20.0f, 0.0f, 0, -1, 3, -1, -1, -1, 5},
+        {2, 2, 40, -1, 0, 5, 0, 0, 20.0f, 0.0f, 0, -1, 3, -1, -1, -1, 4},
+        {2, 3, 41, -1, 0, 5, 0, 0, 20.0f, 0.0f, 0, -1, 3, -1, -1, -1, 6},
+        {2, 2, 42, -1, 0, 5, 0, 0, 20.0f, 0.0f, 0, -1, 3, -1, -1, -1, 7},
+        {2, 2, 43, -1, 0, 5, 0, 0, 20.0f, 0.0f, 0, -1, 3, -1, -1, -1, 12},
+        {2, 3, 44, -1, 0, 5, 0, 0, 30.0f, 0.0f, 0, -1, 3, -1, -1, -1, 9},
+        {2, 2, 45, -1, 0, 5, 0, 0, 30.0f, 0.0f, 0, -1, 3, -1, -1, -1, 8},
         /* sighted_enemy */
         {4, 5, 108, 3, 0, 6, 3, 6, 10.0f, 10.0f, 0, -1, -1, 0, -1, -1, -1},
         {4, 5, 109, 3, 0, 6, 3, 6, 10.0f, 25.0f, 0, -1, -1, 2, -1, -1, -1},
-        /* grenade_danger */
-        {12, 5, 118, -1, 0, 5, 4, 5, 10.0f, 4.0f, 0, 0, 3, -1, -1, -1, -1},
-        {12, 5, 120, -1, 0, 5, 4, 5, 10.0f, 0.0f, 0, 0, 2, -1, -1, -1, -1},
-        {12, 6, 119, -1, 0, 6, 4, 5, 10.0f, 0.0f, 0, -1, 1, -1, -1, -1, -1},
-        /* grenade_throwing */
-        {9, 7, 115, -1, 0, 4, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* shooting */
+        {26, 1, 149, -1, 0, 0, 0, 0, 10.0f, 10.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* shooting_vehicle */
+        {27, 1, 150, -1, 0, 0, 0, 0, 20.0f, 10.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* shooting_berserk */
+        {28, 2, 151, -1, 0, 0, 0, 0, 20.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* shooting_group */
+        {29, 2, 152, -1, 0, 0, 0, 0, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* shooting_traitor */
+        {30, 1, 153, -1, 0, 0, 0, 0, 30.0f, 10.0f, 0, -1, -1, -1, -1, -1, -1},
         /* flee */
         {31, 3, 156, -1, 0, 0, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
         /* flee_leader_died */
         {32, 4, 158, -1, 0, 0, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* grenade_sighted */
+        {11, 3, 117, -1, 0, 6, 4, 6, 10.0f, 4.0f, 0, 0, 3, -1, -1, -1, -1},
+        /* grenade_danger */
+        {12, 5, 118, -1, 0, 5, 4, 5, 10.0f, 4.0f, 0, 0, 3, -1, -1, -1, -1},
+        {12, 5, 120, -1, 0, 5, 4, 5, 10.0f, 0.0f, 0, 0, 2, -1, -1, -1, -1},
+        {12, 6, 119, -1, 0, 6, 4, 5, 10.0f, 0.0f, 0, -1, 1, -1, -1, -1, -1},
+        /* berserk */
+        {42, 7, 178, -1, 0, 4, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* melee */
+        {43, 7, 179, -1, 0, 4, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* grenade_throwing */
+        {9, 7, 115, -1, 0, 4, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* dive */
+        {44, 7, 180, -1, 0, 4, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
+        /* leap */
+        {47, 7, 182, -1, 0, 4, 2, 1, 10.0f, 0.0f, 0, -1, -1, -1, -1, -1, -1},
     };
     constexpr int usageCount = int(sizeof(usages) / sizeof(usages[0]));
     enum { USAGE_LOOKUP = 1, USAGE_FORCE = 2, USAGE_IMMEDIATE_NOTIFY = 4, USAGE_PLAYER = 8, USAGE_SAME_VEHICLE = 16, USAGE_ALLOW_SUBJECT = 32,
@@ -850,13 +900,31 @@ namespace
         updateSpeechTimers(*sp, p.priority, p.usage);
     }
 
-    // unit_dialogue_update (unit_dialogue.c:968-1112) and the recent body damage's decay, one tick.
+    // The delayed ai_handle_damage calls a tick raised (run after every speaker has ticked: an event may
+    // add speakers).
+    struct DelayedHit { playerent *unit, *attacker; int category; float peak; };
+    std::vector<DelayedHit> delayedHits;
+
+    // unit_dialogue_update (unit_dialogue.c:968-1112), the recent damage's decay and the delayed damage
+    // timer (units.c:5897-5915), one tick.
     void tick(Speaker &s)
     {
         if(s.decayTimer >= 0)
         {
             if(++s.decayTimer >= 60) s.recentBody = max(0.0f, s.recentBody - 0.016666668f);
             if(s.recentBody <= 0) s.decayTimer = -1;
+        }
+        if(s.shieldDecayTimer >= 0)
+        {
+            if(++s.shieldDecayTimer >= 60) s.recentShield = max(0.0f, s.recentShield - 0.016666668f);
+            if(s.recentShield <= 0) s.shieldDecayTimer = -1;
+        }
+        if(s.delayedTimer > 0 && --s.delayedTimer == 0)
+        {
+            delayedHits.push_back({s.unit, s.delayedAttacker, s.delayedCategory, s.delayedPeak});
+            s.delayedCategory = 0;
+            s.delayedAttacker = nullptr;
+            s.delayedPeak = 0;
         }
         if(s.minorDecay > 0 && --s.minorDecay == 0 && s.minorSounds > 0) { --s.minorSounds; s.minorDecay = 22; }
         // January decrements the minor timer twice and never the major one (the port's BUG note at
@@ -895,6 +963,78 @@ namespace
         const int start = haloactorstarthealth(p);
         return start > 0 ? float(start) : 100.0f;
     }
+
+    // ai_handle_damage's communication (ai/ai.c:1316-1380) for a hit that did not kill (`delayed`: the
+    // delayed call on the peak of the recent damage). `responsible` is the unit behind the hit (nobody
+    // for an ownerless one), `fraction` what Halo passes: the hit's total_damage in damage points
+    // (shield plus body before the vitality normalization, units/units.c:6759), or for the delayed call
+    // the peak of the normalized recent shield plus body damage (6812-6832; the port's own mix of
+    // units, followed as written). A friend's hit raises damage (hurt friend, damaged friend) unless
+    // delayed; otherwise 0.3 or more raises hurt (the rows want an enemy). The falling category is excluded only from
+    // actor_handle_damage there, not from these events.
+    void handleDamage(playerent *unit, playerent *responsible, int category, float fraction, bool delayed)
+    {
+        // A dead unit's delayed call is dropped (judgement call: its death event spoke for the kill, and
+        // a corpse's actor, so its team, is gone once halokilled detaches it).
+        if(!unit || !present(unit) || (delayed && !alive(unit))) return;
+        if(responsible && !present(responsible)) responsible = nullptr;
+        int hostility = HALO_HOSTILITY_NONE;
+        if(responsible == unit) hostility = HALO_HOSTILITY_SELF;
+        else if(responsible)
+            hostility = haloteamhostile(teamOf(unit), halodamageteam(responsible)) ? HALO_HOSTILITY_ENEMY : HALO_HOSTILITY_FRIEND;
+        if(halo_dialoguetrace)
+            conoutf("COMM_DAMAGE unit=%s cause=%s hostility=%d category=%d fraction=%.3f delayed=%d", unitName(unit), unitName(responsible),
+                    hostility, category, fraction, int(delayed));
+        if(!delayed && hostility == HALO_HOSTILITY_FRIEND) event(HALO_COMM_DAMAGE, unit, responsible, HALO_HOSTILITY_FRIEND, category, 0x3f);
+        else if(fraction >= 0.3f) event(HALO_COMM_HURT, unit, responsible, hostility, category, 0x3f);
+    }
+
+    // unit_make_damage_sound (unit_dialogue.c:725-886) for the hit on the unit `s` speaks for.
+    void damageSound(Speaker &s, const HaloHitReport &report, float body, bool died)
+    {
+        playerent *const unit = s.unit;
+        int vocalization = -1;
+        bool involuntary = false;
+        const bool tookBody = s.recentBody > 0, tookMajor = s.recentBody >= 0.6f;
+        if(died)
+        {
+            bool severe = false;
+            const bool instantaneous = report.acceleration >= 2;
+            if(haloisactor(unit)) severe = haloactorstatus(unit) >= 6;      // combat_status >= definite
+            else severe = s.recentBody > body + 0.2f;
+            if(report.category == CATEGORY_FALLING) vocalization = VOC_DEATH_FALLING;
+            else if(report.category == CATEGORY_FLAME) vocalization = VOC_DEATH_AGONIZING;
+            else if(instantaneous) vocalization = VOC_DEATH_FLYING;
+            else if(!severe) vocalization = VOC_DEATH_QUIET;
+            else vocalization = report.instant ? VOC_DEATH_INSTANT : VOC_DEATH_VIOLENT;
+            involuntary = true;
+        }
+        else if(s.majorTimer == 0)
+        {
+            if(report.category == CATEGORY_FALLING) { involuntary = true; vocalization = VOC_PAIN_FALLING; }
+            else if(tookMajor) { involuntary = true; vocalization = VOC_PAIN_BODY_MAJOR; }
+            else if(s.minorTimer == 0 && s.minorSounds < 3 && (s.current.priority == SPEECH_NONE || rndscale(1.0f) < 0.4f))
+                vocalization = tookBody ? VOC_PAIN_BODY : VOC_PAIN_SHIELD;
+        }
+        if(vocalization < 0) return;
+        int sound = -1;
+        const int priority = died ? SPEECH_DEATH : involuntary ? SPEECH_INVOLUNTARY : SPEECH_PAIN;
+        const int playType = testSpeech(s, priority, true, false, nullptr, vocalization, sound);
+        if(playType == PLAY_NONE) return;
+        SpeechItem item;
+        item.priority = priority;
+        item.vocalization = vocalization;
+        item.sound = sound;
+        item.pause = 7;
+        speak(s, playType, item);
+        if(tookMajor) s.majorTimer = 60;
+        else
+        {
+            ++s.minorSounds;
+            s.minorTimer = 30;
+            s.minorDecay = 22;
+        }
+    }
 }
 
 bool halodialogueactive() { return halo_dialogue && haloactive() && load(); }
@@ -915,6 +1055,7 @@ void halodialogueforget(const playerent *unit)
 {
     if(!unit) return;
     speakers.erase(std::remove_if(speakers.begin(), speakers.end(), [unit](const Speaker &s) { return s.unit == unit; }), speakers.end());
+    for(Speaker &s : speakers) if(s.delayedAttacker == unit) s.delayedAttacker = nullptr;
 }
 
 void halodialogueupdate()
@@ -925,12 +1066,17 @@ void halodialogueupdate()
     tickMillis = lastmillis;
     // A unit gone from the game (an erased or kicked bot) loses its speech.
     speakers.erase(std::remove_if(speakers.begin(), speakers.end(), [](const Speaker &s) { return !present(s.unit); }), speakers.end());
+    for(Speaker &s : speakers) if(s.delayedAttacker && !present(s.delayedAttacker)) s.delayedAttacker = nullptr;
     for(int steps = 0; tickRemainder >= 1000 && steps < 30; ++steps)
     {
         tickRemainder -= 1000;
         ++ticks;
+        delayedHits.clear();
         for(Speaker &s : speakers) tick(s);
+        // The delayed ai_handle_damage calls, after the loop: their events may add speakers.
+        for(const DelayedHit &h : delayedHits) handleDamage(h.unit, h.attacker, h.category, h.peak, true);
     }
+    delayedHits.clear();
     tickRemainder = min(tickRemainder, 1000);
 }
 
@@ -940,7 +1086,6 @@ void halodialoguetriggers(bool on) { triggersEnabled = on; }
 
 void halodialoguedamage(playerent *unit, playerent *attacker, int healthLost, bool died, int gun)
 {
-    (void)attacker;
     (void)gun;
     if(!halodialogueactive() || !unit) return;
     HaloHitReport report;
@@ -964,57 +1109,39 @@ void halodialoguedamage(playerent *unit, playerent *attacker, int healthLost, bo
         sp->unit = unit;
         sp->dialogue = dialogueFor(unit);
     }
-    if(!sp || sp->dialogue < 0) return;
-    const float body = clamp(healthLost / maximumHealth(unit), 0.0f, 1.0f);
+    if(!sp) return;
+    // ai_get_responsible_unit (ai/ai.c:931-965): nobody for an ownerless hit (dealt in the player's name).
+    playerent *responsible = hit ? attacker : nullptr;
+    if(responsible == player1 && haloactorownerlessdamage()) responsible = nullptr;
+    const float body = clamp(healthLost / maximumHealth(unit), 0.0f, 1.0f), shieldDamage = hit ? report.shieldDamage : 0.0f;
     if(body > 0)
     {
         sp->recentBody = min(1.0f, sp->recentBody + body);
         sp->decayTimer = 0;
     }
+    if(shieldDamage > 0)
+    {
+        sp->recentShield = min(1.0f, sp->recentShield + shieldDamage);
+        sp->shieldDecayTimer = 0;
+    }
+    // The delayed damage (units.c:6812-6832): restarted at 45 ticks by every hit with recent damage, on
+    // the peak of the recent shield and body damage, keeping the last attacker that had an owner.
+    const float recent = sp->recentShield + sp->recentBody;
+    if(hit && recent > 0)
+    {
+        sp->delayedCategory = max(report.category, 0);
+        sp->delayedTimer = 45;
+        sp->delayedPeak = max(sp->delayedPeak, recent);
+        if(responsible) sp->delayedAttacker = responsible;
+    }
     // unit_damage_aftermath's test (units/units.c:6966-6987): the body depleted, or any body or shield damage.
     if(!died && !(body > 0) && !report.shield) return;
-    // unit_make_damage_sound (unit_dialogue.c:725-886).
-    int vocalization = -1;
-    bool involuntary = false;
-    const bool tookBody = sp->recentBody > 0, tookMajor = sp->recentBody >= 0.6f;
-    if(died)
-    {
-        bool severe = false;
-        const bool instantaneous = report.acceleration >= 2;
-        if(haloisactor(unit)) severe = haloactorstatus(unit) >= 6;      // combat_status >= definite
-        else severe = sp->recentBody > body + 0.2f;
-        if(report.category == CATEGORY_FALLING) vocalization = VOC_DEATH_FALLING;
-        else if(report.category == CATEGORY_FLAME) vocalization = VOC_DEATH_AGONIZING;
-        else if(instantaneous) vocalization = VOC_DEATH_FLYING;
-        else if(!severe) vocalization = VOC_DEATH_QUIET;
-        else vocalization = report.instant ? VOC_DEATH_INSTANT : VOC_DEATH_VIOLENT;
-        involuntary = true;
-    }
-    else if(sp->majorTimer == 0)
-    {
-        if(report.category == CATEGORY_FALLING) { involuntary = true; vocalization = VOC_PAIN_FALLING; }
-        else if(tookMajor) { involuntary = true; vocalization = VOC_PAIN_BODY_MAJOR; }
-        else if(sp->minorTimer == 0 && sp->minorSounds < 3 && (sp->current.priority == SPEECH_NONE || rndscale(1.0f) < 0.4f))
-            vocalization = tookBody ? VOC_PAIN_BODY : VOC_PAIN_SHIELD;
-    }
-    if(vocalization < 0) return;
-    int sound = -1;
-    const int priority = died ? SPEECH_DEATH : involuntary ? SPEECH_INVOLUNTARY : SPEECH_PAIN;
-    const int playType = testSpeech(*sp, priority, true, false, nullptr, vocalization, sound);
-    if(playType == PLAY_NONE) return;
-    SpeechItem item;
-    item.priority = priority;
-    item.vocalization = vocalization;
-    item.sound = sound;
-    item.pause = 7;
-    speak(*sp, playType, item);
-    if(tookMajor) sp->majorTimer = 60;
-    else
-    {
-        ++sp->minorSounds;
-        sp->minorTimer = 30;
-        sp->minorDecay = 22;
-    }
+    if(sp->dialogue >= 0) damageSound(*sp, report, body, died);
+    // Then ai_handle_damage for a biped the hit did not kill (units.c:6993-7013; a kill raises the death
+    // event instead, halodialoguedeath). `sp` is not used past this: the event may add speakers.
+    // Its fraction is total_damage (units.c:6759, 7004-7011): the hit's damage points, so nearly every
+    // hit passes the 0.3 test; only the delayed call's peak is normalized.
+    if(hit && !died) handleDamage(unit, responsible, report.category, report.points, false);
 }
 
 void halodialoguedeath(playerent *victim, playerent *killer)

@@ -53,10 +53,13 @@ assert len(LOOKUP) == VOCALIZATION_TYPES
 # falling, agonizing, instant, flying), unit_scream's (887-966: 10 scream fear, 11 scream pain, 39
 # hurt enemy grenade) and the ai_communication events' (ai/ai_communication.c global_dialogue_table,
 # 1215-1484): the death event's killer and friend lines (49, 51, 53, 55, 57, 59, 61, 63, 65-75,
-# 96-105), sighted enemy (108, 109), grenade throwing (115), grenade danger (118, 119, 120), flee
-# (156) and flee leader died (158). Their lookups are added (fallbacks).
-SPOKEN = (6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 39, 49, 51, 53, 55, 57, 59, 61, 63, *range(65, 76),
-          *range(96, 106), 108, 109, 115, 118, 119, 120, 156, 158)
+# 96-105), damage (21, 22, 29, 31), hurt (23, 32, 35-38, 40-45), sighted enemy (108, 109), grenade
+# throwing (115), grenade sighted (117), grenade danger (118, 119, 120), shooting, shooting vehicle,
+# berserk, group and traitor (149-153), flee (156), flee leader died (158), berserk (178), melee
+# (179), dive (180) and leap (182). Their lookups are added (fallbacks).
+SPOKEN = (6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 21, 22, 23, 29, 31, 32, 35, 36, 37, 38, *range(39, 46),
+          49, 51, 53, 55, 57, 59, 61, 63, *range(65, 76), *range(96, 106), 108, 109, 115, 117, 118, 119, 120,
+          *range(149, 154), 156, 158, 178, 179, 180, 182)
 
 
 def vocalizations():

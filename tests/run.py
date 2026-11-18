@@ -59,6 +59,7 @@ QUICK = [
     'test_difficulty.py',             # halo_difficulty: squad sizes, game_difficulty_get, enemy scaling
     'test_falling_damage.py',         # falling damage: player.txt's matg block, the planned-drop scan, the player's and an actor's falls on a30
     'test_kill_credit.py',            # ownerless kills credit nobody: no frag, team kill, hit credit or "you ..." message; the player's fall and game_revert read "you died"
+    'test_explosion_corpses.py',      # explosion kills keep Halo's bodies: no gibs, the jpt! death push, bodies lie 90 s, infection takes them; no tinnitus, no red blood on non-humans
     'test_script_damage.py',          # damage_object/damage_new by their jpt!: effects.txt records, pulse generator only on the shield, oven, a10 zapper 0
     'test_major_upgrades.py',         # major upgrades at squad placement (chance table, error diffusion, revert, Continue), Halo's squad sizes
     'test_flood.py',                  # squad cap counts living actors; carrier burst from the tag, corpse infection, leap, pop, stagger; forms in the carrier's squad, blast
@@ -67,6 +68,7 @@ QUICK = [
     'test_vehicle_damage.py',         # vehicle body vitality: the Wraith destroyed with its pilot, occupied-only Ghost, vehicle gun variants, covered riders, death explosion, tilted hit box, wreck
     'test_vehicle_jump.py',           # d40 section 8's planned Warthog jumps flown by the engine (launch along the ramp, retail-derived gravity), capped and governed
     'test_dialogue.py',               # unit dialogue: dialogue.txt against the caches, decoded permutations, jpt! kinds, pain, death, death event, calls, screams, stock fallback
+    'test_dialogue_events.py',        # communication events: rows against the port, damage/hurt (friendly fire, taunt, delayed), berserk/melee/dive/leap/shooting/grenade sighted, same-millisecond kill
     'test_presentation.py',           # script effects, shake, screen effects, flashlight, damage indicator, class gains, lunge, engine loops, effect_new damage cvar
     'test_package_relocatable.py',    # relocatable signed package, retail-leak check, strict asset verification
 ]

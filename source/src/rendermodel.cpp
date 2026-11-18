@@ -974,12 +974,14 @@ void renderclient(playerent *d, const char *mdlname, const char *vwepname, int t
         anim = ANIM_DEATH;
         basetime = d->lastpain;
         int t = lastmillis-d->lastpain;
-        if(t<0 || t>20000) return;
+        // A Halo unit's body lies before it sinks (halocorpsemillis); Halo keeps its dead.
+        const int lies = halocorpsemillis(d);
+        if(t<0 || t>20000+lies) return;
         if(t>2000)
         {
             anim = ANIM_LYING_DEAD|ANIM_NOINTERP|ANIM_LOOP;
             basetime += 2000;
-            t -= 2000;
+            t = max(t-2000-lies, 0);
             o.z -= t*t/10000000000.0f*t;
         }
     }

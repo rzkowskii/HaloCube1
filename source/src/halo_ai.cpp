@@ -82,6 +82,9 @@ namespace
         // melee delay values on each swing (the slot's delay is rewritten there, so it is read once).
         int baseDelay = 0;
         bool hiding = false, berserkTried = false;
+        // Halo's emotions.played_berserk_sound (actor_moving.c:3439-3475, reset by actor_berserk,
+        // actor_perception.c:3088-3097): the berserk call was made for the current berserk.
+        bool berserkSpoken = false;
         // Whether it ever had a target (Halo's target.any_target_ever, for the sighted-enemy line).
         bool everTargeted = false;
         int startHealth = 0;
@@ -301,6 +304,13 @@ namespace
             else if(key == "major") std::getline(in >> std::ws, d->majorPath);
             // Optional format 3 lines (tools/halo_actors.py; older engines skip them).
             else if(key == "unit") ok = d->hasUnitFlags = bool(in >> d->unitFlags >> d->bipedFlags);
+            // accelscale <scale>: the unit object's acceleration scale (optional; older engines skip it).
+            else if(key == "accelscale")
+            {
+                float scale = -1;
+                ok = bool(in >> scale) && std::isfinite(scale);
+                d->accelerationScale = ok && scale >= 0 ? scale : -1;
+            }
             // melee <range> <abort> <berserk range> <berserk abort> <attack range> <charge timer>
             //       <suicide sensing> <weapon melee> <frames> <key frame> <key x> <total x>
             else if(key == "melee")
@@ -985,6 +995,29 @@ namespace
         else a.nextSecondary = true;
     }
 
+    // actor_start_burst's call (actor_combat.c:1472-1510): with its target in sight (combat status
+    // visible: the engine's sighting this think) a burst begins with shooting berserk while berserk,
+    // shooting traitor at a unit of a team whose allegiance broke (the prop's ally flag), shooting group
+    // with five or more enemies in sight (cumulative_threats visible, actor_perception.c:1755-1779),
+    // else shooting vehicle from an armed seat (vehicle_gunner) or shooting.
+    void burstCall(Actor &a, CBot *body)
+    {
+        botent *e = a.bot;
+        playerent *t = a.target;
+        if(!t || a.lastSeen != lastmillis) return;
+        int type = HALO_COMM_SHOOTING;
+        if(a.morale == BERSERK) type = HALO_COMM_SHOOTING_BERSERK;
+        else if(haloallegiancebroken(a.team, haloactorteam(t))) type = HALO_COMM_SHOOTING_TRAITOR;
+        else
+        {
+            int visible = 0;
+            eachCombatant([&](playerent *p) { if(visible < 5 && p != e && haloactorhostile(e, p) && sees(a, body, p)) ++visible; });
+            if(visible >= 5) type = HALO_COMM_SHOOTING_GROUP;
+            else if(halovehiclearmedseat(e)) type = HALO_COMM_SHOOTING_VEHICLE;
+        }
+        halodialogueevent(type, e, t, HALO_HOSTILITY_ENEMY);
+    }
+
     void fire(Actor &a, CBot *body)
     {
         botent *e = a.bot;
@@ -1041,6 +1074,7 @@ namespace
             a.nextSecondary = false;
             a.specialBurst = a.burstSecondary || a.overcharging;
             if(a.specialBurst) specialTrace(a, "burst", a.burstSecondary ? 1 : 0, haloactorburstmodifier(e));
+            if(!melee) burstCall(a, body);
         }
         if(lastmillis >= a.burstUntil && !melee) return;
         // Fire only once roughly facing the target.
@@ -1211,6 +1245,8 @@ namespace
         e->jumpnext = true;
         a.nextLeap = lastmillis + 1500 + rnd(1500);
         ++a.leaps;
+        // The leap's call (actor_moving.c:3496-3523, on unit_leap_begin).
+        halodialogueevent(HALO_COMM_LEAP, e, nullptr);
     }
 
     // Infection forms head for a fallen marine or Elite when it is closer than their target.
@@ -1283,6 +1319,8 @@ namespace
         dir.normalize();
         e->lastattackweapon = e->weaponsel;
         e->lastaction = lastmillis;
+        // The melee call as the attack begins (action_charge.c:723-735, on unit_melee_attack_begin).
+        halodialogueevent(HALO_COMM_MELEE, e, t, HALO_HOSTILITY_ENEMY);
         // The smash carries its jpt!'s material modifiers (actors.txt `unitmeleematerials`), as any
         // damage does in Halo (../Halo3DS objects/damage.c:898-899, 1174): 1 on the player's
         // cyborg armour and shield, 0 on another Hunter. Without the line, none, as before.
@@ -1543,6 +1581,7 @@ namespace
             // (10020-10045): 40 ticks for the carrier. think (meleeBurst) stands it there and then
             // kills it, setting off its body destroyed blast and released forms (halokilled).
             meleeTrace(a, "suicide", t, distance, receding);
+            halodialogueevent(HALO_COMM_MELEE, e, t, HALO_HOSTILITY_ENEMY);
             a.meleePhase = MELEE_ATTACKING;
             a.meleeStrikeAt = 0;
             a.meleeBusyUntil = lastmillis + meleeLengthMillis(d);
@@ -1554,6 +1593,8 @@ namespace
         a.meleeBusyUntil = lastmillis + meleeLengthMillis(d);
         e->move = e->strafe = 0;
         meleeTrace(a, "attack", t, distance, reach);
+        // The melee call as the attack begins (action_charge.c:723-735: unit_melee_attack_begin succeeded).
+        halodialogueevent(HALO_COMM_MELEE, e, t, HALO_HOSTILITY_ENEMY);
         if(meleeKeyMillis(d) <= 0)
         {
             a.meleeStrikeAt = 0;
@@ -1863,9 +1904,13 @@ namespace
                 else z.allowDive = dangerDraw(true) < a.def->grenadeDive;
                 ++a.dangerNotices;
                 dangerTrace(a, "notice", z.allowDive ? 1 : 0);
-                // actor_stimulus_noticed_danger_zone (actor_stimulus.c:395-469): a combat stimulus; an unaware
-                // actor turns alert, towards whoever is behind it when that is an enemy. Its grenade sighted
-                // communication (actor_stimulus.c:432) is not raised yet; the grenade danger one is (avoidDanger).
+                // actor_stimulus_noticed_danger_zone (actor_stimulus.c:395-469): a projectile's grenade sighted
+                // call (:414-439, by who is behind it), then a combat stimulus: an unaware actor turns alert,
+                // towards whoever is behind it when that is an enemy.
+                if(z.type == DANGER_PROJECTILE)
+                    halodialogueevent(HALO_COMM_GRENADE_SIGHTED, e, nullptr,
+                                      z.hostility == HOSTILITY_ENEMY ? HALO_HOSTILITY_ENEMY :
+                                      z.hostility == HOSTILITY_FRIEND ? HALO_HOSTILITY_FRIEND : HALO_HOSTILITY_SELF);
                 if(a.awareness == UNAWARE)
                 {
                     a.awareness = ALERT;
@@ -2111,6 +2156,8 @@ namespace
         e->attacking = false;
         ++a.dives;
         dangerTrace(a, "dive", length);
+        // The dive's call (actions.c:3920-3936, once the animation impulse has begun).
+        halodialogueevent(HALO_COMM_DIVE, e, nullptr);
         return true;
     }
 
@@ -2356,6 +2403,15 @@ namespace
         perceiveDanger(a, body);
         // A dive under way takes the whole think (actor_move_animation_busy).
         if(continueDive(a)) return;
+        // The berserk call (actor_moving.c:3439-3475): once per berserk, on foot and not in mid-air, at
+        // its target; a berserk that ends lets the next one call again (actor_berserk's reset). A berserk
+        // begun later in this think (attachedDanger) calls on the next.
+        if(a.morale != BERSERK) a.berserkSpoken = false;
+        else if(!a.berserkSpoken && !halovehicleinside(e) && e->onfloor)
+        {
+            a.berserkSpoken = true;
+            halodialogueevent(HALO_COMM_BERSERK, e, alive(a.target) ? a.target : nullptr, HALO_HOSTILITY_ENEMY);
+        }
         if(giveWay(a)) return;
 
         if(a.boarding)

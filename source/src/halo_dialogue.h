@@ -24,7 +24,11 @@ void halodialogueupdate();
 // points off the body (0 for a hit the shield took whole), `died` when it kills. The shield damage,
 // the jpt! category, its instantaneous acceleration and a headshot come from halodamage's report of
 // the same hit (halohitreport); a kill without one (the scripts' INT_MAX kills) is silent unless an
-// act-of-god scope is open (ai_kill: the globals' falling jpt!, objects/damage.c:1830-1872).
+// act-of-god scope is open (ai_kill: the globals' falling jpt!, objects/damage.c:1830-1872). A hit
+// that does not kill then raises ai_handle_damage's events (ai/ai.c:1316-1380): damage for a
+// friend's hit, else hurt when the hit dealt 0.3 damage points or more (total_damage, not normalized,
+// units/units.c:6759: nearly every hit); and 45 ticks after the last hit the delayed hurt on the peak
+// of the normalized recent shield and body damage (units/units.c:5897-5915, 6812-6832).
 void halodialoguedamage(playerent *unit, playerent *attacker, int healthLost, bool died, int gun);
 // ai_handle_death's communication event (ai/ai.c:968-1003) for a unit dokill kills.
 void halodialoguedeath(playerent *victim, playerent *killer);
@@ -36,8 +40,10 @@ void halodialoguescream(playerent *unit, int type);
 // 3 enemy, 4 traitor), damage the jpt! category (-1 none). `enemyStatus` holds Halo's six
 // enemy-status tests (bit 0 never had a target, 1 dead, 2 lost, 3 not visible, 4 no danger,
 // 5 visible) for the subject; all set when the subject is not an actor.
-enum { HALO_COMM_DEATH = 0, HALO_COMM_SIGHTED_ENEMY = 4, HALO_COMM_GRENADE_THROWING = 9, HALO_COMM_GRENADE_DANGER = 12,
-       HALO_COMM_FLEE = 31, HALO_COMM_FLEE_LEADER_DIED = 32 };
+enum { HALO_COMM_DEATH = 0, HALO_COMM_HURT = 2, HALO_COMM_DAMAGE = 3, HALO_COMM_SIGHTED_ENEMY = 4, HALO_COMM_GRENADE_THROWING = 9,
+       HALO_COMM_GRENADE_SIGHTED = 11, HALO_COMM_GRENADE_DANGER = 12, HALO_COMM_SHOOTING = 26, HALO_COMM_SHOOTING_VEHICLE = 27,
+       HALO_COMM_SHOOTING_BERSERK = 28, HALO_COMM_SHOOTING_GROUP = 29, HALO_COMM_SHOOTING_TRAITOR = 30, HALO_COMM_FLEE = 31,
+       HALO_COMM_FLEE_LEADER_DIED = 32, HALO_COMM_BERSERK = 42, HALO_COMM_MELEE = 43, HALO_COMM_DIVE = 44, HALO_COMM_LEAP = 47 };
 enum { HALO_HOSTILITY_NONE = 0, HALO_HOSTILITY_SELF = 1, HALO_HOSTILITY_FRIEND = 2, HALO_HOSTILITY_ENEMY = 3, HALO_HOSTILITY_TRAITOR = 4 };
 void halodialogueevent(int type, playerent *subject, playerent *cause, int hostility = HALO_HOSTILITY_NONE, int damage = -1,
                        unsigned enemyStatus = 0x3f);

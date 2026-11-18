@@ -511,3 +511,76 @@ COMMANDF(qa_kill_credit, "s", (const char *label)
             player1->state == CS_ALIVE);
     fflush(stdout);
 });
+
+// Explosion deaths and bodies (weapon.cpp halohit's death push, clientgame.cpp dokill's gore gate,
+// halo.cpp halokilled, halocorpsemillis and halostockblood; tests/test_explosion_corpses.py; written
+// while testing was on hold, not run).
+// qa_corpse_kill KIND TYPE: a player-owned grenade of TYPE (0 frag, 1 plasma) goes off 0.8 world units
+// from the living actor of KIND (ActorKind) nearest the player, on the player's side of it:
+// CORPSE_KILL actor=<name|-> ok=<0|1> pos=<x,y,z of the blast>
+COMMANDF(qa_corpse_kill, "ii", (int *kind, int *type)
+{
+    playerent *bot = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        botent *b = enemies[i].bot;
+        if(!b || b->state != CS_ALIVE || enemies[i].kind != *kind) continue;
+        const float d = player1->o.squareddist(b->o);
+        if(d < best) { best = d; bot = b; }
+    }
+    vec at(0, 0, 0);
+    bool ok = false;
+    if(bot)
+    {
+        vec toward = vec(player1->o).sub(bot->o);
+        toward.z = 0;
+        if(toward.iszero()) toward = vec(1, 0, 0);
+        toward.normalize().mul(.8f * haloscenarioscale());
+        at = feetOf(bot).add(toward).add(vec(0, 0, .2f));
+        ok = haloqagrenadeat(*type, at, player1);
+    }
+    conoutf("CORPSE_KILL actor=%s ok=%d pos=%.2f,%.2f,%.2f", bot ? bot->name : "-", ok, at.x, at.y, at.z);
+    fflush(stdout);
+});
+// qa_corpse_blast_player DISTANCE: a player-owned frag goes off DISTANCE world units before the player.
+COMMANDF(qa_corpse_blast_player, "f", (float *distance)
+{
+    const float yaw = player1->yaw * RAD;
+    const vec at = feetOf(player1).add(vec(sinf(yaw), -cosf(yaw), 0).mul(*distance * haloscenarioscale())).add(vec(0, 0, .2f));
+    conoutf("CORPSE_KILL actor=player ok=%d pos=%.2f,%.2f,%.2f", haloqagrenadeat(0, at, player1), at.x, at.y, at.z);
+    fflush(stdout);
+});
+// qa_corpse_state LABEL: CORPSE_STATE <label> gibs=<AssaultCube gib bounce entities> ear=<ms of the player's
+// ear damage left> corpses=<bodies the infection forms may take>, then per actor CORPSE_QA <label> cn=
+// kind= dead= nocorpse= drawn=<renderclient draws the body> lies=<halocorpsemillis> since=<ms since death>
+// sink=<cubes the renderer sinks it> blood=<halostockblood> pos=<feet> vel=, and CORPSE_ENTRY <label>
+// kind= body=<cn|-> pos= per corpse.
+extern vector<bounceent *> bounceents;
+COMMANDF(qa_corpse_state, "s", (const char *label)
+{
+    int gibs = 0;
+    loopv(bounceents) if(bounceents[i] && bounceents[i]->bouncetype == BT_GIB) ++gibs;
+    conoutf("CORPSE_STATE %s gibs=%d ear=%d corpses=%d", label, gibs, max(0, player1->eardamagemillis - lastmillis), corpses.length());
+    loopv(enemies)
+    {
+        botent *b = enemies[i].bot;
+        if(!b) continue;
+        const bool dead = b->state == CS_DEAD;
+        const int since = dead ? lastmillis - b->lastpain : 0;
+        const int lies = halocorpsemillis(b);
+        const int sinking = dead && since > 2000 ? max(since - 2000 - lies, 0) : 0;
+        const bool drawn = dead && !b->nocorpse && since >= 0 && since <= 20000 + lies;
+        const vec feet = feetOf(b);
+        conoutf("CORPSE_QA %s cn=%d kind=%d dead=%d nocorpse=%d drawn=%d lies=%d since=%d sink=%.3f blood=%d pos=%.2f,%.2f,%.2f vel=%.3f,%.3f,%.3f",
+                label, b->clientnum, int(enemies[i].kind), dead, int(b->nocorpse), drawn, lies, since,
+                float(sinking) * sinking / 10000000000.0f * sinking, int(halostockblood(b)), feet.x, feet.y, feet.z, b->vel.x, b->vel.y, b->vel.z);
+    }
+    loopv(corpses)
+    {
+        const playerent *body = corpseBody(corpses[i]);
+        conoutf("CORPSE_ENTRY %s kind=%d body=%d pos=%.2f,%.2f,%.2f", label, int(corpses[i].kind), body ? body->clientnum : -1,
+                corpses[i].o.x, corpses[i].o.y, corpses[i].o.z);
+    }
+    fflush(stdout);
+});

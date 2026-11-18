@@ -601,6 +601,8 @@ bool intersectgeometry(const vec &from, vec &to) // check line for contact with 
 
 void damageeffect(int damage, playerent *d)
 {
+    // AssaultCube's red blood: in the campaign only on Halo's human bodies (halostockblood).
+    if(!halostockblood(d)) return;
     particle_splash(PART_BLOOD, damage/10, 1000, d->o);
 }
 
@@ -625,6 +627,9 @@ void hit(int damage, playerent *d, playerent *at, const vec &vel, int gun, bool 
     // stops besides the ping animations: ../Halo3DS objects/damage.c:1043); it is still hurt.
     const bool impervious = haloactive() && d != player1 && (haloactorflags(d) & HALO_AI_IMPERVIOUS);
     if(!impervious && (d==player1 || d->type==ENT_BOT || !m_mp(gamemode))) d->hitpush(damage, vel, at, gun);
+    // hitpush's ear damage (a grenade hit over 50: S_TINNITUS and every sound's pitch lowered for
+    // damage / 10 s, audiomanager.cpp) is AssaultCube's; Halo has nothing like it.
+    if(d == player1 && haloactive()) d->eardamagemillis = 0;
 
     // No hit sound for damage nobody owns (dealt in the player's name: halo.h haloownerless).
     if(at == player1 && d != player1 && !haloownerless(at))
@@ -2135,9 +2140,44 @@ void halohit(float damage, int sideEffect, playerent *victim, playerent *owner, 
              const HaloDamage *source, const vec *at)
 {
     if(!victim || !(damage > 0)) return;
+    // Read before the hit: a lethal one detaches the actor (haloactordeath).
+    const HaloActorDef *variant = victim != player1 && victim->state == CS_ALIVE ? haloactorvariant(victim) : nullptr;
+    // Not thrown: an impervious unit, or one whose unit tag is special (the wounded sitting marine,
+    // the suicidal marine: ../Halo3DS units/bipeds.c:1635 skips biped_accelerate for it).
+    const bool impervious = variant && ((haloactorflags(victim) & HALO_AI_IMPERVIOUS) || (variant->hasUnitFlags && variant->specialUnit()));
+    const vec before = victim->vel;
     halopendinghit(victim, damage, sideEffect, source, at);
     hit(max(1, int(damage + .5f)), victim, owner, dir, gun, gib, info);
     halopendinghit(NULL, 0, 0);
+    // The death push. Halo throws a unit its damage kills by the jpt!'s instantaneous acceleration
+    // times the object's acceleration scale, a world unit a second for each, along the damage's
+    // direction tilted 0.45 upwards (../Halo3DS objects/damage.c:1005-1016), in full on a dead biped
+    // (units/bipeds.c:1639-1655: a living one takes half), unless the unit is impervious (1036-1037).
+    // On the killing blow of an actor whose jpt! has an acceleration (the grenades' and fuel rod's 4,
+    // the rocket's and Scorpion shell's 6, the vehicles' death explosions' 2 to 4, the sword's 2.5)
+    // and whose variant has the `accelscale` line, it replaces AssaultCube's push from that hit
+    // (hitpush, guns[].pushfactor), at the section's scale in the engine's velocity units (16 cubes
+    // a second, as throwSpawned). The body slides on the engine's corpse physics (bot.cpp: 1.2 s,
+    // up to 6 s while in the air, with the engine's friction), not Halo's limp body, and does not spin (judgement calls). Other
+    // blows (the bullets' acceleration is 0, an older table) keep AssaultCube's push as before.
+    if(variant && victim->state == CS_DEAD && source && source->acceleration > 0 && variant->accelerationScale >= 0)
+    {
+        if(impervious) victim->vel = before;
+        else
+        {
+            vec push = dir.iszero() ? vec(0, 0, 1) : vec(dir).normalize();
+            push.z += 0.45f;
+            push.normalize().mul(source->acceleration * variant->accelerationScale / 16.0f);
+            push.x *= haloscenarioscale();
+            push.y *= haloscenarioscale();
+            push.z *= haloscenarioverticalscale();
+            victim->vel = vec(before).add(push);
+        }
+        // DEATH_PUSH victim=<name> acceleration=<jpt!> scale=<object> vel=<x,y,z engine units>
+        if(halo_damagetrace)
+            conoutf("DEATH_PUSH victim=%s acceleration=%.3f scale=%.3f vel=%.3f,%.3f,%.3f", victim->name, source->acceleration,
+                    variant->accelerationScale, victim->vel.x, victim->vel.y, victim->vel.z);
+    }
 }
 
 void halofiretrigger(playerent *owner, const HaloWeaponDef &def, HaloWeaponState &state, int index,

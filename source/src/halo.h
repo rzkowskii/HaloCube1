@@ -10,10 +10,16 @@ void halodrawtitle();
 void halodamage(int &damage, playerent *target, playerent *attacker, int gun);
 // What halodamage made of its last hit, for the unit's pain or death line (halo_dialogue.cpp): whether
 // the shield (or overshield) took damage, whether it was a headshot (Halo's killed instantly), the
-// jpt! category (-1 not known) and its instantaneous acceleration. True for the target of a hit this
-// frame.
-struct HaloHitReport { bool shield = false, instant = false; int category = -1; float acceleration = 0; };
+// jpt! category (-1 not known), its instantaneous acceleration, the shield damage as a fraction of
+// the maximum shield (Halo's normalized recent shield damage) and `points`, the hit's damage after
+// the playfight and difficulty factors (unit_damage_aftermath's total_damage, which Halo passes to
+// ai_handle_damage as its "fraction": damage points, not normalized, units/units.c:6759). True for the
+// target of the last hit halodamage dealt it this frame: a hit halodamage does not model (the INT_MAX
+// kills, a zero hit) and haloforgethit (a direct dokill) clear it, so a kill the same millisecond as a
+// real hit is not taken for that hit.
+struct HaloHitReport { bool shield = false, instant = false; int category = -1; float acceleration = 0, shieldDamage = 0, points = 0; };
 bool halohitreport(const playerent *target, HaloHitReport &out);
+void haloforgethit(const playerent *target);
 // Falling damage (halo.cpp updateFalling): physics.cpp's retailmove reports each surface an
 // airborne player or actor touches (`floor`: one it can stand on), read only to project the
 // Halo-equivalent fall velocity along a steep face it slides down and onto the floor it lands on.
@@ -188,4 +194,11 @@ void halokilled(playerent *victim, playerent *killer);
 // The nearest marine or Elite body an infection form could reach within `range`.
 void haloclearflood();
 bool halonearestcorpse(const vec &from, float range, vec &body);
+// How long a dead body lies before it sinks (rendermodel.cpp renderclient): a Halo unit's for the
+// corpse life (90 s, the infection forms' reach on it), 0 for any other (AssaultCube's 2 s death
+// animation, then the sink).
+int halocorpsemillis(const playerent *p);
+// Whether a hit on `p` sprays AssaultCube's red blood (weapon.cpp damageeffect): outside the
+// campaign always, in it only on the player and the human actors.
+bool halostockblood(const playerent *p);
 void halorenderweapons();

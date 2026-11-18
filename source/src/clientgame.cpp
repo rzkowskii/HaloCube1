@@ -940,7 +940,8 @@ void dodamage(int damage, playerent *pl, playerent *actor, int gun, bool gib, bo
     const bool voices = campaign && halodialogueactive();
     if (pl != player1 && damage > 0)
     {
-        damageeffect(damage == INT_MAX ? pl->health : damage, pl);
+        // A killing amount sprays for the health it took (a destroyed vehicle's riders take 100000).
+        damageeffect(damage == INT_MAX || (campaign && damage > pl->health) ? max(pl->health, 0) : damage, pl);
         if(!voices) audiomgr.playsound(S_PAIN1+rnd(5), pl);
     }
 
@@ -1026,7 +1027,11 @@ void dokill(playerent *pl, playerent *act, bool gib, int gun)
         else if(!m_mp(gamemode)) act->frags += ( gib && gun != GUN_GRENADE && gun != GUN_SHOTGUN) ? 2 : 1;
     }
 
-    if(gib)
+    // AssaultCube's gore (S_GIB, the gib bounce entities, the hidden corpse) and its headshot sound
+    // stay out of the campaign: Halo destroys no unit's body by damage (a body goes only when its
+    // unit is destroyed after dying, halokilled), so a grenade, a blast or a vehicle's destruction
+    // leaves the body, thrown by the jpt! (halohit's death push).
+    if(gib && !haloactive())
     {
         if(pl!=act && !ownerless && gun == GUN_SNIPER) audiomgr.playsound(S_HEADSHOT, SP_LOW);
         addgib(pl);

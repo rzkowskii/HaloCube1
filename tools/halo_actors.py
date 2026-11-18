@@ -58,6 +58,12 @@ DIFFICULTY_VALUES = (
 UNIT_FLAGS = 380                  # unit: flags (../Halo3DS units/unit_definitions.h:21-48; bit 19 is_inconsequential)
 UNIT_TEAM = 384                   # unit: default team
 UNIT_COLLISION = 112              # object: coll reference
+# object: acceleration_scale (../Halo3DS objects/object_definitions.h:134-141: after type, flags,
+# bounding radius, bounding and origin offsets): what scales a jpt!'s instantaneous acceleration on
+# the object (objects/damage.c:1005-1016). Checked against the cache bytes: cyborg 0.7, elite 0.6,
+# grunt 0.9, hunter 0.5, carrier 1.2, engineer 2, marine and jackal 1 (bounding radius at +4 0.45,
+# 0.44, 0.48, 0.7 alongside).
+OBJECT_ACCELERATION_SCALE = 32
 UNIT_MELEE = 648                  # unit: melee damage jpt! reference
 # unit: the actors a unit releases when it is destroyed (unit_definitions.h:152-155): the
 # spawned_actor_variant actv reference, spawn_actor_lower_bound and _upper_bound (h, h) and
@@ -186,6 +192,7 @@ FIELDS = '''# difficulty <value index> <name> <easy> <normal> <hard> <impossible
 # shieldtime <minimum stun damage> <stun s> <recharge s> <runtime recharge velocity>   the coll's shield stun and recharge, velocity per tick (absent: none)
 # major <actv tag>                  the variant a major upgrade places instead (absent: none)
 # unit <unit flags> <biped flags>   the unit tag's flags (bit 19: inconsequential) and a biped's (bit 11: random speed increase; 0 for a vehicle)
+# accelscale <scale>                the unit object's acceleration scale on a jpt!'s instantaneous acceleration (the death push; older engines skip it)
 # spawn <actor index> <lower> <upper> <throw velocity>   the actors the unit releases when destroyed (absent: none), velocity in world units a second
 # pop <inner> <outer> <lower> <upper min> <upper max> <jpt flags>   the body destroyed effect's infection-form pop damage (absent: none)
 # destroyed <effe tag>              the body destroyed effect a unit destroyed after dying sets off, when it is not the pop (absent: none; effects.txt holds its damage)
@@ -385,6 +392,7 @@ def unit_record(halo, unit):
     unit_flags, = t.read('I', unit.address + UNIT_FLAGS)
     biped_flags = t.read('I', unit.address + BIPED_FLAGS)[0] if unit.group == 'bipd' else 0
     record['unit'] = (unit_flags, biped_flags)
+    record['accelscale'], = t.read('f', unit.address + OBJECT_ACCELERATION_SCALE)
     spawned = halo.reference(t, unit.address + UNIT_SPAWN_VARIANT)
     if spawned and spawned.group == 'actv':
         lower, upper = t.read('2h', unit.address + UNIT_SPAWN_BOUNDS)
@@ -497,6 +505,8 @@ def write(records, path, difficulty=None):
             lines.append(f'major {r["major"]}')
         if 'unit' in r:
             lines.append('unit ' + ' '.join(map(number, r['unit'])))
+        if 'accelscale' in r:
+            lines.append(f'accelscale {number(r["accelscale"])}')
         spawn = r.get('spawn')
         if spawn and spawn[0] in index_of:
             lines.append('spawn ' + ' '.join(map(number, (index_of[spawn[0]], *spawn[1:]))))

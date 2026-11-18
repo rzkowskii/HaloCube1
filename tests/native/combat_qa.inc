@@ -275,6 +275,49 @@ COMMANDF(qa_dialogue_event, "iis", (int *type, int *hostility, const char *label
     if(subject) halodialogueevent(*type, subject, player1, *hostility);
     fflush(stdout);
 });
+// qa_dialogue_hit <amount> <mode> <label>: an exact hit of `amount` (no jpt!) through halohit, for
+// ai_handle_damage's damage and hurt events (halo_dialogue.cpp handleDamage, logged COMM_DAMAGE with
+// halo_dialoguetrace 1): mode 0 the player hits the nearest living actor, 1 that actor hits the player.
+// DIALOGUE_HIT label= mode= victim= attacker= health= alive=
+COMMANDF(qa_dialogue_hit, "fis", (float *amount, int *mode, const char *label)
+{
+    botent *actor = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot->state != CS_ALIVE) continue;
+        const float d = player1->o.squareddist(bot->o);
+        if(d < best) { best = d; actor = bot; }
+    }
+    if(!actor) { conoutf("DIALOGUE_HIT label=%s no-actor", label); fflush(stdout); return; }
+    playerent *victim = *mode ? (playerent *)player1 : (playerent *)actor;
+    playerent *attacker = *mode ? (playerent *)actor : (playerent *)player1;
+    halohit(*amount, 0, victim, attacker, vec(0, 0, 1), *mode ? GUN_SUBGUN : GUN_GRENADE, false, 0);
+    conoutf("DIALOGUE_HIT label=%s mode=%d victim=%s attacker=%s health=%d alive=%d", label, *mode, victim == player1 ? "player" : victim->name,
+            attacker == player1 ? "player" : attacker->name, victim->health, victim->state == CS_ALIVE);
+    fflush(stdout);
+});
+// qa_dialogue_hitkill <amount> <label>: the player's exact hit of `amount` on the nearest living actor,
+// then in the same millisecond a silent INT_MAX kill (a command list's die atom). The kill has no hit
+// report of its own (halohitreport), so it stays silent. DIALOGUE_HITKILL label= victim= alive=
+COMMANDF(qa_dialogue_hitkill, "fs", (float *amount, const char *label)
+{
+    botent *actor = NULL;
+    float best = 1e16f;
+    loopv(enemies)
+    {
+        botent *bot = enemies[i].bot;
+        if(!bot || bot->state != CS_ALIVE) continue;
+        const float d = player1->o.squareddist(bot->o);
+        if(d < best) { best = d; actor = bot; }
+    }
+    if(!actor) { conoutf("DIALOGUE_HITKILL label=%s no-actor", label); fflush(stdout); return; }
+    halohit(*amount, 0, actor, player1, vec(0, 0, 1), GUN_GRENADE, false, 0);
+    if(actor->state == CS_ALIVE) dodamage(INT_MAX, actor, actor, GUN_KNIFE);
+    conoutf("DIALOGUE_HITKILL label=%s victim=%s alive=%d", label, actor->name, actor->state == CS_ALIVE);
+    fflush(stdout);
+});
 // qa_dialogue_scream <type> <label>: unit_scream on the nearest living actor (0 falling fear, 1 grenade
 // attached, 2 burning). DIALOGUE_SCREAM label= subject=
 COMMANDF(qa_dialogue_scream, "is", (int *type, const char *label)

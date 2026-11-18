@@ -95,7 +95,10 @@ void CBot::Think()
     // Bot is dead?
     if (m_pMyEnt->state == CS_DEAD)
     {
-        if(lastmillis-m_pMyEnt->lastdeath<1200)
+        // A Halo body (it lies 90 s, halocorpsemillis) still in the air at 1.2 s, thrown off a ledge
+        // by the death push (weapon.cpp halohit), keeps falling for up to 6 s rather than hanging there.
+        const int dead = lastmillis-m_pMyEnt->lastdeath;
+        if(dead<1200 || (haloactive() && m_pMyEnt->timeinair && dead<6000))
         {
             m_pMyEnt->move = 0;
             moveplayer(m_pMyEnt, 1, true);
