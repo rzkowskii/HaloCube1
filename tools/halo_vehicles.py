@@ -151,10 +151,12 @@ def record(halo, tag, index, name, kind, weapon, player, output):
     marker = {m[0]: m[1:4] for m in markers}
     rows = []
     flags = [t.read('I', seat)[0] for seat in t.block(tag.address + UNIT_SEATS, SEAT_STRIDE)]
-    for index, (seat, label) in enumerate(seats):
+    # seat_index, not index: the record's vehicle index is still needed for its `vehicle` line.
+    for seat_index, (seat, label) in enumerate(seats):
         at = marker.get(label, ((low[0] + high[0]) / 2, 0., high[2] * .5))
         enter = marker.get(f'{label} enter', at)
-        rows.append((seat.replace(' ', '_'), label.replace(' ', '_'), *at, *enter, flags[index] if index < len(flags) else 0))
+        rows.append((seat.replace(' ', '_'), label.replace(' ', '_'), *at, *enter,
+                     flags[seat_index] if seat_index < len(flags) else 0))
     camera = next((marker[n] for n in ('camera driver', 'camera', 'driver camera', 'camera gunner') if n in marker),
                   ((low[0] + high[0]) / 2, 0., high[2]))
     lines = [f'vehicle {index} {name}', f'path {tag.name}', f'class {kind}', f'player {int(player)}',
