@@ -25,7 +25,7 @@ about three times as long and needs `./scripts/build-macos.sh --asan` first (the
 `HALO_SANITIZE` client in `build/macos-asan`). `scripts/ci-macos.sh` logs each step under
 `build/ci/<time>/` (`docs/macos-build.md`, Robustness, sanitizers and CI).
 
-Nothing has been run since commit `e0806ab`. Every change since then is listed, with the tests and
+Nothing has been run since commit `b77d5d4`. Every change since then is listed, with the tests and
 QA hooks that check it, in `docs/macos-build.md` ("Not yet verified in the game": the earlier work
 by area) and `docs/unverified-changes.md` (batch 5 onwards, batch by batch). The tests marked "Not
 yet run" below are new, and the existing tests have not been re-run against that work. Expect first
@@ -360,7 +360,7 @@ Under `tests/tools/`:
 
 ## Test plan for when testing resumes
 
-Nothing below has been run since commit `e0806ab` except `test_route_metrics.py` (run statically
+Nothing below has been run since commit `b77d5d4` except `test_route_metrics.py` (run statically
 while writing it, before batch 5) and `test_campaign_tables.py` (run once, statically, by an
 earlier batch). No test has run any of the work in `docs/unverified-changes.md` (batch 5 to the
 special-fire change); the steps below name each batch's checks by the batch's name there.

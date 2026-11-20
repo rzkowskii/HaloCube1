@@ -1,6 +1,6 @@
 # Changes not yet run in the game
 
-Everything here was written and compiled while testing was on hold. None of it has been run in the game or by any test, and the tests that check it (registered in `tests/run.py`, listed in [tests/README.md](../tests/README.md)) have not been run either: nothing committed after `e0806ab` has run. Results reported in [the build guide](macos-build.md) (the 55-section replay, the walked a10 sections, the device checks) predate all of it. The build guide's Status gives the current state and its "Not yet verified in the game" lists the earlier work by area; the steps for checking it all are in the [test plan](../tests/README.md#test-plan-for-when-testing-resumes). When something here is seen in the game, note the result in the build guide's Status table and take it out of this file.
+Everything here was written and compiled while testing was on hold. None of it has been run in the game or by any test, and the tests that check it (registered in `tests/run.py`, listed in [tests/README.md](../tests/README.md)) have not been run either: nothing committed after `b77d5d4` has run. Results reported in [the build guide](macos-build.md) (the 55-section replay, the walked a10 sections, the device checks) predate all of it. The build guide's Status gives the current state and its "Not yet verified in the game" lists the earlier work by area; the steps for checking it all are in the [test plan](../tests/README.md#test-plan-for-when-testing-resumes). When something here is seen in the game, note the result in the build guide's Status table and take it out of this file.
 
 ## What every section is waiting on
 
@@ -29,18 +29,18 @@ The routes and maps of every section, and the fights in them, changed after the 
 
 In the order the work was done, grouped by the commit that holds it; each group ends with the final integration review of its batches where one was made. Names in parentheses such as (Difficulty), (Scenery collision) or (Import, build and play) are headings or bold paragraph labels in [the build guide](macos-build.md).
 
-- [Batches 5 to 9 (commit `9546635`)](#batches-5-to-9-commit-9546635)
-- [Batch 10 and the scenery, route, script and combat batches (commit `bb04e83`)](#batch-10-and-the-scenery-route-script-and-combat-batches-commit-bb04e83)
-- [The c10 section 5, scenery-everywhere, jump governor and fresh-start batches (commit `03376ff`)](#the-c10-section-5-scenery-everywhere-jump-governor-and-fresh-start-batches-commit-03376ff)
-- [The d40 section 3 batch, the cube-raster stamp and the ownerless-kill batch (commit `2c6e46b`)](#the-d40-section-3-batch-the-cube-raster-stamp-and-the-ownerless-kill-batch-commit-2c6e46b)
-- [The use-aware rule's batch (commit `f66abc8`)](#the-use-aware-rules-batch-commit-f66abc8)
-- [Content currency, squad sizes, the difficulty table, combat scaling, the Flood tags and stood members (commit `07c0a61`)](#content-currency-squad-sizes-the-difficulty-table-combat-scaling-the-flood-tags-and-stood-members-commit-07c0a61)
-- [Shield leaks, script vitality, the MD3 range, carrier squads and the actors' timers (commit `f1d0e85`)](#shield-leaks-script-vitality-the-md3-range-carrier-squads-and-the-actors-timers-commit-f1d0e85)
-- [Headshots, the cyborg, playfight and effect damage (commit `2e70385`)](#headshots-the-cyborg-playfight-and-effect-damage-commit-2e70385)
-- [Actor melee, falling damage, the scripts' jpt!s and special fire (after `2e70385`)](#actor-melee-falling-damage-the-scripts-jpts-and-special-fire-after-2e70385)
-- [Danger zones and dives (after `e92a256`)](#danger-zones-and-dives-after-e92a256)
+- [Batches 5 to 9 (commit `03fda52`)](#batches-5-to-9-commit-03fda52)
+- [Batch 10 and the scenery, route, script and combat batches (commit `eac3296`)](#batch-10-and-the-scenery-route-script-and-combat-batches-commit-eac3296)
+- [The c10 section 5, scenery-everywhere, jump governor and fresh-start batches (commit `aa9d9a2`)](#the-c10-section-5-scenery-everywhere-jump-governor-and-fresh-start-batches-commit-aa9d9a2)
+- [The d40 section 3 batch, the cube-raster stamp and the ownerless-kill batch (commit `16b231f`)](#the-d40-section-3-batch-the-cube-raster-stamp-and-the-ownerless-kill-batch-commit-16b231f)
+- [The use-aware rule's batch (commit `053ad8e`)](#the-use-aware-rules-batch-commit-053ad8e)
+- [Content currency, squad sizes, the difficulty table, combat scaling, the Flood tags and stood members (commit `bf97776`)](#content-currency-squad-sizes-the-difficulty-table-combat-scaling-the-flood-tags-and-stood-members-commit-bf97776)
+- [Shield leaks, script vitality, the MD3 range, carrier squads and the actors' timers (commit `416eecd`)](#shield-leaks-script-vitality-the-md3-range-carrier-squads-and-the-actors-timers-commit-416eecd)
+- [Headshots, the cyborg, playfight and effect damage (commit `dd87770`)](#headshots-the-cyborg-playfight-and-effect-damage-commit-dd87770)
+- [Actor melee, falling damage, the scripts' jpt!s and special fire (after `dd87770`)](#actor-melee-falling-damage-the-scripts-jpts-and-special-fire-after-dd87770)
+- [Danger zones and dives (after `9e43f19`)](#danger-zones-and-dives-after-9e43f19)
 
-### Batches 5 to 9 (commit `9546635`)
+### Batches 5 to 9 (commit `03fda52`)
 
 #### Batch 5: route fixes and the frag throw
 
@@ -66,7 +66,7 @@ The melee's side effect in `weapons.txt` (a fourth `melee` field) and the kill f
 
 A full `--metrics-only` run found `halo_b40_03`, `halo_b40_05` (route and map) and `halo_a50_01` (map only) no longer what the importer writes: they predate batch 7's regenerated `vehicles.txt`, whose vehicle bounds the parked-vehicle avoidance and the map's vehicle placements read. The three were re-imported (b40 section 5's route is now 337 steps, detouring round its parked vehicles; b40 section 3's still ends in `bsp 1,8`), and every map is current again; all ten `.hscb` re-imported byte for byte the same. `qa_hs_script <name> 3` (a QA action that runs a static script as a thread of its own) replaces `test_mission_exits.py` item 3's wake of the static `ini_post_rescue`, which could not run. Nothing was run in the game.
 
-### Batch 10 and the scenery, route, script and combat batches (commit `bb04e83`)
+### Batch 10 and the scenery, route, script and combat batches (commit `eac3296`)
 
 #### Batch 10: the Warthog's jumps and d40 section 8's drive
 
@@ -92,7 +92,7 @@ The `.hcol` SCN1 trailer and its writer and loader (`write_structure_collision` 
 
 A clean rebuild of `halo-ac` and `halo-ac-qa` (no new warnings), `check-no-retail.sh` clean, and a full `--metrics-only` run with every map and route current and the one known stub (`halo_c10_05`). Fixed: `euler_rows` (`tools/halo_collision.py`) is now Halo's own placement rotation, read from the Halo CE source port in `../Halo3DS` (`matrix4x3_rotation_from_angles`: yaw, then pitch about the world's y axis, then roll about its x axis), which moves every scenery placement that is both turned and tilted (the Crash Site's `.hcol`, c10 section 3's `.cgz`, `.hcol` and `.mesh`, c10 section 6's `.hcol` were regenerated; the routes came out the same); the flown sections' flights resampled at most 7 units apart (`plan_vehicle_route`; c40 section 1's route is 1,576 rows, section 4's 167), so `tests/test_traversal_routes.py`'s 8.5-unit check between flight rows holds (it failed on both before, section 4's at HEAD already); `spawnCarried` passes over spots behind a wall, a closed door or a ledge from the player. Nothing was run.
 
-### The c10 section 5, scenery-everywhere, jump governor and fresh-start batches (commit `03376ff`)
+### The c10 section 5, scenery-everywhere, jump governor and fresh-start batches (commit `aa9d9a2`)
 
 #### The c10 section 5 batch: c10 section 5 on retail collision
 
@@ -114,7 +114,7 @@ A clean rebuild of `halo-ac` and `halo-ac-qa` (no new warnings), `check-no-retai
 
 A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` (no new warnings: only the existing OpenAL, `sprintf` and `readdir_r` deprecations), `check-no-retail.sh` clean, nothing untracked, and a full `--metrics-only` run with all 55 sections current (map, route and `.cfg`), no stub and no planner warning; nothing needed re-importing. Fixed: a10 section 7 started on its own had no `freshScripts` row, so on Normal the tutorial held the player in section 1's off-map cryotube for its minutes, and on every difficulty `mission_a10` never got past its wait for the bridge flags, so `mission_final` (the section's encounters, `final_door_1`) never ran; it now gets the row sections 3 and 4 have (a judgement call, read from the decompiled `mission_a10`; `tests/test_starting_profiles.py` item 7 covers section 7 too, not run). The fresh-start batch had labelled itself "batch 7", which is the vehicle routes batch's name; its mentions in the build guide, in `tests/README.md`, the tests and the code comments now say "the fresh-start batch". `tests/test_retail_collision.py` no longer lists d40 section 3 (stock geometry, no walk) as pending a walk with its scenery. Nothing was run.
 
-### The d40 section 3 batch, the cube-raster stamp and the ownerless-kill batch (commit `2c6e46b`)
+### The d40 section 3 batch, the cube-raster stamp and the ownerless-kill batch (commit `16b231f`)
 
 #### The d40 section 3 batch: d40 section 3 on retail collision, the extra BSPs' scenery and scenery scripted by name pattern
 
@@ -132,13 +132,13 @@ A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` (no new 
 
 A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` (only the existing OpenAL, `sprintf` and `readdir_r` deprecations), `check-no-retail.sh` clean, nothing untracked but `tests/test_scenery_raster.py`, and a full `--metrics-only` run: all 55 sections current (map, route and `.cfg`; 50 walked, 3 driven, 2 flown), format 2, no stub, no planner warning, every metrics file the same as before the run (4,113 scenery placements). Changed: the scripts' kills are ownerless as Halo's are (`ai_kill`, `ai_kill_silent`, `ai_erase`, `ai_erase_all`, `damage_object`, `damage_new`: `HaloScriptDamage(true)`; Vehicle damage, the death explosion's damage), so they no longer alert the dead actor's hostile neighbours to the player; the Vehicles section's stale "not handled" notes (the chase camera's wall test traces the retail collision on retail collision; the death explosion does deal damage) and the Crash Site's Status row (its lifepod, `pod_of_death`, draws without colliding) corrected. A scan of every placed scenery placement the whole-name rule leaves out found none with a collision model whose name the scripts use only as something other than an object (c20's `section2` and the like are smoke and lights), but seven with collision that a script names without creating, destroying or moving them while the section they stand in plays (listed under Scenery collision); left for a later batch. Not seen in the game: a script kill's `DEATH_TRACE` line should read `killer=- ownerless=1 alerted=0`.
 
-### The use-aware rule's batch (commit `f66abc8`)
+### The use-aware rule's batch (commit `053ad8e`)
 
 #### The use-aware rule's batch: the use-aware scenery rule, the Crash Site's lifepod, `intro_tree` and the scene meshes
 
 `object_uses` (`tools/import_halo_scripts.py`), `scenery_scripted`, `SCENERY_READ_ONLY` and `SCENERY_PARENT_ARGUMENT` (`tools/halo_collision.py`), the `SCENERY_SCRIPTS_AT_END` and `SCENERY_KEPT` rows and the Crash Site's `SECTION_ANCHORS` row (`tools/import_halo_campaign.py`): seven named placements with collision baked, ten section placements in all since b30's three shaft crates stand in sections 1 and 3, and drawn in their sections' meshes, where outside the Crash Site they were not drawn in play before (Scenery collision, Scripted scenery by use), the Crash Site's start moved just outside the lifepod's rear end and `intro_tree` no longer drawn (`crash_site_scenery`). Re-imported: the Crash Site, a10 section 7, a50 section 1, b30 sections 1 and 3, c10 section 1 (only the Crash Site's route changed: 1,123 steps), and `a30.hscb` (its Crash Site projection's origin, two bytes); every campaign scene mesh that differed from a fresh export was regenerated (61 of 68, Import, build and play) and `--check-scenes` added. A full `--metrics-only` run afterwards: all 55 current, format 2, 50 walked, 3 driven, 2 flown, no stub, no warning, 4,123 placements. New static tests, not run: `tests/test_scenery_uses.py`, `tests/test_scene_meshes.py`. Not seen in the game: the player spawning beside the pod and walking off, the pod stopping shots, grenades and bodies, the mapmodel and the `.hcol` agreeing on the pod's pose, the cinematics in the regenerated scene worlds.
 
-### Content currency, squad sizes, the difficulty table, combat scaling, the Flood tags and stood members (commit `07c0a61`)
+### Content currency, squad sizes, the difficulty table, combat scaling, the Flood tags and stood members (commit `bf97776`)
 
 #### The content-currency fix: map and scene currency by content, and PNG writes that skip unchanged files
 
@@ -168,7 +168,7 @@ A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` (only th
 
 A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a fresh build directory (83 warnings, all the existing OpenAL and `sprintf` deprecations, the same count as before these batches), `check-no-retail.sh` clean, nothing addable but the tracked sources, tests and docs, and a full `--metrics-only` run under Python 3.15.2: all 55 sections current (map, route and `.cfg`), format 2, 50 walked, 3 driven, 2 flown, no stub, no warning, 4,123 scenery placements, every `cgz_raw_sha1` equal to the gunzipped `.cgz`; all ten `.hscb` version 10 and actors.txt format 3. Checked by reading, not by running: the one difficulty table serves the damage, vitality and recharge scaling and the actors' combat values alike (`difficultyAt`, `halodifficultyteamvalue`); the `s squad` record's optional fields come in the order the major flag, then health and shield, then the stood point, written and read alike; a reverted member keeps its variant (`startVariant` with the saved flag) and its fractions of a maximum already scaled by its team's vitality. Fixed in the docs only: the build guide's Status introduction now names the difficulty-table work, the Difficulty introduction says which values read the level live (the damage factor, recharge, combat values, the Flood pop and stagger, homing) and which at placement, and `tests/README.md`'s test plan has the current asset versions and steps for the Flood tag batch and the stood-members change. Nothing run.
 
-### Shield leaks, script vitality, the MD3 range, carrier squads and the actors' timers (commit `f1d0e85`)
+### Shield leaks, script vitality, the MD3 range, carrier squads and the actors' timers (commit `416eecd`)
 
 #### The shield-leak work: shield leak and shield timing from each coll
 
@@ -190,7 +190,7 @@ A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a f
 
 A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a fresh build directory (83 warnings, the existing OpenAL, `sprintf` and `readdir_r` deprecations, the same count as before), `check-no-retail.sh` clean, nothing addable but the tracked sources, tests and docs (and the new `tests/test_md3_range.py`), a full `--metrics-only` run under Python 3.15.2 (all 55 current, format 2, 50 walked, 3 driven, 2 flown, no stub, no warning, 4,123 scenery placements) and `--check-scenes` (all ten missions' scene meshes and cast current, no failed export). Checked by reading, not by running: the shield step's leak, failure curve and stun, the script vitality's points and the carried and saved maxima all count against the same difficulty-scaled maxima (`variantVitality` at spawn, `haloenemysetmaximumvitality` after a script), so an actv with a body and no shield has neither a shield nor its coll's recharge; a major keeps its own variant's coll; a released form comes back from a revert or a Continue as its own variant (no major roll, as `actors_spawn_from_unit` gives none, `../Halo3DS/source/ai/actors.c:2918-2931`), and the released forms' starts (`spawnedStarts`) and the encounter grenade times (`haloactorsclear`) are cleared when a section starts. Fixed in the docs only: kills of a whole body (`ai_kill`, `ai_erase`, script depletion, a lethal `damage_object`) never reach `halodamage` (an `INT_MAX` hit skips it), so the script-vitality entry no longer says `ai_kill` used to be stopped by a Jackal's hand-held shield; the build guide's Status introduction names the shield-leak work; `tests/README.md`'s test plan names these batches and the 24-effect `effects.txt`. Nothing run.
 
-### Headshots, the cyborg, playfight and effect damage (commit `2e70385`)
+### Headshots, the cyborg, playfight and effect damage (commit `dd87770`)
 
 #### The headshot work: headshots, the actors' material modifiers by default and modifier 0 as full damage
 
@@ -212,7 +212,7 @@ A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a f
 
 A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a fresh build directory (83 warnings, the existing OpenAL, `sprintf` and `readdir_r` deprecations, the same set as before), `check-no-retail.sh` clean, nothing addable but the tracked sources, tests and docs (and the new `tools/halo_effect_reach.py` and this file), a full `--metrics-only` run under Python 3.15.2 (all 55 current, format 2, 50 walked, 3 driven, 2 flown, no stub, no warning, 4,123 scenery placements) and `--check-scenes` (all ten missions current). Checked by reading, not by running: in `halodamage` the playfight 0.3 comes first (owner-based, so an ownerless script blast and a dead actor's grenade are not scaled), then the protection test, the difficulty factor, and either the player branch (the cyborg's modifiers, once, through the overshield and shield) or the actor branch (the material, the leak, the post-modifier excess, the difficulty divisor, then the headshot test on what reaches the body, which `INT_MAX` kills never reach); the effects' blasts reach both branches with their `jpt!` materials and no owner. Fixed: `halo_actormaterials 0` now keeps the old model's pre-modifier excess too, so the switch restores the old shields exactly but for the non-head hits' indirect material (Material damage); a stale cvar comment on the built-in player rule.
 
-### Actor melee, falling damage, the scripts' jpt!s and special fire (after `2e70385`)
+### Actor melee, falling damage, the scripts' jpt!s and special fire (after `dd87770`)
 
 #### The actor-melee work: Halo's melee charge, the infection forms' contact and the carrier's fatal melee
 
@@ -232,9 +232,9 @@ A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a f
 
 #### Final integration review of the actor-melee work, the falling-damage work, the script-jpt change and the special-fire change
 
-A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a fresh build directory (83 warnings, the same OpenAL, `sprintf` and `readdir_r` deprecations as the last review's, none from the edited files), `check-no-retail.sh` clean, nothing addable but the tracked sources, tests and docs and the new `tools/halo_fall_scan.py`, `tests/test_falling_damage.py` and `tests/test_script_damage.py`, `tools/halo_actors.py` and `tools/halo_effects.py` re-run into a scratch directory (actors.txt, player.txt and effects.txt byte for byte those in `packages/halo`), a full `--metrics-only` run under Python 3.15.2 (all 55 current, format 2, 50 walked, 3 driven, 2 flown, no stub, no warning, 4,123 scenery placements) and `--check-scenes` (all ten missions current). Checked by reading, not by running: all four reach `halodamage` through `halohit` with their `jpt!`, so the playfight 0.3 (Halo's `ai_adjust_damage` scales any damage an actor owns, melee included, `ai/ai.c:654-680`), the difficulty factor (an actor's melee is owned by its team; the falls and the scripts' damage are ownerless, so none), the cyborg's and the actors' material modifiers and the shield step all apply; falling-category hits alone skip the player's difficulty scale (the scripts' `plummet` kill is category 1 too, as in Halo); only-hurts-shields and skips-shields are read only from a hit's own `jpt!`; the `INT_MAX` paths (a carrier's burst, a spent infection form) still return before `halodamage`, as intended. The planned routes stay survivable: the walker is protected, which now also spares it the guaranteed kills, and no planned drop reaches Halo's 3 units. One docs fix: the committed group's heading now names `2e70385` instead of "after `f1d0e85`".
+A clean rebuild of `halo-ac` and `halo-ac-qa` with `-DHALO_BUILD_QA=ON` into a fresh build directory (83 warnings, the same OpenAL, `sprintf` and `readdir_r` deprecations as the last review's, none from the edited files), `check-no-retail.sh` clean, nothing addable but the tracked sources, tests and docs and the new `tools/halo_fall_scan.py`, `tests/test_falling_damage.py` and `tests/test_script_damage.py`, `tools/halo_actors.py` and `tools/halo_effects.py` re-run into a scratch directory (actors.txt, player.txt and effects.txt byte for byte those in `packages/halo`), a full `--metrics-only` run under Python 3.15.2 (all 55 current, format 2, 50 walked, 3 driven, 2 flown, no stub, no warning, 4,123 scenery placements) and `--check-scenes` (all ten missions current). Checked by reading, not by running: all four reach `halodamage` through `halohit` with their `jpt!`, so the playfight 0.3 (Halo's `ai_adjust_damage` scales any damage an actor owns, melee included, `ai/ai.c:654-680`), the difficulty factor (an actor's melee is owned by its team; the falls and the scripts' damage are ownerless, so none), the cyborg's and the actors' material modifiers and the shield step all apply; falling-category hits alone skip the player's difficulty scale (the scripts' `plummet` kill is category 1 too, as in Halo); only-hurts-shields and skips-shields are read only from a hit's own `jpt!`; the `INT_MAX` paths (a carrier's burst, a spent infection form) still return before `halodamage`, as intended. The planned routes stay survivable: the walker is protected, which now also spares it the guaranteed kills, and no planned drop reaches Halo's 3 units. One docs fix: the committed group's heading now names `dd87770` instead of "after `416eecd`".
 
-### Danger zones and dives (after `e92a256`)
+### Danger zones and dives (after `9e43f19`)
 
 #### The danger-zone work: dodging grenades, vehicles and carriers
 
