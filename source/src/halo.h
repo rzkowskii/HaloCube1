@@ -1,5 +1,9 @@
 // Offline Halo campaign hooks into the AssaultCube client.
 bool haloactive();
+// True in the verification client (halo-ac-qa) unless HALO_QA_VISIBLE=1: its window stays hidden, it
+// does not become the active app, takes no input grab and plays no sound, so test runs never
+// cover or interrupt the user's work. Always false in the game itself.
+bool haloqahidden();
 void halomapstart(const char *name);
 bool halorespawn();
 void haloupdate(int elapsed);

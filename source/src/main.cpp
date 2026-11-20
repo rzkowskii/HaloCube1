@@ -128,6 +128,7 @@ VAR(sdl_xgrab_bug, 0, 0, 1);
 
 void inputgrab(bool on, bool delay = false)
 {
+    if(haloqahidden()) return; // a hidden verification run never takes the mouse or keyboard
 #ifdef SDL_VIDEO_DRIVER_X11
     bool wasrelativemouse = relativemouse;
 #endif
@@ -594,6 +595,7 @@ void setupscreen(int &useddepthbits, int &usedfsaa)
     int winh = fullscreen && fullscreendesktop ? desktoph : scr_h;
 
     int flags = SDL_WINDOW_RESIZABLE;
+    if(haloqahidden()) flags |= SDL_WINDOW_HIDDEN;
     if(fullscreen) flags |= fullscreendesktop ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_FULLSCREEN;
 
     static int configs[] =
@@ -1349,6 +1351,8 @@ int main(int argc, char **argv)
 #ifdef _DEBUG
     par = SDL_INIT_NOPARACHUTE;
 #endif
+    // A hidden verification run stays a background app on macOS: no Dock icon, no activation.
+    if(haloqahidden()) SDL_SetHint("SDL_MAC_BACKGROUND_APP", "1");
     if(SDL_Init(SDL_INIT_TIMER|SDL_INIT_VIDEO|par)<0) fatal("Unable to initialize SDL");
     SDL_version sdlver;
     SDL_GetVersion(&sdlver);

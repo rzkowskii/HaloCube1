@@ -12,6 +12,11 @@ python3 tests/run.py devices b30   # rerun by name once built (any tier)
 ./scripts/ci-macos.sh --release --asan   # plus the release tier, also under ASan/UBSan
 ```
 
+The QA client (`halo-ac-qa`) runs hidden and silent by default: its window is never shown, it does
+not become the active app or take the mouse, and its sound is muted, so runs do not interrupt other
+work on the Mac. Screenshots still render. Set `HALO_QA_VISIBLE=1` to watch a run; the keystroke
+tests need that.
+
 The quick tier takes 10 to 15 minutes. It needs the imported campaign assets
 (`docs/macos-build.md`) and the AssaultCube runtime staged in `build/runtime`. The
 release tier (`test_asset_robustness.py`, about 10 minutes, and `test_soak.py`, about 8)

@@ -5125,6 +5125,21 @@ COMMANDF(halo_zoom, "d", (bool down)
     }
 });
 
+bool haloqahidden()
+{
+#ifdef HALO_QA
+    static int hidden = -1;
+    if(hidden < 0)
+    {
+        const char *visible = getenv("HALO_QA_VISIBLE");
+        hidden = visible && *visible && *visible != '0' ? 0 : 1;
+    }
+    return hidden != 0;
+#else
+    return false;
+#endif
+}
+
 #ifdef HALO_QA
 #include "halo_ai.h"
 // Verification hooks live in tests/native. They read this file's internal

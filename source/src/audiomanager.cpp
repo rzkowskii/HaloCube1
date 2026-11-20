@@ -1,6 +1,7 @@
 // audio interface of the engine
 
 #include "cube.h"
+#include "halo.h"
 
 #define DEBUGCOND (audiodebug==1)
 
@@ -63,6 +64,7 @@ void audiomanager::initsound()
             alcMakeContextCurrent(context);
 
             alDistanceModel(AL_INVERSE_DISTANCE_CLAMPED);
+            if(haloqahidden()) alListenerf(AL_GAIN, 0.0f); // hidden verification runs are silent from the start
 
             // backend infos
             conoutf("Sound: %s / %s (%s)", alcGetString(device, ALC_DEVICE_SPECIFIER), alGetString(AL_RENDERER), alGetString(AL_VENDOR));
@@ -188,7 +190,7 @@ void audiomanager::setlistenervol(int vol)
     static int oldvol = 0;
     if(!nosound)
     {
-        alListenerf(AL_GAIN, vol/255.0f);
+        alListenerf(AL_GAIN, haloqahidden() ? 0.0f : vol/255.0f); // hidden verification runs are silent
         if(vol && !oldvol && !mapsounds.length()) reloadmapsoundconfig();
     }
     oldvol = vol;
