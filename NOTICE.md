@@ -17,6 +17,10 @@ An app built this way is for local use only. AssaultCube stock data is
 read from the AssaultCube release you provide and is covered by its own license
 (`build/runtime/docs/license.html`).
 
+The screenshots in `docs/screenshots/` show the game running with locally imported
+assets. They are included to illustrate the project; the artwork they show belongs
+to its owners.
+
 ## Engine and libraries
 
 - **AssaultCube 1.3.0.2** (Lockdown Edition) engine source, in `source/`.
